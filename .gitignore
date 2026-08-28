@@ -1,0 +1,8 @@
+/target
+*.db
+*.db-shm
+*.db-wal
+
+# local test data (downloaded audio, not for distribution)
+/Punk Goes Pop, Vol. 4/
+gemini-code-1787911410765.md
