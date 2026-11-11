@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 /// What a [`sync_directory`] run did.
 #[derive(Debug, Clone, Default)]
 pub struct ImportSummary {
+    /// The library directory row of the root, which every saved track points to.
+    pub directory_id: i64,
     /// Files whose tags were read.
     pub scanned: usize,
     /// Files skipped because their modification time matched the database.
@@ -73,6 +75,15 @@ pub async fn sync_directory(
     Ok(summary)
 }
 
+/// Sends a scan event to the progress display, or prints its warning when
+/// there is none.
+fn emit(progress: Option<&ImportProgress>, event: ScanEvent) {
+    match progress {
+        Some(progress) => progress.scan_event(event),
+        None => scanner::eprint_warning(event),
+    }
+}
+
 /// [`sync_directory`] without the rebuild: syncs the files under `dir` into
 /// the rows of the library directory `directory_id`. The watcher uses it for
 /// a folder that appeared inside the watched root, and rebuilds once per batch.
@@ -101,19 +112,7 @@ pub(crate) async fn sync_files(
                 known.modified_at == modified_at && Path::new(&known.path) == path
             })
         },
-        |event| match progress {
-            Some(progress) => progress.scan_event(event),
-            None => match event {
-                ScanEvent::Warning { message }
-                | ScanEvent::FileFinished {
-                    warning: Some(message),
-                    ..
-                } => eprintln!("{message}"),
-                ScanEvent::Discovering
-                | ScanEvent::Discovered { .. }
-                | ScanEvent::FileFinished { .. } => {}
-            },
-        },
+        |event| emit(progress, event),
     )
     .await?;
 
@@ -125,11 +124,9 @@ pub(crate) async fn sync_files(
             dir.display(),
             known.len()
         );
-        match progress {
-            Some(progress) => progress.scan_event(ScanEvent::Warning { message }),
-            None => eprintln!("{message}"),
-        }
+        emit(progress, ScanEvent::Warning { message });
         return Ok(ImportSummary {
+            directory_id,
             kept: known.len(),
             ..ImportSummary::default()
         });
@@ -183,6 +180,7 @@ pub(crate) async fn sync_files(
     let removed = store::remove_tracks_by_paths(pool, &gone).await?;
 
     Ok(ImportSummary {
+        directory_id,
         scanned: tracks.len(),
         unchanged: unchanged.len(),
         saved,
@@ -193,70 +191,30 @@ pub(crate) async fn sync_files(
 }
 
 #[cfg(test)]
-pub(crate) mod test_support {
-    use std::path::{Path, PathBuf};
-
-    /// A scratch directory removed when dropped, including when a test panics.
-    pub(crate) struct ScratchDir(PathBuf);
-
-    impl ScratchDir {
-        pub(crate) fn new(label: &str) -> Self {
-            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let dir = std::env::temp_dir().join(format!(
-                "radish-{label}-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            // Canonical, so paths compare equal to what the importer stores.
-            Self(dir.canonicalize().unwrap())
-        }
-
-        pub(crate) fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    /// Writes a minimal valid PCM WAV file.
-    pub(crate) fn write_wav(path: &Path) {
-        let data = [0u8; 32];
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"RIFF");
-        bytes.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(b"WAVE");
-        bytes.extend_from_slice(b"fmt ");
-        bytes.extend_from_slice(&16u32.to_le_bytes());
-        bytes.extend_from_slice(&1u16.to_le_bytes());
-        bytes.extend_from_slice(&1u16.to_le_bytes());
-        bytes.extend_from_slice(&44100u32.to_le_bytes());
-        bytes.extend_from_slice(&88200u32.to_le_bytes());
-        bytes.extend_from_slice(&2u16.to_le_bytes());
-        bytes.extend_from_slice(&16u16.to_le_bytes());
-        bytes.extend_from_slice(b"data");
-        bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&data);
-        std::fs::write(path, bytes).unwrap();
-    }
-}
-
-#[cfg(test)]
 mod tests {
-    use super::test_support::{ScratchDir, write_wav};
     use super::*;
     use crate::db;
+    use crate::test_support::{ScratchDir, write_wav};
 
     async fn revisions(pool: &SqlitePool) -> Vec<String> {
         sqlx::query_scalar("SELECT source_revision FROM local_releases ORDER BY id")
             .fetch_all(pool)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_summary_names_the_library_directory_of_the_root() {
+        let pool = db::connect_in_memory().await.unwrap();
+        let music = ScratchDir::new("importer-directory-id");
+        let progress = ImportProgress::new();
+
+        let summary = sync_directory(&pool, music.path(), &progress)
+            .await
+            .unwrap();
+
+        let stored = store::upsert_directory(&pool, music.path()).await.unwrap();
+        assert_eq!(summary.directory_id, stored);
     }
 
     #[test]

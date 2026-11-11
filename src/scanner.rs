@@ -198,17 +198,22 @@ pub enum ScanEvent {
     },
 }
 
-/// Reads audio tags in parallel, printing warnings for failed reads.
-pub async fn scan_directory(root: &Path) -> Result<Vec<ScannedTrack>> {
-    scan_directory_with_progress(root, |event| match event {
+/// Prints the warning a scan event carries, if any, to stderr. For callers
+/// that have no progress display to route warnings through.
+pub fn eprint_warning(event: ScanEvent) {
+    match event {
         ScanEvent::Warning { message }
         | ScanEvent::FileFinished {
             warning: Some(message),
             ..
         } => eprintln!("{message}"),
         ScanEvent::Discovering | ScanEvent::Discovered { .. } | ScanEvent::FileFinished { .. } => {}
-    })
-    .await
+    }
+}
+
+/// Reads audio tags in parallel, printing warnings for failed reads.
+pub async fn scan_directory(root: &Path) -> Result<Vec<ScannedTrack>> {
+    scan_directory_with_progress(root, eprint_warning).await
 }
 
 /// Outcome of an incremental scan.

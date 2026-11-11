@@ -29,7 +29,6 @@ pub async fn watch_directory(pool: SqlitePool, root: &Path, db_path: &Path) -> R
     let root = root.canonicalize()?;
     // The pool has connected, so the file exists and can be made absolute.
     let scope = Scope::new(&root, &db_path.canonicalize()?);
-    let directory_id = store::upsert_directory(&pool, &root).await?;
 
     // Start watching first so changes made during the initial sync are queued.
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -49,6 +48,7 @@ pub async fn watch_directory(pool: SqlitePool, root: &Path, db_path: &Path) -> R
         summary.removed
     );
     importer::report_rebuild(&summary.rebuild);
+    let directory_id = summary.directory_id;
 
     let mut state = WatchState::default();
     while let Some(batch) = collect_batch(&mut rx, DEBOUNCE).await {
@@ -344,7 +344,7 @@ async fn apply_path(
 mod tests {
     use super::*;
     use crate::db;
-    use crate::importer::test_support::{ScratchDir, write_wav};
+    use crate::test_support::{ScratchDir, write_wav};
     use notify::event::{
         AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, RemoveKind, RenameMode,
     };

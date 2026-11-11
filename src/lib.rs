@@ -24,6 +24,8 @@ pub mod providers;
 pub mod runner;
 pub mod scanner;
 pub mod store;
+#[cfg(test)]
+mod test_support;
 pub mod watcher;
 
 /// Prints a line to stdout; a write failure ends the process.
