@@ -97,7 +97,9 @@ pub enum ClefError {
     /// The request or its response body could not be transported.
     Transport,
     /// The request could not be built or the response could not be trusted.
-    Invalid(String),
+    Invalid(&'static str),
+    /// Even the smallest complete request exceeds the size limit.
+    RequestTooLarge { smallest: usize, limit: usize },
 }
 
 impl ClefError {
@@ -115,17 +117,15 @@ impl std::fmt::Display for ClefError {
             Self::Status(status) => write!(f, "AI review returned HTTP {status}"),
             Self::Transport => f.write_str("AI review request failed"),
             Self::Invalid(message) => f.write_str(message),
+            Self::RequestTooLarge { smallest, limit } => write!(
+                f,
+                "AI review skipped: smallest complete candidate request is {smallest} bytes; request limit is {limit} bytes"
+            ),
         }
     }
 }
 
 impl std::error::Error for ClefError {}
-
-impl From<anyhow::Error> for ClefError {
-    fn from(error: anyhow::Error) -> Self {
-        Self::Invalid(format!("{error:#}"))
-    }
-}
 
 /// Optional Cloudflare service. The runner applies separate acceptance checks.
 pub struct ClefClient {
@@ -252,14 +252,14 @@ impl ClefClient {
             .is_some_and(|size| size > MAX_RESPONSE_BYTES as u64)
         {
             return Err(ClefError::Invalid(
-                "AI review response exceeded its size limit".into(),
+                "AI review response exceeded its size limit",
             ));
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| ClefError::Transport)? {
             if chunk.len() > MAX_RESPONSE_BYTES - bytes.len() {
                 return Err(ClefError::Invalid(
-                    "AI review response exceeded its size limit".into(),
+                    "AI review response exceeded its size limit",
                 ));
             }
             bytes.extend_from_slice(&chunk);
@@ -291,14 +291,16 @@ fn prepare_request(
     candidates: &[ReviewCandidate<'_>],
     request_limit: usize,
     model: &str,
-) -> Result<PreparedRequest> {
+) -> Result<PreparedRequest, ClefError> {
     if candidates.is_empty() {
-        bail!("AI review requires existing candidates");
+        return Err(ClefError::Invalid("AI review requires existing candidates"));
     }
     let mut identities = BTreeSet::new();
     for review in candidates {
         if !identities.insert(&review.candidate.release.id) {
-            bail!("AI review candidate identities must be distinct");
+            return Err(ClefError::Invalid(
+                "AI review candidate identities must be distinct",
+            ));
         }
     }
     let mut ranked: Vec<_> = candidates.iter().collect();
@@ -348,7 +350,7 @@ fn prepare_request(
     redact_paths(&mut state, &private_paths);
     omit_absent_fields(&mut state);
     let evidence = state["candidates"].as_array().unwrap();
-    let build = |indices: &[usize]| -> Result<PreparedRequest> {
+    let build = |indices: &[usize]| -> Result<PreparedRequest, ClefError> {
         let choices: BTreeMap<_, _> = indices
             .iter()
             .map(|&index| {
@@ -371,7 +373,7 @@ fn prepare_request(
         let body = serde_json::to_vec(&json!({
             "model": model, "state": compact,
             "questions": {"match": {"type": "choice", "instructions": INSTRUCTIONS, "criteria": criteria}},
-        })).map_err(|_| anyhow!("AI review evidence could not be serialized"))?;
+        })).map_err(|_| ClefError::Invalid("AI review evidence could not be serialized"))?;
         Ok(PreparedRequest { body, choices })
     };
     let all: Vec<_> = (0..ranked.len()).collect();
@@ -416,9 +418,10 @@ fn prepare_request(
             selected.pop();
         }
     }
-    result.ok_or_else(|| anyhow!(
-        "AI review skipped: smallest complete candidate request is {smallest} bytes; request limit is {request_limit} bytes"
-    ))
+    result.ok_or(ClefError::RequestTooLarge {
+        smallest,
+        limit: request_limit,
+    })
 }
 
 /// The key a candidate is offered to the model under, and stored under in
@@ -652,25 +655,29 @@ fn parse_advice(
     bytes: &[u8],
     choices: &BTreeMap<String, ReleaseId>,
     model: &str,
-) -> Result<Advice> {
+) -> Result<Advice, ClefError> {
     let envelope: Envelope = serde_json::from_slice(bytes)
-        .map_err(|_| anyhow!("AI review returned an invalid response"))?;
+        .map_err(|_| ClefError::Invalid("AI review returned an invalid response"))?;
     if !envelope.success {
-        bail!("AI review service reported failure");
+        return Err(ClefError::Invalid("AI review service reported failure"));
     }
-    let result = envelope
-        .result
-        .ok_or_else(|| anyhow!("AI review response is missing its result"))?;
+    let result = envelope.result.ok_or(ClefError::Invalid(
+        "AI review response is missing its result",
+    ))?;
     if result.model != model && result.model != format!("@cf/cloudflare/{model}") {
-        bail!("AI review returned an unexpected model");
+        return Err(ClefError::Invalid("AI review returned an unexpected model"));
     }
     let answer = result
         .answers
         .into_iter()
         .find_map(|(key, answer)| (key == "match").then_some(answer))
-        .ok_or_else(|| anyhow!("AI review response is missing the match answer"))?;
+        .ok_or(ClefError::Invalid(
+            "AI review response is missing the match answer",
+        ))?;
     if answer.answer_type != "choice" {
-        bail!("AI review returned an unexpected answer type");
+        return Err(ClefError::Invalid(
+            "AI review returned an unexpected answer type",
+        ));
     }
     let choice = match answer.choice.as_str() {
         "none" => AdviceChoice::NoMatch,
@@ -679,7 +686,7 @@ fn parse_advice(
             release: choices
                 .get(key)
                 .cloned()
-                .ok_or_else(|| anyhow!("AI review selected an unknown choice"))?,
+                .ok_or(ClefError::Invalid("AI review selected an unknown choice"))?,
         },
     };
     let mut expected_keys: Vec<&str> = choices
@@ -695,7 +702,9 @@ fn parse_advice(
         .collect::<Vec<_>>()
         != expected_keys
     {
-        bail!("AI review probabilities do not match the offered choices");
+        return Err(ClefError::Invalid(
+            "AI review probabilities do not match the offered choices",
+        ));
     }
     if answer
         .probabilities
@@ -705,7 +714,9 @@ fn parse_advice(
         || !answer.confidence.is_finite()
         || !(0.0..=1.0).contains(&answer.confidence)
     {
-        bail!("AI review probabilities or confidence are invalid");
+        return Err(ClefError::Invalid(
+            "AI review probabilities or confidence are invalid",
+        ));
     }
     let selected = answer.probabilities[&answer.choice];
     if answer
@@ -713,7 +724,9 @@ fn parse_advice(
         .values()
         .any(|value| *value > selected + 1e-9)
     {
-        bail!("AI review selected a choice inconsistent with its probabilities");
+        return Err(ClefError::Invalid(
+            "AI review selected a choice inconsistent with its probabilities",
+        ));
     }
     Ok(Advice {
         model: model.to_string(),
@@ -1946,6 +1959,28 @@ mod tests {
         assert!(prepare_request(&local, &reviews, flash.body.len() - 1, "clef-flash").is_err());
     }
 
+    #[test]
+    fn an_oversized_request_reports_sizes_and_nothing_from_the_evidence() {
+        let (mut local, candidate, evaluation) = fixture();
+        local.album_title = Some("private-album-title".into());
+        let reviews = [ReviewCandidate {
+            candidate: &candidate,
+            evaluation: &evaluation,
+        }];
+        let error = match prepare_request(&local, &reviews, 10, "clef") {
+            Err(error) => error,
+            Ok(_) => panic!("a ten byte limit cannot hold a request"),
+        };
+        assert!(
+            matches!(error, ClefError::RequestTooLarge { limit: 10, .. }),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("request limit is 10 bytes"), "{message}");
+        assert!(!message.contains("private-album-title"), "{message}");
+        assert!(!error.disables_run());
+    }
+
     #[tokio::test]
     async fn accepts_cloudflare_qualified_model_name() {
         let mut body = valid_response();
@@ -2067,7 +2102,7 @@ mod tests {
             assert!(!ClefError::Status(status).disables_run(), "{status}");
         }
         assert!(ClefError::Transport.disables_run());
-        assert!(!ClefError::Invalid("bad".into()).disables_run());
+        assert!(!ClefError::Invalid("bad").disables_run());
     }
 
     #[test]
