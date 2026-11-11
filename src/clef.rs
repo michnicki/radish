@@ -71,6 +71,45 @@ impl Advice {
     }
 }
 
+/// Why one AI request produced no advice. Messages never carry URLs, response
+/// bodies or credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClefError {
+    /// The service answered with a non-success HTTP status.
+    Status(u16),
+    /// The request or its response body could not be transported.
+    Transport,
+    /// The request could not be built or the response could not be trusted.
+    Invalid(String),
+}
+
+impl ClefError {
+    /// True when retrying for other releases would be futile or costly: the
+    /// credential or endpoint is rejected, the quota is exhausted, or the
+    /// service cannot be reached at all.
+    pub fn disables_run(&self) -> bool {
+        matches!(self, Self::Status(401 | 403 | 404 | 429) | Self::Transport)
+    }
+}
+
+impl std::fmt::Display for ClefError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Status(status) => write!(f, "AI review returned HTTP {status}"),
+            Self::Transport => f.write_str("AI review request failed"),
+            Self::Invalid(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ClefError {}
+
+impl From<anyhow::Error> for ClefError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Invalid(format!("{error:#}"))
+    }
+}
+
 /// Optional Cloudflare service. The runner applies separate acceptance checks.
 pub struct ClefClient {
     http: Client,
@@ -157,7 +196,7 @@ impl ClefClient {
         &self,
         local: &LocalRelease,
         candidates: &[ReviewCandidate<'_>],
-    ) -> Result<Advice> {
+    ) -> Result<Advice, ClefError> {
         let PreparedRequest { body, choices } =
             prepare_request(local, candidates, MAX_REQUEST_BYTES, self.model)?;
         let mut response = self
@@ -168,29 +207,29 @@ impl ClefClient {
             .body(body)
             .send()
             .await
-            .map_err(|_| anyhow!("AI review request failed"))?;
+            .map_err(|_| ClefError::Transport)?;
         let status = response.status();
         if !status.is_success() {
-            bail!("AI review returned HTTP {}", status.as_u16());
+            return Err(ClefError::Status(status.as_u16()));
         }
         if response
             .content_length()
             .is_some_and(|size| size > MAX_RESPONSE_BYTES as u64)
         {
-            bail!("AI review response exceeded its size limit");
+            return Err(ClefError::Invalid(
+                "AI review response exceeded its size limit".into(),
+            ));
         }
         let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| anyhow!("AI review response could not be read"))?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(|_| ClefError::Transport)? {
             if chunk.len() > MAX_RESPONSE_BYTES - bytes.len() {
-                bail!("AI review response exceeded its size limit");
+                return Err(ClefError::Invalid(
+                    "AI review response exceeded its size limit".into(),
+                ));
             }
             bytes.extend_from_slice(&chunk);
         }
-        parse_advice(&bytes, &choices, self.model)
+        Ok(parse_advice(&bytes, &choices, self.model)?)
     }
 }
 
@@ -1324,7 +1363,7 @@ mod tests {
         (origin, task)
     }
 
-    async fn call(body: Value) -> Result<Advice> {
+    async fn call(body: Value) -> Result<Advice, ClefError> {
         let (origin, request) = server(200, body.to_string()).await;
         let client =
             ClefClient::configured("test-account", "fake-api-token", &origin, DEFAULT_MODEL)
@@ -1990,5 +2029,17 @@ mod tests {
                 10
             );
         }
+    }
+
+    #[test]
+    fn only_credential_quota_and_transport_failures_disable_the_run() {
+        for status in [401, 403, 404, 429] {
+            assert!(ClefError::Status(status).disables_run(), "{status}");
+        }
+        for status in [400, 500, 503] {
+            assert!(!ClefError::Status(status).disables_run(), "{status}");
+        }
+        assert!(ClefError::Transport.disables_run());
+        assert!(!ClefError::Invalid("bad".into()).disables_run());
     }
 }

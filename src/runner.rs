@@ -63,6 +63,37 @@ impl MatchSummary {
     }
 }
 
+/// The run's single AI client. It is built on first use so a run that never
+/// needs AI never reports missing credentials, and a failure that would repeat
+/// for every release turns AI off once instead of being retried and re-reported.
+enum AiState {
+    Unbuilt,
+    Ready(ClefClient),
+    Disabled,
+}
+
+impl AiState {
+    /// The client, or `None` once the run has turned AI off. Building can fail
+    /// (for example, missing credentials); that is reported once.
+    fn client(&mut self) -> Option<&ClefClient> {
+        if matches!(self, Self::Unbuilt) {
+            *self = match ClefClient::from_env() {
+                Ok(client) => Self::Ready(client),
+                Err(error) => {
+                    outln!(
+                        "  AI review disabled for this run: {error}; continuing without AI matching"
+                    );
+                    Self::Disabled
+                }
+            };
+        }
+        match self {
+            Self::Ready(client) => Some(client),
+            Self::Unbuilt | Self::Disabled => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Outcome {
     Accepted,
@@ -344,6 +375,7 @@ where
     let mut musicbrainz_client: Option<M> = None;
     let mut discogs_client: Option<D> = None;
     let mut discogs_disabled: Option<String> = None;
+    let mut ai = AiState::Unbuilt;
 
     for release in &selected {
         let label = format!(
@@ -419,6 +451,7 @@ where
             &mut musicbrainz_client,
             &mut discogs_client,
             &mut discogs_disabled,
+            &mut ai,
             &make_musicbrainz,
             &make_discogs,
             &guard,
@@ -468,6 +501,7 @@ async fn process_release<M, D>(
     musicbrainz_client: &mut Option<M>,
     discogs_client: &mut Option<D>,
     discogs_disabled: &mut Option<String>,
+    ai: &mut AiState,
     make_musicbrainz: impl Fn() -> Result<M>,
     make_discogs: impl Fn() -> Result<D>,
     guard: &MatchGuard,
@@ -652,7 +686,7 @@ where
 
     if has_candidates {
         if options.ai_review {
-            add_ai_advice(release, &mut attempts).await;
+            add_ai_advice(release, &mut attempts, ai).await;
         }
         if !options.review
             && direct.is_none()
@@ -731,7 +765,10 @@ where
     Ok(Outcome::Unmatched)
 }
 
-async fn add_ai_advice(release: &LocalRelease, attempts: &mut [ProviderAttempt]) {
+async fn add_ai_advice(release: &LocalRelease, attempts: &mut [ProviderAttempt], ai: &mut AiState) {
+    let Some(client) = ai.client() else {
+        return;
+    };
     let candidates: Vec<ReviewCandidate<'_>> = attempts
         .iter()
         .flat_map(|attempt| {
@@ -747,11 +784,7 @@ async fn add_ai_advice(release: &LocalRelease, attempts: &mut [ProviderAttempt])
         })
         .collect();
 
-    let result = match ClefClient::from_env() {
-        Ok(client) => client.advise(release, &candidates).await,
-        Err(error) => Err(error),
-    };
-    match result {
+    match client.advise(release, &candidates).await {
         Ok(advice) => {
             print_ai_advice(&advice);
             let assessed = candidates
@@ -769,6 +802,10 @@ async fn add_ai_advice(release: &LocalRelease, attempts: &mut [ProviderAttempt])
                     attempt.ai_advice = Some(advice.clone());
                 }
             }
+        }
+        Err(error) if error.disables_run() => {
+            outln!("  AI review disabled for this run: {error}; continuing without AI matching");
+            *ai = AiState::Disabled;
         }
         Err(error) => outln!("  AI review unavailable: {error}; continuing without AI matching"),
     }

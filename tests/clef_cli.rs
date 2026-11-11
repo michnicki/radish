@@ -12,8 +12,12 @@ const MBID: &str = "76df3287-6cda-33eb-8e9a-044b5e15ffdd";
 const TOKEN: &str = "synthetic-cloudflare-token";
 
 async fn seed(db: &Path, exact_titles: bool) -> i64 {
+    seed_in(db, "/music/private-library/blue", exact_titles).await
+}
+
+async fn seed_in(db: &Path, directory: &str, exact_titles: bool) -> i64 {
     let pool = radish::db::connect(db).await.unwrap();
-    let directory = Path::new("/music/private-library/blue");
+    let directory = Path::new(directory);
     let directory_id = store::upsert_directory(&pool, directory).await.unwrap();
     for number in 1..=2 {
         let title = if exact_titles {
@@ -256,8 +260,55 @@ async fn missing_ai_credentials_preserve_the_review_queue() {
         false,
     );
     assert!(output.status.success(), "{output:?}");
-    assert!(stdout(&output).contains("AI review unavailable"));
+    assert!(stdout(&output).contains("AI review disabled for this run"));
     assert!(stdout(&output).contains("Queued for review: 1"));
+    assert_eq!(server.requests_matching("/ai/run/"), 0);
+}
+
+#[tokio::test]
+async fn a_rejected_ai_credential_disables_ai_for_the_rest_of_the_run() {
+    let db = db_path("clef-run-shutoff");
+    seed_in(&db, "/music/private-library/blue", false).await;
+    seed_in(&db, "/music/private-library/blue-again", false).await;
+    let server = server(401, "none");
+    let output = run(
+        &db,
+        &server,
+        &["match", "--provider", "musicbrainz", "--ai-review"],
+        true,
+    );
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("Queued for review: 2"), "{text}");
+    assert_eq!(
+        text.matches("AI review disabled for this run").count(),
+        1,
+        "{text}"
+    );
+    assert_eq!(server.requests_matching("/ai/run/"), 1, "{text}");
+    assert!(!format!("{output:?}").contains(TOKEN));
+}
+
+#[tokio::test]
+async fn missing_ai_credentials_are_reported_once_per_run() {
+    let db = db_path("clef-missing-credentials-once");
+    seed_in(&db, "/music/private-library/blue", false).await;
+    seed_in(&db, "/music/private-library/blue-again", false).await;
+    let server = server(200, "none");
+    let output = run(
+        &db,
+        &server,
+        &["match", "--provider", "musicbrainz", "--ai-review"],
+        false,
+    );
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("Queued for review: 2"), "{text}");
+    assert_eq!(
+        text.matches("AI review disabled for this run").count(),
+        1,
+        "{text}"
+    );
     assert_eq!(server.requests_matching("/ai/run/"), 0);
 }
 
