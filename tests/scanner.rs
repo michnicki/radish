@@ -1,6 +1,8 @@
 mod support;
 
-use radish::scanner::{ScanEvent, scan_directory, scan_directory_with_progress};
+use radish::scanner::{
+    ScanEvent, scan_directory, scan_directory_incremental, scan_directory_with_progress,
+};
 use support::{temp_dir, write_wav};
 
 #[tokio::test]
@@ -163,5 +165,60 @@ async fn corrupt_files_produce_a_warning_containing_their_path() {
         })
         .unwrap_or_else(|| panic!("expected a read warning, got {events:?}"));
     assert!(warning.contains(broken.to_str().unwrap()), "{warning}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn mtime_secs(path: &std::path::Path) -> i64 {
+    std::fs::metadata(path)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+#[tokio::test]
+async fn unchanged_files_are_skipped_but_still_counted_as_finished() {
+    let root = temp_dir("scan-incremental");
+    let known = root.join("known.wav");
+    let fresh = root.join("fresh.wav");
+    write_wav(&known);
+    write_wav(&fresh);
+    let known_mtime = mtime_secs(&known);
+    let mut events = Vec::new();
+
+    let result = scan_directory_incremental(
+        &root,
+        |path, mtime| path == known && mtime == known_mtime,
+        |event| events.push(event),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.unchanged, std::slice::from_ref(&known));
+    assert_eq!(result.tracks.len(), 1);
+    assert_eq!(result.tracks[0].path, fresh);
+    assert_eq!(events[1], ScanEvent::Discovered { total: 2 });
+    let finished: Vec<usize> = events
+        .iter()
+        .filter_map(|event| match event {
+            ScanEvent::FileFinished {
+                completed, total, ..
+            } => {
+                assert_eq!(*total, 2);
+                Some(*completed)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finished, [1, 2]);
+
+    // A different modification time means the file is read again.
+    let stale = scan_directory_incremental(&root, |_, mtime| mtime == known_mtime + 1, |_| {})
+        .await
+        .unwrap();
+    assert!(stale.unchanged.is_empty());
+    assert_eq!(stale.tracks.len(), 2);
     std::fs::remove_dir_all(root).unwrap();
 }
