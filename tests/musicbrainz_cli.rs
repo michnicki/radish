@@ -162,3 +162,204 @@ async fn an_invalid_musicbrainz_selector_fails_before_any_request() {
     assert!(!output.status.success());
     assert_eq!(server.request_count(), 0);
 }
+
+const TWIN_MBID: &str = "11111111-1111-1111-1111-111111111111";
+
+fn album_handler(target: &str) -> (u16, String) {
+    for id in [MBID, TWIN_MBID] {
+        if target.contains(&format!("/ws/2/release/{id}")) {
+            return (
+                200,
+                musicbrainz_release_json(id, &["Track 1!", "Track 2!"], &[180.0, 181.0]),
+            );
+        }
+    }
+    if target.contains("/ws/2/release") {
+        let releases: Vec<_> = [MBID, TWIN_MBID]
+            .into_iter()
+            .map(|id| {
+                serde_json::json!({
+                    "id": id, "title": "Blue", "date": "2001-05-01",
+                    "artist-credit": [{"name": "Test Artist", "joinphrase": ""}]
+                })
+            })
+            .collect();
+        return (
+            200,
+            serde_json::json!({"count": 2, "offset": 0, "releases": releases}).to_string(),
+        );
+    }
+    (500, "unexpected Discogs request".to_string())
+}
+
+async fn seed_without_edition_ids(db: &Path) -> i64 {
+    let id = seed(db, 1990).await;
+    let pool = radish::db::connect(db).await.unwrap();
+    sqlx::query("UPDATE tracks SET musicbrainz_ids_json = ?1")
+        .bind(r#"{"release":[],"release_group":[],"release_track":[],"recording":[]}"#)
+        .execute(&pool)
+        .await
+        .unwrap();
+    store::rebuild_local_releases(&pool, None).await.unwrap();
+    pool.close().await;
+    id
+}
+
+#[tokio::test]
+async fn equivalent_editions_match_automatically_without_edition_identifiers() {
+    let db = db_path("album-auto");
+    seed_without_edition_ids(&db).await;
+    let server = MockServer::start(album_handler);
+
+    let output = run(&db, &server, &["match"]);
+    let text = stdout(&output);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("Accepted: 1"), "{text}");
+    assert!(text.contains("edition unconfirmed"), "{text}");
+    assert_eq!(server.requests_matching("/database/search"), 0);
+
+    let pool = radish::db::connect(&db).await.unwrap();
+    let row: (String, Option<i64>, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT match_scope, year, country, catalog_number FROM release_matches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row, ("album".to_string(), None, None, None));
+    let mappings: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_track_matches")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(mappings, 2);
+    pool.close().await;
+
+    let listed = run(&db, &server, &["list"]);
+    assert!(stdout(&listed).contains("Track 1!"));
+    let releases = run(&db, &server, &["releases"]);
+    assert!(stdout(&releases).contains("edition unconfirmed"));
+}
+
+#[tokio::test]
+async fn normal_match_reconsiders_a_saved_review_queue() {
+    let db = db_path("album-reconsider");
+    let id = seed_without_edition_ids(&db).await;
+    let server = MockServer::start(album_handler);
+    let queued = run(
+        &db,
+        &server,
+        &[
+            "match",
+            "--local-release",
+            &id.to_string(),
+            "--musicbrainz-release",
+            MBID,
+        ],
+    );
+    assert!(queued.status.success(), "{queued:?}");
+
+    let output = run(&db, &server, &["match"]);
+    let text = stdout(&output);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("Accepted: 1"), "{text}");
+    let pool = radish::db::connect(&db).await.unwrap();
+    let reviews: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM match_reviews")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(reviews, 0);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn conflicting_recordings_stay_queued_for_review() {
+    let db = db_path("album-recording-conflict");
+    seed_without_edition_ids(&db).await;
+    let server = MockServer::start(|target| {
+        let (status, body) = album_handler(target);
+        if target.contains(&format!("/ws/2/release/{TWIN_MBID}")) {
+            return (
+                status,
+                body.replace(
+                    "00000001-bbbb-4bbb-8bbb-000000000001",
+                    "99999999-bbbb-4bbb-8bbb-000000000001",
+                ),
+            );
+        }
+        (status, body)
+    });
+    let output = run(&db, &server, &["match"]);
+    let text = stdout(&output);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("Accepted: 0"), "{text}");
+    assert!(text.contains("Queued for review: 1"), "{text}");
+}
+
+#[tokio::test]
+async fn album_dry_run_keeps_the_database_unmatched() {
+    let db = db_path("album-dry-run");
+    seed_without_edition_ids(&db).await;
+    let server = MockServer::start(album_handler);
+    let output = run(&db, &server, &["match", "--dry-run"]);
+    let text = stdout(&output);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("would accept"), "{text}");
+    assert!(text.contains("edition unconfirmed"), "{text}");
+    let pool = radish::db::connect(&db).await.unwrap();
+    for query in [
+        "SELECT COUNT(*) FROM release_matches",
+        "SELECT COUNT(*) FROM match_reviews",
+    ] {
+        let count: i64 = sqlx::query_scalar(query).fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 0);
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn album_match_preserves_local_disc_and_track_numbers() {
+    let db = db_path("album-track-numbers");
+    seed_without_edition_ids(&db).await;
+    let pool = radish::db::connect(&db).await.unwrap();
+    sqlx::query("UPDATE tracks SET disc_number = 2, track_number = 1 WHERE path LIKE '%02.flac'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let server = MockServer::start(album_handler);
+    let output = run(&db, &server, &["match"]);
+    assert!(stdout(&output).contains("Accepted: 1"), "{output:?}");
+    let pool = radish::db::connect(&db).await.unwrap();
+    let tracks = store::list_tracks(&pool).await.unwrap();
+    assert_eq!(tracks[1].disc_number, Some(2));
+    assert_eq!(tracks[1].track_number, Some(1));
+    let searched = store::search_tracks(&pool, "Track 2").await.unwrap();
+    assert_eq!(searched[0].track_number, Some(1));
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn a_proven_edition_takes_precedence_over_an_album_score_advantage() {
+    let db = db_path("album-exact-precedence");
+    seed(&db, 1990).await;
+    let server = MockServer::start(|target| {
+        let (status, body) = album_handler(target);
+        if target.contains(&format!("/ws/2/release/{MBID}")) {
+            return (
+                status,
+                body.replace("2001-05-01", "1990-05-01")
+                    .replace("180000", "181000"),
+            );
+        }
+        (status, body)
+    });
+    let output = run(&db, &server, &["match"]);
+    let text = stdout(&output);
+    assert!(text.contains("Accepted: 1"), "{text}");
+    let pool = radish::db::connect(&db).await.unwrap();
+    let row: (String, String) =
+        sqlx::query_as("SELECT remote_release_id, match_scope FROM release_matches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row, (MBID.to_string(), "edition".to_string()));
+    pool.close().await;
+}

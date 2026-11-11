@@ -99,7 +99,7 @@ async fn row_count(db: &Path, table: &str) -> i64 {
 }
 
 #[tokio::test]
-async fn noninteractive_match_queues_candidates_instead_of_accepting() {
+async fn noninteractive_discogs_match_accepts_strong_album_evidence() {
     let db = db_path("queue");
     seed_library(&db).await;
     let server = MockServer::start(handler);
@@ -113,9 +113,10 @@ async fn noninteractive_match_queues_candidates_instead_of_accepting() {
     assert!(output.status.success(), "{:?}", output);
 
     let text = stdout(&output);
-    assert!(text.contains("Queued for review"), "{text}");
-    assert_eq!(row_count(&db, "release_matches").await, 0);
-    assert_eq!(row_count(&db, "match_reviews").await, 1);
+    assert!(text.contains("Accepted: 1"), "{text}");
+    assert!(text.contains("edition unconfirmed"), "{text}");
+    assert_eq!(row_count(&db, "release_matches").await, 1);
+    assert_eq!(row_count(&db, "match_reviews").await, 0);
     // Explicit provider mode never contacts MusicBrainz.
     assert_eq!(server.requests_matching("/ws/2/"), 0);
 }
@@ -137,6 +138,20 @@ async fn dry_run_reports_without_persisting() {
     let text = stdout(&output);
     assert!(text.contains("Dry run"), "{text}");
     assert!(text.contains("would"), "{text}");
+    assert_eq!(row_count(&db, "release_matches").await, 0);
+    assert_eq!(row_count(&db, "match_reviews").await, 0);
+}
+
+#[tokio::test]
+async fn dry_run_reports_an_automatic_fallback_album_match() {
+    let db = db_path("dry-run-fallback-album");
+    seed_library(&db).await;
+    let server = MockServer::start(handler);
+    let output = run(&db, &server, &["match", "--dry-run"], Some("test-token"));
+    let text = stdout(&output);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("Accepted: 1"), "{text}");
+    assert!(text.contains("edition unconfirmed"), "{text}");
     assert_eq!(row_count(&db, "release_matches").await, 0);
     assert_eq!(row_count(&db, "match_reviews").await, 0);
 }

@@ -7,7 +7,9 @@
 
 use crate::discogs::{AdapterError, DiscogsAdapter};
 use crate::discovery::{self, DiscoveryResult};
-use crate::matcher::{self, Candidate, DiscoveryEvidence, Evaluation, LocalRelease, RemoteRelease};
+use crate::matcher::{
+    self, Candidate, DiscoveryEvidence, Evaluation, LocalRelease, MatchScope, RemoteRelease,
+};
 use crate::musicbrainz::MusicBrainzAdapter;
 use crate::providers::{MetadataProvider, ProviderError, ProviderKind, ProviderPolicy, ReleaseId};
 use crate::store::{self, AcceptanceMethod, MatchGuard, StoredCandidate};
@@ -123,6 +125,7 @@ impl ProviderAttempt {
         local: &LocalRelease,
         result: DiscoveryResult,
         error: Option<ProviderError>,
+        direct: bool,
     ) -> Self {
         let embedded_release_resolved = result
             .evidence
@@ -136,10 +139,33 @@ impl ProviderAttempt {
             .into_iter()
             .map(|release| Candidate::new(local, release))
             .collect();
+        // Strong edition evidence wins before comparing album confidence.
+        let exact_id = candidates
+            .iter()
+            .filter(|candidate| {
+                let runner_up = candidates
+                    .iter()
+                    .filter(|other| other.release.id != candidate.release.id)
+                    .max_by(|a, b| a.score.total.total_cmp(&b.score.total));
+                let evidence = result
+                    .evidence
+                    .get(&candidate.release.id)
+                    .cloned()
+                    .unwrap_or_default();
+                matcher::evaluate(local, candidate, runner_up, &evidence).auto_accept
+            })
+            .max_by(|a, b| {
+                a.score
+                    .total
+                    .total_cmp(&b.score.total)
+                    .then_with(|| b.release.id.cmp(&a.release.id))
+            })
+            .map(|candidate| candidate.release.id.clone());
         candidates.sort_by(|a, b| {
-            b.score
-                .total
-                .total_cmp(&a.score.total)
+            (exact_id.as_ref() == Some(&b.release.id))
+                .cmp(&(exact_id.as_ref() == Some(&a.release.id)))
+                .then_with(|| b.score.album_score().total_cmp(&a.score.album_score()))
+                .then_with(|| b.score.total.total_cmp(&a.score.total))
                 .then_with(|| a.release.id.cmp(&b.release.id))
         });
 
@@ -153,7 +179,11 @@ impl ProviderAttempt {
                     .cloned()
                     .unwrap_or_default();
                 let runner_up = if index == 0 { candidates.get(1) } else { None };
-                matcher::evaluate(local, candidate, runner_up, &evidence)
+                if direct {
+                    matcher::evaluate(local, candidate, runner_up, &evidence)
+                } else {
+                    matcher::evaluate_for_matching(local, candidate, &candidates, &evidence)
+                }
             })
             .collect();
 
@@ -182,8 +212,9 @@ pub async fn attempt_provider<P: MetadataProvider>(
     direct: Option<ReleaseId>,
 ) -> ProviderAttempt {
     let kind = provider.kind();
+    let is_direct = direct.is_some();
     match discovery::discover(provider, local, direct).await {
-        Ok(result) => ProviderAttempt::from_discovery(kind, local, result, None),
+        Ok(result) => ProviderAttempt::from_discovery(kind, local, result, None, is_direct),
         Err(error) => ProviderAttempt::failed(kind, error),
     }
 }
@@ -330,16 +361,11 @@ where
 
         let guard = store::load_match_guard(pool, release.id).await?;
 
-        // Unchanged saved queues are reviewed without contacting a provider.
-        if let Some(saved) = load_saved_reviews(pool, release, &guard, release_policy).await? {
-            if !options.review {
-                outln!(
-                    "  queued for review from saved candidates ({} provider group(s))",
-                    saved.len()
-                );
-                summary.queued += 1;
-                continue;
-            }
+        // Explicit review stays offline. Normal matching rediscovers candidates
+        // so an old edition-only review does not permanently block automation.
+        if options.review
+            && let Some(saved) = load_saved_reviews(pool, release, &guard, release_policy).await?
+        {
             match review_saved_release(pool, release, saved, options.dry_run, &guard).await {
                 Ok(Outcome::Accepted) => summary.accepted += 1,
                 Ok(Outcome::Queued) => summary.queued += 1,
@@ -560,7 +586,7 @@ where
             candidate,
             primary.embedded_release_resolved,
         );
-        if conflicts.is_empty() && direct.is_none() && !options.review && !options.dry_run {
+        if conflicts.is_empty() && direct.is_none() && !options.review {
             if let Some(error) = &primary.error {
                 outln!("  recovered the release from a failed MusicBrainz stage: {error}");
             }
@@ -571,7 +597,7 @@ where
                 candidate,
                 evaluation,
                 AcceptanceMethod::Automatic,
-                false,
+                options.dry_run,
                 guard,
             )
             .await;
@@ -656,22 +682,34 @@ async fn accept(
         outln!(
             "  would accept {provider} release {} (score {:.3}) as {}",
             candidate.release.id,
-            candidate.score.total,
+            evaluation.match_scope.score(&candidate.score),
             method.as_str()
         );
         return Ok(Outcome::Accepted);
     }
 
-    match store::accept_match(pool, release.id, candidate, method, guard).await {
+    match store::accept_match(
+        pool,
+        release.id,
+        candidate,
+        method,
+        evaluation.match_scope,
+        guard,
+    )
+    .await
+    {
         Ok(()) => {
             outln!(
                 "  accepted {provider} release {} (score {:.3}, {})",
                 candidate.release.id,
-                candidate.score.total,
+                evaluation.match_scope.score(&candidate.score),
                 method.as_str()
             );
             outln!("    {} {}", provider, candidate.release.id.storage_id());
             outln!("    {}", candidate.release.url);
+            if evaluation.match_scope == MatchScope::Album {
+                outln!("    album and tracks matched; exact edition unconfirmed");
+            }
             Ok(Outcome::Accepted)
         }
         Err(error) => {
@@ -692,6 +730,7 @@ fn stored_candidates(attempt: &ProviderAttempt) -> Vec<StoredCandidate> {
             mapping: candidate.mapping.clone(),
             score: candidate.score,
             auto_accept: evaluation.auto_accept,
+            match_scope: evaluation.match_scope,
             blockers: evaluation.blockers.clone(),
             warnings: evaluation.warnings.clone(),
             evidence: evaluation.evidence.clone(),
@@ -762,6 +801,7 @@ async fn review_saved_release(
                 .iter()
                 .map(|stored| Evaluation {
                     auto_accept: stored.auto_accept,
+                    match_scope: stored.match_scope,
                     blockers: stored.blockers.clone(),
                     warnings: stored.warnings.clone(),
                     evidence: stored.evidence.clone(),
@@ -915,7 +955,7 @@ fn print_candidate(
         index + 1,
         provider,
         release.id.storage_id(),
-        candidate.score.total,
+        evaluation.match_scope.score(&candidate.score),
         if evaluation.auto_accept {
             " [auto-acceptable]"
         } else {
@@ -967,7 +1007,17 @@ fn print_candidate(
         .score
         .components()
         .iter()
-        .map(|(name, value, weight)| format!("{name} {value:.2}×{weight:.2}"))
+        .filter_map(|(name, value, weight)| {
+            if evaluation.match_scope == MatchScope::Album && *name == "year" {
+                return None;
+            }
+            let weight = if evaluation.match_scope == MatchScope::Album {
+                weight / (1.0 - matcher::WEIGHT_YEAR)
+            } else {
+                *weight
+            };
+            Some(format!("{name} {value:.2}×{weight:.2}"))
+        })
         .collect();
     outln!("      score: {}", components.join("  "));
     outln!(
@@ -1159,7 +1209,7 @@ fn print_decision(attempt: &ProviderAttempt) {
             attempt.provider,
             candidate.release.id.storage_id(),
             candidate.release.title,
-            candidate.score.total,
+            evaluation.match_scope.score(&candidate.score),
             if evaluation.auto_accept {
                 " [auto-acceptable]"
             } else {
@@ -1168,6 +1218,9 @@ fn print_decision(attempt: &ProviderAttempt) {
         );
         for blocker in &evaluation.blockers {
             outln!("       blocked: {blocker}");
+        }
+        for warning in &evaluation.warnings {
+            outln!("       note: {warning}");
         }
     }
     if let (Some(candidate), Some(evaluation)) =
@@ -1178,7 +1231,7 @@ fn print_decision(attempt: &ProviderAttempt) {
                 "  would accept {} release {} (score {:.3})",
                 attempt.provider,
                 candidate.release.id.storage_id(),
-                candidate.score.total
+                evaluation.match_scope.score(&candidate.score)
             );
         } else {
             outln!("  would queue for review");

@@ -1,6 +1,6 @@
 use crate::matcher::{
     self, ArtistKind, Candidate, EmbeddedReleaseEvidence, LocalRelease, LocalTrack, Mapping,
-    RemoteRelease, RemoteTrack,
+    MatchScope, RemoteRelease, RemoteTrack,
 };
 use crate::providers::{GroupId, Mbid, ProviderKind, ReleaseId};
 use crate::scanner::{ObservedMusicBrainzIds, ScannedTrack};
@@ -883,6 +883,7 @@ pub struct LocalReleaseStatus {
     pub remote_release_id: Option<String>,
     pub remote_url: Option<String>,
     pub remote_title: Option<String>,
+    pub match_scope: Option<String>,
     pub stale: bool,
     pub queued_providers: Vec<ProviderKind>,
 }
@@ -905,6 +906,7 @@ struct StatusRow {
     remote_release_id: Option<String>,
     remote_url: Option<String>,
     remote_title: Option<String>,
+    match_scope: Option<String>,
     stale: Option<i64>,
 }
 
@@ -915,7 +917,7 @@ pub async fn list_local_releases(
     let rows = sqlx::query_as::<_, StatusRow>(
         "SELECT lr.id, lr.directory_path, lr.album_title, lr.album_artist, lr.track_count,
                 lr.status, m.provider AS provider, m.remote_release_id AS remote_release_id,
-                m.release_url AS remote_url, m.title AS remote_title, m.stale AS stale
+                m.release_url AS remote_url, m.title AS remote_title, m.stale AS stale, m.match_scope
          FROM local_releases lr
          LEFT JOIN release_matches m ON m.local_release_id = lr.id
          ORDER BY lr.directory_path, lr.album_title_norm",
@@ -955,6 +957,7 @@ pub async fn list_local_releases(
             remote_release_id: row.remote_release_id,
             remote_url: row.remote_url,
             remote_title: row.remote_title,
+            match_scope: row.match_scope,
             stale: row.stale.unwrap_or(0) != 0,
             queued_providers: queued_by_release.remove(&row.id).unwrap_or_default(),
         })
@@ -986,6 +989,8 @@ pub struct StoredCandidate {
     pub mapping: Mapping,
     pub score: matcher::ScoreBreakdown,
     pub auto_accept: bool,
+    #[serde(default)]
+    pub match_scope: MatchScope,
     pub blockers: Vec<String>,
     pub warnings: Vec<String>,
     pub evidence: Vec<String>,
@@ -1168,6 +1173,7 @@ pub fn decode_stored_candidates(
                     mapping: candidate.mapping,
                     score: candidate.score,
                     auto_accept: candidate.auto_accept,
+                    match_scope: MatchScope::Edition,
                     blockers: candidate.blockers,
                     warnings: candidate.warnings,
                     evidence: candidate.evidence,
@@ -1197,6 +1203,7 @@ pub async fn accept_match(
     local_release_id: i64,
     candidate: &Candidate,
     method: AcceptanceMethod,
+    match_scope: MatchScope,
     guard: &MatchGuard,
 ) -> Result<()> {
     if !candidate.mapping.complete {
@@ -1243,6 +1250,7 @@ pub async fn accept_match(
     }
 
     let remote = &candidate.release;
+    let edition = (match_scope == MatchScope::Edition).then_some(remote);
     let provider = remote.provider();
     let metadata_json = serde_json::to_string(remote)?;
 
@@ -1260,9 +1268,9 @@ pub async fn accept_match(
             local_release_id, provider, remote_release_id, remote_group_id, release_url, title,
             artist, year, country, label, catalog_number, format, barcode, score,
             algorithm_version, acceptance_method, source_revision, stale, snapshot_version,
-            metadata_json
+            metadata_json, match_scope
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 0, ?18, ?19)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 0, ?18, ?19, ?20)
          RETURNING id",
     )
     .bind(local_release_id)
@@ -1272,18 +1280,19 @@ pub async fn accept_match(
     .bind(&remote.url)
     .bind(non_empty(&remote.title))
     .bind(non_empty(&remote.artist_display()))
-    .bind(remote.year)
-    .bind(&remote.country)
-    .bind(remote.label_display())
-    .bind(remote.catalog_number())
-    .bind(remote.format_display())
-    .bind(remote.barcodes.first())
-    .bind(candidate.score.total)
+    .bind(edition.and_then(|release| release.year))
+    .bind(edition.and_then(|release| release.country.as_ref()))
+    .bind(edition.and_then(RemoteRelease::label_display))
+    .bind(edition.and_then(RemoteRelease::catalog_number))
+    .bind(edition.and_then(RemoteRelease::format_display))
+    .bind(edition.and_then(|release| release.barcodes.first()))
+    .bind(match_scope.score(&candidate.score))
     .bind(matcher::algorithm_version(provider))
     .bind(method.as_str())
     .bind(&guard.source_revision)
     .bind(SNAPSHOT_VERSION)
     .bind(&metadata_json)
+    .bind(match_scope.as_str())
     .fetch_one(&mut *tx)
     .await?;
 
@@ -1304,6 +1313,7 @@ pub async fn accept_match(
         let Some(remote_track) = remote.tracklist.get(remote_index) else {
             bail!("mapping refers to a remote track that does not exist");
         };
+        let edition_track = (match_scope == MatchScope::Edition).then_some(remote_track);
         let ordinal = ordinals
             .get(&remote_index)
             .copied()
@@ -1325,13 +1335,13 @@ pub async fn accept_match(
         .bind(match_id)
         .bind(local_track_id)
         .bind(ordinal)
-        .bind(&remote_track.position)
+        .bind(edition_track.and_then(|track| track.position.as_ref()))
         .bind(non_empty(&remote_track.title))
         .bind(non_empty(&track_artist))
         .bind(remote_track.duration_secs)
-        .bind(remote_track.medium_position.map(i64::from))
-        .bind(remote_track.track_position.map(i64::from))
-        .bind(remote_track.release_track_id.map(|id| id.to_string()))
+        .bind(edition_track.and_then(|track| track.medium_position.map(i64::from)))
+        .bind(edition_track.and_then(|track| track.track_position.map(i64::from)))
+        .bind(edition_track.and_then(|track| track.release_track_id.map(|id| id.to_string())))
         .bind(remote_track.recording_id.map(|id| id.to_string()))
         .execute(&mut *tx)
         .await?;
@@ -1530,7 +1540,8 @@ pub async fn list_tracks(pool: &SqlitePool) -> Result<Vec<TrackRow>> {
                 COALESCE(tm.remote_title, t.title) AS title,
                 COALESCE(tm.remote_artist, t.artist) AS artist,
                 COALESCE(m.title, a.title) AS album,
-                COALESCE(tm.track_position, tm.remote_ordinal, t.track_number) AS track_number,
+                CASE WHEN m.match_scope = 'album' THEN t.track_number
+                     ELSE COALESCE(tm.track_position, tm.remote_ordinal, t.track_number) END AS track_number,
                 COALESCE(tm.medium_position, t.disc_number) AS disc_number,
                 t.duration_secs AS duration_secs,
                 (m.stale = 1) AS stale
@@ -1552,7 +1563,8 @@ pub async fn search_tracks(pool: &SqlitePool, query: &str) -> Result<Vec<TrackRo
                 COALESCE(tm.remote_title, t.title) AS title,
                 COALESCE(tm.remote_artist, t.artist) AS artist,
                 COALESCE(m.title, a.title) AS album,
-                COALESCE(tm.track_position, tm.remote_ordinal, t.track_number) AS track_number,
+                CASE WHEN m.match_scope = 'album' THEN t.track_number
+                     ELSE COALESCE(tm.track_position, tm.remote_ordinal, t.track_number) END AS track_number,
                 COALESCE(tm.medium_position, t.disc_number) AS disc_number,
                 t.duration_secs AS duration_secs,
                 (m.stale = 1) AS stale
@@ -1897,6 +1909,7 @@ mod tests {
             release.id,
             &candidate,
             AcceptanceMethod::Automatic,
+            MatchScope::Edition,
             &guard,
         )
         .await
@@ -1954,6 +1967,7 @@ mod tests {
             release.id,
             &candidate,
             AcceptanceMethod::Manual,
+            MatchScope::Edition,
             &guard,
         )
         .await
@@ -2006,6 +2020,7 @@ mod tests {
             release.id,
             &first,
             AcceptanceMethod::Manual,
+            MatchScope::Edition,
             &old_guard,
         )
         .await
@@ -2016,6 +2031,7 @@ mod tests {
                 release.id,
                 &second,
                 AcceptanceMethod::Manual,
+                MatchScope::Edition,
                 &old_guard
             )
             .await
@@ -2058,6 +2074,7 @@ mod tests {
             release.id,
             &candidate,
             AcceptanceMethod::Manual,
+            MatchScope::Edition,
             &guard,
         )
         .await
@@ -2094,6 +2111,7 @@ mod tests {
                 release.id,
                 &candidate,
                 AcceptanceMethod::Manual,
+                MatchScope::Edition,
                 &guard
             )
             .await
@@ -2124,6 +2142,7 @@ mod tests {
             release.id,
             &discogs,
             AcceptanceMethod::Manual,
+            MatchScope::Edition,
             &guard,
         )
         .await
@@ -2136,6 +2155,7 @@ mod tests {
             release.id,
             &musicbrainz,
             AcceptanceMethod::Manual,
+            MatchScope::Edition,
             &guard,
         )
         .await
@@ -2182,6 +2202,7 @@ mod tests {
             release.id,
             &candidate,
             AcceptanceMethod::Manual,
+            MatchScope::Edition,
             &guard,
         )
         .await
@@ -2220,6 +2241,7 @@ mod tests {
             mapping: candidate.mapping.clone(),
             score: candidate.score,
             auto_accept: false,
+            match_scope: MatchScope::Edition,
             blockers: vec!["review".to_string()],
             warnings: Vec::new(),
             evidence: Vec::new(),
@@ -2400,6 +2422,7 @@ mod tests {
             release.id,
             &candidate,
             AcceptanceMethod::Manual,
+            MatchScope::Edition,
             &guard,
         )
         .await

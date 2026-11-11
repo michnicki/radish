@@ -12,7 +12,7 @@ A compiled CLI for music library management. Radish reads the tags in your audio
 - **Reads tags in parallel** — uses Tokio's blocking thread pool to parse files with [Lofty](https://github.com/Serial-ATA/lofty-rs).
 - **Searches locally** — queries stored titles, artists, and albums without rescanning your files.
 - **Watches for changes** — uses filesystem events to refresh tags and remove deleted file entries while running.
-- **Matches MusicBrainz first (opt-in)** — finds candidate releases, compares complete tracklists, auto-accepts only clearly supported editions, and offers interactive review for ambiguous ones. Discogs runs once as a fallback only when MusicBrainz cannot settle the release and a token is available.
+- **Matches MusicBrainz first (opt-in)** — compares complete tracklists and automatically matches strongly supported albums and tracks, even when the exact pressing is unknown. Conflicting results get interactive review. Discogs runs once as a fallback only when MusicBrainz cannot settle the match and a token is available.
 - **Stores everything in SQLite** — runs as a compiled executable without a separate database server or Python environment.
 
 Supported file extensions: `mp3`, `flac`, `m4a`, `ogg`, `opus`, `wav`, `aac`, and `wma`. Extension checks ignore case, so `.FLAC` is accepted too. Files must also be readable by Lofty.
@@ -106,11 +106,13 @@ radish import ~/Music --match --provider musicbrainz
 
 An explicit `--provider` or a direct release selector restricts matching to that service and disables fallback. A direct selector requires `--local-release`, and the two direct flags conflict. `--provider` on `import` requires `--match`. `--review` requires an interactive terminal. `--clear` conflicts with every matching selector. Invalid combinations and malformed MBIDs are rejected before the database is opened or a client is created. Matching failures never roll back a successful import, and `--match` exits nonzero after the import is kept.
 
+Already imported your library? Run `radish --db /path/to/radish.db match`. Strong album/track matches no longer need a barcode, catalog number, or embedded release ID. Ordinary runs search previously queued releases again; `--review` still loads unchanged saved candidates offline.
+
 ### Provider order and fallback
 
 For each selected release Radish evaluates MusicBrainz first. If its best candidate passes every automatic gate, Discogs is never initialized and its token is never read. Otherwise Radish tries Discogs once, when a token is available, for reasons such as:
 
-- no candidates, or candidates that do not settle the edition;
+- no candidates, or candidates that do not settle the album and tracks;
 - incomplete or unsupported mappings;
 - exhausted network, rate-limit, or malformed-response retries.
 
@@ -157,7 +159,7 @@ A mapping must be complete and one-to-one before anything can be applied.
 
 ### Score and automatic acceptance
 
-Scores rank candidates; they are not probabilities.
+Scores rank candidates; they are not probabilities. Album matching uses the first four components below, divided by their combined weight (`0.95`). The edition year does not affect album confidence. Exact-edition matching uses all five components.
 
 | Component | Weight |
 | --- | --- |
@@ -169,7 +171,17 @@ Scores rank candidates; they are not probabilities.
 
 Text uses normalized Levenshtein similarity. Durations use `max(0, 1 − difference_seconds / 10)`. A missing component contributes zero rather than being renormalized into false confidence. MusicBrainz uses the concrete release year; the release-group first-release year is not substituted.
 
-A candidate is accepted automatically only when all of these hold:
+A candidate can be accepted automatically as an **album match** when:
+
+- Its album score is at least `0.95`, with album title and artist similarity each at least `0.90`.
+- Every local file maps uniquely, track counts agree, and no unsupported structures exist.
+- Every track has a local title and a positive, known duration on both sides. Each title scores at least `0.90`, and durations differ by at most three seconds.
+- Observed identifiers and edition qualifiers do not contradict the candidate.
+- Every alternative within `0.05` of its album score describes equivalent audio: matching normalized album/artist and mapped track titles/credits, compatible durations, no conflicting known recording IDs or release groups, and a complete supported mapping.
+
+Equivalent editions can share an album match. The chosen release is a deterministic metadata reference; it does not establish a pressing. Output says `album and tracks matched; exact edition unconfirmed`, and SQLite records `match_scope = 'album'`. Barcode, catalog number, country, label, format, edition year, release-track IDs, and edition-specific track positions are left absent from the applied overlay. The full candidate snapshot is retained for inspection.
+
+Radish prefers an **exact-edition match** when all of these hold:
 
 - Score is at least `0.95`.
 - The runner-up within the same provider is at least `0.05` behind, unless a consistent embedded release ID identifies the chosen release.
@@ -179,7 +191,7 @@ A candidate is accepted automatically only when all of these hold:
 - Edition identity comes from a consistent embedded release ID or a fully resolved barcode/catalog search that uniquely identifies the release. A release group, a recording, or an explicitly entered ID never counts as edition evidence on its own.
 - Identifier discovery was not truncated or left unhydrated.
 
-Everything else is queued or reviewed. Identical tracklists across editions are never accepted on advantage alone. In review you may override score or edition uncertainty after seeing the warnings, but never an invalid, incomplete, or unsupported mapping. New decisions store `musicbrainz-match-v1` or `discogs-match-v2`; historical `discogs-match-v1` values are preserved.
+Everything else is queued or reviewed. In review you may override score or identity uncertainty after seeing the warnings, but never an invalid, incomplete, or unsupported mapping. New decisions store `musicbrainz-match-v2` or `discogs-match-v3`; historical algorithm versions and accepted matches are preserved.
 
 ### Review
 
@@ -200,7 +212,7 @@ Actions are: accept a candidate, choose another provider group, enter a release 
 ### Known limits
 
 - **No fingerprinting or AcoustID.** Matching relies on tags, embedded IDs, barcode, catalog number, titles, artists, years, and durations.
-- **Edition twins:** releases with identical tracklists and no distinguishing identifier reach review rather than being accepted.
+- **Edition twins:** equivalent editions may be accepted as an album match, but their exact pressing stays unconfirmed. Conflicting recordings or tracklists still require review.
 - **Incomplete editions:** a single disc from a larger set, pregaps, data/video tracks, and unsupported media produce suggestions only.
 - **MusicBrainz MBIDs:** only hyphenated non-nil UUIDs are accepted. Nil IDs and compact 32-character forms are rejected everywhere, including stored snapshots.
 - **Rate limits and retries:** MusicBrainz attempts share a scheduler with at least 1.1 seconds between starts, including redirect hops. Every attempt has a 30-second timeout and a logical request gets at most three actual attempts. Transport failures, 429, and 5xx retry with 2s/4s backoff and honor both `Retry-After` forms; a suggested wait above 120 seconds is reported instead of slept. Discogs keeps its own existing spacing and retries.
@@ -300,7 +312,7 @@ The SQLite database contains these tables:
 - `albums` — scanned album metadata.
 - `tracks` — file paths, observed tag metadata, observed MusicBrainz identifier JSON, and local-release association.
 - `local_releases` — grouping identity, observed release metadata, embedded MusicBrainz evidence and problems, source revision, and status.
-- `release_matches` — the single accepted overlay per local release, qualified by `provider` and provider-local TEXT release ID, with snapshot version and normalized metadata snapshot.
+- `release_matches` — the single accepted overlay per local release, qualified by `provider` and provider-local TEXT release ID, with `match_scope` (`album` or `edition`), snapshot version and normalized metadata snapshot. Existing accepted decisions retain edition scope on upgrade.
 - `release_track_matches` — one-to-one file-to-track mapping with remote ordinals, medium/track positions, and MusicBrainz track/recording IDs.
 - `match_reviews` — candidate summaries, proposed mappings, and reasons keyed by `(local_release_id, provider)`.
 

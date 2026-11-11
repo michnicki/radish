@@ -234,6 +234,9 @@ fn print_releases(rows: &[store::LocalReleaseStatus]) {
         let artist = row.album_artist.as_deref().unwrap_or("(unknown artist)");
         let title = row.album_title.as_deref().unwrap_or("(no album tag)");
         let mut status = row.status.clone();
+        if row.match_scope.as_deref() == Some("album") {
+            status.push_str(", album match; edition unconfirmed");
+        }
         if row.stale && row.status != store::STATUS_STALE {
             status.push_str(", stale");
         }

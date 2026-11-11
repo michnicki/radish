@@ -165,7 +165,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(applied, 2);
+        assert_eq!(applied, 3);
     }
 
     #[tokio::test]
@@ -239,6 +239,17 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/20261111000001_album_matching.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let scope: String = sqlx::query_scalar("SELECT match_scope FROM release_matches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(scope, "edition");
 
         let match_row: (i64, i64, String, String, Option<String>, String, bool, i64) =
             sqlx::query_as(

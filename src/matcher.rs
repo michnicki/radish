@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v2";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v1";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v3";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v2";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -997,6 +997,15 @@ pub struct ScoreBreakdown {
 }
 
 impl ScoreBreakdown {
+    /// Album identity does not depend on a particular pressing's year.
+    pub fn album_score(&self) -> f64 {
+        (WEIGHT_ALBUM_TITLE * self.album_title
+            + WEIGHT_ALBUM_ARTIST * self.album_artist
+            + WEIGHT_TRACK_TITLES * self.track_titles
+            + WEIGHT_DURATIONS * self.durations)
+            / (1.0 - WEIGHT_YEAR)
+    }
+
     /// Component values paired with their weights, for the review screen.
     pub fn components(&self) -> [(&'static str, f64, f64); 5] {
         [
@@ -1245,9 +1254,35 @@ pub struct DiscoveryEvidence {
     pub blockers: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchScope {
+    Album,
+    #[default]
+    Edition,
+}
+
+impl MatchScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Album => "album",
+            Self::Edition => "edition",
+        }
+    }
+
+    pub fn score(self, score: &ScoreBreakdown) -> f64 {
+        match self {
+            Self::Album => score.album_score(),
+            Self::Edition => score.total,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Evaluation {
     pub auto_accept: bool,
+    #[serde(default)]
+    pub match_scope: MatchScope,
     /// Reasons the candidate may not be accepted automatically.
     pub blockers: Vec<String>,
     /// Non-blocking notes, including contradictions shown during review.
@@ -1269,6 +1304,97 @@ pub fn evaluate(
     candidate: &Candidate,
     runner_up: Option<&Candidate>,
     discovery: &DiscoveryEvidence,
+) -> Evaluation {
+    evaluate_at_scope(local, candidate, runner_up, discovery, MatchScope::Edition)
+}
+
+/// Prefer a proven edition, otherwise accept strong album/track evidence.
+/// Close alternatives must describe equivalent audio, not just score similarly.
+pub fn evaluate_for_matching(
+    local: &LocalRelease,
+    candidate: &Candidate,
+    alternatives: &[Candidate],
+    discovery: &DiscoveryEvidence,
+) -> Evaluation {
+    let runner_up = alternatives
+        .iter()
+        .filter(|other| other.release.id != candidate.release.id)
+        .max_by(|a, b| a.score.total.total_cmp(&b.score.total));
+    let exact = evaluate(local, candidate, runner_up, discovery);
+    if exact.auto_accept {
+        return exact;
+    }
+    let mut album = evaluate_at_scope(local, candidate, None, discovery, MatchScope::Album);
+    for other in alternatives {
+        if other.release.id != candidate.release.id
+            && candidate.score.album_score() - other.score.album_score() + 1e-9 < RUNNER_UP_GAP
+            && !equivalent_audio(candidate, other)
+        {
+            album.blockers.push(format!(
+                "close alternative {} does not establish the same album and recordings",
+                other.release.id
+            ));
+        }
+    }
+    album.auto_accept = album.blockers.is_empty();
+    album
+}
+
+fn equivalent_audio(a: &Candidate, b: &Candidate) -> bool {
+    if !b.mapping.complete || b.mapping.ambiguous || b.release.has_unsupported_entries() {
+        return false;
+    }
+    if a.release.group_id.is_some()
+        && b.release.group_id.is_some()
+        && a.release.group_id != b.release.group_id
+    {
+        return false;
+    }
+    if normalize_text(&a.release.title) != normalize_text(&b.release.title)
+        || normalize_artist_for(a.release.provider(), &a.release.artist_display())
+            != normalize_artist_for(b.release.provider(), &b.release.artist_display())
+        || remote_edition_qualifiers(&a.release) != remote_edition_qualifiers(&b.release)
+        || a.mapping.pairs.len() != b.mapping.pairs.len()
+    {
+        return false;
+    }
+    a.mapping
+        .assigned_pairs()
+        .all(|(local_index, remote_index)| {
+            let Some(other_index) = b.mapping.pairs.get(local_index).and_then(|pair| *pair) else {
+                return false;
+            };
+            let x = &a.release.tracklist[remote_index];
+            let y = &b.release.tracklist[other_index];
+            let x_artist = x.artist_credit.clone().unwrap_or_else(|| {
+                if x.artists.is_empty() {
+                    a.release.artist_display()
+                } else {
+                    x.artist_display()
+                }
+            });
+            let y_artist = y.artist_credit.clone().unwrap_or_else(|| {
+                if y.artists.is_empty() {
+                    b.release.artist_display()
+                } else {
+                    y.artist_display()
+                }
+            });
+            normalize_text(&x.title) == normalize_text(&y.title)
+                && normalize_artist_for(a.release.provider(), &x_artist)
+                    == normalize_artist_for(b.release.provider(), &y_artist)
+                && matches!((x.duration_secs, y.duration_secs), (Some(x), Some(y))
+                if x.is_finite() && y.is_finite() && (x-y).abs() <= DURATION_TOLERANCE_SECS)
+                && !matches!((x.recording_id, y.recording_id), (Some(x), Some(y)) if x != y)
+        })
+}
+
+fn evaluate_at_scope(
+    local: &LocalRelease,
+    candidate: &Candidate,
+    runner_up: Option<&Candidate>,
+    discovery: &DiscoveryEvidence,
+    match_scope: MatchScope,
 ) -> Evaluation {
     let mut blockers = Vec::new();
     let mut warnings = Vec::new();
@@ -1295,11 +1421,19 @@ pub fn evaluate(
         blockers.push("track mapping has indistinguishable alternatives".to_string());
     }
 
-    if candidate.score.total + 1e-9 < SCORE_THRESHOLD {
+    let acceptance_score = match_scope.score(&candidate.score);
+    if acceptance_score + 1e-9 < SCORE_THRESHOLD {
         blockers.push(format!(
             "score {:.3} is below the {:.2} acceptance threshold",
-            candidate.score.total, SCORE_THRESHOLD
+            acceptance_score, SCORE_THRESHOLD
         ));
+    }
+
+    if match_scope == MatchScope::Album
+        && (candidate.score.album_title < TITLE_SIMILARITY_THRESHOLD
+            || candidate.score.album_artist < TITLE_SIMILARITY_THRESHOLD)
+    {
+        blockers.push("album title or artist does not agree closely enough".to_string());
     }
 
     if let Some(runner_up) = runner_up {
@@ -1321,6 +1455,30 @@ pub fn evaluate(
     for (local_index, remote_index) in candidate.mapping.assigned_pairs() {
         let local_track = &local.tracks[local_index];
         let remote_track = &remote.tracklist[remote_index];
+
+        if match_scope == MatchScope::Album {
+            if local_track
+                .title
+                .as_deref()
+                .is_none_or(|title| title.trim().is_empty())
+                || !matches!((local_track.duration_secs, remote_track.duration_secs),
+                    (Some(a), Some(b)) if a.is_finite() && b.is_finite() && a > 0.0 && b > 0.0)
+            {
+                blockers.push(
+                    "album matching requires a title and known duration for every track"
+                        .to_string(),
+                );
+            }
+            if matches!((local_track.recording_id, remote_track.recording_id),
+                (Some(a), Some(b)) if a != b)
+                || matches!((local_track.release_track_id, remote_track.release_track_id),
+                    (Some(a), Some(b)) if a != b)
+            {
+                blockers.push(
+                    "observed track identifiers contradict the proposed recording".to_string(),
+                );
+            }
+        }
 
         if let Some(title) = &local_track.title {
             let score = similarity(title, &remote_track.title);
@@ -1456,7 +1614,9 @@ pub fn evaluate(
 
     // Evidence identifying this specific release rather than an edition twin.
     // A release group or an explicitly entered ID never counts on its own.
-    if embedded_consistent {
+    if match_scope == MatchScope::Album {
+        warnings.push("album and tracks matched; exact edition unconfirmed".to_string());
+    } else if embedded_consistent {
         // Already recorded as evidence above.
     } else if discovery.identifier_unique {
         evidence.push("barcode or catalog number uniquely identifies this release".to_string());
@@ -1466,12 +1626,12 @@ pub fn evaluate(
         );
     }
 
-    if discovery.identifier_search_truncated {
+    if match_scope == MatchScope::Edition && discovery.identifier_search_truncated {
         blockers.push("identifier search results were truncated".to_string());
     }
 
-    for blocker in &discovery.blockers {
-        blockers.push(blocker.clone());
+    if match_scope == MatchScope::Edition {
+        blockers.extend(discovery.blockers.iter().cloned());
     }
 
     if local.is_compilation {
@@ -1486,6 +1646,7 @@ pub fn evaluate(
 
     Evaluation {
         auto_accept: blockers.is_empty(),
+        match_scope,
         blockers,
         warnings,
         evidence,
@@ -2217,10 +2378,65 @@ mod tests {
 
     #[test]
     fn algorithm_versions_are_provider_specific() {
-        assert_eq!(algorithm_version(ProviderKind::Discogs), "discogs-match-v2");
+        assert_eq!(algorithm_version(ProviderKind::Discogs), "discogs-match-v3");
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v1"
+            "musicbrainz-match-v2"
+        );
+    }
+
+    #[test]
+    fn album_matching_keeps_track_and_identity_checks() {
+        let baseline = local_release(&["One", "Two"]);
+        for problem in [
+            "missing title",
+            "missing duration",
+            "incomplete",
+            "different version",
+            "conflicting barcode",
+            "unknown artist",
+        ] {
+            let mut local = baseline.clone();
+            let mut remote = remote_release(&["One", "Two"]);
+            match problem {
+                "missing title" => local.tracks[0].title = None,
+                "missing duration" => remote.tracklist[0].duration_secs = None,
+                "incomplete" => {
+                    remote.tracklist.pop();
+                }
+                "different version" => remote.edition_notes.push("Live".to_string()),
+                "conflicting barcode" => local.barcode = Some("9999999999999".to_string()),
+                "unknown artist" => local.album_artist = None,
+                _ => unreachable!(),
+            }
+            let candidate = Candidate::new(&local, remote);
+            let evaluation =
+                evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default());
+            assert!(!evaluation.auto_accept, "accepted {problem}");
+        }
+    }
+
+    #[test]
+    fn album_matching_checks_every_close_alternative() {
+        let local = local_release(&["One", "Two"]);
+        let first = Candidate::new(&local, remote_release(&["One", "Two"]));
+        let mut twin = remote_release(&["One", "Two"]);
+        twin.id = ReleaseId::Discogs(43);
+        let mut different = twin.clone();
+        different.id = ReleaseId::Discogs(44);
+        different.tracklist[0].artists = vec!["Different performer".to_string()];
+        let candidates = [
+            Candidate::new(&local, twin),
+            Candidate::new(&local, different),
+        ];
+        let evaluation =
+            evaluate_for_matching(&local, &first, &candidates, &DiscoveryEvidence::default());
+        assert!(!evaluation.auto_accept);
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|reason| reason.contains("44"))
         );
     }
 }
