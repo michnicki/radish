@@ -68,16 +68,41 @@ async fn upsert_album(
     Ok(id)
 }
 
-/// Writes observed tag metadata. Accepted provider metadata lives in separate
-/// tables and is never touched here, so re-importing keeps an accepted match.
+/// How many tracks one `upsert_tracks` transaction covers. One transaction per
+/// file is dominated by commit cost on large imports; one for the whole library
+/// would hold the write lock for minutes. Five hundred keeps each lock hold
+/// short while amortizing the commit.
+pub const UPSERT_BATCH_SIZE: usize = 500;
+
+/// Writes observed tag metadata for a batch of files in one transaction, and
+/// returns the number of rows that changed. Accepted provider metadata lives in
+/// separate tables and is never touched here, so re-importing keeps an accepted
+/// match.
+pub async fn upsert_tracks(
+    pool: &SqlitePool,
+    tracks: &[ScannedTrack],
+    directory_id: i64,
+) -> Result<u64> {
+    let mut tx = begin_write(pool).await?;
+    // Albums repeat across a folder, so remember each one for this batch only.
+    // The cache dies with the transaction, so a rollback can never leave a
+    // stale ID behind.
+    let mut albums: HashMap<(String, Option<String>), i64> = HashMap::new();
+    let mut changed = 0;
+    for track in tracks {
+        changed += write_track(&mut tx, track, directory_id, &mut albums).await?;
+    }
+    tx.commit().await?;
+    Ok(changed)
+}
+
+/// Writes observed tag metadata for one file. See [`upsert_tracks`].
 pub async fn upsert_track(
     pool: &SqlitePool,
     track: &ScannedTrack,
     directory_id: i64,
 ) -> Result<()> {
-    let mut tx = begin_write(pool).await?;
-    write_track(&mut tx, track, directory_id).await?;
-    tx.commit().await?;
+    upsert_tracks(pool, std::slice::from_ref(track), directory_id).await?;
     Ok(())
 }
 
@@ -85,10 +110,21 @@ async fn write_track(
     conn: &mut SqliteConnection,
     track: &ScannedTrack,
     directory_id: i64,
+    albums: &mut HashMap<(String, Option<String>), i64>,
 ) -> Result<u64> {
     let album_id = match &track.album {
         Some(title) if !title.is_empty() => {
-            Some(upsert_album(&mut *conn, title, track.artist.as_deref()).await?)
+            let artist = track.artist.clone().filter(|artist| !artist.is_empty());
+            let key = (title.clone(), artist);
+            let id = match albums.get(&key) {
+                Some(id) => *id,
+                None => {
+                    let id = upsert_album(&mut *conn, title, key.1.as_deref()).await?;
+                    albums.insert(key, id);
+                    id
+                }
+            };
+            Some(id)
         }
         _ => None,
     };
@@ -116,7 +152,19 @@ async fn write_track(
             catalog_number = excluded.catalog_number,
             discogs_release_id = excluded.discogs_release_id,
             musicbrainz_ids_json = excluded.musicbrainz_ids_json,
-            year = excluded.year",
+            year = excluded.year
+         WHERE (
+            tracks.title, tracks.artist, tracks.album_id, tracks.directory_id,
+            tracks.track_number, tracks.duration_secs, tracks.modified_at, tracks.album_artist,
+            tracks.disc_number, tracks.barcode, tracks.catalog_number, tracks.discogs_release_id,
+            tracks.musicbrainz_ids_json, tracks.year
+         ) IS NOT (
+            excluded.title, excluded.artist, excluded.album_id, excluded.directory_id,
+            excluded.track_number, excluded.duration_secs, excluded.modified_at,
+            excluded.album_artist, excluded.disc_number, excluded.barcode,
+            excluded.catalog_number, excluded.discogs_release_id,
+            excluded.musicbrainz_ids_json, excluded.year
+         )",
     )
     .bind(&path_str)
     .bind(&track.title)
@@ -2995,5 +3043,62 @@ mod tests {
         insert(&pool, "/music/a", &[anonymous, blank]).await;
 
         assert_eq!(count(&pool, "albums").await, 1);
+    }
+
+    #[tokio::test]
+    async fn batched_upsert_writes_all_tracks_and_skips_unchanged_rows() {
+        let pool = test_pool().await;
+        let directory_id = upsert_directory(&pool, Path::new("/music/a"))
+            .await
+            .unwrap();
+        let mut tracks: Vec<ScannedTrack> = (1..=3)
+            .map(|n| {
+                scanned(
+                    &format!("/music/a/0{n}.flac"),
+                    Some("Blue"),
+                    Some("Artist"),
+                    n,
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            upsert_tracks(&pool, &tracks, directory_id).await.unwrap(),
+            3
+        );
+        assert_eq!(count(&pool, "tracks").await, 3);
+        assert_eq!(count(&pool, "albums").await, 1);
+
+        assert_eq!(
+            upsert_tracks(&pool, &tracks, directory_id).await.unwrap(),
+            0,
+            "unchanged rows must not be rewritten"
+        );
+
+        tracks[1].title = Some("Renamed".into());
+        assert_eq!(
+            upsert_tracks(&pool, &tracks, directory_id).await.unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn batched_upsert_is_atomic() {
+        let pool = test_pool().await;
+        let tracks: Vec<ScannedTrack> = (1..=2)
+            .map(|n| {
+                scanned(
+                    &format!("/music/a/0{n}.flac"),
+                    Some("Blue"),
+                    Some("Artist"),
+                    n,
+                )
+            })
+            .collect();
+
+        // Directory 999 does not exist, so the foreign key rejects every row.
+        assert!(upsert_tracks(&pool, &tracks, 999).await.is_err());
+        assert_eq!(count(&pool, "tracks").await, 0);
+        assert_eq!(count(&pool, "albums").await, 0);
     }
 }

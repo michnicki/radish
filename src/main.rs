@@ -343,9 +343,11 @@ async fn run_import(pool: &sqlx::SqlitePool, path: &std::path::Path) -> Result<P
     let count = tracks.len();
 
     progress.saving(count);
-    for track in &tracks {
-        store::upsert_track(pool, track, directory_id).await?;
-        progress.saved();
+    for chunk in tracks.chunks(store::UPSERT_BATCH_SIZE) {
+        store::upsert_tracks(pool, chunk, directory_id).await?;
+        for _ in chunk {
+            progress.saved();
+        }
     }
 
     progress.grouping();
