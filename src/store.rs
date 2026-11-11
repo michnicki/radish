@@ -205,14 +205,30 @@ pub fn path_key(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+/// True for a normalized scope that covers a whole volume: a bare drive such as
+/// `C:`, or a UNC server or share root such as `//server/share`. Pure string
+/// logic, so it behaves the same on every platform.
+fn is_volume_root(normalized: &str) -> bool {
+    let bytes = normalized.as_bytes();
+    if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return true;
+    }
+    normalized
+        .strip_prefix("//")
+        .is_some_and(|unc| unc.split('/').filter(|part| !part.is_empty()).count() <= 2)
+}
+
 /// Deletes the track rows for a file, or for every file under a directory,
 /// and returns how many were removed. Directories match whole path components
 /// only, so `/music/Blue` never touches `/music/Bluegrass`, and matching is
-/// case-insensitive. The library root is refused, so an empty or mistaken
-/// path can never wipe the whole library.
+/// case-insensitive. The library root, a bare drive and a UNC share root are
+/// refused, so an empty or mistaken path can never wipe the whole library.
 pub async fn remove_tracks_under(pool: &SqlitePool, path: &Path) -> Result<u64> {
-    let Some(root) = scope_param(path) else {
-        bail!("refusing to remove every track: the path is the library root or empty");
+    let Some(root) = scope_param(path).filter(|root| !is_volume_root(root)) else {
+        bail!(
+            "refusing to remove every track under {}: it is a filesystem or volume root",
+            path.display()
+        );
     };
     let result = sqlx::query(
         "DELETE FROM tracks
@@ -4257,5 +4273,51 @@ mod tests {
         assert_eq!(summary.groups, 0);
         assert!(!summary.changed());
         assert_eq!(release_ids(&pool).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_tracks_under_refuses_volume_roots() {
+        for root in [
+            "/",
+            "",
+            r"C:\",
+            "c:",
+            "//server/share",
+            r"\\server\share\",
+            "//server",
+        ] {
+            assert!(
+                is_volume_root(&scope_param(Path::new(root)).unwrap_or_default())
+                    || root.is_empty()
+                    || root == "/",
+                "{root:?}"
+            );
+        }
+        for root in ["C:/Music", "//server/share/music", "/music", "/m"] {
+            assert!(!is_volume_root(root), "{root:?}");
+        }
+
+        let pool = test_pool().await;
+        let directory_id = upsert_directory(&pool, Path::new("C:/")).await.unwrap();
+        upsert_track(
+            &pool,
+            &scanned("C:/Music/01.flac", Some("Blue"), Some("Artist"), 1),
+            directory_id,
+        )
+        .await
+        .unwrap();
+        for root in [r"C:\", "c:", r"\\server\share"] {
+            assert!(
+                remove_tracks_under(&pool, Path::new(root)).await.is_err(),
+                "{root:?}"
+            );
+        }
+        assert_eq!(count(&pool, "tracks").await, 1);
+        assert_eq!(
+            remove_tracks_under(&pool, Path::new(r"C:\Music"))
+                .await
+                .unwrap(),
+            1
+        );
     }
 }
