@@ -196,6 +196,54 @@ pub async fn remove_track_by_path(pool: &SqlitePool, path: &Path) -> Result<()> 
     Ok(())
 }
 
+/// The comparison key for a file path: forward slashes and ASCII lowercase,
+/// matching how the path columns compare. Use it to look paths up in the
+/// result of [`known_modified_times`].
+pub fn path_key(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+}
+
+/// Deletes the track rows for a file, or for every file under a directory,
+/// and returns how many were removed. Directories match whole path components
+/// only, so `/music/Blue` never touches `/music/Bluegrass`, and matching is
+/// case-insensitive. The library root is refused, so an empty or mistaken
+/// path can never wipe the whole library.
+pub async fn remove_tracks_under(pool: &SqlitePool, path: &Path) -> Result<u64> {
+    let Some(root) = scope_param(path) else {
+        bail!("refusing to remove every track: the path is the library root or empty");
+    };
+    let result = sqlx::query(
+        "DELETE FROM tracks
+         WHERE replace(path, '\\', '/') = ?1 COLLATE NOCASE
+            OR substr(replace(path, '\\', '/'), 1, length(?1) + 1) = (?1 || '/') COLLATE NOCASE",
+    )
+    .bind(root)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Modification times of every stored file under `root`, keyed by
+/// [`path_key`] of the stored path. The watcher compares them with the files on
+/// disk to find what changed.
+pub async fn known_modified_times(pool: &SqlitePool, root: &Path) -> Result<HashMap<String, i64>> {
+    let root = scope_param(root);
+    let rows = sqlx::query_as::<_, (String, i64)>(
+        "SELECT path, modified_at FROM tracks
+         WHERE (?1 IS NULL
+                OR substr(replace(path, '\\', '/'), 1, length(?1) + 1) = (?1 || '/') COLLATE NOCASE)",
+    )
+    .bind(root)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(path, modified_at)| (path_key(Path::new(&path)), modified_at))
+        .collect())
+}
+
 // ---------------------------------------------------------------------------
 // Observed identifier helpers
 // ---------------------------------------------------------------------------
@@ -1275,24 +1323,53 @@ pub async fn load_local_releases(
     pool: &SqlitePool,
     scope: Option<&Path>,
 ) -> Result<Vec<LocalRelease>> {
+    load_selected_releases(pool, scope, None).await
+}
+
+/// Loads local releases with their tracks, filtered in SQL: only releases whose
+/// directory is `scope` or under it, and only the release with ID `id`. Either
+/// filter may be absent. Tracks come back in `order_release_tracks` order.
+pub async fn load_selected_releases(
+    pool: &SqlitePool,
+    scope: Option<&Path>,
+    id: Option<i64>,
+) -> Result<Vec<LocalRelease>> {
+    let scope = scope.and_then(scope_param);
+    let scope = scope.as_deref();
+
     let release_rows = sqlx::query_as::<_, LocalReleaseRow>(
-        "SELECT id, directory_path, album_title, album_artist, artist_kind, year, barcode,
-                catalog_number, embedded_discogs_id, embedded_musicbrainz_release_id,
-                embedded_musicbrainz_release_group_id, musicbrainz_problems_json,
-                is_compilation, has_album_tag, source_revision
-         FROM local_releases
-         ORDER BY directory_path, album_title_norm",
+        "SELECT lr.id, lr.directory_path, lr.album_title, lr.album_artist, lr.artist_kind,
+                lr.year, lr.barcode, lr.catalog_number, lr.embedded_discogs_id,
+                lr.embedded_musicbrainz_release_id, lr.embedded_musicbrainz_release_group_id,
+                lr.musicbrainz_problems_json, lr.is_compilation, lr.has_album_tag,
+                lr.source_revision
+         FROM local_releases lr
+         WHERE (?1 IS NULL
+                OR replace(lr.directory_path, '\\', '/') = ?1 COLLATE NOCASE
+                OR substr(replace(lr.directory_path, '\\', '/'), 1, length(?1) + 1)
+                    = (?1 || '/') COLLATE NOCASE)
+           AND (?2 IS NULL OR lr.id = ?2)
+         ORDER BY lr.directory_path, lr.album_title_norm",
     )
+    .bind(scope)
+    .bind(id)
     .fetch_all(pool)
     .await?;
 
     let track_rows = sqlx::query_as::<_, LocalTrackRow>(
-        "SELECT id, path, title, disc_number, track_number, duration_secs, local_release_id,
-                musicbrainz_ids_json
-         FROM tracks
-         WHERE local_release_id IS NOT NULL
-         ORDER BY path",
+        "SELECT t.id, t.path, t.title, t.disc_number, t.track_number, t.duration_secs,
+                t.local_release_id, t.musicbrainz_ids_json
+         FROM tracks t
+         JOIN local_releases lr ON lr.id = t.local_release_id
+         WHERE (?1 IS NULL
+                OR replace(lr.directory_path, '\\', '/') = ?1 COLLATE NOCASE
+                OR substr(replace(lr.directory_path, '\\', '/'), 1, length(?1) + 1)
+                    = (?1 || '/') COLLATE NOCASE)
+           AND (?2 IS NULL OR lr.id = ?2)
+         ORDER BY t.path",
     )
+    .bind(scope)
+    .bind(id)
     .fetch_all(pool)
     .await?;
 
@@ -1306,12 +1383,6 @@ pub async fn load_local_releases(
 
     let mut releases = Vec::new();
     for row in release_rows {
-        if let Some(scope) = scope
-            && !path_within(&row.directory_path, scope)
-        {
-            continue;
-        }
-
         let mut tracks = tracks_by_release.remove(&row.id).unwrap_or_default();
         order_release_tracks(&mut tracks);
 
@@ -3922,5 +3993,149 @@ mod tests {
             vec![Target::New, Target::New, Target::Existing(3)]
         );
         assert_eq!(plan.removed, vec![1, 2, 4]);
+    }
+
+    #[tokio::test]
+    async fn selected_releases_filter_by_scope_and_id_in_sql() {
+        let pool = test_pool().await;
+        insert(
+            &pool,
+            "/music/Blue",
+            &[
+                scanned("/music/Blue/01.flac", Some("Blue"), Some("Artist"), 1),
+                scanned("/music/Blue/02.flac", Some("Blue"), Some("Artist"), 2),
+            ],
+        )
+        .await;
+        insert(
+            &pool,
+            "/music/blue/sub",
+            &[scanned(
+                "/music/blue/sub/01.flac",
+                Some("Sub"),
+                Some("Artist"),
+                1,
+            )],
+        )
+        .await;
+        insert(
+            &pool,
+            "/music/Bluegrass",
+            &[scanned(
+                "/music/Bluegrass/01.flac",
+                Some("Grass"),
+                Some("Artist"),
+                1,
+            )],
+        )
+        .await;
+
+        let all = load_selected_releases(&pool, None, None).await.unwrap();
+        assert_eq!(all.len(), 3);
+        let wrapped = load_local_releases(&pool, None).await.unwrap();
+        assert_eq!(
+            wrapped.iter().map(|release| release.id).collect::<Vec<_>>(),
+            all.iter().map(|release| release.id).collect::<Vec<_>>()
+        );
+
+        let scoped = load_selected_releases(&pool, Some(Path::new("/MUSIC/blue")), None)
+            .await
+            .unwrap();
+        let mut titles: Vec<_> = scoped
+            .iter()
+            .map(|release| release.album_title.clone().unwrap())
+            .collect();
+        titles.sort();
+        assert_eq!(titles, vec!["Blue", "Sub"]);
+        assert!(scoped.iter().all(|release| !release.tracks.is_empty()));
+
+        let blue = scoped
+            .iter()
+            .find(|release| release.album_title.as_deref() == Some("Blue"))
+            .unwrap();
+        assert_eq!(blue.tracks.len(), 2);
+
+        let by_id = load_selected_releases(&pool, None, Some(blue.id))
+            .await
+            .unwrap();
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id[0].id, blue.id);
+        assert_eq!(by_id[0].tracks.len(), 2);
+
+        let outside =
+            load_selected_releases(&pool, Some(Path::new("/music/Bluegrass")), Some(blue.id))
+                .await
+                .unwrap();
+        assert!(outside.is_empty());
+        assert!(
+            load_selected_releases(&pool, None, Some(9999))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_tracks_under_respects_component_boundaries_and_case() {
+        let pool = test_pool().await;
+        let directory_id = upsert_directory(&pool, Path::new("/music")).await.unwrap();
+        let tracks: Vec<ScannedTrack> = [
+            "/music/Blue/01.flac",
+            "/music/blue/sub/02.flac",
+            "/music/Bluegrass/01.flac",
+        ]
+        .iter()
+        .map(|path| scanned(path, Some("Album"), Some("Artist"), 1))
+        .collect();
+        upsert_tracks(&pool, &tracks, directory_id).await.unwrap();
+
+        assert!(remove_tracks_under(&pool, Path::new("/")).await.is_err());
+        assert!(remove_tracks_under(&pool, Path::new("")).await.is_err());
+        assert_eq!(count(&pool, "tracks").await, 3);
+
+        assert_eq!(
+            remove_tracks_under(&pool, Path::new("/MUSIC/Blue"))
+                .await
+                .unwrap(),
+            2
+        );
+        let left: Vec<String> = sqlx::query_scalar("SELECT path FROM tracks")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, vec!["/music/Bluegrass/01.flac"]);
+
+        assert_eq!(
+            remove_tracks_under(&pool, Path::new("/MUSIC/bluegrass/01.FLAC"))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(count(&pool, "tracks").await, 0);
+    }
+
+    #[tokio::test]
+    async fn known_modified_times_lists_files_under_a_root() {
+        let pool = test_pool().await;
+        let directory_id = upsert_directory(&pool, Path::new("/music")).await.unwrap();
+        let mut first = scanned("/music/Blue/01.flac", Some("Album"), Some("Artist"), 1);
+        first.modified_at = 11;
+        let mut nested = scanned("/music/blue/Sub/02.flac", Some("Album"), Some("Artist"), 2);
+        nested.modified_at = 22;
+        let sibling = scanned("/music/Bluegrass/01.flac", Some("Album"), Some("Artist"), 1);
+        upsert_tracks(&pool, &[first, nested, sibling], directory_id)
+            .await
+            .unwrap();
+
+        let known = known_modified_times(&pool, Path::new("/MUSIC/blue"))
+            .await
+            .unwrap();
+        assert_eq!(known.len(), 2);
+        assert_eq!(known["/music/blue/01.flac"], 11);
+        assert_eq!(known["/music/blue/sub/02.flac"], 22);
+        assert_eq!(
+            path_key(Path::new(r"C:\Music\Blue")),
+            "c:/music/blue".to_string()
+        );
     }
 }

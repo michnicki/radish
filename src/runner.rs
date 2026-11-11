@@ -286,13 +286,14 @@ where
 
     let statuses = store::status_by_id(pool).await?;
     let existing_matches = store::accepted_matches_by_release(pool).await?;
-    let mut releases = store::load_local_releases(pool, options.scope.as_deref()).await?;
+    let releases =
+        store::load_selected_releases(pool, options.scope.as_deref(), options.local_release)
+            .await?;
 
-    if let Some(id) = options.local_release {
-        releases.retain(|release| release.id == id);
-        if releases.is_empty() {
-            bail!("local release {id} was not found");
-        }
+    if let Some(id) = options.local_release
+        && releases.is_empty()
+    {
+        bail!("local release {id} was not found");
     }
 
     let mut summary = MatchSummary {
