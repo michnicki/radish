@@ -70,9 +70,11 @@ pub(crate) async fn sync_files(
     } = scanner::scan_directory_incremental(
         dir,
         |path, modified_at| {
-            known
-                .get(&store::path_key(path))
-                .is_some_and(|known| known.modified_at == modified_at)
+            // The stored path must match exactly, not just case-insensitively:
+            // a case-only rename has to be read and saved again.
+            known.get(&store::path_key(path)).is_some_and(|known| {
+                known.modified_at == modified_at && Path::new(&known.path) == path
+            })
         },
         |event| match progress {
             Some(progress) => progress.scan_event(event),
@@ -411,5 +413,27 @@ mod tests {
         assert_eq!(summary.removed, 0, "{summary:?}");
         assert_eq!(summary.kept, 3, "{summary:?}");
         assert_eq!(paths(&pool).await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_case_only_rename_is_reflected_after_import() {
+        let pool = db::connect_in_memory().await.unwrap();
+        let music = ScratchDir::new("importer-case-rename");
+        write_wav(&music.path().join("01.wav"));
+        let progress = ImportProgress::new();
+        sync_directory(&pool, music.path(), &progress)
+            .await
+            .unwrap();
+
+        std::fs::rename(music.path().join("01.wav"), music.path().join("01.WAV")).unwrap();
+        let summary = sync_directory(&pool, music.path(), &progress)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.removed, 0, "{summary:?}");
+        assert_eq!(
+            paths(&pool).await,
+            [music.path().join("01.WAV").display().to_string()]
+        );
     }
 }

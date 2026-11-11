@@ -139,6 +139,7 @@ async fn write_track(
          )
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(path) DO UPDATE SET
+            path = excluded.path,
             title = excluded.title,
             artist = excluded.artist,
             album_id = excluded.album_id,
@@ -153,7 +154,7 @@ async fn write_track(
             discogs_release_id = excluded.discogs_release_id,
             musicbrainz_ids_json = excluded.musicbrainz_ids_json,
             year = excluded.year
-         WHERE (
+         WHERE tracks.path COLLATE BINARY <> excluded.path OR (
             tracks.title, tracks.artist, tracks.album_id, tracks.directory_id,
             tracks.track_number, tracks.duration_secs, tracks.modified_at, tracks.album_artist,
             tracks.disc_number, tracks.barcode, tracks.catalog_number, tracks.discogs_release_id,
@@ -4226,6 +4227,33 @@ mod tests {
             path_key(Path::new(r"C:\Music\Blue")),
             "c:/music/blue".to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn upserting_a_case_changed_path_updates_the_stored_casing() {
+        let pool = test_pool().await;
+        let directory_id = upsert_directory(&pool, Path::new("/music")).await.unwrap();
+        let original = scanned("/music/A/01.wav", Some("Album"), None, 1);
+        let renamed = scanned("/music/A/01.WAV", Some("Album"), None, 1);
+        upsert_tracks(&pool, &[original], directory_id)
+            .await
+            .unwrap();
+
+        let changed = upsert_tracks(&pool, &[renamed.clone()], directory_id)
+            .await
+            .unwrap();
+
+        assert_eq!(changed, 1);
+        assert_eq!(count(&pool, "tracks").await, 1);
+        let stored: String = sqlx::query_scalar("SELECT path FROM tracks")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, "/music/A/01.WAV");
+        let again = upsert_tracks(&pool, &[renamed], directory_id)
+            .await
+            .unwrap();
+        assert_eq!(again, 0);
     }
 
     #[tokio::test]
