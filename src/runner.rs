@@ -489,6 +489,16 @@ where
     Ok(summary)
 }
 
+/// A primary stage that failed for a reason that says nothing about the
+/// release means a fallback candidate was never compared against what the
+/// primary would have found, so it must be reviewed rather than accepted.
+fn primary_failed_transiently(attempts: &[ProviderAttempt]) -> bool {
+    attempts
+        .first()
+        .and_then(|attempt| attempt.error.as_ref())
+        .is_some_and(ProviderError::is_transient)
+}
+
 async fn load_saved_reviews(
     pool: &SqlitePool,
     release: &LocalRelease,
@@ -678,10 +688,7 @@ where
         && let (Some(candidate), Some(evaluation)) =
             (fallback.candidates.first(), fallback.evaluations.first())
         && evaluation.auto_accept
-        && !attempts[0]
-            .error
-            .as_ref()
-            .is_some_and(ProviderError::is_transient)
+        && !primary_failed_transiently(&attempts)
     {
         let primary = &attempts[0];
         let conflicts = matcher::fallback_conflicts(
@@ -915,6 +922,7 @@ fn choose_ai_match(
         .iter()
         .find_map(|attempt| attempt.ai_advice.as_ref())
         .ok_or_else(|| "no model assessment is available".to_string())?;
+    let primary_provider = attempts.first().map(|attempt| attempt.provider);
     if matches!(advice.choice, AdviceChoice::NoMatch) {
         return Err("the model found no supported match".into());
     }
@@ -950,6 +958,13 @@ fn choose_ai_match(
         }
         AdviceChoice::NoMatch => unreachable!(),
     };
+    if primary_failed_transiently(attempts)
+        && Some(candidate.release.provider()) != primary_provider
+    {
+        return Err(
+            "MusicBrainz stage failed transiently; fallback candidates need review".to_string(),
+        );
+    }
     // Include candidates outside the model budget when checking ambiguity.
     let alternatives: Vec<Candidate> = attempts
         .iter()

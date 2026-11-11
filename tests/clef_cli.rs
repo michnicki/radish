@@ -382,6 +382,89 @@ async fn changed_files_invalidate_saved_advice() {
     assert_eq!(server.requests_matching("/ai/run/"), 2);
 }
 
+fn outage_server(ai_choice: &'static str) -> MockServer {
+    MockServer::start(move |target| {
+        if target.contains("/ai/run/") {
+            return (
+                200,
+                serde_json::json!({
+                    "success": true,
+                    "result": {
+                        "model": "clef-flash",
+                        "answers": {"match": {
+                            "type": "choice", "choice": ai_choice,
+                            "probabilities": {ai_choice: 1.0, "none": 0.0, "equivalent_editions": 0.0},
+                            "confidence": 1.0
+                        }}
+                    }
+                })
+                .to_string(),
+            );
+        }
+        if target.contains("/ws/2/") {
+            return (503, "{}".into());
+        }
+        if target.contains("/database/search") {
+            return (200, discogs_search_json());
+        }
+        if target.contains("/releases/42") {
+            return (200, discogs_release_json());
+        }
+        (404, "{}".into())
+    })
+}
+
+fn run_with_discogs(db: &Path, server: &MockServer, args: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_radish"));
+    command
+        .arg("--db")
+        .arg(db)
+        .args(args)
+        .env("RADISH_MUSICBRAINZ_BASE_URL", &server.url)
+        .env("RADISH_DISCOGS_BASE_URL", &server.url)
+        .env("RADISH_DISCOGS_TOKEN", "test-token")
+        .env("RADISH_CLOUDFLARE_BASE_URL", &server.url)
+        .env("RADISH_CLOUDFLARE_MODEL", "clef-flash")
+        .env(
+            "RADISH_CLOUDFLARE_ACCOUNT_ID",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .env("RADISH_CLOUDFLARE_API_TOKEN", TOKEN)
+        .stdin(Stdio::null());
+    command.output().unwrap()
+}
+
+async fn release_match_rows(db: &Path) -> i64 {
+    let pool = radish::db::connect(db).await.unwrap();
+    let count = sqlx::query_scalar("SELECT count(*) FROM release_matches")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    count
+}
+
+#[tokio::test]
+async fn ai_cannot_accept_a_discogs_fallback_after_a_transient_musicbrainz_failure() {
+    let db = db_path("clef-outage-fallback");
+    seed(&db, true).await;
+    // Without an observed MusicBrainz ID nothing else blocks the fallback.
+    let pool = radish::db::connect(&db).await.unwrap();
+    sqlx::query("UPDATE tracks SET musicbrainz_ids_json = '{}'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let server = outage_server("discogs:42");
+    let output = run_with_discogs(&db, &server, &["match", "--ai-review"]);
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert_eq!(server.requests_matching("/ai/run/"), 1, "{text}");
+    assert!(text.contains("Queued for review: 1"), "{text}");
+    assert!(text.contains("Accepted: 0"), "{text}");
+    assert_eq!(release_match_rows(&db).await, 0, "{text}");
+}
+
 #[tokio::test]
 async fn ai_dry_run_shows_advice_without_saving_it() {
     let db = db_path("clef-dry-run");
