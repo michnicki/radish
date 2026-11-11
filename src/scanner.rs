@@ -1,7 +1,7 @@
 use anyhow::Result;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::probe::Probe;
-use lofty::tag::Accessor;
+use lofty::tag::{Accessor, ItemKey};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
@@ -14,8 +14,13 @@ pub struct ScannedTrack {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
+    pub album_artist: Option<String>,
     pub year: Option<i64>,
     pub track_number: Option<i64>,
+    pub disc_number: Option<i64>,
+    pub barcode: Option<String>,
+    pub catalog_number: Option<String>,
+    pub discogs_release_id: Option<i64>,
     pub duration_secs: Option<f64>,
     pub modified_at: i64,
 }
@@ -31,7 +36,9 @@ pub fn is_audio_file(path: &Path) -> bool {
 
 pub fn read_tags(path: &Path) -> Result<ScannedTrack> {
     let tagged_file = Probe::open(path)?.read()?;
-    let tag = tagged_file.primary_tag().or_else(|| tagged_file.first_tag());
+    let tag = tagged_file
+        .primary_tag()
+        .or_else(|| tagged_file.first_tag());
 
     let (title, artist, album, year, track_number) = match tag {
         Some(tag) => (
@@ -44,6 +51,30 @@ pub fn read_tags(path: &Path) -> Result<ScannedTrack> {
         None => (None, None, None, None, None),
     };
 
+    let album_artist = tag.and_then(|tag| {
+        tag.get_string(ItemKey::AlbumArtist)
+            .or_else(|| tag.get_string(ItemKey::AlbumArtists))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    });
+    let disc_number = tag
+        .and_then(|tag| tag.disk())
+        .map(i64::from)
+        .filter(|disk| *disk > 0);
+    let barcode = tag.and_then(|tag| {
+        tag.get_string(ItemKey::Barcode)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    });
+    let catalog_number = tag.and_then(|tag| {
+        tag.get_string(ItemKey::CatalogNumber)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    });
+    // Lofty 0.25 has no item key for Discogs identifiers, so an embedded
+    // release ID stays absent until a format-specific reader supplies it.
+    let discogs_release_id = None;
+
     let duration_secs = Some(tagged_file.properties().duration().as_secs_f64());
     let modified_at = std::fs::metadata(path)?
         .modified()?
@@ -55,8 +86,13 @@ pub fn read_tags(path: &Path) -> Result<ScannedTrack> {
         title,
         artist,
         album,
+        album_artist,
         year,
         track_number,
+        disc_number,
+        barcode,
+        catalog_number,
+        discogs_release_id,
         duration_secs,
         modified_at,
     })
@@ -88,4 +124,17 @@ pub async fn scan_directory(root: &Path) -> Result<Vec<ScannedTrack>> {
     }
 
     Ok(tracks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_uppercase_audio_extensions() {
+        assert!(is_audio_file(Path::new("song.FLAC")));
+        assert!(is_audio_file(Path::new("song.Mp3")));
+        assert!(!is_audio_file(Path::new("cover.jpg")));
+        assert!(!is_audio_file(Path::new("no-extension")));
+    }
 }

@@ -3,6 +3,10 @@ name = "Radish"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "radish"
+path = "src/lib.rs"
+
 [[bin]]
 name = "radish"
 path = "src/main.rs"
@@ -10,8 +14,12 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.6", features = ["derive"] }
+discogger = { git = "https://github.com/isabelgk/discogger.git", rev = "8e9bef2ac1c893cb4ea685e49334cc91ba8dbe5b" }
 lofty = "0.25.1"
 notify = "8.2.0"
-sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 tokio = { version = "1.53.1", features = ["full"] }
+unicode-normalization = "0.1.24"
 walkdir = "2.5"
