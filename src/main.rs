@@ -249,6 +249,8 @@ fn canonical_scope(path: Option<&Path>) -> Result<Option<PathBuf>> {
 }
 
 fn print_releases(rows: &[store::LocalReleaseStatus]) {
+    use radish::output::Clean;
+
     if rows.is_empty() {
         outln!("No local releases found.");
         return;
@@ -274,10 +276,11 @@ fn print_releases(rows: &[store::LocalReleaseStatus]) {
         }
         let remote = match (&row.provider, &row.remote_release_id) {
             (Some(provider), Some(id)) => format!(
-                " -> {provider} {id}{}",
+                " -> {provider} {}{}",
+                Clean(id),
                 row.remote_title
                     .as_deref()
-                    .map(|title| format!(" ({title})"))
+                    .map(|title| format!(" ({})", Clean(title)))
                     .unwrap_or_default()
             ),
             _ => String::new(),
@@ -285,16 +288,18 @@ fn print_releases(rows: &[store::LocalReleaseStatus]) {
         outln!(
             "#{} {} — {}  [{} track(s)]  {status}{remote}\n     {}",
             row.id,
-            artist,
-            title,
+            Clean(artist),
+            Clean(title),
             row.track_count,
-            row.directory
+            Clean(&row.directory)
         );
     }
     outln!("\n{} local release(s).", rows.len());
 }
 
 fn print_tracks(rows: &[store::TrackRow]) {
+    use radish::output::Clean;
+
     if rows.is_empty() {
         outln!("No tracks found.");
         return;
@@ -311,13 +316,17 @@ fn print_tracks(rows: &[store::TrackRow]) {
         let stale = if row.stale { "  [stale match]" } else { "" };
         let location = match (&row.album, row.disc_number, row.track_number) {
             (Some(album), Some(disc), Some(number)) if disc > 1 => {
-                format!("  [{album} disc {disc} #{number}]")
+                format!("  [{} disc {disc} #{number}]", Clean(album))
             }
-            (Some(album), _, Some(number)) => format!("  [{album} #{number}]"),
-            (Some(album), _, None) => format!("  [{album}]"),
+            (Some(album), _, Some(number)) => format!("  [{} #{number}]", Clean(album)),
+            (Some(album), _, None) => format!("  [{}]", Clean(album)),
             _ => String::new(),
         };
-        outln!("{artist} - {title}{location}  {duration}{stale}");
+        outln!(
+            "{} - {}{location}  {duration}{stale}",
+            Clean(artist),
+            Clean(title)
+        );
     }
     outln!("\n{} track(s).", rows.len());
 }

@@ -33,6 +33,10 @@ async fn seed_library_year(db: &Path, year: i64) -> i64 {
 }
 
 async fn seed_directory(db: &Path, directory: &str, year: i64) -> i64 {
+    seed_album(db, directory, "Blue", year).await
+}
+
+async fn seed_album(db: &Path, directory: &str, album: &str, year: i64) -> i64 {
     let pool = radish::db::connect(db).await.unwrap();
     let directory = Path::new(directory);
     let directory_id = store::upsert_directory(&pool, directory).await.unwrap();
@@ -42,7 +46,7 @@ async fn seed_directory(db: &Path, directory: &str, year: i64) -> i64 {
             path: directory.join(format!("0{number}.flac")),
             title: Some(format!("Track {number}")),
             artist: Some("Test Artist".to_string()),
-            album: Some("Blue".to_string()),
+            album: Some(album.to_string()),
             album_artist: Some("Test Artist".to_string()),
             year: Some(year),
             track_number: Some(number),
@@ -476,4 +480,75 @@ async fn a_rejected_discogs_token_is_not_retried_for_later_releases() {
         1,
         "the second release must not contact Discogs: {text}"
     );
+}
+
+#[tokio::test]
+async fn listings_escape_terminal_control_sequences_from_tags() {
+    let db = db_path("hostile-tags");
+    let pool = radish::db::connect(&db).await.unwrap();
+    let directory = Path::new("/music/hostile\x1b[2J");
+    let directory_id = store::upsert_directory(&pool, directory).await.unwrap();
+    let track = ScannedTrack {
+        path: directory.join("01.flac"),
+        title: Some("\x1b]0;PWNED\x07".to_string()),
+        artist: Some("Artist\x1b[31m".to_string()),
+        album: Some("Album\u{202e}".to_string()),
+        album_artist: Some("Artist\x1b[31m".to_string()),
+        year: Some(2001),
+        track_number: Some(1),
+        disc_number: None,
+        barcode: None,
+        catalog_number: None,
+        discogs_release_id: None,
+        musicbrainz: ObservedMusicBrainzIds::default(),
+        duration_secs: Some(180.0),
+        modified_at: 1,
+    };
+    store::upsert_track(&pool, &track, directory_id)
+        .await
+        .unwrap();
+    store::rebuild_local_releases(&pool, None).await.unwrap();
+    pool.close().await;
+    let server = MockServer::start(handler);
+
+    for args in [&["list"][..], &["search", "Artist"], &["releases"]] {
+        let output = run(&db, &server, args, None);
+        assert!(output.status.success(), "{output:?}");
+        let text = stdout(&output);
+        assert!(
+            !text.contains(['\x1b', '\x07', '\u{202e}']),
+            "{args:?}: {text:?}"
+        );
+        assert!(text.contains("\\u{1b}"), "{args:?}: {text:?}");
+    }
+}
+
+#[tokio::test]
+async fn matching_output_escapes_control_sequences_from_tags_and_provider_data() {
+    let db = db_path("hostile-matching");
+    seed_album(&db, "/music/blue", "Blue\x1b]0;PWNED\x07", 2001).await;
+    let server = MockServer::start(|target| {
+        if target.contains("/releases/42") {
+            let mut release: serde_json::Value =
+                serde_json::from_str(&discogs_release_json()).unwrap();
+            release["title"] = "Blue\u{1b}[2J".into();
+            release["tracklist"][0]["title"] = "Track\u{1b}[31m 1".into();
+            return (200, release.to_string());
+        }
+        handler(target)
+    });
+
+    for args in [
+        &["match", "--dry-run", "--provider", "discogs"][..],
+        &["match", "--provider", "discogs"],
+    ] {
+        let output = run(&db, &server, args, Some("test-token"));
+        let all = format!(
+            "{}{}",
+            stdout(&output),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!all.contains(['\x1b', '\x07']), "{args:?}: {all:?}");
+        assert!(all.contains("Matching local release"), "{all:?}");
+    }
 }

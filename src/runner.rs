@@ -12,6 +12,7 @@ use crate::matcher::{
     self, Candidate, DiscoveryEvidence, Evaluation, LocalRelease, MatchScope, RemoteRelease,
 };
 use crate::musicbrainz::MusicBrainzAdapter;
+use crate::output::Clean;
 use crate::providers::{MetadataProvider, ProviderError, ProviderKind, ProviderPolicy, ReleaseId};
 use crate::store::{self, AcceptanceMethod, MatchGuard, StoredCandidate};
 use crate::{out, outln};
@@ -386,7 +387,11 @@ where
                 .unwrap_or("(unknown artist)"),
             release.album_title.as_deref().unwrap_or("(no album tag)")
         );
-        outln!("\nMatching local release {} ({label})", release.id);
+        outln!(
+            "\nMatching local release {} ({})",
+            release.id,
+            Clean(&label)
+        );
 
         // A stale match is refreshed from the provider that accepted it; a
         // different source requires deliberate review.
@@ -436,7 +441,11 @@ where
                 Ok(Outcome::Quit) => return Ok(summary),
                 Ok(_) => summary.failed += 1,
                 Err(error) => {
-                    eprintln!("failed to review local release {}: {error:#}", release.id);
+                    eprintln!(
+                        "failed to review local release {}: {}",
+                        release.id,
+                        Clean(&format!("{error:#}"))
+                    );
                     summary.failed += 1;
                 }
             }
@@ -468,7 +477,11 @@ where
             Ok(Outcome::Quit) => return Ok(summary),
             Err(error) => {
                 summary.failed += 1;
-                eprintln!("failed to match local release {}: {error:#}", release.id);
+                eprintln!(
+                    "failed to match local release {}: {}",
+                    release.id,
+                    Clean(&format!("{error:#}"))
+                );
             }
         }
     }
@@ -533,7 +546,7 @@ where
             } else {
                 "primary candidates did not settle the edition".to_string()
             };
-            outln!("  Discogs fallback: {reason}");
+            outln!("  Discogs fallback: {}", Clean(&reason));
         }
 
         match provider {
@@ -610,14 +623,18 @@ where
 
     for attempt in &attempts {
         for note in &attempt.notes {
-            eprintln!("  note ({}): {note}", attempt.provider);
+            eprintln!("  note ({}): {}", attempt.provider, Clean(note));
         }
         if let Some(error) = &attempt.error {
-            eprintln!("  {} stage error: {error}", attempt.provider);
+            eprintln!(
+                "  {} stage error: {}",
+                attempt.provider,
+                Clean(&error.to_string())
+            );
         }
     }
     if let Some(reason) = &fallback_skip {
-        outln!("  {reason}");
+        outln!("  {}", Clean(reason));
     }
 
     // A settled primary result stops discovery and never touches Discogs.
@@ -675,7 +692,10 @@ where
         );
         if conflicts.is_empty() && direct.is_none() && !options.review {
             if let Some(error) = &primary.error {
-                outln!("  recovered the release from a failed MusicBrainz stage: {error}");
+                outln!(
+                    "  recovered the release from a failed MusicBrainz stage: {}",
+                    Clean(&error.to_string())
+                );
             }
             return accept(
                 pool,
@@ -691,7 +711,7 @@ where
             .await;
         }
         for conflict in &conflicts {
-            outln!("  fallback conflict: {conflict}");
+            outln!("  fallback conflict: {}", Clean(conflict));
         }
         attempts[1].notes.extend(conflicts);
     }
@@ -728,7 +748,7 @@ where
                 }
                 Err(reason) => {
                     let note = format!("AI match not applied: {reason}");
-                    outln!("  {note}");
+                    outln!("  {}", Clean(&note));
                     for attempt in &mut attempts {
                         if !attempt.candidates.is_empty() {
                             attempt.notes.push(note.clone());
@@ -767,7 +787,7 @@ where
     // No usable candidates. A completed-empty stage means no match; an
     // unrecovered attempted-stage failure must not be disguised as one.
     if let Some(error) = attempts.iter().find_map(|attempt| attempt.error.clone()) {
-        eprintln!("  {error}");
+        eprintln!("  {}", Clean(&error.to_string()));
         if fallback_failed {
             eprintln!("  the fallback stage also failed; the release outcome is a failure");
         }
@@ -999,7 +1019,7 @@ async fn accept(
         outln!(
             "  cannot accept {provider} release {}: the track mapping is invalid or incomplete ({})",
             candidate.release.id,
-            candidate.mapping.notes.join("; ")
+            Clean(&candidate.mapping.notes.join("; "))
         );
         return Ok(Outcome::Skipped);
     }
@@ -1037,7 +1057,7 @@ async fn accept(
                 method.as_str()
             );
             outln!("    {} {}", provider, candidate.release.id.storage_id());
-            outln!("    {}", candidate.release.url);
+            outln!("    {}", Clean(&candidate.release.url));
             if ai_advice.is_some() {
                 outln!("    AI-supported album match; decision evidence saved");
             }
@@ -1051,7 +1071,10 @@ async fn accept(
             Ok(Outcome::Skipped)
         }
         Err(error) => {
-            eprintln!("  could not apply the match: {error:#}");
+            eprintln!(
+                "  could not apply the match: {}",
+                Clean(&format!("{error:#}"))
+            );
             Ok(Outcome::Failed)
         }
     }
@@ -1134,7 +1157,7 @@ async fn queue_attempts(
     }
 
     let reason = review_reason_summary(attempts);
-    outln!("  queued for review: {reason}");
+    outln!("  queued for review: {}", Clean(&reason));
     Ok(())
 }
 
@@ -1296,17 +1319,17 @@ fn print_release_header(release: &LocalRelease) {
     outln!(
         "  local release {} — {} ({} file(s))",
         release.id,
-        release.album_title.as_deref().unwrap_or("(no album tag)"),
+        Clean(release.album_title.as_deref().unwrap_or("(no album tag)")),
         release.tracks.len()
     );
     outln!(
         "  artist: {}   folder: {}",
-        release.album_artist.as_deref().unwrap_or("(unknown)"),
-        release.directory
+        Clean(release.album_artist.as_deref().unwrap_or("(unknown)")),
+        Clean(&release.directory)
     );
     if !release.embedded_evidence.problems.is_empty() {
         for problem in &release.embedded_evidence.problems {
-            outln!("  identifier problem: {problem}");
+            outln!("  identifier problem: {}", Clean(problem));
         }
     }
 }
@@ -1332,8 +1355,8 @@ fn print_candidate(
             " [review]"
         }
     );
-    outln!("      {}", release.artist_display());
-    outln!("      {}", release.url);
+    outln!("      {}", Clean(&release.artist_display()));
+    outln!("      {}", Clean(&release.url));
     let mut details = Vec::new();
     if let Some(year) = release.year {
         details.push(format!("year {year}"));
@@ -1354,11 +1377,11 @@ fn print_candidate(
         details.push(format!("edition: {}", release.edition_notes.join(", ")));
     }
     if !details.is_empty() {
-        outln!("      {}", details.join(" · "));
+        outln!("      {}", Clean(&details.join(" · ")));
     }
     if !release.structure_issues.is_empty() {
         for issue in &release.structure_issues {
-            outln!("      structure: {issue}");
+            outln!("      structure: {}", Clean(issue));
         }
     }
     if !release.lookup_aliases.is_empty() {
@@ -1397,19 +1420,19 @@ fn print_candidate(
     );
 
     for note in &evaluation.evidence {
-        outln!("      evidence: {note}");
+        outln!("      evidence: {}", Clean(note));
     }
     for blocker in &evaluation.blockers {
-        outln!("      blocker: {blocker}");
+        outln!("      blocker: {}", Clean(blocker));
     }
     for warning in &evaluation.warnings {
-        outln!("      warning: {warning}");
+        outln!("      warning: {}", Clean(warning));
     }
     for note in &candidate.mapping.notes {
-        outln!("      mapping: {note}");
+        outln!("      mapping: {}", Clean(note));
     }
     if let Some(error) = stage_error {
-        outln!("      stage error: {error}");
+        outln!("      stage error: {}", Clean(&error.to_string()));
     }
 }
 
@@ -1499,7 +1522,7 @@ where
                 if !evaluation.can_apply(candidate) {
                     outln!(
                         "cannot accept: the track mapping is invalid, incomplete, or structurally unsupported ({})",
-                        candidate.mapping.notes.join("; ")
+                        Clean(&candidate.mapping.notes.join("; "))
                     );
                     continue;
                 }
@@ -1507,11 +1530,11 @@ where
                 if !evaluation.auto_accept {
                     outln!("manual acceptance overrides these automatic checks:");
                     for blocker in &evaluation.blockers {
-                        outln!("  - {blocker}");
+                        outln!("  - {}", Clean(blocker));
                     }
                 }
                 for warning in &evaluation.warnings {
-                    outln!("  warning: {warning}");
+                    outln!("  warning: {}", Clean(warning));
                 }
 
                 let confirm = prompt("accept this release? [y/N] > ")?;
@@ -1537,7 +1560,7 @@ where
                 let id = match parse_entered_id(provider, &raw) {
                     Ok(id) => id,
                     Err(error) => {
-                        outln!("invalid release ID: {error}");
+                        outln!("invalid release ID: {}", Clean(&error.to_string()));
                         continue;
                     }
                 };
@@ -1555,7 +1578,7 @@ where
                         groups.push((provider, vec![candidate], vec![evaluation]));
                         outln!("  candidate added to this review");
                     }
-                    Err(error) => outln!("could not fetch release: {error}"),
+                    Err(error) => outln!("could not fetch release: {}", Clean(&error.to_string())),
                 }
             }
             "s" => return Ok(ReviewOutcome::Skip),
@@ -1578,7 +1601,7 @@ fn print_decision(attempt: &ProviderAttempt) {
             index + 1,
             attempt.provider,
             candidate.release.id.storage_id(),
-            candidate.release.title,
+            Clean(&candidate.release.title),
             evaluation.match_scope.score(&candidate.score),
             if evaluation.auto_accept {
                 " [auto-acceptable]"
@@ -1587,10 +1610,10 @@ fn print_decision(attempt: &ProviderAttempt) {
             }
         );
         for blocker in &evaluation.blockers {
-            outln!("       blocked: {blocker}");
+            outln!("       blocked: {}", Clean(blocker));
         }
         for warning in &evaluation.warnings {
-            outln!("       note: {warning}");
+            outln!("       note: {}", Clean(warning));
         }
     }
     if let (Some(candidate), Some(evaluation)) =
