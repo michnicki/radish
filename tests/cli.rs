@@ -362,3 +362,29 @@ async fn fallback_queue_explains_its_blockers_after_a_musicbrainz_outage() {
     assert_eq!(row_count(&db, "release_matches").await, 0);
     assert_eq!(row_count(&db, "match_reviews").await, 1);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn list_fails_when_stdout_cannot_be_written() {
+    let db = db_path("list-dev-full");
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_radish"))
+        .arg("--db")
+        .arg(&db)
+        .arg("list")
+        .stdin(Stdio::null())
+        .stdout(full)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error: failed to write output:"),
+        "{stderr}"
+    );
+}
