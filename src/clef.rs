@@ -55,6 +55,18 @@ impl Advice {
             })
     }
 
+    /// True when this saved advice answers the question a client with `model`
+    /// would ask now: same model, same prompt, same offered candidates.
+    pub fn answers(&self, model: &str, offered: &BTreeSet<String>) -> bool {
+        self.model == model
+            && self.prompt_version == PROMPT_VERSION
+            && self
+                .probabilities
+                .keys()
+                .filter(|key| !matches!(key.as_str(), "none" | "equivalent_editions"))
+                .eq(offered.iter())
+    }
+
     pub fn summary(&self) -> String {
         let recommendation = match &self.choice {
             AdviceChoice::Candidate { release } => format!("recommend {release}"),
@@ -190,6 +202,22 @@ impl ClefClient {
             token: authorization,
             model,
         })
+    }
+
+    /// The configured model name.
+    pub fn model(&self) -> &str {
+        self.model
+    }
+
+    /// Choice keys a request for these candidates would offer, computed
+    /// offline. Candidates that do not fit the request budget are left out.
+    pub fn offered_choices(
+        &self,
+        local: &LocalRelease,
+        candidates: &[ReviewCandidate<'_>],
+    ) -> Result<BTreeSet<String>, ClefError> {
+        let prepared = prepare_request(local, candidates, MAX_REQUEST_BYTES, self.model)?;
+        Ok(prepared.choices.into_keys().collect())
     }
 
     pub async fn advise(
@@ -2041,5 +2069,32 @@ mod tests {
         }
         assert!(ClefError::Transport.disables_run());
         assert!(!ClefError::Invalid("bad".into()).disables_run());
+    }
+
+    #[test]
+    fn saved_advice_answers_only_the_same_model_prompt_and_offered_choices() {
+        let advice = Advice {
+            model: "clef-flash".into(),
+            prompt_version: PROMPT_VERSION.into(),
+            choice: AdviceChoice::NoMatch,
+            probabilities: [
+                ("discogs:1", 0.0),
+                ("none", 1.0),
+                ("equivalent_editions", 0.0),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect(),
+            confidence: 1.0,
+        };
+        let offered: BTreeSet<String> = ["discogs:1".to_string()].into();
+        assert!(advice.answers("clef-flash", &offered));
+        assert!(!advice.answers("clef", &offered));
+        assert!(!advice.answers("clef-flash", &BTreeSet::new()));
+        let more: BTreeSet<String> = ["discogs:1".to_string(), "discogs:2".to_string()].into();
+        assert!(!advice.answers("clef-flash", &more));
+        let mut old = advice.clone();
+        old.prompt_version = "radish-clef-album-v2".into();
+        assert!(!old.answers("clef-flash", &offered));
     }
 }

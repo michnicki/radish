@@ -705,7 +705,7 @@ where
 
     if has_candidates {
         if options.ai_review {
-            add_ai_advice(release, &mut attempts, ai).await;
+            add_ai_advice(pool, release, guard, &mut attempts, ai).await?;
         }
         if !options.review
             && direct.is_none()
@@ -783,9 +783,15 @@ where
     Ok(Outcome::Unmatched)
 }
 
-async fn add_ai_advice(release: &LocalRelease, attempts: &mut [ProviderAttempt], ai: &mut AiState) {
+async fn add_ai_advice(
+    pool: &SqlitePool,
+    release: &LocalRelease,
+    guard: &MatchGuard,
+    attempts: &mut [ProviderAttempt],
+    ai: &mut AiState,
+) -> Result<()> {
     let Some(client) = ai.client() else {
-        return;
+        return Ok(());
     };
     let candidates: Vec<ReviewCandidate<'_>> = attempts
         .iter()
@@ -802,7 +808,15 @@ async fn add_ai_advice(release: &LocalRelease, attempts: &mut [ProviderAttempt],
         })
         .collect();
 
-    match client.advise(release, &candidates).await {
+    // Paid advice is reused while everything it was based on is unchanged.
+    let result = match saved_advice(pool, release, guard, attempts, client, &candidates).await? {
+        Some(advice) => {
+            outln!("  reusing saved AI advice; no new request was made");
+            Ok(advice)
+        }
+        None => client.advise(release, &candidates).await,
+    };
+    match result {
         Ok(advice) => {
             print_ai_advice(&advice);
             let assessed = candidates
@@ -827,6 +841,40 @@ async fn add_ai_advice(release: &LocalRelease, attempts: &mut [ProviderAttempt],
         }
         Err(error) => outln!("  AI review unavailable: {error}; continuing without AI matching"),
     }
+    Ok(())
+}
+
+/// Advice stored with a queued review, if it still answers the question that
+/// would be asked now: unchanged files and edition, same candidates, same
+/// model and prompt.
+async fn saved_advice(
+    pool: &SqlitePool,
+    release: &LocalRelease,
+    guard: &MatchGuard,
+    attempts: &[ProviderAttempt],
+    client: &ClefClient,
+    candidates: &[ReviewCandidate<'_>],
+) -> Result<Option<Advice>> {
+    let Ok(offered) = client.offered_choices(release, candidates) else {
+        return Ok(None);
+    };
+    for attempt in attempts {
+        let Some(saved) = store::load_review(pool, release.id, attempt.provider).await? else {
+            continue;
+        };
+        if saved.guard != *guard {
+            continue;
+        }
+        let advice = saved
+            .candidates
+            .into_iter()
+            .filter_map(|candidate| candidate.ai_advice)
+            .find(|advice| advice.answers(client.model(), &offered));
+        if advice.is_some() {
+            return Ok(advice);
+        }
+    }
+    Ok(None)
 }
 
 fn print_ai_advice(advice: &Advice) {

@@ -313,6 +313,76 @@ async fn missing_ai_credentials_are_reported_once_per_run() {
 }
 
 #[tokio::test]
+async fn unchanged_queued_releases_reuse_saved_advice_instead_of_paying_again() {
+    let db = db_path("clef-reuse");
+    let id = seed(&db, false).await;
+    let server = server(200, &format!("musicbrainz:{MBID}"));
+    let args = ["match", "--provider", "musicbrainz", "--ai-review"];
+
+    let first = run(&db, &server, &args, true);
+    assert!(first.status.success(), "{first:?}");
+    assert_eq!(server.requests_matching("/ai/run/"), 1);
+
+    let second = run(&db, &server, &args, true);
+    assert!(second.status.success(), "{second:?}");
+    let text = stdout(&second);
+    assert_eq!(server.requests_matching("/ai/run/"), 1, "{text}");
+    assert!(text.contains("AI advice"), "{text}");
+    assert!(text.contains("saved"), "{text}");
+    let pool = radish::db::connect(&db).await.unwrap();
+    let review = store::load_review(&pool, id, ProviderKind::MusicBrainz)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(review.candidates[0].ai_advice.is_some());
+}
+
+#[tokio::test]
+async fn changed_files_invalidate_saved_advice() {
+    let db = db_path("clef-reuse-changed");
+    seed(&db, false).await;
+    let server = server(200, &format!("musicbrainz:{MBID}"));
+    let args = ["match", "--provider", "musicbrainz", "--ai-review"];
+    assert!(run(&db, &server, &args, true).status.success());
+    assert_eq!(server.requests_matching("/ai/run/"), 1);
+
+    // A retag changes the release revision, so the old answer no longer applies.
+    let pool = radish::db::connect(&db).await.unwrap();
+    let directory = Path::new("/music/private-library/blue");
+    let directory_id = store::upsert_directory(&pool, directory).await.unwrap();
+    store::upsert_track(
+        &pool,
+        &ScannedTrack {
+            path: directory.join("1.flac"),
+            title: Some("Another title".into()),
+            artist: Some("Test Artist".into()),
+            album: Some("Blue".into()),
+            album_artist: Some("Test Artist".into()),
+            year: Some(2001),
+            track_number: Some(1),
+            disc_number: None,
+            barcode: None,
+            catalog_number: None,
+            discogs_release_id: None,
+            musicbrainz: ObservedMusicBrainzIds {
+                release: vec![MBID.into()],
+                ..Default::default()
+            },
+            duration_secs: Some(180.0),
+            modified_at: 2,
+        },
+        directory_id,
+    )
+    .await
+    .unwrap();
+    store::rebuild_local_releases(&pool, None).await.unwrap();
+    pool.close().await;
+
+    assert!(run(&db, &server, &args, true).status.success());
+    assert_eq!(server.requests_matching("/ai/run/"), 2);
+}
+
+#[tokio::test]
 async fn ai_dry_run_shows_advice_without_saving_it() {
     let db = db_path("clef-dry-run");
     let id = seed(&db, false).await;
