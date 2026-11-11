@@ -601,26 +601,28 @@ pub struct Mapping {
     /// Two pairings were indistinguishable, so the result needs review.
     pub ambiguous: bool,
     pub notes: Vec<String>,
-    /// Title similarity of each assigned pair, indexed like `pairs`. Reviews
-    /// saved before this field existed decode to an empty vector, and readers
-    /// recompute whenever the vector does not line up with `pairs`.
-    #[serde(default)]
-    pub pair_similarity: Vec<Option<f64>>,
+    /// Per local track, the assigned remote index and the title similarity
+    /// that `map_tracks` measured for it. A cache only: never serialized, so
+    /// decoded mappings start empty and readers recompute.
+    #[serde(skip)]
+    pub pair_similarity: Vec<Option<(usize, f64)>>,
 }
 
 impl Mapping {
-    /// Title similarity between a local track and its assigned remote track,
-    /// or `None` when the local file has no title. Reuses the value recorded
-    /// by `map_tracks` and recomputes when it is missing or out of range.
+    /// Title similarity between a local track and the remote track it is being
+    /// scored against, or `None` when the local file has no title. Reuses the
+    /// recorded value only when it was measured for this same remote track, so
+    /// edited pairs are recomputed.
     fn title_similarity(
         &self,
         local_index: usize,
+        remote_index: usize,
         local_track: &LocalTrack,
         remote_track: &RemoteTrack,
     ) -> Option<f64> {
         let title = local_track.title.as_deref()?;
-        if self.pair_similarity.len() == self.pairs.len()
-            && let Some(Some(recorded)) = self.pair_similarity.get(local_index)
+        if let Some(Some((recorded_remote, recorded))) = self.pair_similarity.get(local_index)
+            && *recorded_remote == remote_index
             && (0.0..=1.0).contains(recorded)
         {
             return Some(*recorded);
@@ -919,7 +921,8 @@ pub fn map_tracks(local: &LocalRelease, remote: &RemoteRelease) -> Mapping {
         .iter()
         .enumerate()
         .map(|(local_index, pair)| {
-            pair.and_then(|remote_index| titles.get(local_index, remote_index))
+            let remote_index = (*pair)?;
+            Some((remote_index, titles.get(local_index, remote_index)?))
         })
         .collect();
 
@@ -1146,7 +1149,9 @@ pub fn score(local: &LocalRelease, remote: &RemoteRelease, mapping: &Mapping) ->
             let Some(remote_track) = remote.tracklist.get(remote_index) else {
                 continue;
             };
-            if let Some(similarity) = mapping.title_similarity(index, track, remote_track) {
+            if let Some(similarity) =
+                mapping.title_similarity(index, remote_index, track, remote_track)
+            {
                 total += similarity;
             }
         }
@@ -1796,7 +1801,7 @@ fn evaluate_at_scope(
         if let Some(score) =
             candidate
                 .mapping
-                .title_similarity(local_index, local_track, remote_track)
+                .title_similarity(local_index, remote_index, local_track, remote_track)
             && score < worst_title
         {
             worst_title = score;
@@ -2457,25 +2462,54 @@ mod tests {
                 local.tracks[local_index].title.as_deref().unwrap(),
                 &remote.tracklist[remote_index].title,
             );
-            assert_eq!(mapping.pair_similarity[local_index], Some(expected));
+            assert_eq!(
+                mapping.pair_similarity[local_index],
+                Some((remote_index, expected))
+            );
         }
     }
 
     #[test]
-    fn mappings_saved_without_pair_similarity_still_score_the_same() {
+    fn mappings_round_trip_without_recorded_similarities_and_score_the_same() {
         let local = local_release(&["One", "Two", "Three"]);
         let remote = remote_release(&["One", "Two", "Tree"]);
         let candidate = Candidate::new(&local, remote.clone());
 
-        let mut json = serde_json::to_value(&candidate.mapping).unwrap();
-        json.as_object_mut().unwrap().remove("pair_similarity");
-        let old: Mapping = serde_json::from_value(json).unwrap();
-        assert!(old.pair_similarity.is_empty());
-        assert_eq!(score(&local, &remote, &old), candidate.score);
+        let json = serde_json::to_value(&candidate.mapping).unwrap();
+        assert!(json.get("pair_similarity").is_none(), "{json}");
+        let decoded: Mapping = serde_json::from_value(json).unwrap();
+        assert!(decoded.pair_similarity.is_empty());
+        assert_eq!(score(&local, &remote, &decoded), candidate.score);
+    }
 
-        let mut invalid = candidate.mapping.clone();
-        invalid.pair_similarity = vec![Some(f64::NAN), Some(7.0), Some(-1.0)];
-        assert_eq!(score(&local, &remote, &invalid), candidate.score);
+    #[test]
+    fn recorded_similarities_are_recomputed_when_the_pairs_change() {
+        let mut local = local_release(&["Alpha", "Bravo"]);
+        local.barcode = Some("0123456789012".to_string());
+        let remote = remote_release(&["Alpha", "Bravo"]);
+        let mut candidate = Candidate::new(&local, remote.clone());
+        candidate.mapping.pairs = vec![Some(1), Some(0)];
+
+        let rescored = score(&local, &remote, &candidate.mapping);
+        assert!(rescored.track_titles < 0.5, "{}", rescored.track_titles);
+        let evaluation = evaluate(
+            &local,
+            &candidate,
+            None,
+            &DiscoveryEvidence {
+                identifier_unique: true,
+                ..DiscoveryEvidence::default()
+            },
+        );
+        assert!(!evaluation.auto_accept, "{:?}", evaluation.evidence);
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|reason| reason.contains("track title")),
+            "{:?}",
+            evaluation.blockers
+        );
     }
 
     #[test]
