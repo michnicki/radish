@@ -50,8 +50,9 @@ pub async fn watch_directory(pool: SqlitePool, root: &Path, db_path: &Path) -> R
     );
     importer::report_rebuild(&summary.rebuild);
 
+    let mut state = WatchState::default();
     while let Some(batch) = collect_batch(&mut rx, DEBOUNCE).await {
-        if process_batch(&pool, &scope, directory_id, batch).await == Flow::RootGone {
+        if process_batch(&pool, &scope, directory_id, batch, &mut state).await == Flow::RootGone {
             outln!("{} was removed; no longer watching.", root.display());
             break;
         }
@@ -153,6 +154,13 @@ async fn collect_batch(
     Some(batch)
 }
 
+/// What the watcher carries from one batch to the next.
+#[derive(Debug, Default)]
+struct WatchState {
+    /// Something may have been missed, so the next batch starts with a full sync.
+    rescan_pending: bool,
+}
+
 /// Whether the watch goes on after a batch.
 #[derive(Debug, PartialEq, Eq)]
 enum Flow {
@@ -162,27 +170,41 @@ enum Flow {
 
 /// Handles one collected batch. Watch errors and failures are reported and
 /// never end the watch; only the loss of the watched root does.
+///
+/// A watch error means events may have been lost, and a database failure means
+/// some were not applied. Either way the next sync is a full one.
 async fn process_batch(
     pool: &SqlitePool,
     scope: &Scope,
     directory_id: i64,
     batch: Vec<WatchEvent>,
+    state: &mut WatchState,
 ) -> Flow {
     let mut events = Vec::new();
+    let mut lost_events = false;
     for res in batch {
         match res {
             Ok(event) => events.push(event),
-            Err(err) => eprintln!("watch error: {err}"),
+            Err(err) => {
+                eprintln!("watch error: {err}");
+                lost_events = true;
+            }
         }
     }
-    match handle_events(pool, scope, directory_id, &events).await {
-        Ok(outcome) if outcome.root_gone => Flow::RootGone,
-        Ok(_) => Flow::Continue,
+    let force_rescan = state.rescan_pending || lost_events;
+    match handle_events(pool, scope, directory_id, &events, force_rescan).await {
+        Ok(outcome) => {
+            state.rescan_pending = outcome.failed;
+            if outcome.root_gone {
+                return Flow::RootGone;
+            }
+        }
         Err(err) => {
-            eprintln!("warning: failed to process filesystem events: {err}");
-            Flow::Continue
+            eprintln!("warning: failed to process filesystem events: {err:#}");
+            state.rescan_pending = true;
         }
     }
+    Flow::Continue
 }
 
 /// What one batch of events changed.
@@ -193,6 +215,8 @@ struct BatchOutcome {
     /// Set only when the batch changed rows and local releases were rebuilt.
     rebuild: Option<store::RebuildSummary>,
     root_gone: bool,
+    /// A database write failed, so the database may have missed changes.
+    failed: bool,
 }
 
 /// Applies one batch of events to the database.
@@ -206,13 +230,15 @@ async fn handle_events(
     scope: &Scope,
     directory_id: i64,
     events: &[notify::Event],
+    force_rescan: bool,
 ) -> Result<BatchOutcome> {
     let plan = plan_batch(scope, events);
     let mut outcome = BatchOutcome::default();
-    if plan.rescan {
-        // Events were lost, so a full sync is the only way to be sure.
+    if force_rescan || plan.rescan {
+        // Events were lost or not applied, so a full sync is the only way to be sure.
         let progress = ImportProgress::new();
         let summary = importer::sync_directory(pool, &scope.root, &progress).await?;
+        drop(progress);
         outcome.synced = summary.saved;
         outcome.removed = summary.removed;
         importer::report_rebuild(&summary.rebuild);
@@ -229,62 +255,89 @@ async fn handle_events(
     }
 
     for (key, path) in &plan.paths {
-        match tokio::fs::metadata(path).await {
-            Ok(metadata) if metadata.is_dir() => {
-                let summary = importer::sync_files(pool, path, directory_id, None).await?;
-                outcome.synced += summary.saved;
-                outcome.removed += summary.removed;
-                if summary.saved > 0 {
-                    outln!("synced: {} ({} tracks)", path.display(), summary.saved);
-                }
-                if summary.removed > 0 {
-                    outln!("removed: {} ({} tracks)", path.display(), summary.removed);
-                }
-            }
-            Ok(metadata) if metadata.is_file() && scanner::is_audio_file(path) => {
-                let read = tokio::task::spawn_blocking({
-                    let path = path.clone();
-                    move || scanner::read_tags(&path)
-                })
-                .await?;
-                match read {
-                    Ok(track) => {
-                        let changed =
-                            store::upsert_tracks(pool, std::slice::from_ref(&track), directory_id)
-                                .await?;
-                        outcome.synced += changed;
-                        if changed > 0 {
-                            outln!("synced: {}", path.display());
-                        }
-                    }
-                    Err(err) => eprintln!("warning: failed to tag {}: {err}", path.display()),
-                }
-            }
-            Ok(_) => {}
-            Err(err) if err.kind() == ErrorKind::NotFound => {
-                if *key == scope.root_key {
-                    // Keep the rows: an unmounted library should not empty the DB.
-                    outcome.root_gone = true;
-                    return Ok(outcome);
-                }
-                let removed = store::remove_tracks_under(pool, path).await?;
-                outcome.removed += removed;
-                if removed > 0 {
-                    outln!("removed: {}", path.display());
-                }
-            }
-            Err(err) => eprintln!("warning: failed to inspect {}: {err}", path.display()),
+        // One path failing must not cost the rest of the batch.
+        if let Err(err) = apply_path(pool, scope, directory_id, key, path, &mut outcome).await {
+            eprintln!("warning: failed to sync {}: {err:#}", path.display());
+            outcome.failed |= err.downcast_ref::<sqlx::Error>().is_some();
+        }
+        if outcome.root_gone {
+            return Ok(outcome);
         }
     }
 
     // Refresh grouping so membership changes mark accepted matches stale while
     // leaving their overlay in place. Nothing changed means nothing to refresh.
     if outcome.synced + outcome.removed > 0 {
-        let rebuild = store::rebuild_local_releases(pool, Some(&scope.root)).await?;
-        importer::report_rebuild(&rebuild);
-        outcome.rebuild = Some(rebuild);
+        match store::rebuild_local_releases(pool, Some(&scope.root)).await {
+            Ok(rebuild) => {
+                importer::report_rebuild(&rebuild);
+                outcome.rebuild = Some(rebuild);
+            }
+            Err(err) => {
+                eprintln!("warning: failed to refresh local releases: {err:#}");
+                outcome.failed = true;
+            }
+        }
     }
     Ok(outcome)
+}
+
+/// Brings the database in line with what is on disk at one path.
+async fn apply_path(
+    pool: &SqlitePool,
+    scope: &Scope,
+    directory_id: i64,
+    key: &str,
+    path: &Path,
+    outcome: &mut BatchOutcome,
+) -> Result<()> {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) if metadata.is_dir() => {
+            let summary = importer::sync_files(pool, path, directory_id, None).await?;
+            outcome.synced += summary.saved;
+            outcome.removed += summary.removed;
+            if summary.saved > 0 {
+                outln!("synced: {} ({} tracks)", path.display(), summary.saved);
+            }
+            if summary.removed > 0 {
+                outln!("removed: {} ({} tracks)", path.display(), summary.removed);
+            }
+        }
+        Ok(metadata) if metadata.is_file() && scanner::is_audio_file(path) => {
+            let read = tokio::task::spawn_blocking({
+                let path = path.to_path_buf();
+                move || scanner::read_tags(&path)
+            })
+            .await?;
+            match read {
+                Ok(track) => {
+                    let changed =
+                        store::upsert_tracks(pool, std::slice::from_ref(&track), directory_id)
+                            .await?;
+                    outcome.synced += changed;
+                    if changed > 0 {
+                        outln!("synced: {}", path.display());
+                    }
+                }
+                Err(err) => eprintln!("warning: failed to tag {}: {err}", path.display()),
+            }
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            if key == scope.root_key {
+                // Keep the rows: an unmounted library should not empty the DB.
+                outcome.root_gone = true;
+                return Ok(());
+            }
+            let removed = store::remove_tracks_under(pool, path).await?;
+            outcome.removed += removed;
+            if removed > 0 {
+                outln!("removed: {}", path.display());
+            }
+        }
+        Err(err) => eprintln!("warning: failed to inspect {}: {err}", path.display()),
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -330,7 +383,7 @@ mod tests {
         }
 
         async fn handle(&self, events: &[notify::Event]) -> BatchOutcome {
-            handle_events(&self.pool, &self.scope, self.directory_id, events)
+            handle_events(&self.pool, &self.scope, self.directory_id, events, false)
                 .await
                 .unwrap()
         }
@@ -680,6 +733,8 @@ mod tests {
     async fn a_watch_error_in_a_batch_does_not_stop_the_rest() {
         let fixture = Fixture::new("watcher-error-event").await;
         write_wav(&fixture.path("a.wav"));
+        // No event is ever reported for b.wav; only a full sync can find it.
+        write_wav(&fixture.path("b.wav"));
         let batch = vec![
             Err(notify::Error::generic("queue overflow")),
             Ok(event(
@@ -688,10 +743,107 @@ mod tests {
             )),
         ];
 
-        let flow = process_batch(&fixture.pool, &fixture.scope, fixture.directory_id, batch).await;
+        let flow = process_batch(
+            &fixture.pool,
+            &fixture.scope,
+            fixture.directory_id,
+            batch,
+            &mut WatchState::default(),
+        )
+        .await;
 
         assert_eq!(flow, Flow::Continue);
+        assert_eq!(fixture.track_count().await, 2);
+    }
+
+    /// Makes saving any file named `bad.wav` fail with a database error.
+    async fn fail_saving_bad_files(pool: &SqlitePool) {
+        sqlx::query(
+            "CREATE TRIGGER reject_bad BEFORE INSERT ON tracks
+             WHEN NEW.path LIKE '%bad.wav'
+             BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn create_events(fixture: &Fixture, names: &[&str]) -> Vec<notify::Event> {
+        names
+            .iter()
+            .map(|name| event(EventKind::Create(CreateKind::File), &[&fixture.path(name)]))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn one_failing_path_does_not_stop_the_rest_of_the_batch() {
+        let fixture = Fixture::new("watcher-path-failure").await;
+        let names = ["a-good.wav", "bad.wav", "z-good.wav"];
+        for name in names {
+            write_wav(&fixture.path(name));
+        }
+        fail_saving_bad_files(&fixture.pool).await;
+
+        let outcome = handle_events(
+            &fixture.pool,
+            &fixture.scope,
+            fixture.directory_id,
+            &create_events(&fixture, &names),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.synced, 2, "{outcome:?}");
+        assert!(outcome.failed, "{outcome:?}");
+        assert!(outcome.rebuild.is_some_and(|rebuild| rebuild.groups > 0));
+        assert_eq!(fixture.track_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_database_failure_makes_the_next_batch_a_full_sync() {
+        let fixture = Fixture::new("watcher-pending-rescan").await;
+        let names = ["a-good.wav", "bad.wav"];
+        for name in names {
+            write_wav(&fixture.path(name));
+        }
+        fail_saving_bad_files(&fixture.pool).await;
+        let mut state = WatchState::default();
+        let batch = create_events(&fixture, &names)
+            .into_iter()
+            .map(Ok)
+            .collect();
+        process_batch(
+            &fixture.pool,
+            &fixture.scope,
+            fixture.directory_id,
+            batch,
+            &mut state,
+        )
+        .await;
+        assert!(state.rescan_pending);
         assert_eq!(fixture.track_count().await, 1);
+
+        sqlx::query("DROP TRIGGER reject_bad")
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+        // An unrelated read event: nothing to do for it except the pending sync.
+        let quiet = vec![Ok(event(
+            EventKind::Access(AccessKind::Read),
+            &[&fixture.path("a-good.wav")],
+        ))];
+        process_batch(
+            &fixture.pool,
+            &fixture.scope,
+            fixture.directory_id,
+            quiet,
+            &mut state,
+        )
+        .await;
+
+        assert!(!state.rescan_pending);
+        assert_eq!(fixture.track_count().await, 2);
     }
 
     #[tokio::test]
@@ -703,7 +855,14 @@ mod tests {
             &[fixture.music.path()],
         ))];
 
-        let flow = process_batch(&fixture.pool, &fixture.scope, fixture.directory_id, batch).await;
+        let flow = process_batch(
+            &fixture.pool,
+            &fixture.scope,
+            fixture.directory_id,
+            batch,
+            &mut WatchState::default(),
+        )
+        .await;
 
         assert_eq!(flow, Flow::RootGone);
     }
