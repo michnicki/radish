@@ -381,7 +381,7 @@ fn list_fails_when_stdout_cannot_be_written() {
         .output()
         .unwrap();
 
-    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("error: failed to write output:"),

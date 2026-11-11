@@ -27,7 +27,8 @@ fn exit_on_error(result: io::Result<()>) {
     let Err(error) = result else { return };
     let code = exit_code_for(&error);
     if code != 0 {
-        eprintln!("error: failed to write output: {error}");
+        // Ignore a failure here: stderr may be the same broken destination.
+        let _ = writeln!(io::stderr(), "error: failed to write output: {error}");
     }
     std::process::exit(code);
 }
@@ -43,14 +44,16 @@ pub struct Clean<'a>(pub &'a str);
 
 impl fmt::Display for Clean<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut escaped = String::with_capacity(self.0.len());
         for c in self.0.chars() {
             if c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
-                write!(f, "{}", c.escape_unicode())?;
+                write!(escaped, "{}", c.escape_unicode())?;
             } else {
-                f.write_char(c)?;
+                escaped.push(c);
             }
         }
-        Ok(())
+        // `pad` applies the caller's width, alignment and precision.
+        f.pad(&escaped)
     }
 }
 
@@ -86,6 +89,12 @@ mod tests {
         assert_eq!(exit_code_for(&closed), 0);
         assert_eq!(exit_code_for(&io::Error::other("disk full")), 1);
         assert_eq!(exit_code_for(&io::Error::from(ErrorKind::StorageFull)), 1);
+    }
+
+    #[test]
+    fn clean_honors_width_and_alignment() {
+        assert_eq!(format!("{:<5}|", Clean("ab")), "ab   |");
+        assert_eq!(format!("{:>5}|", Clean("ab")), "   ab|");
     }
 
     #[test]
