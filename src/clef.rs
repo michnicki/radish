@@ -719,7 +719,7 @@ fn parse_advice(
         bail!("AI review selected a choice inconsistent with its probabilities");
     }
     Ok(Advice {
-        model: result.model,
+        model: model.to_string(),
         prompt_version: PROMPT_VERSION.to_string(),
         choice,
         probabilities: answer.probabilities,
@@ -1866,7 +1866,9 @@ mod tests {
             )));
             assert_eq!(body["model"], model);
             let advice = result.unwrap();
-            assert_eq!(advice.model, returned);
+            // The stored identity is the configured model, whatever form the
+            // service echoes it in.
+            assert_eq!(advice.model, model);
             assert_eq!(advice.prompt_version, "radish-clef-album-v3");
         }
     }
@@ -1952,7 +1954,7 @@ mod tests {
         let mut body = valid_response();
         body["result"]["model"] = json!("@cf/cloudflare/clef-flash");
         let advice = call(body).await.unwrap();
-        assert_eq!(advice.model, "@cf/cloudflare/clef-flash");
+        assert_eq!(advice.model, "clef-flash");
     }
 
     #[tokio::test]
