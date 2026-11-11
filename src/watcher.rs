@@ -51,20 +51,9 @@ pub async fn watch_directory(pool: SqlitePool, root: &Path, db_path: &Path) -> R
     importer::report_rebuild(&summary.rebuild);
 
     while let Some(batch) = collect_batch(&mut rx, DEBOUNCE).await {
-        let mut events = Vec::new();
-        for res in batch {
-            match res {
-                Ok(event) => events.push(event),
-                Err(err) => eprintln!("watch error: {err}"),
-            }
-        }
-        match handle_events(&pool, &scope, directory_id, &events).await {
-            Ok(outcome) if outcome.root_gone => {
-                outln!("{} was removed; no longer watching.", root.display());
-                break;
-            }
-            Ok(_) => {}
-            Err(err) => eprintln!("warning: failed to process filesystem events: {err}"),
+        if process_batch(&pool, &scope, directory_id, batch).await == Flow::RootGone {
+            outln!("{} was removed; no longer watching.", root.display());
+            break;
         }
     }
 
@@ -162,6 +151,38 @@ async fn collect_batch(
         }
     }
     Some(batch)
+}
+
+/// Whether the watch goes on after a batch.
+#[derive(Debug, PartialEq, Eq)]
+enum Flow {
+    Continue,
+    RootGone,
+}
+
+/// Handles one collected batch. Watch errors and failures are reported and
+/// never end the watch; only the loss of the watched root does.
+async fn process_batch(
+    pool: &SqlitePool,
+    scope: &Scope,
+    directory_id: i64,
+    batch: Vec<WatchEvent>,
+) -> Flow {
+    let mut events = Vec::new();
+    for res in batch {
+        match res {
+            Ok(event) => events.push(event),
+            Err(err) => eprintln!("watch error: {err}"),
+        }
+    }
+    match handle_events(pool, scope, directory_id, &events).await {
+        Ok(outcome) if outcome.root_gone => Flow::RootGone,
+        Ok(_) => Flow::Continue,
+        Err(err) => {
+            eprintln!("warning: failed to process filesystem events: {err}");
+            Flow::Continue
+        }
+    }
 }
 
 /// What one batch of events changed.
@@ -653,5 +674,60 @@ mod tests {
 
         assert!(outcome.root_gone, "{outcome:?}");
         assert_eq!(fixture.track_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_watch_error_in_a_batch_does_not_stop_the_rest() {
+        let fixture = Fixture::new("watcher-error-event").await;
+        write_wav(&fixture.path("a.wav"));
+        let batch = vec![
+            Err(notify::Error::generic("queue overflow")),
+            Ok(event(
+                EventKind::Create(CreateKind::File),
+                &[&fixture.path("a.wav")],
+            )),
+        ];
+
+        let flow = process_batch(&fixture.pool, &fixture.scope, fixture.directory_id, batch).await;
+
+        assert_eq!(flow, Flow::Continue);
+        assert_eq!(fixture.track_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn removing_the_root_ends_the_watch() {
+        let fixture = Fixture::new("watcher-root-flow").await;
+        std::fs::remove_dir_all(fixture.music.path()).unwrap();
+        let batch = vec![Ok(event(
+            EventKind::Remove(RemoveKind::Folder),
+            &[fixture.music.path()],
+        ))];
+
+        let flow = process_batch(&fixture.pool, &fixture.scope, fixture.directory_id, batch).await;
+
+        assert_eq!(flow, Flow::RootGone);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_continuous_stream_is_cut_off_at_the_window() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let data = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+        // One event every 150 ms for 900 ms, longer than the 500 ms window.
+        let sender = tokio::spawn(async move {
+            for n in 0..6 {
+                tx.send(Ok(event(data, &[Path::new(&format!("/music/{n}.wav"))])))
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        });
+
+        let first = collect_batch(&mut rx, DEBOUNCE).await.unwrap();
+        let second = collect_batch(&mut rx, DEBOUNCE).await.unwrap();
+
+        // Events at 0, 150, 300 and 450 ms make the first batch; the window
+        // closes at 500 ms even though events keep coming.
+        assert_eq!(first.len(), 4);
+        assert_eq!(second.len(), 2);
+        sender.await.unwrap();
     }
 }
