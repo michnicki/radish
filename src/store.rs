@@ -1690,8 +1690,24 @@ pub async fn list_tracks(pool: &SqlitePool) -> Result<Vec<TrackRow>> {
     Ok(rows)
 }
 
+/// A `LIKE` pattern matching `query` as a literal substring. The backslash is
+/// escaped first so the escapes added for `%` and `_` stay intact; the query
+/// must use `ESCAPE '\'`.
+fn like_contains(query: &str) -> String {
+    let mut pattern = String::with_capacity(query.len() + 2);
+    pattern.push('%');
+    for ch in query.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern.push('%');
+    pattern
+}
+
 pub async fn search_tracks(pool: &SqlitePool, query: &str) -> Result<Vec<TrackRow>> {
-    let pattern = format!("%{query}%");
+    let pattern = like_contains(query);
     let rows = sqlx::query_as::<_, TrackRow>(
         "SELECT t.path AS path,
                 COALESCE(tm.remote_title, t.title) AS title,
@@ -1706,9 +1722,9 @@ pub async fn search_tracks(pool: &SqlitePool, query: &str) -> Result<Vec<TrackRo
          LEFT JOIN albums a ON a.id = t.album_id
          LEFT JOIN release_matches m ON m.local_release_id = t.local_release_id
          LEFT JOIN release_track_matches tm ON tm.track_id = t.id AND tm.match_id = m.id
-         WHERE COALESCE(tm.remote_title, t.title) LIKE ?1 COLLATE NOCASE
-            OR COALESCE(tm.remote_artist, t.artist) LIKE ?1 COLLATE NOCASE
-            OR COALESCE(m.title, a.title) LIKE ?1 COLLATE NOCASE
+         WHERE COALESCE(tm.remote_title, t.title) LIKE ?1 COLLATE NOCASE ESCAPE '\\'
+            OR COALESCE(tm.remote_artist, t.artist) LIKE ?1 COLLATE NOCASE ESCAPE '\\'
+            OR COALESCE(m.title, a.title) LIKE ?1 COLLATE NOCASE ESCAPE '\\'
          ORDER BY album, disc_number, track_number, title",
     )
     .bind(pattern)
@@ -2833,5 +2849,43 @@ mod tests {
         let rows = list_tracks(&pool).await.unwrap();
         let moved_row = rows.iter().find(|r| r.path.ends_with("02.flac")).unwrap();
         assert_eq!(moved_row.title.as_deref(), Some("Moved"));
+    }
+
+    #[tokio::test]
+    async fn search_treats_percent_and_underscore_literally() {
+        let pool = test_pool().await;
+        let titled = |path: &str, title: &str, number: i64| {
+            let mut track = scanned(path, Some("Blue"), Some("Artist"), number);
+            track.title = Some(title.to_string());
+            track
+        };
+        insert(
+            &pool,
+            "/music/a",
+            &[
+                titled("/music/a/01.flac", "100% Pure", 1),
+                titled("/music/a/02.flac", "1000 Pure", 2),
+                titled("/music/a/03.flac", "a_b", 3),
+                titled("/music/a/04.flac", "axb", 4),
+                titled("/music/a/05.flac", r"back\slash", 5),
+            ],
+        )
+        .await;
+
+        let titles = |rows: Vec<TrackRow>| -> Vec<String> {
+            rows.into_iter().filter_map(|row| row.title).collect()
+        };
+        assert_eq!(
+            titles(search_tracks(&pool, "100%").await.unwrap()),
+            vec!["100% Pure"]
+        );
+        assert_eq!(
+            titles(search_tracks(&pool, "A_B").await.unwrap()),
+            vec!["a_b"]
+        );
+        assert_eq!(
+            titles(search_tracks(&pool, r"k\s").await.unwrap()),
+            vec![r"back\slash"]
+        );
     }
 }
