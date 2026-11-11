@@ -608,6 +608,10 @@ where
         && let (Some(candidate), Some(evaluation)) =
             (fallback.candidates.first(), fallback.evaluations.first())
         && evaluation.auto_accept
+        && !attempts[0]
+            .error
+            .as_ref()
+            .is_some_and(ProviderError::is_transient)
     {
         let primary = &attempts[0];
         let conflicts = matcher::fallback_conflicts(

@@ -118,7 +118,7 @@ For each selected release Radish evaluates MusicBrainz first. If its best candid
 
 Each provider keeps its own requests, budgets, caches, scores, and runner-up gaps; they are never merged. A fallback candidate must pass its own gates and must not contradict the local edition or a complete, plausible primary candidate on edition qualifiers, mapped titles (below `0.90`), or known durations (more than three seconds apart). An observed but unresolved MusicBrainz release ID blocks automatic fallback. Both groups are kept for review when identity cannot be established.
 
-Intermediate failures are counted once, from the final release outcome. A successful fallback after a MusicBrainz failure is reported as recovered; an attempted stage that failed with no usable result is a failure, not an unmatched release.
+Intermediate failures are counted once, from the final release outcome. A Discogs fallback after a permanent MusicBrainz failure can be accepted as recovered, but after a transient MusicBrainz failure (network error, rate limit, cooldown, or unusable response) the fallback candidate is queued for review instead; an attempted stage that failed with no usable result is a failure, not an unmatched release.
 
 ### Identity
 

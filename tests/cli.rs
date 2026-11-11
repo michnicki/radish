@@ -389,3 +389,24 @@ fn list_fails_when_stdout_cannot_be_written() {
         "{stderr}"
     );
 }
+
+#[tokio::test]
+async fn musicbrainz_outage_queues_a_discogs_fallback_instead_of_accepting_it() {
+    let db = db_path("outage-fallback-queued");
+    seed_library(&db).await;
+    // Discogs offers a complete, otherwise auto-acceptable release.
+    let server = MockServer::start(|target| {
+        if target.contains("/ws/2/") {
+            return (503, "{}".into());
+        }
+        handler(target)
+    });
+    let output = run(&db, &server, &["match"], Some("test-token"));
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("Queued for review: 1"), "{text}");
+    assert!(text.contains("Accepted: 0"), "{text}");
+    assert!(!text.contains("recovered the release"), "{text}");
+    assert_eq!(row_count(&db, "release_matches").await, 0);
+    assert_eq!(row_count(&db, "match_reviews").await, 1);
+}
