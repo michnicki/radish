@@ -1493,6 +1493,14 @@ impl AcceptancePolicy {
     }
 }
 
+/// Track version qualifiers that distinguish recordings. A remastering is a
+/// different mastering of the same recording, so it never separates tracks.
+fn album_track_qualifiers(title: &str) -> BTreeSet<&'static str> {
+    let mut qualifiers = edition_qualifiers(title);
+    qualifiers.remove("remastered");
+    qualifiers
+}
+
 fn equivalent_audio(a: &Candidate, b: &Candidate) -> bool {
     if !b.mapping.complete || b.mapping.ambiguous || b.release.has_unsupported_entries() {
         return false;
@@ -1653,6 +1661,14 @@ fn evaluate_at_scope(
                     "album matching requires a title and known duration for every track"
                         .to_string(),
                 );
+            }
+            if album_track_qualifiers(local_track.title.as_deref().unwrap_or_default())
+                != album_track_qualifiers(&remote_track.title)
+            {
+                blockers.push(format!(
+                    "track version qualifiers differ for '{}'",
+                    remote_track.title
+                ));
             }
             if matches!((local_track.recording_id, remote_track.recording_id),
                 (Some(a), Some(b)) if a != b)
@@ -2758,6 +2774,39 @@ mod tests {
                 .blockers
                 .iter()
                 .any(|reason| reason.contains("track title"))
+        );
+    }
+
+    #[test]
+    fn album_scope_blocks_track_version_qualifier_mismatches() {
+        let local = local_release(&["Yesterday", "Michelle"]);
+        let remote = remote_release(&["Yesterday (Live)", "Michelle (Live)"]);
+        let candidate = Candidate::new(&local, remote);
+        let result = evaluate_ai_album(&local, &candidate, &[]);
+        assert!(!result.auto_accept);
+        assert!(
+            result
+                .blockers
+                .iter()
+                .any(|reason| reason.contains("qualifier")),
+            "{:?}",
+            result.blockers
+        );
+    }
+
+    #[test]
+    fn album_scope_ignores_remastered_in_track_titles() {
+        let local = local_release(&["Song - Remastered 2009", "Other"]);
+        let remote = remote_release(&["Song", "Other"]);
+        let candidate = Candidate::new(&local, remote);
+        let result = evaluate_ai_album(&local, &candidate, &[]);
+        assert!(
+            !result
+                .blockers
+                .iter()
+                .any(|reason| reason.contains("qualifier")),
+            "{:?}",
+            result.blockers
         );
     }
 
