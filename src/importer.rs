@@ -59,9 +59,9 @@ pub fn report_rebuild(rebuild: &store::RebuildSummary) {
 
 /// Brings the database in line with the audio files under `root`.
 ///
-/// Files whose modification time matches the stored one are not read again,
-/// and rows whose files no longer exist are deleted. Local releases are
-/// rebuilt for `root` afterwards.
+/// Files whose modification time matches the stored one are not read again
+/// unless `force` is set, and rows whose files no longer exist are deleted.
+/// Local releases are rebuilt for `root` afterwards.
 ///
 /// # Errors
 ///
@@ -71,9 +71,10 @@ pub async fn sync_directory(
     pool: &SqlitePool,
     root: &Path,
     progress: &ImportProgress,
+    force: bool,
 ) -> Result<ImportSummary> {
     let directory_id = store::upsert_directory(pool, root).await?;
-    let mut summary = sync_files(pool, root, directory_id, Some(progress)).await?;
+    let mut summary = sync_files(pool, root, directory_id, Some(progress), force).await?;
     progress.grouping();
     summary.rebuild = store::rebuild_local_releases(pool, Some(root)).await?;
     Ok(summary)
@@ -91,12 +92,14 @@ fn emit(progress: Option<&ImportProgress>, event: ScanEvent) {
 /// [`sync_directory`] without the rebuild: syncs the files under `dir` into
 /// the rows of the library directory `directory_id`. The watcher uses it for
 /// a folder that appeared inside the watched root, and rebuilds once per batch.
-/// Without a `progress` display, warnings go to stderr.
+/// Without a `progress` display, warnings go to stderr. With `force`, every
+/// file is read again whatever its modification time says.
 pub(crate) async fn sync_files(
     pool: &SqlitePool,
     dir: &Path,
     directory_id: i64,
     progress: Option<&ImportProgress>,
+    force: bool,
 ) -> Result<ImportSummary> {
     // A missing directory would otherwise look like every file was deleted.
     if !tokio::fs::metadata(dir).await?.is_dir() {
@@ -113,9 +116,10 @@ pub(crate) async fn sync_files(
         |path, modified_at| {
             // The stored path must match exactly, not just case-insensitively:
             // a case-only rename has to be read and saved again.
-            known.get(&store::path_key(path)).is_some_and(|known| {
-                known.modified_at == modified_at && Path::new(&known.path) == path
-            })
+            !force
+                && known.get(&store::path_key(path)).is_some_and(|known| {
+                    known.modified_at == modified_at && Path::new(&known.path) == path
+                })
         },
         |event| emit(progress, event),
     )
@@ -222,7 +226,7 @@ pub(crate) async fn sync_files(
 mod tests {
     use super::*;
     use crate::db;
-    use crate::test_support::{ScratchDir, write_wav};
+    use crate::test_support::{ScratchDir, write_tagged_wav, write_wav};
 
     async fn revisions(pool: &SqlitePool) -> Vec<String> {
         sqlx::query_scalar("SELECT source_revision FROM local_releases ORDER BY id")
@@ -237,7 +241,7 @@ mod tests {
         let music = ScratchDir::new("importer-directory-id");
         let progress = ImportProgress::new();
 
-        let summary = sync_directory(&pool, music.path(), &progress)
+        let summary = sync_directory(&pool, music.path(), &progress, false)
             .await
             .unwrap();
 
@@ -269,14 +273,14 @@ mod tests {
         write_wav(&music.path().join("b.wav"));
         let progress = ImportProgress::new();
 
-        let first = sync_directory(&pool, music.path(), &progress)
+        let first = sync_directory(&pool, music.path(), &progress, false)
             .await
             .unwrap();
         assert_eq!((first.scanned, first.unchanged), (2, 0));
         let before = revisions(&pool).await;
         assert!(!before.is_empty());
 
-        let second = sync_directory(&pool, music.path(), &progress)
+        let second = sync_directory(&pool, music.path(), &progress, false)
             .await
             .unwrap();
         assert_eq!(second.unchanged, 2, "{second:?}");
@@ -293,12 +297,12 @@ mod tests {
         write_wav(&music.path().join("Keep.wav"));
         write_wav(&music.path().join("Gone.wav"));
         let progress = ImportProgress::new();
-        sync_directory(&pool, music.path(), &progress)
+        sync_directory(&pool, music.path(), &progress, false)
             .await
             .unwrap();
         std::fs::remove_file(music.path().join("Gone.wav")).unwrap();
 
-        let summary = sync_directory(&pool, music.path(), &progress)
+        let summary = sync_directory(&pool, music.path(), &progress, false)
             .await
             .unwrap();
 
@@ -338,7 +342,7 @@ mod tests {
         write_wav(&music.path().join("a.wav"));
         write_wav(&music.path().join("b.wav"));
         let progress = ImportProgress::new();
-        sync_directory(&pool, music.path(), &progress)
+        sync_directory(&pool, music.path(), &progress, false)
             .await
             .unwrap();
 
@@ -351,7 +355,7 @@ mod tests {
             .unwrap()
             .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
             .unwrap();
-        let summary = sync_directory(&pool, music.path(), &progress)
+        let summary = sync_directory(&pool, music.path(), &progress, false)
             .await
             .unwrap();
 
@@ -372,7 +376,7 @@ mod tests {
         write_wav(&album.join("02.wav"));
         write_wav(&music.path().join("top.wav"));
         let progress = ImportProgress::new();
-        sync_directory(&pool, music.path(), &progress)
+        sync_directory(&pool, music.path(), &progress, false)
             .await
             .unwrap();
 
@@ -381,7 +385,7 @@ mod tests {
         if std::fs::read_dir(&album).is_ok() {
             return; // running as root: permissions do not apply
         }
-        let summary = sync_directory(&pool, music.path(), &progress)
+        let summary = sync_directory(&pool, music.path(), &progress, false)
             .await
             .unwrap();
 
@@ -403,13 +407,13 @@ mod tests {
         write_wav(&music.path().join("top.wav"));
         std::os::unix::fs::symlink(&share, music.path().join("NAS")).unwrap();
         let progress = ImportProgress::new();
-        let first = sync_directory(&pool, music.path(), &progress)
+        let first = sync_directory(&pool, music.path(), &progress, false)
             .await
             .unwrap();
         assert_eq!(first.scanned, 3);
 
         std::fs::rename(&share, holder.path().join("gone")).unwrap();
-        let summary = sync_directory(&pool, music.path(), &progress)
+        let summary = sync_directory(&pool, music.path(), &progress, false)
             .await
             .unwrap();
 
@@ -426,14 +430,14 @@ mod tests {
             write_wav(&music.path().join(name));
         }
         let progress = ImportProgress::new();
-        sync_directory(&pool, music.path(), &progress)
+        sync_directory(&pool, music.path(), &progress, false)
             .await
             .unwrap();
 
         for name in ["a.wav", "b.wav", "c.wav"] {
             std::fs::remove_file(music.path().join(name)).unwrap();
         }
-        let summary = sync_directory(&pool, music.path(), &progress)
+        let summary = sync_directory(&pool, music.path(), &progress, false)
             .await
             .unwrap();
 
@@ -449,12 +453,12 @@ mod tests {
         let music = ScratchDir::new("importer-case-rename");
         write_wav(&music.path().join("01.wav"));
         let progress = ImportProgress::new();
-        sync_directory(&pool, music.path(), &progress)
+        sync_directory(&pool, music.path(), &progress, false)
             .await
             .unwrap();
 
         std::fs::rename(music.path().join("01.wav"), music.path().join("01.WAV")).unwrap();
-        let summary = sync_directory(&pool, music.path(), &progress)
+        let summary = sync_directory(&pool, music.path(), &progress, false)
             .await
             .unwrap();
 
@@ -463,5 +467,87 @@ mod tests {
             paths(&pool).await,
             [music.path().join("01.WAV").display().to_string()]
         );
+    }
+
+    /// A database as the pre-migration binary left it: only the original schema.
+    async fn legacy_pool() -> SqlitePool {
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        use std::str::FromStr;
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("schema.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool
+    }
+
+    fn mtime_secs(path: &Path) -> i64 {
+        std::fs::metadata(path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    #[tokio::test]
+    async fn an_upgraded_database_rereads_files_so_polluted_years_are_replaced() {
+        let music = ScratchDir::new("importer-upgrade-year");
+        let file = music.path().join("01.wav");
+        write_tagged_wav(&file, "Blue", 2005);
+        // The old binary stored the year on the shared album row, so this track
+        // carries whichever year was written last, with the file's current mtime.
+        let pool = legacy_pool().await;
+        sqlx::query("INSERT INTO directories (id, path) VALUES (1, ?1)")
+            .bind(music.path().display().to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO albums (id, title, artist, year) VALUES (1, 'Blue', NULL, 1971)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tracks (id, path, album_id, directory_id, modified_at)
+             VALUES (10, ?1, 1, 1, ?2)",
+        )
+        .bind(file.display().to_string())
+        .bind(mtime_secs(&file))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        db::initialize(&pool).await.unwrap();
+        let before: Option<i64> = sqlx::query_scalar("SELECT year FROM tracks WHERE id = 10")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            before,
+            Some(1971),
+            "the migration carries the old year over"
+        );
+        let summary = sync_directory(&pool, music.path(), &ImportProgress::new(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.scanned, 1, "{summary:?}");
+        let after: Option<i64> = sqlx::query_scalar("SELECT year FROM tracks WHERE id = 10")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after, Some(2005));
     }
 }

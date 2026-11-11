@@ -40,6 +40,9 @@ enum Command {
             requires = "match_releases"
         )]
         ai_review: bool,
+        /// Read every file again, even when its modification time is unchanged
+        #[arg(long)]
+        rescan: bool,
     },
     /// Watch a music directory and keep the library in sync in real time
     Watch { path: PathBuf },
@@ -227,8 +230,9 @@ async fn run() -> Result<()> {
             match_releases,
             provider: _,
             ai_review,
+            rescan,
         } => {
-            let canonical = run_import(&pool, &path).await?;
+            let canonical = run_import(&pool, &path, rescan).await?;
             if match_releases {
                 let summary = runner::run_match(
                     &pool,
@@ -402,12 +406,16 @@ fn format_duration(secs: Option<f64>) -> String {
     }
 }
 
-async fn run_import(pool: &sqlx::SqlitePool, path: &std::path::Path) -> Result<PathBuf> {
+async fn run_import(
+    pool: &sqlx::SqlitePool,
+    path: &std::path::Path,
+    rescan: bool,
+) -> Result<PathBuf> {
     let path = path.canonicalize()?;
     outln!("Scanning {}...", clean_path(&path));
 
     let progress = ImportProgress::new();
-    let summary = importer::sync_directory(pool, &path, &progress).await?;
+    let summary = importer::sync_directory(pool, &path, &progress, rescan).await?;
     drop(progress);
 
     let mut kept = String::new();

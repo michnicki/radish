@@ -50,3 +50,22 @@ pub(crate) fn write_wav(path: &Path) {
     bytes.extend_from_slice(&data);
     std::fs::write(path, bytes).unwrap();
 }
+
+/// Writes a WAV file whose tag holds `album` and the release `year`.
+pub(crate) fn write_tagged_wav(path: &Path, album: &str, year: u16) {
+    use lofty::config::WriteOptions;
+    use lofty::file::{AudioFile, TaggedFileExt};
+    use lofty::tag::items::Timestamp;
+    use lofty::tag::{Accessor, Tag};
+
+    write_wav(path);
+    let mut file = lofty::probe::Probe::open(path).unwrap().read().unwrap();
+    let mut tag = Tag::new(file.primary_tag_type());
+    tag.set_album(album.to_string());
+    tag.set_date(Timestamp {
+        year,
+        ..Timestamp::default()
+    });
+    file.insert_tag(tag);
+    file.save_to_path(path, WriteOptions::default()).unwrap();
+}

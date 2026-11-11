@@ -40,7 +40,7 @@ pub async fn watch_directory(pool: SqlitePool, root: &Path, db_path: &Path) -> R
 
     outln!("Doing initial scan of {}...", clean_path(&root));
     let progress = ImportProgress::new();
-    let summary = importer::sync_directory(&pool, &root, &progress).await?;
+    let summary = importer::sync_directory(&pool, &root, &progress, false).await?;
     drop(progress);
     outln!(
         "Synced {} tracks ({} unchanged, {} removed). Watching for changes... (Ctrl+C to stop)",
@@ -241,7 +241,7 @@ async fn handle_events(
     if force_rescan || plan.rescan {
         // Events were lost or not applied, so a full sync is the only way to be sure.
         let progress = ImportProgress::new();
-        let synced = importer::sync_directory(pool, &scope.root, &progress).await;
+        let synced = importer::sync_directory(pool, &scope.root, &progress, false).await;
         drop(progress);
         let summary = match synced {
             Ok(summary) => summary,
@@ -320,7 +320,7 @@ async fn apply_path(
 ) -> Result<()> {
     match tokio::fs::metadata(path).await {
         Ok(metadata) if metadata.is_dir() => {
-            let summary = importer::sync_files(pool, path, directory_id, None).await?;
+            let summary = importer::sync_files(pool, path, directory_id, None, false).await?;
             outcome.synced += summary.saved;
             outcome.removed += summary.removed;
             if summary.saved > 0 {
