@@ -608,7 +608,7 @@ pub struct Mapping {
     /// that `map_tracks` measured for it. A cache only: never serialized, so
     /// decoded mappings start empty and readers recompute.
     #[serde(skip)]
-    pub pair_similarity: Vec<Option<(usize, f64)>>,
+    pair_similarity: Vec<Option<(usize, f64)>>,
 }
 
 impl Mapping {
@@ -1590,7 +1590,7 @@ fn normalized_track_credit(release: &RemoteRelease, track: &RemoteTrack) -> Stri
 }
 
 /// Do not trust a serialized mapping's summary flags without checking its pairs.
-fn supported_album_mapping(candidate: &Candidate, row_count: usize) -> bool {
+pub(crate) fn supported_album_mapping(candidate: &Candidate, row_count: usize) -> bool {
     if row_count == 0
         || !candidate.mapping.complete
         || candidate.mapping.ambiguous

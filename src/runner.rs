@@ -5,7 +5,7 @@
 //! unsatisfactory MusicBrainz stage and only when a token is available. An
 //! explicit provider or direct selector uses one service and no fallback.
 
-use crate::clef::{Advice, AdviceChoice, ClefClient, ReviewCandidate};
+use crate::clef::{Advice, AdviceChoice, ClefClient, ReviewCandidate, choice_key};
 use crate::discogs::{AdapterError, DiscogsAdapter};
 use crate::discovery::{self, DiscoveryResult};
 use crate::matcher::{
@@ -902,11 +902,9 @@ fn print_ai_advice(advice: &Advice) {
 }
 
 fn advice_assessed(advice: &Advice, candidate: &Candidate) -> bool {
-    advice.probabilities.contains_key(&format!(
-        "{}:{}",
-        candidate.release.provider(),
-        candidate.release.id.storage_id()
-    ))
+    advice
+        .probabilities
+        .contains_key(&choice_key(&candidate.release.id))
 }
 
 fn choose_ai_match(
@@ -964,8 +962,7 @@ fn choose_ai_match(
     // The model cannot supply semantic agreement for evidence it never saw.
     if let Some(other) = alternatives.iter().find(|other| {
         !advice_assessed(advice, other)
-            && candidate.score.album_score() - other.score.album_score()
-                <= matcher::RUNNER_UP_GAP + 1e-9
+            && matcher::within_gap(candidate.score.album_score() - other.score.album_score())
             && !matcher::equivalent_unassessed_audio(candidate, other)
     }) {
         return Err(format!(

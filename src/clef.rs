@@ -1,6 +1,6 @@
 //! Bounded Clef evaluation of existing candidate evidence.
 
-use crate::matcher::{Candidate, Evaluation, LocalRelease, RemoteRelease};
+use crate::matcher::{Candidate, Evaluation, LocalRelease, RemoteRelease, supported_album_mapping};
 use crate::providers::ReleaseId;
 use anyhow::{Result, anyhow, bail};
 use reqwest::{Client, Url};
@@ -48,9 +48,7 @@ impl Advice {
     /// Model scores are uncalibrated signals; structural checks are also required.
     pub fn can_automate(&self) -> bool {
         let key = match &self.choice {
-            AdviceChoice::Candidate { release } => {
-                format!("{}:{}", release.provider(), release.storage_id())
-            }
+            AdviceChoice::Candidate { release } => choice_key(release),
             AdviceChoice::EquivalentEditions => "equivalent_editions".into(),
             AdviceChoice::NoMatch => return false,
         };
@@ -292,8 +290,8 @@ fn prepare_request(
     }
     let mut ranked: Vec<_> = candidates.iter().collect();
     ranked.sort_by(|a, b| {
-        supported_mapping(b.candidate, local.tracks.len())
-            .cmp(&supported_mapping(a.candidate, local.tracks.len()))
+        supported_album_mapping(b.candidate, local.tracks.len())
+            .cmp(&supported_album_mapping(a.candidate, local.tracks.len()))
             .then_with(|| {
                 b.candidate
                     .score
@@ -378,7 +376,7 @@ fn prepare_request(
             .iter()
             .copied()
             .filter(|&index| {
-                supported_mapping(ranked[index].candidate, local.tracks.len()) == supported
+                supported_album_mapping(ranked[index].candidate, local.tracks.len()) == supported
             })
             .collect();
         for &index in &group {
@@ -410,31 +408,10 @@ fn prepare_request(
     ))
 }
 
-fn choice_key(release: &ReleaseId) -> String {
+/// The key a candidate is offered to the model under, and stored under in
+/// advice probabilities.
+pub(crate) fn choice_key(release: &ReleaseId) -> String {
     format!("{}:{}", release.provider(), release.storage_id())
-}
-
-fn supported_mapping(candidate: &Candidate, rows: usize) -> bool {
-    if rows == 0
-        || !candidate.mapping.complete
-        || candidate.mapping.ambiguous
-        || candidate.release.has_unsupported_entries()
-        || candidate.mapping.pairs.len() != rows
-        || candidate.release.playable_tracks().len() != rows
-    {
-        return false;
-    }
-    let mut targets = BTreeSet::new();
-    candidate.mapping.pairs.iter().all(|pair| {
-        pair.is_some_and(|index| {
-            candidate
-                .release
-                .tracklist
-                .get(index)
-                .is_some_and(|track| track.is_playable())
-                && targets.insert(index)
-        })
-    })
 }
 
 const LOCAL_TRACK_COLUMNS: &[&str] = &[
@@ -1003,9 +980,7 @@ mod tests {
             let key = row["choice"].as_str().unwrap();
             let expected = candidates
                 .iter()
-                .find(|c| {
-                    format!("{}:{}", c.release.id.provider(), c.release.id.storage_id()) == key
-                })
+                .find(|c| choice_key(&c.release.id) == key)
                 .unwrap();
             let tracks = row["release"]["tracklist"].as_array().unwrap();
             assert_eq!(tracks.len(), 24);
