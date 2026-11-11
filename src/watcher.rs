@@ -22,9 +22,11 @@ pub async fn watch_directory(pool: SqlitePool, root: &Path) -> Result<()> {
     let tracks =
         scanner::scan_directory_with_progress(&root, |event| progress.scan_event(event)).await?;
     progress.saving(tracks.len());
-    for track in &tracks {
-        store::upsert_track(&pool, track, directory_id).await?;
-        progress.saved();
+    for chunk in tracks.chunks(store::UPSERT_BATCH_SIZE) {
+        store::upsert_tracks(&pool, chunk, directory_id).await?;
+        for _ in chunk {
+            progress.saved();
+        }
     }
     progress.grouping();
     store::rebuild_local_releases(&pool, Some(&root)).await?;

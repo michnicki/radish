@@ -286,13 +286,14 @@ where
 
     let statuses = store::status_by_id(pool).await?;
     let existing_matches = store::accepted_matches_by_release(pool).await?;
-    let mut releases = store::load_local_releases(pool, options.scope.as_deref()).await?;
+    let releases =
+        store::load_selected_releases(pool, options.scope.as_deref(), options.local_release)
+            .await?;
 
-    if let Some(id) = options.local_release {
-        releases.retain(|release| release.id == id);
-        if releases.is_empty() {
-            bail!("local release {id} was not found");
-        }
+    if let Some(id) = options.local_release
+        && releases.is_empty()
+    {
+        bail!("local release {id} was not found");
     }
 
     let mut summary = MatchSummary {
@@ -367,7 +368,29 @@ where
             release_policy = ProviderPolicy::Only(provider);
         }
 
-        let guard = store::load_match_guard(pool, release.id).await?;
+        let guard = match store::load_match_guard(pool, release.id).await {
+            Ok(guard) => guard,
+            Err(error) if error.downcast_ref::<store::SnapshotChanged>().is_some() => {
+                outln!(
+                    "  skipping local release {}: it no longer exists; run match again",
+                    release.id
+                );
+                summary.skipped += 1;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        // The release was loaded before provider calls began. If its files
+        // changed since, any candidate evaluated against the old snapshot
+        // would map onto the wrong files, so do not contact a provider.
+        if guard.source_revision != release.revision {
+            outln!(
+                "  skipping local release {}: its files changed since matching started; run match again",
+                release.id
+            );
+            summary.skipped += 1;
+            continue;
+        }
 
         // Explicit review stays offline. Normal matching rediscovers candidates
         // so an old edition-only review does not permanently block automation.
@@ -886,11 +909,11 @@ async fn accept(
     }
 
     let result = if let Some(advice) = ai_advice {
-        store::accept_ai_match(pool, release.id, candidate, guard, advice).await
+        store::accept_ai_match(pool, release, candidate, guard, advice).await
     } else {
         store::accept_match(
             pool,
-            release.id,
+            release,
             candidate,
             method,
             evaluation.match_scope,
@@ -915,6 +938,10 @@ async fn accept(
                 outln!("    album and tracks matched; exact edition unconfirmed");
             }
             Ok(Outcome::Accepted)
+        }
+        Err(error) if error.downcast_ref::<store::SnapshotChanged>().is_some() => {
+            outln!("  skipping: {error}; run match again");
+            Ok(Outcome::Skipped)
         }
         Err(error) => {
             eprintln!("  could not apply the match: {error:#}");
@@ -1490,7 +1517,7 @@ fn print_decision_for(provider: ProviderKind, candidate: &Candidate, evaluation:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::Mbid;
+    use crate::providers::{Mbid, SearchPage, SearchRequest};
 
     fn mbid(value: &str) -> Mbid {
         value.parse().unwrap()
@@ -1713,5 +1740,180 @@ mod tests {
                 "budget-omitted candidates cannot inherit semantic agreement"
             );
         }
+    }
+
+    fn scanned_track(path: &str, album: &str, number: i64) -> crate::scanner::ScannedTrack {
+        crate::scanner::ScannedTrack {
+            path: std::path::PathBuf::from(path),
+            title: Some(format!("Track {number}")),
+            artist: Some("Artist".into()),
+            album: Some(album.into()),
+            album_artist: Some("Artist".into()),
+            year: Some(2001),
+            track_number: Some(number),
+            disc_number: None,
+            barcode: None,
+            catalog_number: None,
+            discogs_release_id: None,
+            musicbrainz: crate::scanner::ObservedMusicBrainzIds::default(),
+            duration_secs: Some(180.0),
+            modified_at: 1,
+        }
+    }
+
+    /// Answers the first search by retagging another release's files, as a
+    /// concurrent import would, then reports no results.
+    struct RetaggingProvider {
+        pool: SqlitePool,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        retag: crate::scanner::ScannedTrack,
+        directory_id: i64,
+    }
+
+    impl MetadataProvider for RetaggingProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::MusicBrainz
+        }
+
+        async fn search(&self, _request: SearchRequest) -> Result<SearchPage, ProviderError> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                store::upsert_tracks(
+                    &self.pool,
+                    std::slice::from_ref(&self.retag),
+                    self.directory_id,
+                )
+                .await
+                .unwrap();
+                store::rebuild_local_releases(&self.pool, None)
+                    .await
+                    .unwrap();
+            }
+            Ok(SearchPage {
+                hits: Vec::new(),
+                total: Some(0),
+                next_offset: None,
+            })
+        }
+
+        async fn fetch_release(&self, id: ReleaseId) -> Result<RemoteRelease, ProviderError> {
+            Err(ProviderError::Permanent {
+                provider: id.provider(),
+                status: None,
+                message: "not available in this test".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn release_changed_after_loading_is_skipped_without_contacting_providers() {
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let directory_id = store::upsert_directory(&pool, std::path::Path::new("/music"))
+            .await
+            .unwrap();
+        let first = scanned_track("/music/a/01.flac", "Alpha", 1);
+        let second = scanned_track("/music/b/01.flac", "Beta", 1);
+        store::upsert_tracks(&pool, &[first, second.clone()], directory_id)
+            .await
+            .unwrap();
+        store::rebuild_local_releases(&pool, None).await.unwrap();
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let make_provider = || -> Result<RetaggingProvider> {
+            let mut retag = second.clone();
+            retag.title = Some("Retitled".into());
+            retag.modified_at = 2;
+            Ok(RetaggingProvider {
+                pool: pool.clone(),
+                calls: calls.clone(),
+                retag,
+                directory_id,
+            })
+        };
+        let options = MatchOptions {
+            policy: ProviderPolicy::Only(ProviderKind::MusicBrainz),
+            ..MatchOptions::default()
+        };
+
+        let summary = run_with_policy(
+            &pool,
+            &options,
+            make_provider,
+            || -> Result<RetaggingProvider> { bail!("Discogs is not used in this test") },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.skipped, 1, "{summary:?}");
+        assert_eq!(summary.failed, 0, "{summary:?}");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the first release may contact the provider"
+        );
+        let beta = store::load_local_releases(&pool, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|release| release.album_title.as_deref() == Some("Beta"))
+            .unwrap();
+        assert!(
+            store::load_review(&pool, beta.id, ProviderKind::MusicBrainz)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_turns_a_changed_snapshot_into_a_skip() {
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let directory_id = store::upsert_directory(&pool, std::path::Path::new("/music"))
+            .await
+            .unwrap();
+        let file = scanned_track("/music/a/01.flac", "Alpha", 1);
+        store::upsert_tracks(&pool, std::slice::from_ref(&file), directory_id)
+            .await
+            .unwrap();
+        store::rebuild_local_releases(&pool, None).await.unwrap();
+        let release = store::load_local_releases(&pool, None)
+            .await
+            .unwrap()
+            .remove(0);
+        let guard = store::load_match_guard(&pool, release.id).await.unwrap();
+
+        let (_, mut remote) = ai_album_fixture();
+        remote.tracklist.truncate(1);
+        let candidate = Candidate::new(&release, remote);
+        let evaluation = matcher::evaluate(
+            &release,
+            &candidate,
+            None,
+            &matcher::DiscoveryEvidence::default(),
+        );
+        assert!(evaluation.can_apply(&candidate));
+
+        // The files change after the release was loaded and the guard taken.
+        let mut retagged = file;
+        retagged.title = Some("Retitled".into());
+        retagged.modified_at = 2;
+        store::upsert_tracks(&pool, &[retagged], directory_id)
+            .await
+            .unwrap();
+        store::rebuild_local_releases(&pool, None).await.unwrap();
+
+        let outcome = accept(
+            &pool,
+            &release,
+            ProviderKind::Discogs,
+            &candidate,
+            &evaluation,
+            AcceptanceMethod::Manual,
+            false,
+            &guard,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, Outcome::Skipped), "{outcome:?}");
     }
 }

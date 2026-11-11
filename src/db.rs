@@ -1,7 +1,11 @@
 use anyhow::Result;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
+};
 use std::path::Path;
+#[cfg(test)]
 use std::str::FromStr;
+use std::time::Duration;
 
 /// The original, pre-migration schema. It is applied before migrations so that
 /// existing databases keep their current shape and fresh databases start from
@@ -10,34 +14,59 @@ const LEGACY_SCHEMA: &str = include_str!("schema.sql");
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
-pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
-    let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", db_path.display()))?
-        .create_if_missing(true)
-        .foreign_keys(true);
+/// How long a connection waits for another writer's lock before giving up.
+///
+/// Matching holds no write lock while it talks to providers, so contention is
+/// limited to short import, rebuild and accept transactions. Fifteen seconds
+/// is long enough for a large import batch to finish and short enough that a
+/// wedged process is reported instead of hanging forever.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
-    connect_with_options(options).await
+/// Connections for file databases. Concurrent readers and one writer is the
+/// usual shape: the watcher, an import and a match run can overlap.
+const FILE_POOL_CONNECTIONS: u32 = 8;
+
+/// Opens the library database at `db_path`, creating it when missing.
+///
+/// The path is passed as a file name, never spliced into a URL, so characters
+/// such as `?`, `#` and `%` are safe. File databases use WAL with
+/// `synchronous = NORMAL`, so readers do not block the writer.
+pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
+    let options = SqliteConnectOptions::new()
+        .filename(db_path)
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(BUSY_TIMEOUT);
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(FILE_POOL_CONNECTIONS)
+        .connect_with(options)
+        .await?;
+    initialize(&pool).await?;
+
+    Ok(pool)
 }
 
 /// Opens an in-memory database, used by tests.
+///
+/// Every connection to a private in-memory database is a separate database, so
+/// the pool holds exactly one connection and never recycles it. WAL does not
+/// apply to memory databases, and shared-cache locking reports `SQLITE_LOCKED`,
+/// which `busy_timeout` does not wait on.
 #[cfg(test)]
 pub async fn connect_in_memory() -> Result<SqlitePool> {
     let options = SqliteConnectOptions::from_str("sqlite::memory:")?
         .foreign_keys(true)
         .create_if_missing(true);
 
-    connect_with_options(options).await
-}
-
-async fn connect_with_options(options: SqliteConnectOptions) -> Result<SqlitePool> {
     let pool = SqlitePoolOptions::new()
-        .max_connections(if options.get_filename() == Path::new(":memory:") {
-            1
-        } else {
-            8
-        })
+        .max_connections(1)
+        .idle_timeout(None)
+        .max_lifetime(None)
         .connect_with(options)
         .await?;
-
     initialize(&pool).await?;
 
     Ok(pool)
@@ -130,6 +159,100 @@ mod tests {
         pool
     }
 
+    /// A scratch directory that is removed when dropped, including when the
+    /// test panics. It also removes the `-wal` and `-shm` side files.
+    struct ScratchDir(std::path::PathBuf);
+
+    impl std::ops::Deref for ScratchDir {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for ScratchDir {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A unique scratch directory for file-backed databases.
+    fn scratch_dir(label: &str) -> ScratchDir {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "radish-db-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        ScratchDir(dir)
+    }
+
+    // `?` is not a valid character in Windows file names.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_opens_paths_with_url_metacharacters() {
+        let dir = scratch_dir("meta");
+        let path = dir.join("lib ?#%.db");
+
+        let pool = connect(&path).await.unwrap();
+        sqlx::query("INSERT INTO directories (path) VALUES ('/music')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        assert!(
+            path.exists(),
+            "the database must be created at the exact path"
+        );
+        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        assert!(
+            entries.iter().all(|entry| entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("lib ?#%.db")),
+            "no stray database files expected: {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_databases_use_wal_and_normal_sync() {
+        let dir = scratch_dir("wal");
+        let pool = connect(&dir.join("library.db")).await.unwrap();
+
+        let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(journal, "wal");
+        assert_eq!(synchronous, 1, "NORMAL");
+
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_pools_hold_a_single_connection() {
+        let pool = connect_in_memory().await.unwrap();
+        assert_eq!(pool.options().get_max_connections(), 1);
+        assert_eq!(pool.options().get_idle_timeout(), None);
+        assert_eq!(pool.options().get_max_lifetime(), None);
+    }
+
     #[tokio::test]
     async fn creates_a_fresh_database_with_every_table() {
         let pool = connect_in_memory().await.unwrap();
@@ -165,7 +288,163 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(applied, 3);
+        assert_eq!(applied, 5);
+    }
+
+    /// A database migrated up to and including the album-matching migration.
+    async fn pool_before_store_integrity() -> SqlitePool {
+        let pool = legacy_pool().await;
+        for migration in [
+            include_str!("../migrations/20260101000000_discogs_matching.sql"),
+            include_str!("../migrations/20261111000000_musicbrainz_matching.sql"),
+            include_str!("../migrations/20261111000001_album_matching.sql"),
+        ] {
+            sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+        }
+        pool
+    }
+
+    #[tokio::test]
+    async fn migration_marks_misordered_matches_stale() {
+        let pool = pool_before_store_integrity().await;
+        let mut seed = String::from(
+            "INSERT INTO directories (id, path) VALUES (1, '/m');
+             INSERT INTO albums (id, title, artist, year) VALUES (1, 'Blue', 'Artist', 2001);",
+        );
+        // Release 1: path order differs from track order. Release 2: they agree.
+        // Release 3: a single track.
+        for (release, dir, tracks) in [
+            (1, "one", vec![(10, "A.flac", 2), (11, "B.flac", 1)]),
+            (2, "two", vec![(20, "A.flac", 1), (21, "B.flac", 2)]),
+            (3, "three", vec![(30, "A.flac", 1)]),
+        ] {
+            seed.push_str(&format!(
+                "INSERT INTO local_releases (id, directory_path, album_title_norm, source_revision, status, track_count)
+                 VALUES ({release}, '/m/{dir}', 'blue', 'rev', 'matched', {});
+                 INSERT INTO release_matches (id, local_release_id, provider, remote_release_id, release_url, score,
+                    algorithm_version, acceptance_method, source_revision, snapshot_version, metadata_json)
+                 VALUES ({release}, {release}, 'discogs', '42', 'https://example.test', 1.0, 'v', 'manual', 'rev', 2, '{{}}');",
+                tracks.len()
+            ));
+            for (id, file, number) in tracks {
+                seed.push_str(&format!(
+                    "INSERT INTO tracks (id, path, album_id, directory_id, track_number, modified_at, local_release_id)
+                     VALUES ({id}, '/m/{dir}/{file}', 1, 1, {number}, 1, {release});
+                     INSERT INTO release_track_matches (match_id, track_id, remote_ordinal, remote_title)
+                     VALUES ({release}, {id}, {number}, 'Remote {number}');"
+                ));
+            }
+        }
+        // An overlay row whose track no longer belongs to the match's release.
+        seed.push_str(
+            "INSERT INTO tracks (id, path, album_id, directory_id, track_number, modified_at, local_release_id)
+             VALUES (40, '/m/elsewhere/A.flac', 1, 1, 1, 1, NULL);
+             INSERT INTO release_track_matches (match_id, track_id, remote_ordinal, remote_title)
+             VALUES (3, 40, 9, 'Orphan');",
+        );
+        sqlx::raw_sql(sqlx::AssertSqlSafe(seed))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(include_str!(
+            "../migrations/20261112000000_store_integrity.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rows: Vec<(i64, String, bool)> = sqlx::query_as(
+            "SELECT lr.id, lr.status, m.stale
+             FROM local_releases lr JOIN release_matches m ON m.local_release_id = lr.id
+             ORDER BY lr.id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "stale".to_string(), true),
+                (2, "matched".to_string(), false),
+                (3, "matched".to_string(), false),
+            ]
+        );
+
+        let orphans: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM release_track_matches WHERE remote_title = 'Orphan'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(orphans, 0, "overlay rows for foreign tracks are removed");
+        let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_track_matches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept, 5);
+    }
+
+    #[tokio::test]
+    async fn migration_moves_year_to_tracks_and_dedupes_albums() {
+        let pool = pool_before_store_integrity().await;
+        sqlx::raw_sql(
+            "INSERT INTO directories (id, path) VALUES (1, '/m');
+             INSERT INTO albums (id, title, artist, year) VALUES (1, 'Blue', NULL, 2001);
+             INSERT INTO albums (id, title, artist, year) VALUES (2, 'Blue', NULL, 2002);
+             INSERT INTO albums (id, title, artist, year) VALUES (3, 'Blue', '', 1999);
+             INSERT INTO albums (id, title, artist, year) VALUES (4, 'Blue', 'Artist', 2010);
+             INSERT INTO tracks (id, path, album_id, directory_id, modified_at) VALUES (10, '/m/1.flac', 1, 1, 1);
+             INSERT INTO tracks (id, path, album_id, directory_id, modified_at) VALUES (11, '/m/2.flac', 2, 1, 1);
+             INSERT INTO tracks (id, path, album_id, directory_id, modified_at) VALUES (12, '/m/3.flac', 3, 1, 1);
+             INSERT INTO tracks (id, path, album_id, directory_id, modified_at) VALUES (13, '/m/4.flac', 4, 1, 1);
+             INSERT INTO tracks (id, path, album_id, directory_id, modified_at) VALUES (14, '/m/5.flac', NULL, 1, 1);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(include_str!(
+            "../migrations/20261112000001_track_year_album_identity.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let tracks: Vec<(i64, Option<i64>, Option<i64>)> =
+            sqlx::query_as("SELECT id, album_id, year FROM tracks ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            tracks,
+            vec![
+                (10, Some(1), Some(2001)),
+                (11, Some(1), Some(2002)),
+                (12, Some(1), Some(1999)),
+                (13, Some(4), Some(2010)),
+                (14, None, None),
+            ]
+        );
+        let albums: Vec<(i64, Option<i64>)> =
+            sqlx::query_as("SELECT id, year FROM albums ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(albums, vec![(1, None), (4, None)]);
+
+        let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(violations, 0);
+        let index: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_albums_identity'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(index, 1);
     }
 
     #[tokio::test]

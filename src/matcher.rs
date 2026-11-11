@@ -125,6 +125,8 @@ pub struct LocalRelease {
     pub is_compilation: bool,
     pub has_album_tag: bool,
     pub revision: String,
+    /// In the order of `store::order_release_tracks`. `Mapping::pairs` is
+    /// indexed by position in this list.
     pub tracks: Vec<LocalTrack>,
 }
 
