@@ -184,7 +184,7 @@ async fn run() -> Result<()> {
                 }
             }
         }
-        Command::Watch { path } => watcher::watch_directory(pool, &path).await?,
+        Command::Watch { path } => watcher::watch_directory(pool, &path, &cli.db).await?,
         Command::List => print_tracks(&store::list_tracks(&pool).await?),
         Command::Search { query } => print_tracks(&store::search_tracks(&pool, &query).await?),
         Command::Releases { path } => {
