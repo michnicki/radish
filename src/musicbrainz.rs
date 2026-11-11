@@ -815,7 +815,13 @@ pub fn decode_release_document(value: Value) -> Result<RemoteRelease, ProviderEr
                     TrackEntryType::Track
                 },
                 medium_position: Some(medium_position),
-                track_position: number.as_deref().and_then(leading_number),
+                // `position` is the numeric order MusicBrainz always sends; the
+                // free-text `number` ("A1") only has a leading number on CD.
+                track_position: track
+                    .get("position")
+                    .and_then(Value::as_u64)
+                    .and_then(|position| u32::try_from(position).ok())
+                    .or_else(|| number.as_deref().and_then(leading_number)),
                 release_track_id,
                 recording_id,
                 artist_credit: credits_text(credits),
@@ -1150,6 +1156,31 @@ mod tests {
             format!("{RELEASE_URL_PREFIX}{}", release_id().storage_id())
         );
         assert!(!release.has_unsupported_entries());
+    }
+
+    #[test]
+    fn keeps_numeric_positions_for_vinyl_and_cassette_side_numbers() {
+        let mut value = fixture();
+        value["media"][0]["format"] = Value::from("12\" Vinyl");
+        value["media"][0]["tracks"][0]["number"] = Value::from("A1");
+        value["media"][0]["tracks"][0]["position"] = Value::from(1);
+        value["media"][0]["tracks"][1]["number"] = Value::from("B1");
+        value["media"][0]["tracks"][1]["position"] = Value::from(2);
+        let release = decode_release_document(value).unwrap();
+        assert_eq!(release.tracklist[0].position.as_deref(), Some("A1"));
+        assert_eq!(release.tracklist[0].track_position, Some(1));
+        assert_eq!(release.tracklist[1].track_position, Some(2));
+    }
+
+    #[test]
+    fn falls_back_to_the_leading_number_without_a_position_field() {
+        let mut value = fixture();
+        value["media"][0]["tracks"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("position");
+        let release = decode_release_document(value).unwrap();
+        assert_eq!(release.tracklist[1].track_position, Some(2));
     }
 
     #[test]
