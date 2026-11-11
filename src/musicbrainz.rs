@@ -340,12 +340,16 @@ impl MusicBrainzAdapter {
                 artist,
                 release_group,
             } if !title.trim().is_empty() => {
+                // A release group ID already pins the search; ANDing the title
+                // phrase on top would only exclude editions titled differently.
+                // The UUID has no Lucene metacharacters beyond hyphens, which
+                // are harmless inside the quotes.
+                if let Some(group) = release_group {
+                    return Ok(format!("rgid:\"{group}\""));
+                }
                 let mut parts = vec![literal_field("release", title)];
                 if let Some(artist) = artist.as_deref().filter(|value| !value.trim().is_empty()) {
                     parts.push(literal_field("artist", artist));
-                }
-                if let Some(group) = release_group {
-                    parts.push(literal_field("rgid", &group.to_string()));
                 }
                 Ok(parts.join(" AND "))
             }
@@ -355,6 +359,44 @@ impl MusicBrainzAdapter {
                 message: "refusing an unusable empty search term".to_string(),
             }),
         }
+    }
+
+    /// The all-terms fallback for a title/artist search whose exact phrase
+    /// query found nothing. Other strategies are identifier lookups and are
+    /// never loosened.
+    fn loosened_query_for(&self, strategy: &SearchStrategy) -> Option<String> {
+        let SearchStrategy::TitleArtist { title, artist, .. } = strategy else {
+            return None;
+        };
+        if title.trim().is_empty() {
+            return None;
+        }
+        let mut parts = vec![terms_field("release", title)];
+        if let Some(artist) = artist.as_deref().filter(|value| !value.trim().is_empty()) {
+            parts.push(terms_field("artist", artist));
+        }
+        Some(parts.join(" AND "))
+    }
+
+    /// One `/ws/2/release` search for an already-built Lucene query.
+    async fn search_query(
+        &self,
+        query: &str,
+        request: &SearchRequest,
+    ) -> Result<SearchPage, ProviderError> {
+        let mut url = self.endpoint("/ws/2/release")?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            // `reqwest` encodes the query parameter exactly once. The Lucene
+            // escaping above is separate from this URL encoding.
+            pairs.append_pair("query", query);
+            pairs.append_pair("fmt", "json");
+            pairs.append_pair("limit", &request.limit.to_string());
+            pairs.append_pair("offset", &request.offset.to_string());
+        }
+
+        let value = self.request_json(url, "search").await?;
+        decode_search_page(&value, request.offset)
     }
 
     async fn fetch_document(&self, id: Mbid) -> Result<RemoteRelease, ProviderError> {
@@ -397,19 +439,19 @@ impl MetadataProvider for MusicBrainzAdapter {
         }
 
         let query = self.query_for(&request.strategy)?;
-        let mut url = self.endpoint("/ws/2/release")?;
+        let mut page = self.search_query(&query, &request).await?;
+
+        // An exact phrase misses titles with extra words, such as a
+        // "(Remastered)" suffix. Try the all-terms form once; its next page
+        // cannot be requested through the exact strategy, so none is offered.
+        if page.hits.is_empty()
+            && request.offset == 0
+            && let Some(loosened) = self.loosened_query_for(&request.strategy)
         {
-            let mut pairs = url.query_pairs_mut();
-            // `reqwest` encodes the query parameter exactly once. The Lucene
-            // escaping above is separate from this URL encoding.
-            pairs.append_pair("query", &query);
-            pairs.append_pair("fmt", "json");
-            pairs.append_pair("limit", &request.limit.to_string());
-            pairs.append_pair("offset", &request.offset.to_string());
+            page = self.search_query(&loosened, &request).await?;
+            page.next_offset = None;
         }
 
-        let value = self.request_json(url, "search").await?;
-        let page = decode_search_page(&value, request.offset)?;
         lock(&self.search_cache).insert(key, page.clone());
 
         Ok(page)
@@ -485,6 +527,23 @@ fn escape_lucene(value: &str) -> String {
 /// Builds a literal field query such as `release:"Blue"`.
 pub fn literal_field(field: &str, value: &str) -> String {
     format!("{field}:\"{}\"", escape_lucene(value))
+}
+
+/// Builds an unquoted all-terms field query such as `release:(Blue AND Moon)`.
+///
+/// Each whitespace-separated word is escaped on its own. MusicBrainz searches
+/// default to OR between bare terms, so the words are joined with an explicit
+/// `AND`. A literal upper-case `AND`/`OR`/`NOT` word is lowered so Lucene does
+/// not read it as an operator.
+fn terms_field(field: &str, value: &str) -> String {
+    let terms: Vec<String> = value
+        .split_whitespace()
+        .map(|word| match word {
+            "AND" | "OR" | "NOT" => word.to_ascii_lowercase(),
+            _ => escape_lucene(word),
+        })
+        .collect();
+    format!("{field}:({})", terms.join(" AND "))
 }
 
 // ---------------------------------------------------------------------------
@@ -1748,6 +1807,106 @@ mod tests {
         let release = adapter.fetch_release(release_id()).await.unwrap();
         assert_eq!(release.title, "Blue");
         assert_eq!(*attempts.lock().unwrap(), 2);
+    }
+
+    fn query_param(target: &str) -> String {
+        Url::parse("http://test.local")
+            .unwrap()
+            .join(target)
+            .unwrap()
+            .query_pairs()
+            .find(|(key, _)| key == "query")
+            .map(|(_, value)| value.to_string())
+            .unwrap()
+    }
+
+    const EMPTY_SEARCH: &str = r#"{"count":0,"offset":0,"releases":[]}"#;
+    const ONE_HIT_SEARCH: &str = r#"{"count":1,"offset":0,"releases":[{"id":"76df3287-6cda-33eb-8e9a-044b5e15ffdd","title":"Abbey Road","artist-credit":[{"name":"The Beatles","joinphrase":""}]}]}"#;
+
+    #[test]
+    fn known_release_group_is_searched_on_its_own() {
+        let adapter = MusicBrainzAdapter::with_config(MusicBrainzConfig::default()).unwrap();
+        let query = adapter
+            .query_for(&SearchStrategy::TitleArtist {
+                title: "Blue".to_string(),
+                artist: Some("Test Artist".to_string()),
+                release_group: Some("4642ee19-7790-3c8d-ab5e-d133de942db6".parse().unwrap()),
+            })
+            .unwrap();
+        assert_eq!(query, "rgid:\"4642ee19-7790-3c8d-ab5e-d133de942db6\"");
+    }
+
+    #[test]
+    fn term_queries_require_every_escaped_word() {
+        assert_eq!(
+            terms_field("release", "  Abbey Road (Remastered) "),
+            "release:(Abbey AND Road AND \\(Remastered\\))"
+        );
+        // Lucene only treats upper-case words as operators.
+        assert_eq!(terms_field("artist", "This AND That"), "artist:(This AND and AND That)");
+    }
+
+    #[tokio::test]
+    async fn loosens_title_artist_search_once_when_the_exact_phrase_finds_nothing() {
+        let server = MockServer::start(|target| {
+            let body = if query_param(target).contains("release:\"") {
+                EMPTY_SEARCH
+            } else {
+                ONE_HIT_SEARCH
+            };
+            (200, Vec::new(), body.to_string())
+        });
+        let adapter = MusicBrainzAdapter::with_config(config(&server)).unwrap();
+        let request = SearchRequest {
+            strategy: SearchStrategy::TitleArtist {
+                title: "Abbey Road Remastered".to_string(),
+                artist: Some("The Beatles".to_string()),
+                release_group: None,
+            },
+            offset: 0,
+            limit: 50,
+        };
+
+        let page = adapter.search(request.clone()).await.unwrap();
+        assert_eq!(page.hits.len(), 1);
+
+        let queries: Vec<String> = server.targets().iter().map(|t| query_param(t)).collect();
+        assert_eq!(
+            queries,
+            vec![
+                "release:\"Abbey Road Remastered\" AND artist:\"The Beatles\"".to_string(),
+                "release:(Abbey AND Road AND Remastered) AND artist:(The AND Beatles)".to_string(),
+            ]
+        );
+
+        // The loosened result is cached under the original request.
+        adapter.search(request).await.unwrap();
+        assert_eq!(server.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn does_not_loosen_searches_that_have_hits_or_are_identifier_lookups() {
+        let server = MockServer::start(|target| {
+            let body = if query_param(target).starts_with("barcode:") {
+                EMPTY_SEARCH
+            } else {
+                ONE_HIT_SEARCH
+            };
+            (200, Vec::new(), body.to_string())
+        });
+        let adapter = MusicBrainzAdapter::with_config(config(&server)).unwrap();
+
+        adapter.search(search_request("Abbey Road")).await.unwrap();
+        assert_eq!(server.request_count(), 1);
+
+        let barcode = SearchRequest {
+            strategy: SearchStrategy::Barcode("0123456789012".to_string()),
+            offset: 0,
+            limit: 50,
+        };
+        let page = adapter.search(barcode).await.unwrap();
+        assert!(page.hits.is_empty());
+        assert_eq!(server.request_count(), 2);
     }
 
     #[test]

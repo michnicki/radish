@@ -193,7 +193,8 @@ async fn default_match_skips_fallback_without_a_token_and_never_contacts_discogs
     let text = stdout(&output);
     assert!(text.contains("Unmatched: 1"), "{text}");
     assert!(text.contains("Discogs token is not set"), "{text}");
-    assert_eq!(server.requests_matching("/ws/2/release"), 1);
+    // The exact-phrase search finds nothing, so the adapter loosens it once.
+    assert_eq!(server.requests_matching("/ws/2/release"), 2);
     assert_eq!(server.requests_matching("/database/search"), 0);
     assert_eq!(server.requests_matching("/releases/"), 0);
 }
