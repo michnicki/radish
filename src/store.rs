@@ -337,11 +337,16 @@ pub struct ObservedTrack {
     pub catalog_number: Option<String>,
     pub discogs_release_id: Option<i64>,
     pub musicbrainz_ids_json: String,
+    /// The local release this file was assigned to by the last rebuild.
+    pub local_release_id: Option<i64>,
+    /// `musicbrainz_ids_json`, decoded once when the row is loaded.
+    #[sqlx(skip)]
+    pub musicbrainz_ids: ObservedMusicBrainzIds,
 }
 
 impl ObservedTrack {
-    pub fn musicbrainz(&self) -> ObservedMusicBrainzIds {
-        serde_json::from_str(&self.musicbrainz_ids_json).unwrap_or_default()
+    pub fn musicbrainz(&self) -> &ObservedMusicBrainzIds {
+        &self.musicbrainz_ids
     }
 }
 
@@ -640,26 +645,42 @@ pub fn group_tracks(tracks: &[ObservedTrack]) -> Vec<GroupedRelease> {
         .collect()
 }
 
+/// Normalizes a scope root for the SQL path filters: forward slashes, no
+/// trailing slash. `None` means no filtering, which is also what an empty root
+/// (the filesystem root) means.
+fn scope_param(root: &Path) -> Option<String> {
+    let normalized = root.to_string_lossy().replace('\\', "/");
+    let trimmed = normalized.trim_end_matches('/');
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 async fn observed_tracks(
     conn: &mut SqliteConnection,
-    scope: Option<&Path>,
+    scope: Option<&str>,
 ) -> Result<Vec<ObservedTrack>> {
+    // Whole path components only (`/music/Blue` never matches
+    // `/music/Bluegrass`), compared case-insensitively like the path columns.
     let mut rows = sqlx::query_as::<_, ObservedTrack>(
         "SELECT t.id AS id, t.path AS path, t.title AS title, t.artist AS artist,
                 a.title AS album, t.album_artist AS album_artist, t.year AS year,
                 t.track_number AS track_number, t.disc_number AS disc_number,
                 t.duration_secs AS duration_secs, t.barcode AS barcode,
                 t.catalog_number AS catalog_number, t.discogs_release_id AS discogs_release_id,
-                t.musicbrainz_ids_json AS musicbrainz_ids_json
+                t.musicbrainz_ids_json AS musicbrainz_ids_json,
+                t.local_release_id AS local_release_id
          FROM tracks t
          LEFT JOIN albums a ON a.id = t.album_id
+         WHERE (?1 IS NULL
+                OR substr(replace(t.path, '\\', '/'), 1, length(?1) + 1) = (?1 || '/') COLLATE NOCASE)
          ORDER BY t.path",
     )
-    .fetch_all(&mut *conn)
+    .bind(scope)
+    .fetch_all(conn)
     .await?;
 
-    if let Some(scope) = scope {
-        rows.retain(|track| path_within(&directory_of(&track.path), scope));
+    // Decode the identifier JSON once per file, not once per use.
+    for row in &mut rows {
+        row.musicbrainz_ids = serde_json::from_str(&row.musicbrainz_ids_json).unwrap_or_default();
     }
 
     Ok(rows)
@@ -682,119 +703,485 @@ pub fn path_within(candidate: &str, root: &Path) -> bool {
     candidate == root || candidate.starts_with(&format!("{root}/"))
 }
 
+/// What one `rebuild_local_releases` call did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RebuildSummary {
+    /// Local releases that exist in the scope after the rebuild.
+    pub groups: usize,
+    pub created: usize,
+    /// Existing releases whose stored fields or members changed.
+    pub updated: usize,
+    /// Releases that kept their ID while their album title changed.
+    pub rekeyed: usize,
+    pub unchanged: usize,
+    /// Releases deleted because no group claims them any more.
+    pub removed: usize,
+    /// Accepted matches newly marked stale.
+    pub newly_stale: usize,
+    /// Accepted matches deleted together with their release.
+    pub dropped_matches: usize,
+}
+
+impl RebuildSummary {
+    /// True when the rebuild wrote anything to the release tables.
+    pub fn changed(&self) -> bool {
+        self.created + self.updated + self.rekeyed + self.removed > 0
+    }
+}
+
+/// Every persisted column a rebuild derives from the files. Comparing the
+/// stored and the freshly grouped value decides whether a row needs a write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseFields {
+    directory: String,
+    album_title_norm: String,
+    album_title: Option<String>,
+    album_artist: Option<String>,
+    artist_kind: String,
+    year: Option<i64>,
+    barcode: Option<String>,
+    catalog_number: Option<String>,
+    embedded_discogs_id: Option<i64>,
+    is_compilation: bool,
+    has_album_tag: bool,
+    track_count: i64,
+    revision: String,
+    embedded_musicbrainz_release_id: Option<String>,
+    embedded_musicbrainz_release_group_id: Option<String>,
+    musicbrainz_problems_json: String,
+}
+
+impl ReleaseFields {
+    fn of_group(group: &GroupedRelease) -> Result<Self> {
+        Ok(Self {
+            directory: group.directory.clone(),
+            album_title_norm: group.album_title_norm.clone(),
+            album_title: group.album_title.clone(),
+            album_artist: group.album_artist.clone(),
+            artist_kind: group.artist_kind.as_str().to_string(),
+            year: group.year,
+            barcode: group.barcode.clone(),
+            catalog_number: group.catalog_number.clone(),
+            embedded_discogs_id: group.embedded_discogs_id.map(|id| id as i64),
+            is_compilation: group.is_compilation,
+            has_album_tag: group.has_album_tag,
+            track_count: group.track_count,
+            revision: group.revision.clone(),
+            embedded_musicbrainz_release_id: group
+                .embedded_musicbrainz_release_id
+                .map(|id| id.to_string()),
+            embedded_musicbrainz_release_group_id: group
+                .embedded_musicbrainz_release_group_id
+                .map(|id| id.to_string()),
+            musicbrainz_problems_json: serde_json::to_string(&group.musicbrainz_problems)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct StoredReleaseRow {
+    id: i64,
+    directory_path: String,
+    album_title_norm: String,
+    album_title: Option<String>,
+    album_artist: Option<String>,
+    artist_kind: String,
+    year: Option<i64>,
+    barcode: Option<String>,
+    catalog_number: Option<String>,
+    embedded_discogs_id: Option<i64>,
+    is_compilation: bool,
+    has_album_tag: bool,
+    track_count: i64,
+    source_revision: String,
+    embedded_musicbrainz_release_id: Option<String>,
+    embedded_musicbrainz_release_group_id: Option<String>,
+    musicbrainz_problems_json: String,
+    has_match: bool,
+}
+
+/// A persisted local release as seen by the rebuild planner.
+#[derive(Debug, Clone)]
+struct StoredRelease {
+    id: i64,
+    fields: ReleaseFields,
+    has_match: bool,
+}
+
+impl From<StoredReleaseRow> for StoredRelease {
+    fn from(row: StoredReleaseRow) -> Self {
+        Self {
+            id: row.id,
+            has_match: row.has_match,
+            fields: ReleaseFields {
+                directory: row.directory_path,
+                album_title_norm: row.album_title_norm,
+                album_title: row.album_title,
+                album_artist: row.album_artist,
+                artist_kind: row.artist_kind,
+                year: row.year,
+                barcode: row.barcode,
+                catalog_number: row.catalog_number,
+                embedded_discogs_id: row.embedded_discogs_id,
+                is_compilation: row.is_compilation,
+                has_album_tag: row.has_album_tag,
+                track_count: row.track_count,
+                revision: row.source_revision,
+                embedded_musicbrainz_release_id: row.embedded_musicbrainz_release_id,
+                embedded_musicbrainz_release_group_id: row.embedded_musicbrainz_release_group_id,
+                musicbrainz_problems_json: row.musicbrainz_problems_json,
+            },
+        }
+    }
+}
+
+/// Loads the stored releases whose directory is the scope or under it.
+async fn existing_releases(
+    conn: &mut SqliteConnection,
+    scope: Option<&str>,
+) -> Result<Vec<StoredRelease>> {
+    let rows = sqlx::query_as::<_, StoredReleaseRow>(
+        "SELECT lr.id, lr.directory_path, lr.album_title_norm, lr.album_title, lr.album_artist,
+                lr.artist_kind, lr.year, lr.barcode, lr.catalog_number, lr.embedded_discogs_id,
+                lr.is_compilation, lr.has_album_tag, lr.track_count, lr.source_revision,
+                lr.embedded_musicbrainz_release_id, lr.embedded_musicbrainz_release_group_id,
+                lr.musicbrainz_problems_json,
+                EXISTS (SELECT 1 FROM release_matches m WHERE m.local_release_id = lr.id)
+                    AS has_match
+         FROM local_releases lr
+         WHERE (?1 IS NULL
+                OR replace(lr.directory_path, '\\', '/') = ?1 COLLATE NOCASE
+                OR substr(replace(lr.directory_path, '\\', '/'), 1, length(?1) + 1)
+                    = (?1 || '/') COLLATE NOCASE)
+         ORDER BY lr.id",
+    )
+    .bind(scope)
+    .fetch_all(conn)
+    .await?;
+    Ok(rows.into_iter().map(StoredRelease::from).collect())
+}
+
+type ReleaseKey = (String, String);
+
+/// Stored releases are keyed by directory (ASCII case-insensitive, as the
+/// column's collation compares) and normalized album title.
+fn release_key(directory: &str, album_title_norm: &str) -> ReleaseKey {
+    (directory.to_ascii_lowercase(), album_title_norm.to_string())
+}
+
+/// What a freshly grouped release is stored as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    /// The stored row with the same key.
+    Existing(i64),
+    /// A stored row whose files all moved to this group under a new title. It
+    /// keeps its ID, and with it the accepted match.
+    Rekey(i64),
+    New,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RebuildPlan {
+    /// One target per group, in group order.
+    targets: Vec<Target>,
+    /// Stored rows no group claims, in ID order.
+    removed: Vec<i64>,
+}
+
+/// Decides which stored release each group becomes, without touching the
+/// database.
+///
+/// 1. A group whose key matches a stored row is that row.
+/// 2. A stored row whose key no group has is "emptied".
+/// 3. An emptied row whose members all moved into one group that has no row of
+///    its own is a re-key candidate for that group (an album retag). Several
+///    candidates (a merge) compete: a row with an accepted match wins, then the
+///    one with more members, then the lower ID.
+/// 4. Every other emptied row is removed: merge losers, rows whose files split
+///    across several groups, and rows with no surviving files.
+///
+/// The `UNIQUE(directory_path, album_title_norm)` constraint cannot fire while
+/// applying the plan. A re-key target key is held by no row, or step 1 would
+/// have matched it, and an emptied row's old key is no group's key.
+fn plan_rebuild(
+    groups: &[GroupedRelease],
+    stored: &[StoredRelease],
+    members: &HashMap<i64, Vec<i64>>,
+) -> RebuildPlan {
+    let group_keys: Vec<ReleaseKey> = groups
+        .iter()
+        .map(|group| release_key(&group.directory, &group.album_title_norm))
+        .collect();
+    let stored_by_key: HashMap<ReleaseKey, i64> = stored
+        .iter()
+        .map(|row| {
+            (
+                release_key(&row.fields.directory, &row.fields.album_title_norm),
+                row.id,
+            )
+        })
+        .collect();
+
+    let mut targets: Vec<Target> = group_keys
+        .iter()
+        .map(|key| {
+            stored_by_key
+                .get(key)
+                .map_or(Target::New, |id| Target::Existing(*id))
+        })
+        .collect();
+
+    let claimed: std::collections::HashSet<&ReleaseKey> = group_keys.iter().collect();
+    let group_of_track: HashMap<i64, usize> = groups
+        .iter()
+        .enumerate()
+        .flat_map(|(index, group)| group.track_ids.iter().map(move |id| (*id, index)))
+        .collect();
+
+    let mut removed: Vec<i64> = Vec::new();
+    let mut candidates: BTreeMap<usize, Vec<&StoredRelease>> = BTreeMap::new();
+    for row in stored {
+        let key = release_key(&row.fields.directory, &row.fields.album_title_norm);
+        if claimed.contains(&key) {
+            continue;
+        }
+        let row_members = members.get(&row.id).map(Vec::as_slice).unwrap_or_default();
+        let mut destinations = row_members
+            .iter()
+            .map(|track_id| group_of_track.get(track_id).copied());
+        let destination = match destinations.next() {
+            Some(Some(first)) if destinations.all(|next| next == Some(first)) => Some(first),
+            _ => None,
+        };
+        match destination {
+            Some(index) if targets[index] == Target::New => {
+                candidates.entry(index).or_default().push(row);
+            }
+            _ => removed.push(row.id),
+        }
+    }
+
+    for (index, mut rows) in candidates {
+        rows.sort_by(|a, b| {
+            let member_count = |row: &StoredRelease| members.get(&row.id).map_or(0, Vec::len);
+            b.has_match
+                .cmp(&a.has_match)
+                .then_with(|| member_count(b).cmp(&member_count(a)))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        targets[index] = Target::Rekey(rows[0].id);
+        removed.extend(rows[1..].iter().map(|row| row.id));
+    }
+    removed.sort_unstable();
+
+    RebuildPlan { targets, removed }
+}
+
 /// Recomputes grouping for the selected scope and persists it. Existing track
 /// IDs are preserved, and unchanged revisions keep accepted matches intact.
-pub async fn rebuild_local_releases(pool: &SqlitePool, scope: Option<&Path>) -> Result<usize> {
+///
+/// Rows are only written when something differs, so rebuilding an unchanged
+/// library writes nothing. A release whose files were all retagged to one new
+/// album title keeps its ID and accepted match, marked stale. Splitting a
+/// release across several new titles still drops its match; the summary
+/// reports it in `dropped_matches`.
+pub async fn rebuild_local_releases(
+    pool: &SqlitePool,
+    scope: Option<&Path>,
+) -> Result<RebuildSummary> {
+    let scope = scope.and_then(scope_param);
+    let scope = scope.as_deref();
+
     // Observe and write inside one write transaction, so a concurrent writer
     // can never leave this rebuild grouping stale data.
     let mut tx = begin_write(pool).await?;
     let tracks = observed_tracks(&mut tx, scope).await?;
     let groups = group_tracks(&tracks);
+    let stored = existing_releases(&mut tx, scope).await?;
 
-    for group in &groups {
-        let existing = sqlx::query_as::<_, (i64, String, String)>(
-            "SELECT id, source_revision, status FROM local_releases
-             WHERE directory_path = ?1 COLLATE NOCASE AND album_title_norm = ?2",
-        )
-        .bind(&group.directory)
-        .bind(&group.album_title_norm)
-        .fetch_optional(&mut *tx)
-        .await?;
+    let mut members: HashMap<i64, Vec<i64>> = HashMap::new();
+    for track in &tracks {
+        if let Some(release_id) = track.local_release_id {
+            members.entry(release_id).or_default().push(track.id);
+        }
+    }
+    for ids in members.values_mut() {
+        ids.sort_unstable();
+    }
 
-        let id: i64 = sqlx::query_scalar(
-            "INSERT INTO local_releases (
-                directory_path, album_title_norm, album_title, album_artist, artist_kind, year,
-                barcode, catalog_number, embedded_discogs_id, is_compilation, has_album_tag,
-                track_count, source_revision, status, embedded_musicbrainz_release_id,
-                embedded_musicbrainz_release_group_id, musicbrainz_problems_json
-             )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
-             ON CONFLICT(directory_path, album_title_norm) DO UPDATE SET
-                album_title = excluded.album_title,
-                album_artist = excluded.album_artist,
-                artist_kind = excluded.artist_kind,
-                year = excluded.year,
-                barcode = excluded.barcode,
-                catalog_number = excluded.catalog_number,
-                embedded_discogs_id = excluded.embedded_discogs_id,
-                is_compilation = excluded.is_compilation,
-                has_album_tag = excluded.has_album_tag,
-                track_count = excluded.track_count,
-                source_revision = excluded.source_revision,
-                embedded_musicbrainz_release_id = excluded.embedded_musicbrainz_release_id,
-                embedded_musicbrainz_release_group_id = excluded.embedded_musicbrainz_release_group_id,
-                musicbrainz_problems_json = excluded.musicbrainz_problems_json,
-                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
-                status = CASE
-                    WHEN local_releases.source_revision <> excluded.source_revision
-                         AND local_releases.status IN ('matched', 'stale')
-                    THEN 'stale'
-                    ELSE local_releases.status
-                END
-             RETURNING id",
-        )
-        .bind(&group.directory)
-        .bind(&group.album_title_norm)
-        .bind(&group.album_title)
-        .bind(&group.album_artist)
-        .bind(group.artist_kind.as_str())
-        .bind(group.year)
-        .bind(&group.barcode)
-        .bind(&group.catalog_number)
-        .bind(group.embedded_discogs_id.map(|id| id as i64))
-        .bind(group.is_compilation)
-        .bind(group.has_album_tag)
-        .bind(group.track_count)
-        .bind(&group.revision)
-        // Existing status is preserved by the conflict branch above.
-        .bind(STATUS_UNMATCHED)
-        .bind(group.embedded_musicbrainz_release_id.map(|id| id.to_string()))
-        .bind(
-            group
-                .embedded_musicbrainz_release_group_id
-                .map(|id| id.to_string()),
-        )
-        .bind(serde_json::to_string(&group.musicbrainz_problems)?)
-        .fetch_one(&mut *tx)
-        .await?;
+    let plan = plan_rebuild(&groups, &stored, &members);
+    let stored_by_id: HashMap<i64, &StoredRelease> =
+        stored.iter().map(|row| (row.id, row)).collect();
 
-        if let Some((_, previous_revision, _)) = &existing
-            && previous_revision != &group.revision
-        {
-            sqlx::query(
+    let mut summary = RebuildSummary {
+        groups: groups.len(),
+        ..RebuildSummary::default()
+    };
+
+    for (group, target) in groups.iter().zip(&plan.targets) {
+        let fields = ReleaseFields::of_group(group)?;
+        let (id, previous_revision) = match *target {
+            Target::Existing(id) => {
+                let row = stored_by_id[&id];
+                let same_members = members.get(&id).map(Vec::as_slice).unwrap_or_default()
+                    == group.track_ids.as_slice();
+                if row.fields == fields && same_members {
+                    summary.unchanged += 1;
+                    continue;
+                }
+                update_release(&mut tx, id, &fields).await?;
+                summary.updated += 1;
+                (id, Some(row.fields.revision.as_str()))
+            }
+            Target::Rekey(id) => {
+                update_release(&mut tx, id, &fields).await?;
+                summary.rekeyed += 1;
+                (id, Some(stored_by_id[&id].fields.revision.as_str()))
+            }
+            Target::New => {
+                let id = insert_release(&mut tx, &fields).await?;
+                summary.created += 1;
+                (id, None)
+            }
+        };
+
+        if previous_revision.is_some_and(|previous| previous != fields.revision) {
+            let marked = sqlx::query(
                 "UPDATE release_matches SET stale = 1
                  WHERE local_release_id = ?1 AND stale = 0",
             )
             .bind(id)
             .execute(&mut *tx)
             .await?;
+            summary.newly_stale += marked.rows_affected() as usize;
         }
 
-        sqlx::query("UPDATE tracks SET local_release_id = NULL WHERE local_release_id = ?1")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-
-        for track_id in &group.track_ids {
-            sqlx::query("UPDATE tracks SET local_release_id = ?1 WHERE id = ?2")
-                .bind(id)
-                .bind(track_id)
-                .execute(&mut *tx)
-                .await?;
-        }
+        let track_ids = serde_json::to_string(&group.track_ids)?;
+        sqlx::query(
+            "UPDATE tracks SET local_release_id = ?1
+             WHERE id IN (SELECT value FROM json_each(?2)) AND local_release_id IS NOT ?1",
+        )
+        .bind(id)
+        .bind(&track_ids)
+        .execute(&mut *tx)
+        .await?;
+        // A file that moved here may still carry an overlay row from the match
+        // of the release it left.
+        sqlx::query(
+            "DELETE FROM release_track_matches
+             WHERE track_id IN (SELECT value FROM json_each(?2))
+               AND match_id NOT IN (SELECT id FROM release_matches WHERE local_release_id = ?1)",
+        )
+        .bind(id)
+        .bind(&track_ids)
+        .execute(&mut *tx)
+        .await?;
     }
 
-    // Releases whose files all disappeared no longer exist.
-    sqlx::query(
-        "DELETE FROM local_releases
-         WHERE id NOT IN (SELECT local_release_id FROM tracks WHERE local_release_id IS NOT NULL)",
-    )
-    .execute(&mut *tx)
-    .await?;
+    if !plan.removed.is_empty() {
+        summary.removed = plan.removed.len();
+        summary.dropped_matches = plan
+            .removed
+            .iter()
+            .filter(|id| stored_by_id[*id].has_match)
+            .count();
+        sqlx::query("DELETE FROM local_releases WHERE id IN (SELECT value FROM json_each(?1))")
+            .bind(serde_json::to_string(&plan.removed)?)
+            .execute(&mut *tx)
+            .await?;
+    }
 
     tx.commit().await?;
 
-    Ok(groups.len())
+    Ok(summary)
+}
+
+async fn insert_release(conn: &mut SqliteConnection, fields: &ReleaseFields) -> Result<i64> {
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO local_releases (
+            directory_path, album_title_norm, album_title, album_artist, artist_kind, year,
+            barcode, catalog_number, embedded_discogs_id, is_compilation, has_album_tag,
+            track_count, source_revision, status, embedded_musicbrainz_release_id,
+            embedded_musicbrainz_release_group_id, musicbrainz_problems_json
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+         RETURNING id",
+    )
+    .bind(&fields.directory)
+    .bind(&fields.album_title_norm)
+    .bind(&fields.album_title)
+    .bind(&fields.album_artist)
+    .bind(&fields.artist_kind)
+    .bind(fields.year)
+    .bind(&fields.barcode)
+    .bind(&fields.catalog_number)
+    .bind(fields.embedded_discogs_id)
+    .bind(fields.is_compilation)
+    .bind(fields.has_album_tag)
+    .bind(fields.track_count)
+    .bind(&fields.revision)
+    .bind(STATUS_UNMATCHED)
+    .bind(&fields.embedded_musicbrainz_release_id)
+    .bind(&fields.embedded_musicbrainz_release_group_id)
+    .bind(&fields.musicbrainz_problems_json)
+    .fetch_one(conn)
+    .await?;
+    Ok(id)
+}
+
+/// Rewrites every derived column, the key included, so one statement serves
+/// both a changed group and a re-keyed one. A matched or stale release whose
+/// revision changed becomes stale; an unmatched one stays unmatched.
+async fn update_release(
+    conn: &mut SqliteConnection,
+    id: i64,
+    fields: &ReleaseFields,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE local_releases SET
+            directory_path = ?2,
+            album_title_norm = ?3,
+            album_title = ?4,
+            album_artist = ?5,
+            artist_kind = ?6,
+            year = ?7,
+            barcode = ?8,
+            catalog_number = ?9,
+            embedded_discogs_id = ?10,
+            is_compilation = ?11,
+            has_album_tag = ?12,
+            track_count = ?13,
+            embedded_musicbrainz_release_id = ?15,
+            embedded_musicbrainz_release_group_id = ?16,
+            musicbrainz_problems_json = ?17,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+            status = CASE
+                WHEN source_revision <> ?14 AND status IN ('matched', 'stale') THEN 'stale'
+                ELSE status
+            END,
+            source_revision = ?14
+         WHERE id = ?1",
+    )
+    .bind(id)
+    .bind(&fields.directory)
+    .bind(&fields.album_title_norm)
+    .bind(&fields.album_title)
+    .bind(&fields.album_artist)
+    .bind(&fields.artist_kind)
+    .bind(fields.year)
+    .bind(&fields.barcode)
+    .bind(&fields.catalog_number)
+    .bind(fields.embedded_discogs_id)
+    .bind(fields.is_compilation)
+    .bind(fields.has_album_tag)
+    .bind(fields.track_count)
+    .bind(&fields.revision)
+    .bind(&fields.embedded_musicbrainz_release_id)
+    .bind(&fields.embedded_musicbrainz_release_group_id)
+    .bind(&fields.musicbrainz_problems_json)
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -1852,11 +2239,56 @@ mod tests {
     }
 
     async fn insert(pool: &SqlitePool, root: &str, tracks: &[ScannedTrack]) {
+        insert_summary(pool, root, tracks).await;
+    }
+
+    async fn insert_summary(
+        pool: &SqlitePool,
+        root: &str,
+        tracks: &[ScannedTrack],
+    ) -> RebuildSummary {
         let directory_id = upsert_directory(pool, Path::new(root)).await.unwrap();
         for track in tracks {
             upsert_track(pool, track, directory_id).await.unwrap();
         }
-        rebuild_local_releases(pool, None).await.unwrap();
+        rebuild_local_releases(pool, None).await.unwrap()
+    }
+
+    /// Accepts `titles` as the remote tracklist for a release found by album.
+    async fn accept_manually(pool: &SqlitePool, album: &str, titles: &[&str]) -> i64 {
+        let release = load_local_releases(pool, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|release| release.album_title.as_deref() == Some(album))
+            .unwrap();
+        let candidate = Candidate::new(&release, remote_with(titles));
+        let guard = load_match_guard(pool, release.id).await.unwrap();
+        accept_match(
+            pool,
+            &release,
+            &candidate,
+            AcceptanceMethod::Manual,
+            MatchScope::Edition,
+            &guard,
+        )
+        .await
+        .unwrap();
+        release.id
+    }
+
+    async fn release_ids(pool: &SqlitePool) -> Vec<i64> {
+        sqlx::query_scalar("SELECT id FROM local_releases ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    fn retitled(track: &ScannedTrack, album: &str) -> ScannedTrack {
+        let mut moved = track.clone();
+        moved.album = Some(album.to_string());
+        moved.modified_at += 1;
+        moved
     }
 
     /// A unique scratch directory for file-backed databases. Removing it also
@@ -3155,5 +3587,340 @@ mod tests {
         assert_eq!(identity_key("÷"), Some("~÷".to_string()));
         assert_eq!(identity_key("!!!"), identity_key("  !!!  "));
         assert_ne!(identity_key("!!!"), identity_key("???"));
+    }
+
+    #[tokio::test]
+    async fn retagged_album_title_keeps_the_accepted_match_and_marks_it_stale() {
+        let pool = test_pool().await;
+        let files = [
+            scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1),
+            scanned("/music/a/02.flac", Some("Blue"), Some("Artist"), 2),
+        ];
+        insert(&pool, "/music/a", &files).await;
+        let id = accept_manually(&pool, "Blue", &["R1", "R2"]).await;
+
+        let retagged: Vec<ScannedTrack> = files
+            .iter()
+            .map(|track| retitled(track, "Blue (Remaster)"))
+            .collect();
+        let summary = insert_summary(&pool, "/music/a", &retagged).await;
+        assert_eq!(summary.rekeyed, 1);
+        assert_eq!(summary.newly_stale, 1);
+        assert_eq!(summary.dropped_matches, 0);
+
+        let releases = load_local_releases(&pool, None).await.unwrap();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].id, id);
+        assert_eq!(releases[0].album_title.as_deref(), Some("Blue (Remaster)"));
+        let status: String = sqlx::query_scalar("SELECT status FROM local_releases")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, STATUS_STALE);
+        let matches: Vec<(i64, bool, String)> = sqlx::query_as(
+            "SELECT local_release_id, stale, acceptance_method FROM release_matches",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(matches, vec![(id, true, "manual".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn partially_retagged_album_keeps_the_match_on_the_remaining_files() {
+        let pool = test_pool().await;
+        let files = [
+            scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1),
+            scanned("/music/a/02.flac", Some("Blue"), Some("Artist"), 2),
+            scanned("/music/a/03.flac", Some("Blue"), Some("Artist"), 3),
+        ];
+        insert(&pool, "/music/a", &files).await;
+        let id = accept_manually(&pool, "Blue", &["R1", "R2", "R3"]).await;
+
+        let moved = retitled(&files[2], "Other");
+        insert(
+            &pool,
+            "/music/a",
+            &[files[0].clone(), files[1].clone(), moved],
+        )
+        .await;
+
+        let releases = load_local_releases(&pool, None).await.unwrap();
+        assert_eq!(releases.len(), 2);
+        let blue = releases
+            .iter()
+            .find(|release| release.album_title.as_deref() == Some("Blue"))
+            .unwrap();
+        assert_eq!(blue.id, id);
+        assert_eq!(blue.tracks.len(), 2);
+        let other = releases
+            .iter()
+            .find(|release| release.album_title.as_deref() == Some("Other"))
+            .unwrap();
+        assert_ne!(other.id, id);
+
+        let status: String = sqlx::query_scalar("SELECT status FROM local_releases WHERE id = ?1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, STATUS_STALE);
+        let rows = list_tracks(&pool).await.unwrap();
+        let moved_row = rows.iter().find(|r| r.path.ends_with("03.flac")).unwrap();
+        assert_eq!(moved_row.title.as_deref(), Some("Track 3"));
+        let kept_row = rows.iter().find(|r| r.path.ends_with("01.flac")).unwrap();
+        assert_eq!(kept_row.title.as_deref(), Some("R1"));
+    }
+
+    #[tokio::test]
+    async fn merged_releases_reuse_the_matched_row() {
+        let pool = test_pool().await;
+        let files = [
+            scanned("/music/a/01.flac", Some("A"), Some("Artist"), 1),
+            scanned("/music/a/02.flac", Some("A"), Some("Artist"), 2),
+            scanned("/music/a/03.flac", Some("B"), Some("Artist"), 3),
+        ];
+        insert(&pool, "/music/a", &files).await;
+        let matched = accept_manually(&pool, "A", &["R1", "R2"]).await;
+        let other = release_ids(&pool)
+            .await
+            .into_iter()
+            .find(|id| *id != matched)
+            .unwrap();
+
+        let merged: Vec<ScannedTrack> = files.iter().map(|track| retitled(track, "C")).collect();
+        let summary = insert_summary(&pool, "/music/a", &merged).await;
+
+        assert_eq!(release_ids(&pool).await, vec![matched]);
+        assert!(!release_ids(&pool).await.contains(&other));
+        assert_eq!(summary.dropped_matches, 0);
+        assert_eq!(summary.removed, 1);
+        assert_eq!(count(&pool, "release_matches").await, 1);
+        let overlays: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM release_track_matches tm
+             JOIN tracks t ON t.id = tm.track_id WHERE t.local_release_id <> (
+                SELECT local_release_id FROM release_matches WHERE id = tm.match_id)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(overlays, 0);
+    }
+
+    #[tokio::test]
+    async fn merged_releases_that_were_both_matched_keep_the_lower_id() {
+        let pool = test_pool().await;
+        let files = [
+            scanned("/music/a/01.flac", Some("A"), Some("Artist"), 1),
+            scanned("/music/a/02.flac", Some("B"), Some("Artist"), 2),
+        ];
+        insert(&pool, "/music/a", &files).await;
+        let first = accept_manually(&pool, "A", &["R1"]).await;
+        let second = accept_manually(&pool, "B", &["R2"]).await;
+        assert!(first < second);
+
+        let merged: Vec<ScannedTrack> = files.iter().map(|track| retitled(track, "C")).collect();
+        let summary = insert_summary(&pool, "/music/a", &merged).await;
+
+        assert_eq!(release_ids(&pool).await, vec![first]);
+        assert_eq!(summary.dropped_matches, 1);
+    }
+
+    #[tokio::test]
+    async fn split_into_two_new_titles_drops_the_release() {
+        let pool = test_pool().await;
+        let files = [
+            scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1),
+            scanned("/music/a/02.flac", Some("Blue"), Some("Artist"), 2),
+        ];
+        insert(&pool, "/music/a", &files).await;
+        let id = accept_manually(&pool, "Blue", &["R1", "R2"]).await;
+
+        let split = [retitled(&files[0], "X"), retitled(&files[1], "Y")];
+        let summary = insert_summary(&pool, "/music/a", &split).await;
+
+        assert_eq!(summary.dropped_matches, 1);
+        assert_eq!(summary.created, 2);
+        assert!(!release_ids(&pool).await.contains(&id));
+        assert_eq!(release_ids(&pool).await.len(), 2);
+        assert_eq!(count(&pool, "release_matches").await, 0);
+    }
+
+    #[tokio::test]
+    async fn rebuild_without_changes_writes_nothing() {
+        let pool = test_pool().await;
+        insert(
+            &pool,
+            "/music/a",
+            &[
+                scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1),
+                scanned("/music/a/02.flac", Some("Blue"), Some("Artist"), 2),
+            ],
+        )
+        .await;
+        insert(
+            &pool,
+            "/music/b",
+            &[scanned("/music/b/01.flac", Some("Red"), Some("Artist"), 1)],
+        )
+        .await;
+        accept_manually(&pool, "Blue", &["R1", "R2"]).await;
+
+        let before: i64 = sqlx::query_scalar("SELECT total_changes()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let summary = rebuild_local_releases(&pool, None).await.unwrap();
+        let after: i64 = sqlx::query_scalar("SELECT total_changes()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(after, before, "an unchanged rebuild must not write");
+        assert!(!summary.changed(), "{summary:?}");
+        assert_eq!(summary.groups, 2);
+        assert_eq!(summary.unchanged, summary.groups);
+    }
+
+    #[tokio::test]
+    async fn scoped_rebuild_ignores_sibling_prefix_directories() {
+        let pool = test_pool().await;
+        insert(
+            &pool,
+            "/music/Blue",
+            &[scanned(
+                "/music/Blue/01.flac",
+                Some("Blue"),
+                Some("Artist"),
+                1,
+            )],
+        )
+        .await;
+        insert(
+            &pool,
+            "/music/Bluegrass",
+            &[scanned(
+                "/music/Bluegrass/01.flac",
+                Some("Grass"),
+                Some("Artist"),
+                1,
+            )],
+        )
+        .await;
+
+        let summary = rebuild_local_releases(&pool, Some(Path::new("/MUSIC/blue")))
+            .await
+            .unwrap();
+        assert_eq!(summary.groups, 1);
+        assert_eq!(summary.unchanged, 1);
+    }
+
+    fn planned_group(directory: &str, norm: &str, track_ids: &[i64]) -> GroupedRelease {
+        GroupedRelease {
+            directory: directory.to_string(),
+            album_title: Some(norm.to_string()),
+            album_title_norm: norm.to_string(),
+            album_artist: None,
+            artist_kind: ArtistKind::Unknown,
+            year: None,
+            barcode: None,
+            catalog_number: None,
+            embedded_discogs_id: None,
+            embedded_musicbrainz_release_id: None,
+            embedded_musicbrainz_release_group_id: None,
+            musicbrainz_problems: Vec::new(),
+            is_compilation: false,
+            has_album_tag: true,
+            track_count: track_ids.len() as i64,
+            revision: String::new(),
+            track_ids: track_ids.to_vec(),
+        }
+    }
+
+    fn planned_row(id: i64, directory: &str, norm: &str, has_match: bool) -> StoredRelease {
+        StoredRelease {
+            id,
+            has_match,
+            fields: ReleaseFields::of_group(&planned_group(directory, norm, &[])).unwrap(),
+        }
+    }
+
+    fn membership(entries: &[(i64, &[i64])]) -> HashMap<i64, Vec<i64>> {
+        entries
+            .iter()
+            .map(|(id, tracks)| (*id, tracks.to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn planner_maps_exact_keys_case_insensitively_and_creates_the_rest() {
+        let groups = [
+            planned_group("/Music/A", "blue", &[1]),
+            planned_group("/music/a", "red", &[2]),
+        ];
+        let stored = [planned_row(7, "/music/a", "blue", false)];
+        let plan = plan_rebuild(&groups, &stored, &membership(&[(7, &[1])]));
+        assert_eq!(plan.targets, vec![Target::Existing(7), Target::New]);
+        assert!(plan.removed.is_empty());
+    }
+
+    #[test]
+    fn planner_rekeys_a_row_whose_files_all_moved_to_one_group() {
+        let groups = [planned_group("/m", "blue remaster", &[1, 2])];
+        let stored = [planned_row(7, "/m", "blue", true)];
+        let plan = plan_rebuild(&groups, &stored, &membership(&[(7, &[1, 2])]));
+        assert_eq!(plan.targets, vec![Target::Rekey(7)]);
+        assert!(plan.removed.is_empty());
+    }
+
+    #[test]
+    fn planner_prefers_a_matched_row_then_more_members_then_the_lower_id() {
+        let groups = [planned_group("/m", "c", &[1, 2, 3, 4])];
+
+        let stored = [
+            planned_row(1, "/m", "a", false),
+            planned_row(2, "/m", "b", true),
+        ];
+        let plan = plan_rebuild(&groups, &stored, &membership(&[(1, &[1, 2, 3]), (2, &[4])]));
+        assert_eq!(plan.targets, vec![Target::Rekey(2)]);
+        assert_eq!(plan.removed, vec![1]);
+
+        let stored = [
+            planned_row(1, "/m", "a", true),
+            planned_row(2, "/m", "b", true),
+        ];
+        let plan = plan_rebuild(&groups, &stored, &membership(&[(1, &[1]), (2, &[2, 3, 4])]));
+        assert_eq!(plan.targets, vec![Target::Rekey(2)]);
+        assert_eq!(plan.removed, vec![1]);
+
+        let plan = plan_rebuild(&groups, &stored, &membership(&[(1, &[1, 2]), (2, &[3, 4])]));
+        assert_eq!(plan.targets, vec![Target::Rekey(1)]);
+        assert_eq!(plan.removed, vec![2]);
+    }
+
+    #[test]
+    fn planner_removes_split_empty_and_outcompeted_rows() {
+        let groups = [
+            planned_group("/m", "x", &[1]),
+            planned_group("/m", "y", &[2]),
+            planned_group("/m", "kept", &[3]),
+        ];
+        let stored = [
+            planned_row(1, "/m", "blue", true),
+            planned_row(2, "/m", "gone", false),
+            // Its only group already has a row of its own, so no re-key.
+            planned_row(3, "/m", "kept", false),
+            planned_row(4, "/m", "moved", true),
+        ];
+        let plan = plan_rebuild(
+            &groups,
+            &stored,
+            &membership(&[(1, &[1, 2]), (3, &[3]), (4, &[3])]),
+        );
+        assert_eq!(
+            plan.targets,
+            vec![Target::New, Target::New, Target::Existing(3)]
+        );
+        assert_eq!(plan.removed, vec![1, 2, 4]);
     }
 }

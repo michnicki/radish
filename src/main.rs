@@ -351,7 +351,9 @@ async fn run_import(pool: &sqlx::SqlitePool, path: &std::path::Path) -> Result<P
     }
 
     progress.grouping();
-    let groups = store::rebuild_local_releases(pool, Some(&path)).await?;
+    let groups = store::rebuild_local_releases(pool, Some(&path))
+        .await?
+        .groups;
     drop(progress);
 
     outln!("Imported {count} tracks into {groups} local release(s).");
