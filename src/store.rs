@@ -1404,6 +1404,21 @@ async fn accept_recorded_match(
         .bind(local_release_id)
         .execute(&mut *tx)
         .await?;
+    // A member may still carry an overlay row from a match for a release it
+    // used to belong to; `track_id` is unique, so clear those before inserting.
+    let member_ids = serde_json::to_string(
+        &release
+            .tracks
+            .iter()
+            .map(|track| track.id)
+            .collect::<Vec<_>>(),
+    )?;
+    sqlx::query(
+        "DELETE FROM release_track_matches WHERE track_id IN (SELECT value FROM json_each(?1))",
+    )
+    .bind(&member_ids)
+    .execute(&mut *tx)
+    .await?;
 
     let match_id: i64 = sqlx::query_scalar(
         "INSERT INTO release_matches (
@@ -1667,7 +1682,7 @@ pub async fn list_tracks(pool: &SqlitePool) -> Result<Vec<TrackRow>> {
          FROM tracks t
          LEFT JOIN albums a ON a.id = t.album_id
          LEFT JOIN release_matches m ON m.local_release_id = t.local_release_id
-         LEFT JOIN release_track_matches tm ON tm.track_id = t.id
+         LEFT JOIN release_track_matches tm ON tm.track_id = t.id AND tm.match_id = m.id
          ORDER BY album, disc_number, track_number, title",
     )
     .fetch_all(pool)
@@ -1690,7 +1705,7 @@ pub async fn search_tracks(pool: &SqlitePool, query: &str) -> Result<Vec<TrackRo
          FROM tracks t
          LEFT JOIN albums a ON a.id = t.album_id
          LEFT JOIN release_matches m ON m.local_release_id = t.local_release_id
-         LEFT JOIN release_track_matches tm ON tm.track_id = t.id
+         LEFT JOIN release_track_matches tm ON tm.track_id = t.id AND tm.match_id = m.id
          WHERE COALESCE(tm.remote_title, t.title) LIKE ?1 COLLATE NOCASE
             OR COALESCE(tm.remote_artist, t.artist) LIKE ?1 COLLATE NOCASE
             OR COALESCE(m.title, a.title) LIKE ?1 COLLATE NOCASE
@@ -2761,5 +2776,62 @@ mod tests {
             error.downcast_ref::<SnapshotChanged>().is_some(),
             "{error:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn moved_tracks_drop_the_old_overlay_and_can_be_accepted_again() {
+        let pool = test_pool().await;
+        let one = scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1);
+        let two = scanned("/music/a/02.flac", Some("Blue"), Some("Artist"), 2);
+        insert(&pool, "/music/a", &[one.clone(), two.clone()]).await;
+        let release = load_local_releases(&pool, None).await.unwrap().remove(0);
+        let candidate = Candidate::new(&release, remote_with(&["R1", "R2"]));
+        let guard = load_match_guard(&pool, release.id).await.unwrap();
+        accept_match(
+            &pool,
+            &release,
+            &candidate,
+            AcceptanceMethod::Automatic,
+            MatchScope::Edition,
+            &guard,
+        )
+        .await
+        .unwrap();
+
+        let mut moved = two.clone();
+        moved.album = Some("Other".into());
+        moved.modified_at = 2;
+        insert(&pool, "/music/a", &[one, moved]).await;
+
+        let rows = list_tracks(&pool).await.unwrap();
+        let moved_row = rows.iter().find(|r| r.path.ends_with("02.flac")).unwrap();
+        assert_eq!(moved_row.title.as_deref(), Some("Track 2"));
+        assert!(!moved_row.stale);
+        let kept_row = rows.iter().find(|r| r.path.ends_with("01.flac")).unwrap();
+        assert_eq!(kept_row.title.as_deref(), Some("R1"));
+        assert!(kept_row.stale);
+
+        // The moved file can be matched as part of its new release.
+        let other = load_local_releases(&pool, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|release| release.album_title.as_deref() == Some("Other"))
+            .unwrap();
+        let candidate = Candidate::new(&other, remote_with(&["Moved"]));
+        let guard = load_match_guard(&pool, other.id).await.unwrap();
+        accept_match(
+            &pool,
+            &other,
+            &candidate,
+            AcceptanceMethod::Manual,
+            MatchScope::Edition,
+            &guard,
+        )
+        .await
+        .unwrap();
+        let rows = list_tracks(&pool).await.unwrap();
+        let moved_row = rows.iter().find(|r| r.path.ends_with("02.flac")).unwrap();
+        assert_eq!(moved_row.title.as_deref(), Some("Moved"));
     }
 }
