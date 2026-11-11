@@ -25,6 +25,10 @@ fn handler(target: &str) -> (u16, String) {
 }
 
 async fn seed_library(db: &Path) -> i64 {
+    seed_library_year(db, 2001).await
+}
+
+async fn seed_library_year(db: &Path, year: i64) -> i64 {
     let pool = radish::db::connect(db).await.unwrap();
     let directory = Path::new("/music/blue");
     let directory_id = store::upsert_directory(&pool, directory).await.unwrap();
@@ -36,7 +40,7 @@ async fn seed_library(db: &Path) -> i64 {
             artist: Some("Test Artist".to_string()),
             album: Some("Blue".to_string()),
             album_artist: Some("Test Artist".to_string()),
-            year: Some(2001),
+            year: Some(year),
             track_number: Some(number),
             disc_number: None,
             barcode: None,
@@ -409,4 +413,37 @@ async fn musicbrainz_outage_queues_a_discogs_fallback_instead_of_accepting_it() 
     assert!(!text.contains("recovered the release"), "{text}");
     assert_eq!(row_count(&db, "release_matches").await, 0);
     assert_eq!(row_count(&db, "match_reviews").await, 1);
+}
+
+#[tokio::test]
+async fn refreshing_a_stale_discogs_match_without_a_token_is_skipped_not_failed() {
+    let db = db_path("stale-discogs-no-token");
+    seed_library(&db).await;
+    let server = MockServer::start(handler);
+    let accepted = run(
+        &db,
+        &server,
+        &["match", "--provider", "discogs"],
+        Some("test-token"),
+    );
+    assert!(stdout(&accepted).contains("Accepted: 1"), "{accepted:?}");
+    // An observed tag change makes the accepted match stale.
+    seed_library_year(&db, 2002).await;
+    let before = server.request_count();
+
+    let output = run(&db, &server, &["match"], None);
+
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("Skipped: 1"), "{text}");
+    assert!(text.contains("Failed: 0"), "{text}");
+    assert!(
+        text.contains("needs RADISH_DISCOGS_TOKEN to refresh"),
+        "{text}"
+    );
+    assert_eq!(
+        server.request_count(),
+        before,
+        "no provider may be contacted"
+    );
 }

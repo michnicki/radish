@@ -452,6 +452,7 @@ where
             &mut discogs_client,
             &mut discogs_disabled,
             &mut ai,
+            release_policy != options.policy,
             &make_musicbrainz,
             &make_discogs,
             &guard,
@@ -502,6 +503,7 @@ async fn process_release<M, D>(
     discogs_client: &mut Option<D>,
     discogs_disabled: &mut Option<String>,
     ai: &mut AiState,
+    refreshing: bool,
     make_musicbrainz: impl Fn() -> Result<M>,
     make_discogs: impl Fn() -> Result<D>,
     guard: &MatchGuard,
@@ -561,6 +563,14 @@ where
                         Ok(client) => *discogs_client = Some(client),
                         Err(error) => {
                             let missing = is_missing_discogs_token(&error);
+                            if refreshing && missing {
+                                // The release is not at fault and nothing was
+                                // tried, so this is neither a failure nor a miss.
+                                outln!(
+                                    "  stale Discogs match needs RADISH_DISCOGS_TOKEN to refresh"
+                                );
+                                return Ok(Outcome::Skipped);
+                            }
                             if policy.is_explicit() {
                                 attempts.push(ProviderAttempt::failed(
                                     ProviderKind::Discogs,
@@ -755,13 +765,12 @@ where
         return Ok(Outcome::Failed);
     }
 
-    outln!(
-        "  no {} candidates found",
-        attempts
-            .first()
-            .map(|a| a.provider)
-            .unwrap_or(ProviderKind::MusicBrainz)
-    );
+    // Nothing was attempted (the reason was printed above), so there is no
+    // search result to call a miss.
+    let Some(first) = attempts.first() else {
+        return Ok(Outcome::Skipped);
+    };
+    outln!("  no {} candidates found", first.provider);
     Ok(Outcome::Unmatched)
 }
 
