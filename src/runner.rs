@@ -496,8 +496,20 @@ fn primary_failed_transiently(attempts: &[ProviderAttempt]) -> bool {
     attempts
         .first()
         .and_then(|attempt| attempt.error.as_ref())
-        .is_some_and(ProviderError::is_transient)
+        .is_some_and(|error| {
+            // A malformed response is deterministic for that release and starts
+            // no cooldown, so it is not an outage.
+            matches!(
+                error,
+                ProviderError::Network { .. }
+                    | ProviderError::RateLimited { .. }
+                    | ProviderError::Unavailable { .. }
+            )
+        })
 }
+
+const TRANSIENT_PRIMARY_NOTE: &str =
+    "MusicBrainz stage failed transiently; fallback candidates need review";
 
 async fn load_saved_reviews(
     pool: &SqlitePool,
@@ -686,6 +698,18 @@ where
             None,
         )
         .await;
+    }
+
+    // A fallback that would have settled is held for review, and says why.
+    if attempts.len() > 1
+        && attempts[1]
+            .evaluations
+            .first()
+            .is_some_and(|evaluation| evaluation.auto_accept)
+        && primary_failed_transiently(&attempts)
+    {
+        outln!("  {TRANSIENT_PRIMARY_NOTE}");
+        attempts[1].notes.push(TRANSIENT_PRIMARY_NOTE.to_string());
     }
 
     // A fallback candidate is accepted only when it settles its own gates and
@@ -975,9 +999,7 @@ fn choose_ai_match(
     if primary_failed_transiently(attempts)
         && Some(candidate.release.provider()) != primary_provider
     {
-        return Err(
-            "MusicBrainz stage failed transiently; fallback candidates need review".to_string(),
-        );
+        return Err(TRANSIENT_PRIMARY_NOTE.to_string());
     }
     // Include candidates outside the model budget when checking ambiguity.
     let alternatives: Vec<Candidate> = attempts
@@ -2072,5 +2094,45 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(outcome, Outcome::Skipped), "{outcome:?}");
+    }
+
+    #[test]
+    fn only_outage_failures_count_as_a_transient_primary_failure() {
+        let failed = |error| [ProviderAttempt::failed(ProviderKind::MusicBrainz, error)];
+        let provider = ProviderKind::MusicBrainz;
+        assert!(primary_failed_transiently(&failed(
+            ProviderError::Network {
+                provider,
+                message: "down".into(),
+            }
+        )));
+        assert!(primary_failed_transiently(&failed(
+            ProviderError::RateLimited {
+                provider,
+                message: "slow down".into(),
+                retry_after: None,
+            }
+        )));
+        assert!(primary_failed_transiently(&failed(
+            ProviderError::Unavailable {
+                provider,
+                retry_after: std::time::Duration::from_secs(5),
+            }
+        )));
+        // A malformed response is deterministic for that release, and starts no cooldown.
+        assert!(!primary_failed_transiently(&failed(
+            ProviderError::Malformed {
+                provider,
+                message: "bad json".into(),
+            }
+        )));
+        assert!(!primary_failed_transiently(&failed(
+            ProviderError::Permanent {
+                provider,
+                status: Some(400),
+                message: "bad".into(),
+            }
+        )));
+        assert!(!primary_failed_transiently(&[]));
     }
 }
