@@ -1766,7 +1766,7 @@ fn evaluate_at_scope(
 
     if let Some(runner_up) = runner_up {
         let gap = candidate.score.total - runner_up.score.total;
-        if gap + 1e-9 < RUNNER_UP_GAP && !embedded_consistent {
+        if within_gap(gap) && !embedded_consistent {
             blockers.push(format!(
                 "runner-up release {} is only {:.3} behind",
                 runner_up.release.id, gap
@@ -2727,6 +2727,35 @@ mod tests {
             &DiscoveryEvidence::default(),
         );
         assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+    }
+
+    #[test]
+    fn a_runner_up_exactly_at_the_gap_blocks_acceptance() {
+        let mut local = local_release(&["One", "Two"]);
+        local.barcode = Some("0123456789012".to_string());
+        let first = Candidate::new(&local, remote_release(&["One", "Two"]));
+        let discovery = DiscoveryEvidence {
+            identifier_unique: true,
+            ..DiscoveryEvidence::default()
+        };
+        let mut second = first.clone();
+        second.release.id = ReleaseId::Discogs(43);
+
+        second.score.total = first.score.total - (RUNNER_UP_GAP + 0.001);
+        let clear = evaluate(&local, &first, Some(&second), &discovery);
+        assert!(clear.auto_accept, "{:?}", clear.blockers);
+
+        second.score.total = first.score.total - RUNNER_UP_GAP;
+        let boundary = evaluate(&local, &first, Some(&second), &discovery);
+        assert!(!boundary.auto_accept);
+        assert!(
+            boundary
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("runner-up")),
+            "{:?}",
+            boundary.blockers
+        );
     }
 
     #[test]
