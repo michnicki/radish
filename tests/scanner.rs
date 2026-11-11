@@ -222,3 +222,54 @@ async fn unchanged_files_are_skipped_but_still_counted_as_finished() {
     assert_eq!(stale.tracks.len(), 2);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dangling_non_audio_symlinks_are_ignored() {
+    let root = temp_dir("scan-dangling-cover");
+    write_wav(&root.join("good.wav"));
+    std::os::unix::fs::symlink(root.join("missing.jpg"), root.join("cover.jpg")).unwrap();
+    let mut events = Vec::new();
+
+    let tracks = scan_directory_with_progress(&root, |event| events.push(event))
+        .await
+        .unwrap();
+
+    assert_eq!(tracks.len(), 1);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ScanEvent::Warning { .. })),
+        "{events:?}"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dangling_audio_symlinks_warn() {
+    let root = temp_dir("scan-dangling-audio");
+    let link = root.join("gone.flac");
+    std::os::unix::fs::symlink(root.join("missing.flac"), &link).unwrap();
+    let mut events = Vec::new();
+
+    let tracks = scan_directory_with_progress(&root, |event| events.push(event))
+        .await
+        .unwrap();
+
+    assert!(tracks.is_empty());
+    let message = events
+        .iter()
+        .find_map(|event| match event {
+            ScanEvent::Warning { message } => Some(message),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("expected a walk warning, got {events:?}"));
+    // The path appears once: walkdir's own error text repeats it.
+    assert_eq!(
+        message.matches(link.to_str().unwrap()).count(),
+        1,
+        "{message}"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}

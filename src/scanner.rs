@@ -5,6 +5,7 @@ use lofty::probe::Probe;
 use lofty::tag::{Accessor, ItemKey, ItemValue, Tag};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -260,9 +261,18 @@ pub async fn scan_directory_incremental(
             Ok(_) => {}
             Err(err) => {
                 let path = err.path().unwrap_or(root);
-                on_progress(ScanEvent::Warning {
-                    message: format!("warning: skipped {}: {err}", path.display()),
-                });
+                let io_error = err.io_error();
+                // A dangling link to a non-audio file (a cover image) is not worth a warning.
+                if io_error.is_some_and(|e| e.kind() == ErrorKind::NotFound) && !is_audio_file(path)
+                {
+                    continue;
+                }
+                // walkdir's own text repeats the path for I/O errors, so show only the cause.
+                let message = match io_error {
+                    Some(io_error) => format!("warning: skipped {}: {io_error}", path.display()),
+                    None => format!("warning: skipped {}: {err}", path.display()),
+                };
+                on_progress(ScanEvent::Warning { message });
             }
         }
     }
@@ -355,9 +365,10 @@ async fn run_bounded<T, W>(
             Ok((id, value)) => (id, Ok(value)),
             Err(err) => (err.id(), Err(err)),
         };
-        if let Some(path) = in_flight.remove(&id) {
-            on_done(&path, outcome);
-        }
+        let path = in_flight
+            .remove(&id)
+            .expect("every spawned task is tracked");
+        on_done(&path, outcome);
     }
 }
 
@@ -366,6 +377,33 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn panicked_reads_report_their_path() {
+        let paths = vec![PathBuf::from("ok.wav"), PathBuf::from("bad.wav")];
+        let mut seen = Vec::new();
+
+        run_bounded(
+            paths,
+            2,
+            |path| {
+                if path == Path::new("bad.wav") {
+                    panic!("corrupt decoder state");
+                }
+            },
+            |path, outcome| seen.push((path.to_path_buf(), outcome.is_err())),
+        )
+        .await;
+
+        seen.sort();
+        assert_eq!(
+            seen,
+            [
+                (PathBuf::from("bad.wav"), true),
+                (PathBuf::from("ok.wav"), false)
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn bounded_runner_never_exceeds_its_limit() {
