@@ -1,0 +1,92 @@
+{
+  "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  "title": "Synthetic Set",
+  "status": "Official",
+  "disambiguation": "Compilation",
+  "date": "2001-05",
+  "barcode": "",
+  "artist-credit": [
+    {
+      "name": "Various Artists",
+      "joinphrase": "",
+      "artist": {
+        "id": "bbbbbbb2-bbbb-4bbb-8bbb-bbbbbbbbbbb2",
+        "name": "Various Artists"
+      }
+    }
+  ],
+  "release-group": {
+    "id": "ccccccc2-cccc-4ccc-8ccc-ccccccccccc2",
+    "title": "Synthetic Set",
+    "primary-type": "Album",
+    "secondary-types": ["Compilation"],
+    "first-release-date": "1999"
+  },
+  "label-info": [
+    {
+      "catalog-number": "SET-1",
+      "label": {
+        "id": "ddddddd2-dddd-4ddd-8ddd-ddddddddddd2",
+        "name": "Set Label"
+      }
+    }
+  ],
+  "release-events": [
+    {
+      "date": "2001-05",
+      "area": {
+        "id": "eeeeeee2-eeee-4eee-8eee-eeeeeeeeeee2",
+        "name": "Germany"
+      }
+    }
+  ],
+  "media": [
+    {
+      "position": 1,
+      "format": "CD",
+      "track-count": 1,
+      "tracks": [
+        {
+          "id": "11111111-aaaa-4aaa-8aaa-111111111111",
+          "number": "1",
+          "title": "Shared Recording",
+          "length": 200000,
+          "recording": {
+            "id": "99999999-aaaa-4aaa-8aaa-999999999999",
+            "title": "Shared Recording",
+            "length": 200000
+          }
+        }
+      ]
+    },
+    {
+      "position": 2,
+      "format": "CD",
+      "track-count": 2,
+      "tracks": [
+        {
+          "id": "22222222-aaaa-4aaa-8aaa-222222222222",
+          "number": "1",
+          "title": "Shared Recording",
+          "length": 201000,
+          "recording": {
+            "id": "99999999-aaaa-4aaa-8aaa-999999999999",
+            "title": "Shared Recording",
+            "length": 200000
+          }
+        },
+        {
+          "id": "33333333-aaaa-4aaa-8aaa-333333333333",
+          "number": "2",
+          "title": "Second Disc Track",
+          "length": 150000,
+          "recording": {
+            "id": "88888888-aaaa-4aaa-8aaa-888888888888",
+            "title": "Second Disc Track",
+            "length": 150000
+          }
+        }
+      ]
+    }
+  ]
+}
