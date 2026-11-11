@@ -908,7 +908,6 @@ mod tests {
         write_wav(&fixture.path("a.wav"));
         let mut state = WatchState {
             rescan_pending: true,
-            ..WatchState::default()
         };
         std::fs::remove_dir_all(fixture.music.path()).unwrap();
         // An unrelated event: only the pending full sync looks at the root.
