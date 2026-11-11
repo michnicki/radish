@@ -102,8 +102,9 @@ impl Scope {
 
 #[derive(Default)]
 struct Plan {
-    /// Paths worth looking at, once each, keyed by their comparison key.
-    paths: BTreeMap<String, PathBuf>,
+    /// Paths worth looking at, once each, grouped by their comparison key.
+    /// Paths that differ only in letter case stay separate, in arrival order.
+    paths: BTreeMap<String, Vec<PathBuf>>,
     /// The backend lost track of events, so only a full sync is safe.
     rescan: bool,
 }
@@ -112,6 +113,7 @@ struct Plan {
 ///
 /// Reads, metadata-only changes, the database's own files and anything outside
 /// the root are dropped, and repeated events for one path collapse into one.
+/// Distinct spellings of one path (a case-only rename) are all kept.
 fn plan_batch(scope: &Scope, events: &[notify::Event]) -> Plan {
     let mut plan = Plan::default();
     for event in events {
@@ -127,7 +129,10 @@ fn plan_batch(scope: &Scope, events: &[notify::Event]) -> Plan {
         for path in &event.paths {
             let key = store::path_key(path);
             if scope.contains(&key) && !scope.is_ignored(&key) {
-                plan.paths.insert(key, path.clone());
+                let spellings = plan.paths.entry(key).or_default();
+                if !spellings.contains(path) {
+                    spellings.push(path.clone());
+                }
             }
         }
     }
@@ -274,18 +279,30 @@ async fn handle_events(
         return Ok(outcome);
     }
 
-    for (key, path) in &plan.paths {
-        // One path failing must not cost the rest of the batch.
-        if let Err(err) = apply_path(pool, scope, directory_id, key, path, &mut outcome).await {
-            eprintln!(
-                "warning: failed to sync {}: {}",
-                clean_path(path),
-                Clean(&format!("{err:#}"))
-            );
-            outcome.failed |= err.downcast_ref::<sqlx::Error>().is_some();
-        }
-        if outcome.root_gone {
-            return Ok(outcome);
+    for (key, spellings) in &plan.paths {
+        for path in spellings {
+            // One path failing must not cost the rest of the batch.
+            if let Err(err) = apply_path(
+                pool,
+                scope,
+                directory_id,
+                key,
+                path,
+                spellings,
+                &mut outcome,
+            )
+            .await
+            {
+                eprintln!(
+                    "warning: failed to sync {}: {}",
+                    clean_path(path),
+                    Clean(&format!("{err:#}"))
+                );
+                outcome.failed |= err.downcast_ref::<sqlx::Error>().is_some();
+            }
+            if outcome.root_gone {
+                return Ok(outcome);
+            }
         }
     }
 
@@ -310,12 +327,17 @@ async fn handle_events(
 }
 
 /// Brings the database in line with what is on disk at one path.
+///
+/// `spellings` are all the paths of this batch that share `path`'s comparison
+/// key. A missing path keeps its rows when another spelling exists on disk,
+/// because the rows are case-insensitive and that spelling is saved instead.
 async fn apply_path(
     pool: &SqlitePool,
     scope: &Scope,
     directory_id: i64,
     key: &str,
     path: &Path,
+    spellings: &[PathBuf],
     outcome: &mut BatchOutcome,
 ) -> Result<()> {
     match tokio::fs::metadata(path).await {
@@ -359,6 +381,11 @@ async fn apply_path(
                 // Keep the rows: an unmounted library should not empty the DB.
                 outcome.root_gone = true;
                 return Ok(());
+            }
+            for other in spellings.iter().filter(|other| other.as_path() != path) {
+                if tokio::fs::try_exists(other).await? {
+                    return Ok(());
+                }
             }
             let removed = store::remove_tracks_under(pool, path).await?;
             outcome.removed += removed;
@@ -602,6 +629,29 @@ mod tests {
             .map(|name| event(EventKind::Create(CreateKind::File), &[&fixture.path(name)]))
             .collect();
         fixture.handle(&events).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_case_only_rename_reported_new_name_first_keeps_its_row() {
+        let fixture = Fixture::new("watcher-case-rename-order").await;
+        write_wav(&fixture.path("a.wav"));
+        import(&fixture, &["a.wav"]).await;
+        let (old, new) = (fixture.path("a.wav"), fixture.path("A.wav"));
+        std::fs::rename(&old, &new).unwrap();
+        if old.exists() {
+            return; // case-insensitive filesystem: the old name still resolves
+        }
+
+        // The old name arrives after the new one.
+        fixture
+            .handle(&[
+                event(EventKind::Create(CreateKind::File), &[&new]),
+                event(EventKind::Remove(RemoveKind::File), &[&old]),
+            ])
+            .await;
+
+        assert_eq!(track_paths(&fixture).await, [new.display().to_string()]);
     }
 
     #[tokio::test]
