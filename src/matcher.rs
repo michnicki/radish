@@ -1047,7 +1047,6 @@ pub fn score(local: &LocalRelease, remote: &RemoteRelease, mapping: &Mapping) ->
     };
 
     let mut duration_total = 0.0;
-    let mut duration_count = 0usize;
     for (local_index, remote_index) in mapping.assigned_pairs() {
         let Some(local_track) = local.tracks.get(local_index) else {
             continue;
@@ -1057,13 +1056,14 @@ pub fn score(local: &LocalRelease, remote: &RemoteRelease, mapping: &Mapping) ->
         };
         if let (Some(a), Some(b)) = (local_track.duration_secs, remote_track.duration_secs) {
             duration_total += duration_similarity(a, b);
-            duration_count += 1;
         }
     }
-    let durations = if duration_count == 0 {
+    // Unknown durations count as zero, so a release with few known durations
+    // cannot outscore one whose durations were all measured.
+    let durations = if local.tracks.is_empty() {
         0.0
     } else {
-        duration_total / duration_count as f64
+        duration_total / local.tracks.len() as f64
     };
 
     let year = match (local.year, remote.year) {
@@ -2278,6 +2278,31 @@ mod tests {
         let breakdown = score(&local, &remote, &map_tracks(&local, &remote));
         assert_eq!(breakdown.durations, 0.0);
         assert!(breakdown.total < 1.0);
+    }
+
+    #[test]
+    fn missing_durations_lower_the_duration_score_instead_of_being_skipped() {
+        let titles: Vec<String> = (1..=12).map(|n| format!("Song {n}")).collect();
+        let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let local = local_release(&titles);
+
+        let mut sparse = remote_release(&titles);
+        for track in sparse.tracklist.iter_mut().skip(1) {
+            track.duration_secs = None;
+        }
+        let mut complete = remote_release(&titles);
+        for track in &mut complete.tracklist {
+            track.duration_secs = track.duration_secs.map(|secs| secs + 2.0);
+        }
+
+        let sparse = Candidate::new(&local, sparse);
+        let complete = Candidate::new(&local, complete);
+        assert!(
+            complete.score.durations > sparse.score.durations,
+            "complete {} vs sparse {}",
+            complete.score.durations,
+            sparse.score.durations
+        );
     }
 
     #[test]
