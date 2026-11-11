@@ -44,21 +44,26 @@ pub async fn upsert_directory(pool: &SqlitePool, path: &Path) -> Result<i64> {
     Ok(id)
 }
 
-pub async fn upsert_album(
-    pool: &SqlitePool,
+/// Finds or creates the album row for a title and artist. A missing and an
+/// empty artist are the same artist. The year is a per-file tag and lives on
+/// the track, never on the shared album row.
+///
+/// Takes a connection so it can run inside the caller's write transaction.
+async fn upsert_album(
+    conn: &mut SqliteConnection,
     title: &str,
     artist: Option<&str>,
-    year: Option<i64>,
 ) -> Result<i64> {
+    let artist = artist.filter(|artist| !artist.is_empty());
+    // The no-op update makes `RETURNING` yield the existing row on conflict.
     let id: i64 = sqlx::query_scalar(
-        "INSERT INTO albums (title, artist, year) VALUES (?1, ?2, ?3)
-         ON CONFLICT(title, artist) DO UPDATE SET year = excluded.year
+        "INSERT INTO albums (title, artist) VALUES (?1, ?2)
+         ON CONFLICT(title, IFNULL(artist, '')) DO UPDATE SET title = excluded.title
          RETURNING id",
     )
     .bind(title)
     .bind(artist)
-    .bind(year)
-    .fetch_one(pool)
+    .fetch_one(conn)
     .await?;
     Ok(id)
 }
@@ -70,22 +75,33 @@ pub async fn upsert_track(
     track: &ScannedTrack,
     directory_id: i64,
 ) -> Result<()> {
+    let mut tx = begin_write(pool).await?;
+    write_track(&mut tx, track, directory_id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn write_track(
+    conn: &mut SqliteConnection,
+    track: &ScannedTrack,
+    directory_id: i64,
+) -> Result<u64> {
     let album_id = match &track.album {
         Some(title) if !title.is_empty() => {
-            Some(upsert_album(pool, title, track.artist.as_deref(), track.year).await?)
+            Some(upsert_album(&mut *conn, title, track.artist.as_deref()).await?)
         }
         _ => None,
     };
 
     let musicbrainz_json = serde_json::to_string(&track.musicbrainz)?;
     let path_str = track.path.to_string_lossy().to_string();
-    sqlx::query(
+    let result = sqlx::query(
         "INSERT INTO tracks (
             path, title, artist, album_id, directory_id, track_number, duration_secs, modified_at,
             album_artist, disc_number, barcode, catalog_number, discogs_release_id,
-            musicbrainz_ids_json
+            musicbrainz_ids_json, year
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(path) DO UPDATE SET
             title = excluded.title,
             artist = excluded.artist,
@@ -99,7 +115,8 @@ pub async fn upsert_track(
             barcode = excluded.barcode,
             catalog_number = excluded.catalog_number,
             discogs_release_id = excluded.discogs_release_id,
-            musicbrainz_ids_json = excluded.musicbrainz_ids_json",
+            musicbrainz_ids_json = excluded.musicbrainz_ids_json,
+            year = excluded.year",
     )
     .bind(&path_str)
     .bind(&track.title)
@@ -115,10 +132,11 @@ pub async fn upsert_track(
     .bind(&track.catalog_number)
     .bind(track.discogs_release_id)
     .bind(musicbrainz_json)
-    .execute(pool)
+    .bind(track.year)
+    .execute(&mut *conn)
     .await?;
 
-    Ok(())
+    Ok(result.rows_affected())
 }
 
 pub async fn remove_track_by_path(pool: &SqlitePool, path: &Path) -> Result<()> {
@@ -558,7 +576,7 @@ async fn observed_tracks(
 ) -> Result<Vec<ObservedTrack>> {
     let mut rows = sqlx::query_as::<_, ObservedTrack>(
         "SELECT t.id AS id, t.path AS path, t.title AS title, t.artist AS artist,
-                a.title AS album, t.album_artist AS album_artist, a.year AS year,
+                a.title AS album, t.album_artist AS album_artist, t.year AS year,
                 t.track_number AS track_number, t.disc_number AS disc_number,
                 t.duration_secs AS duration_secs, t.barcode AS barcode,
                 t.catalog_number AS catalog_number, t.discogs_release_id AS discogs_release_id,
@@ -2887,5 +2905,95 @@ mod tests {
             titles(search_tracks(&pool, r"k\s").await.unwrap()),
             vec![r"back\slash"]
         );
+    }
+
+    #[tokio::test]
+    async fn year_belongs_to_each_folder_and_reimports_keep_revisions() {
+        let pool = test_pool().await;
+        let mut first = scanned("/music/x/01.flac", Some("Blue"), Some("Artist"), 1);
+        first.year = Some(2001);
+        let mut second = scanned("/music/y/01.flac", Some("Blue"), Some("Artist"), 1);
+        second.year = Some(2005);
+        insert(&pool, "/music/x", std::slice::from_ref(&first)).await;
+        insert(&pool, "/music/y", std::slice::from_ref(&second)).await;
+
+        let releases = load_local_releases(&pool, None).await.unwrap();
+        let year_of = |directory: &str| {
+            releases
+                .iter()
+                .find(|release| release.directory == directory)
+                .unwrap()
+                .year
+        };
+        assert_eq!(year_of("/music/x"), Some(2001));
+        assert_eq!(year_of("/music/y"), Some(2005));
+
+        let release = releases
+            .iter()
+            .find(|release| release.directory == "/music/x")
+            .unwrap();
+        let candidate = Candidate::new(release, remote_with(&["Track 1"]));
+        let guard = load_match_guard(&pool, release.id).await.unwrap();
+        accept_match(
+            &pool,
+            release,
+            &candidate,
+            AcceptanceMethod::Automatic,
+            MatchScope::Edition,
+            &guard,
+        )
+        .await
+        .unwrap();
+
+        // Re-import both folders in the opposite order, with unchanged tags.
+        insert(&pool, "/music/y", &[second]).await;
+        insert(&pool, "/music/x", &[first]).await;
+
+        let status: String = sqlx::query_scalar("SELECT status FROM local_releases WHERE id = ?1")
+            .bind(release.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, STATUS_MATCHED);
+        assert!(list_tracks(&pool).await.unwrap().iter().all(|r| !r.stale));
+    }
+
+    #[tokio::test]
+    async fn reimport_in_another_order_keeps_the_match_current() {
+        let pool = test_pool().await;
+        let one = scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1);
+        let mut two = scanned("/music/a/02.flac", Some("Blue"), Some("Artist"), 2);
+        two.year = None;
+        insert(&pool, "/music/a", &[one.clone(), two.clone()]).await;
+        let release = load_local_releases(&pool, None).await.unwrap().remove(0);
+        let candidate = Candidate::new(&release, remote_with(&["Track 1", "Track 2"]));
+        let guard = load_match_guard(&pool, release.id).await.unwrap();
+        accept_match(
+            &pool,
+            &release,
+            &candidate,
+            AcceptanceMethod::Automatic,
+            MatchScope::Edition,
+            &guard,
+        )
+        .await
+        .unwrap();
+
+        // Same tags, different completion order.
+        insert(&pool, "/music/a", &[two, one]).await;
+        assert!(list_tracks(&pool).await.unwrap().iter().all(|r| !r.stale));
+    }
+
+    #[tokio::test]
+    async fn albums_without_artist_are_not_duplicated() {
+        let pool = test_pool().await;
+        let mut anonymous = scanned("/music/a/01.flac", Some("Blue"), None, 1);
+        anonymous.album_artist = None;
+        let mut blank = scanned("/music/a/02.flac", Some("Blue"), Some(""), 2);
+        blank.album_artist = None;
+        insert(&pool, "/music/a", &[anonymous.clone(), blank.clone()]).await;
+        insert(&pool, "/music/a", &[anonymous, blank]).await;
+
+        assert_eq!(count(&pool, "albums").await, 1);
     }
 }

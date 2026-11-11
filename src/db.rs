@@ -265,7 +265,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(applied, 4);
+        assert_eq!(applied, 5);
     }
 
     /// A database migrated up to and including the album-matching migration.
@@ -360,6 +360,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(kept, 5);
+    }
+
+    #[tokio::test]
+    async fn migration_moves_year_to_tracks_and_dedupes_albums() {
+        let pool = pool_before_store_integrity().await;
+        sqlx::raw_sql(
+            "INSERT INTO directories (id, path) VALUES (1, '/m');
+             INSERT INTO albums (id, title, artist, year) VALUES (1, 'Blue', NULL, 2001);
+             INSERT INTO albums (id, title, artist, year) VALUES (2, 'Blue', NULL, 2002);
+             INSERT INTO albums (id, title, artist, year) VALUES (3, 'Blue', '', 1999);
+             INSERT INTO albums (id, title, artist, year) VALUES (4, 'Blue', 'Artist', 2010);
+             INSERT INTO tracks (id, path, album_id, directory_id, modified_at) VALUES (10, '/m/1.flac', 1, 1, 1);
+             INSERT INTO tracks (id, path, album_id, directory_id, modified_at) VALUES (11, '/m/2.flac', 2, 1, 1);
+             INSERT INTO tracks (id, path, album_id, directory_id, modified_at) VALUES (12, '/m/3.flac', 3, 1, 1);
+             INSERT INTO tracks (id, path, album_id, directory_id, modified_at) VALUES (13, '/m/4.flac', 4, 1, 1);
+             INSERT INTO tracks (id, path, album_id, directory_id, modified_at) VALUES (14, '/m/5.flac', NULL, 1, 1);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(include_str!(
+            "../migrations/20261112000001_track_year_album_identity.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let tracks: Vec<(i64, Option<i64>, Option<i64>)> =
+            sqlx::query_as("SELECT id, album_id, year FROM tracks ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            tracks,
+            vec![
+                (10, Some(1), Some(2001)),
+                (11, Some(1), Some(2002)),
+                (12, Some(1), Some(1999)),
+                (13, Some(4), Some(2010)),
+                (14, None, None),
+            ]
+        );
+        let albums: Vec<(i64, Option<i64>)> =
+            sqlx::query_as("SELECT id, year FROM albums ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(albums, vec![(1, None), (4, None)]);
+
+        let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(violations, 0);
+        let index: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_albums_identity'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(index, 1);
     }
 
     #[tokio::test]
