@@ -1,4 +1,4 @@
-use crate::{scanner, store};
+use crate::{outln, scanner, store};
 use anyhow::Result;
 use notify::event::{CreateKind, ModifyKind, RemoveKind};
 use notify::{EventKind, RecursiveMode, Watcher};
@@ -16,13 +16,13 @@ pub async fn watch_directory(pool: SqlitePool, root: &Path) -> Result<()> {
     let root = root.canonicalize()?;
     let directory_id = store::upsert_directory(&pool, &root).await?;
 
-    println!("Doing initial scan of {}...", root.display());
+    outln!("Doing initial scan of {}...", root.display());
     let tracks = scanner::scan_directory(&root).await?;
     for track in &tracks {
         store::upsert_track(&pool, track, directory_id).await?;
     }
     store::rebuild_local_releases(&pool, Some(&root)).await?;
-    println!(
+    outln!(
         "Synced {} tracks. Watching for changes... (Ctrl+C to stop)",
         tracks.len()
     );
@@ -62,7 +62,7 @@ async fn handle_event(
                     match scanner::read_tags(&path) {
                         Ok(track) => {
                             store::upsert_track(pool, &track, directory_id).await?;
-                            println!("synced: {}", path.display());
+                            outln!("synced: {}", path.display());
                         }
                         Err(err) => eprintln!("warning: failed to tag {}: {err}", path.display()),
                     }
@@ -72,7 +72,7 @@ async fn handle_event(
         EventKind::Remove(RemoveKind::File) | EventKind::Remove(RemoveKind::Any) => {
             for path in event.paths {
                 store::remove_track_by_path(pool, &path).await?;
-                println!("removed: {}", path.display());
+                outln!("removed: {}", path.display());
             }
         }
         _ => {}

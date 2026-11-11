@@ -16,8 +16,31 @@ pub mod discogs;
 pub mod discovery;
 pub mod matcher;
 pub mod musicbrainz;
+pub mod output;
 pub mod providers;
 pub mod runner;
 pub mod scanner;
 pub mod store;
 pub mod watcher;
+
+/// Prints a line to stdout, treating a closed pipe as a clean end.
+///
+/// `println!` panics when the reader exits early (`radish list | head`); CLI
+/// output uses this macro so a closed pipe just stops the output.
+#[macro_export]
+macro_rules! outln {
+    () => {
+        $crate::output::write_line(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::output::write_line(format_args!($($arg)*))
+    };
+}
+
+/// Prints text to stdout without a trailing newline, tolerating a closed pipe.
+#[macro_export]
+macro_rules! out {
+    ($($arg:tt)*) => {
+        $crate::output::write(format_args!($($arg)*))
+    };
+}

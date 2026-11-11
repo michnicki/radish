@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use radish::providers::{ProviderKind, ReleaseId};
-use radish::{db, runner, scanner, store, watcher};
+use radish::{db, outln, runner, scanner, store, watcher};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -180,9 +180,9 @@ async fn main() -> Result<()> {
         } => {
             if let Some(id) = clear {
                 if store::clear_match(&pool, id).await? {
-                    println!("Cleared the accepted match for local release {id}.");
+                    outln!("Cleared the accepted match for local release {id}.");
                 } else {
-                    println!("Local release {id} has no accepted match.");
+                    outln!("Local release {id} has no accepted match.");
                 }
             } else {
                 let scope = canonical_scope(path.as_deref())?;
@@ -225,7 +225,7 @@ fn canonical_scope(path: Option<&Path>) -> Result<Option<PathBuf>> {
 
 fn print_releases(rows: &[store::LocalReleaseStatus]) {
     if rows.is_empty() {
-        println!("No local releases found.");
+        outln!("No local releases found.");
         return;
     }
 
@@ -254,17 +254,21 @@ fn print_releases(rows: &[store::LocalReleaseStatus]) {
             ),
             _ => String::new(),
         };
-        println!(
+        outln!(
             "#{} {} — {}  [{} track(s)]  {status}{remote}\n     {}",
-            row.id, artist, title, row.track_count, row.directory
+            row.id,
+            artist,
+            title,
+            row.track_count,
+            row.directory
         );
     }
-    println!("\n{} local release(s).", rows.len());
+    outln!("\n{} local release(s).", rows.len());
 }
 
 fn print_tracks(rows: &[store::TrackRow]) {
     if rows.is_empty() {
-        println!("No tracks found.");
+        outln!("No tracks found.");
         return;
     }
 
@@ -285,9 +289,9 @@ fn print_tracks(rows: &[store::TrackRow]) {
             (Some(album), _, None) => format!("  [{album}]"),
             _ => String::new(),
         };
-        println!("{artist} - {title}{location}  {duration}{stale}");
+        outln!("{artist} - {title}{location}  {duration}{stale}");
     }
-    println!("\n{} track(s).", rows.len());
+    outln!("\n{} track(s).", rows.len());
 }
 
 fn format_duration(secs: Option<f64>) -> String {
@@ -302,7 +306,7 @@ fn format_duration(secs: Option<f64>) -> String {
 
 async fn run_import(pool: &sqlx::SqlitePool, path: &std::path::Path) -> Result<PathBuf> {
     let path = path.canonicalize()?;
-    println!("Scanning {}...", path.display());
+    outln!("Scanning {}...", path.display());
 
     let directory_id = store::upsert_directory(pool, &path).await?;
     let tracks = scanner::scan_directory(&path).await?;
@@ -314,7 +318,7 @@ async fn run_import(pool: &sqlx::SqlitePool, path: &std::path::Path) -> Result<P
 
     let groups = store::rebuild_local_releases(pool, Some(&path)).await?;
 
-    println!("Imported {count} tracks into {groups} local release(s).");
+    outln!("Imported {count} tracks into {groups} local release(s).");
     Ok(path)
 }
 
