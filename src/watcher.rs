@@ -241,8 +241,24 @@ async fn handle_events(
     if force_rescan || plan.rescan {
         // Events were lost or not applied, so a full sync is the only way to be sure.
         let progress = ImportProgress::new();
-        let summary = importer::sync_directory(pool, &scope.root, &progress).await?;
+        let synced = importer::sync_directory(pool, &scope.root, &progress).await;
         drop(progress);
+        let summary = match synced {
+            Ok(summary) => summary,
+            Err(err) => {
+                // The per-path handling that normally notices a deleted root is
+                // skipped during a full sync, so check for it here. The rows
+                // stay, as in the per-path case.
+                if matches!(
+                    tokio::fs::metadata(&scope.root).await,
+                    Err(error) if error.kind() == ErrorKind::NotFound
+                ) {
+                    outcome.root_gone = true;
+                    return Ok(outcome);
+                }
+                return Err(err);
+            }
+        };
         outcome.synced = summary.saved;
         outcome.removed = summary.removed;
         importer::report_rebuild(&summary.rebuild);
@@ -880,6 +896,33 @@ mod tests {
             fixture.directory_id,
             batch,
             &mut WatchState::default(),
+        )
+        .await;
+
+        assert_eq!(flow, Flow::RootGone);
+    }
+
+    #[tokio::test]
+    async fn a_pending_full_sync_notices_that_the_root_is_gone() {
+        let fixture = Fixture::new("watcher-root-gone-while-pending").await;
+        write_wav(&fixture.path("a.wav"));
+        let mut state = WatchState {
+            rescan_pending: true,
+            ..WatchState::default()
+        };
+        std::fs::remove_dir_all(fixture.music.path()).unwrap();
+        // An unrelated event: only the pending full sync looks at the root.
+        let batch = vec![Ok(event(
+            EventKind::Access(AccessKind::Read),
+            &[&fixture.path("a.wav")],
+        ))];
+
+        let flow = process_batch(
+            &fixture.pool,
+            &fixture.scope,
+            fixture.directory_id,
+            batch,
+            &mut state,
         )
         .await;
 
