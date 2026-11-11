@@ -7,7 +7,7 @@ use crate::scanner::{ScanEvent, ScanResult};
 use crate::{outln, scanner, store};
 use anyhow::{Result, bail};
 use sqlx::SqlitePool;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// What a [`sync_directory`] run did.
@@ -89,6 +89,48 @@ fn emit(progress: Option<&ImportProgress>, event: ScanEvent) {
     }
 }
 
+/// Drops all but one of the scanned files that share a [`store::path_key`] and
+/// returns the dropped paths in sorted order.
+///
+/// The file already stored wins, so an import never swaps one for the other;
+/// when neither is stored, the first in sorted order does.
+fn skip_case_collisions(
+    tracks: &mut Vec<scanner::ScannedTrack>,
+    unchanged: &mut Vec<PathBuf>,
+    known: &HashMap<String, store::KnownTrack>,
+) -> Vec<PathBuf> {
+    let mut groups: HashMap<String, Vec<&Path>> = HashMap::new();
+    for path in tracks
+        .iter()
+        .map(|track| track.path.as_path())
+        .chain(unchanged.iter().map(PathBuf::as_path))
+    {
+        groups.entry(store::path_key(path)).or_default().push(path);
+    }
+    let mut skipped = HashSet::new();
+    for (key, mut paths) in groups {
+        if paths.len() < 2 {
+            continue;
+        }
+        paths.sort();
+        let keep = known
+            .get(&key)
+            .and_then(|stored| {
+                paths
+                    .iter()
+                    .position(|path| Path::new(&stored.path) == *path)
+            })
+            .unwrap_or(0);
+        paths.remove(keep);
+        skipped.extend(paths.into_iter().map(Path::to_path_buf));
+    }
+    tracks.retain(|track| !skipped.contains(&track.path));
+    unchanged.retain(|path| !skipped.contains(path));
+    let mut skipped: Vec<PathBuf> = skipped.into_iter().collect();
+    skipped.sort();
+    skipped
+}
+
 /// [`sync_directory`] without the rebuild: syncs the files under `dir` into
 /// the rows of the library directory `directory_id`. The watcher uses it for
 /// a folder that appeared inside the watched root, and rebuilds once per batch.
@@ -107,8 +149,8 @@ pub(crate) async fn sync_files(
     }
     let known = store::known_tracks(pool, dir).await?;
     let ScanResult {
-        tracks,
-        unchanged,
+        mut tracks,
+        mut unchanged,
         unreadable,
         quietly_skipped,
     } = scanner::scan_directory_incremental(
@@ -124,6 +166,16 @@ pub(crate) async fn sync_files(
         |event| emit(progress, event),
     )
     .await?;
+
+    // `tracks.path` ignores letter case, so files that differ only in case would
+    // overwrite each other's row on every import.
+    for path in skip_case_collisions(&mut tracks, &mut unchanged, &known) {
+        let message = format!(
+            "warning: skipping {}: another file differs only in letter case",
+            clean_path(&path)
+        );
+        emit(progress, ScanEvent::Warning { message });
+    }
 
     // An empty answer for a library that has rows is more likely an unmounted
     // volume or a wiped share than a deliberate delete-everything.
@@ -549,5 +601,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after, Some(2005));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn case_colliding_files_keep_one_stable_row_across_imports() {
+        let pool = db::connect_in_memory().await.unwrap();
+        let music = ScratchDir::new("importer-case-collision");
+        write_wav(&music.path().join("x.wav"));
+        if music.path().join("X.wav").exists() {
+            return; // case-insensitive filesystem: the two names cannot coexist
+        }
+        write_wav(&music.path().join("X.wav"));
+        let progress = ImportProgress::new();
+
+        sync_directory(&pool, music.path(), &progress, false)
+            .await
+            .unwrap();
+        let stored = paths(&pool).await;
+        let revision = revisions(&pool).await;
+        assert_eq!(stored.len(), 1, "{stored:?}");
+        for _ in 0..2 {
+            let summary = sync_directory(&pool, music.path(), &progress, false)
+                .await
+                .unwrap();
+            assert_eq!(summary.saved, 0, "{summary:?}");
+            assert_eq!(paths(&pool).await, stored);
+            assert_eq!(revisions(&pool).await, revision);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_new_case_colliding_file_does_not_displace_the_stored_one() {
+        let pool = db::connect_in_memory().await.unwrap();
+        let music = ScratchDir::new("importer-case-stored");
+        write_wav(&music.path().join("x.wav"));
+        if music.path().join("X.wav").exists() {
+            return; // case-insensitive filesystem
+        }
+        let progress = ImportProgress::new();
+        sync_directory(&pool, music.path(), &progress, false)
+            .await
+            .unwrap();
+        let stored = paths(&pool).await;
+
+        // "X.wav" sorts before "x.wav", but the stored file still wins.
+        write_wav(&music.path().join("X.wav"));
+        let summary = sync_directory(&pool, music.path(), &progress, false)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.saved, 0, "{summary:?}");
+        assert_eq!(paths(&pool).await, stored);
     }
 }
