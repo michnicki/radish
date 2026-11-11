@@ -67,6 +67,10 @@ pub struct MusicBrainzAdapter {
     scheduler: Mutex<Option<Instant>>,
     /// Shared by searches and lookups; successful cache reads bypass this gate.
     cooldown_until: Mutex<Option<tokio::time::Instant>>,
+    /// When each attempt was released by `schedule`; lets tests measure
+    /// spacing without depending on server-side accept latency.
+    #[cfg(test)]
+    released_at: Mutex<Vec<Instant>>,
     release_cache: Mutex<BoundedCache<Mbid, RemoteRelease>>,
     search_cache: Mutex<BoundedCache<String, SearchPage>>,
 }
@@ -98,6 +102,8 @@ impl MusicBrainzAdapter {
             config,
             scheduler: Mutex::new(None),
             cooldown_until: Mutex::new(None),
+            #[cfg(test)]
+            released_at: Mutex::new(Vec::new()),
             release_cache: Mutex::new(BoundedCache::new(RELEASE_CACHE_CAPACITY)),
             search_cache: Mutex::new(BoundedCache::new(SEARCH_CACHE_CAPACITY)),
         })
@@ -131,6 +137,8 @@ impl MusicBrainzAdapter {
         if !wait.is_zero() {
             tokio::time::sleep(wait).await;
         }
+        #[cfg(test)]
+        lock(&self.released_at).push(Instant::now());
     }
 
     fn start_cooldown(&self, retry_after: Option<Duration>) {
@@ -195,14 +203,7 @@ impl MusicBrainzAdapter {
                         if !error.is_builder() {
                             self.start_cooldown(None);
                         }
-                        return Err(ProviderError::Network {
-                            provider: ProviderKind::MusicBrainz,
-                            message: if error.is_timeout() {
-                                "request timed out".to_string()
-                            } else {
-                                error.to_string()
-                            },
-                        });
+                        return Err(transport_error(&error));
                     }
                     tokio::time::sleep(backoff(backoff_index)).await;
                     backoff_index += 1;
@@ -306,14 +307,7 @@ impl MusicBrainzAdapter {
                 Err(error) => {
                     if attempt >= self.config.max_attempts {
                         self.start_cooldown(None);
-                        return Err(ProviderError::Network {
-                            provider: ProviderKind::MusicBrainz,
-                            message: if error.is_timeout() {
-                                "request timed out".to_string()
-                            } else {
-                                error.to_string()
-                            },
-                        });
+                        return Err(transport_error(&error));
                     }
                     tokio::time::sleep(backoff(backoff_index)).await;
                     backoff_index += 1;
@@ -362,29 +356,44 @@ impl MusicBrainzAdapter {
         }
     }
 
-    /// The all-terms fallback for a title/artist search whose exact phrase
-    /// query found nothing. Other strategies are identifier lookups and are
-    /// never loosened.
+    /// The bare-terms fallback for a title/artist search whose first query
+    /// found nothing. It is built from the title and artist alone, so when a
+    /// release group ID was searched first, the exact title phrase is skipped
+    /// and this is the second query. Identifier lookups are never loosened, and
+    /// neither is a search where every field is a single word, since the
+    /// bare-terms form would match exactly what the phrase did.
     fn loosened_query_for(&self, strategy: &SearchStrategy) -> Option<String> {
         let SearchStrategy::TitleArtist { title, artist, .. } = strategy else {
             return None;
         };
-        if title.trim().is_empty() {
+        let artist = artist.as_deref().filter(|value| !value.trim().is_empty());
+        let has_extra_words = [Some(title.as_str()), artist]
+            .into_iter()
+            .flatten()
+            .any(|value| value.split_whitespace().count() > 1);
+        if title.trim().is_empty() || !has_extra_words {
             return None;
         }
         let mut parts = vec![terms_field("release", title)];
-        if let Some(artist) = artist.as_deref().filter(|value| !value.trim().is_empty()) {
+        if let Some(artist) = artist {
             parts.push(terms_field("artist", artist));
         }
         Some(parts.join(" AND "))
     }
 
-    /// One `/ws/2/release` search for an already-built Lucene query.
+    /// One `/ws/2/release` search for an already-built Lucene query, cached by
+    /// the query itself so strategies that build the same query (for example
+    /// two that both carry a release group ID) share one request.
     async fn search_query(
         &self,
         query: &str,
         request: &SearchRequest,
     ) -> Result<SearchPage, ProviderError> {
+        let key = format!("{query}|{}|{}", request.offset, request.limit);
+        if let Some(cached) = lock(&self.search_cache).get(&key) {
+            return Ok(cached);
+        }
+
         let mut url = self.endpoint("/ws/2/release")?;
         {
             let mut pairs = url.query_pairs_mut();
@@ -397,7 +406,9 @@ impl MusicBrainzAdapter {
         }
 
         let value = self.request_json(url, "search").await?;
-        decode_search_page(&value, request.offset)
+        let page = decode_search_page(&value, request.offset)?;
+        lock(&self.search_cache).insert(key, page.clone());
+        Ok(page)
     }
 
     async fn fetch_document(&self, id: Mbid) -> Result<RemoteRelease, ProviderError> {
@@ -438,20 +449,13 @@ impl MetadataProvider for MusicBrainzAdapter {
     }
 
     async fn search(&self, request: SearchRequest) -> Result<SearchPage, ProviderError> {
-        let key = format!(
-            "{:?}|{}|{}",
-            request.strategy, request.offset, request.limit
-        );
-        if let Some(cached) = lock(&self.search_cache).get(&key) {
-            return Ok(cached);
-        }
-
         let query = self.query_for(&request.strategy)?;
         let mut page = self.search_query(&query, &request).await?;
 
-        // An exact phrase misses titles with extra words, such as a
-        // "(Remastered)" suffix. Try the all-terms form once; its next page
-        // cannot be requested through the exact strategy, so none is offered.
+        // The exact phrase misses when the local title has words the remote
+        // one lacks (a "Remastered" or "Deluxe Edition" suffix). Try the
+        // bare-terms form once; its next page cannot be requested through the
+        // exact strategy, so none is offered. Both queries are cached.
         if page.hits.is_empty()
             && request.offset == 0
             && let Some(loosened) = self.loosened_query_for(&request.strategy)
@@ -459,8 +463,6 @@ impl MetadataProvider for MusicBrainzAdapter {
             page = self.search_query(&loosened, &request).await?;
             page.next_offset = None;
         }
-
-        lock(&self.search_cache).insert(key, page.clone());
 
         Ok(page)
     }
@@ -475,6 +477,18 @@ impl MetadataProvider for MusicBrainzAdapter {
         };
 
         self.fetch_document(mbid).await
+    }
+}
+
+/// Classifies a failed send or body read as a transient network failure.
+fn transport_error(error: &reqwest::Error) -> ProviderError {
+    ProviderError::Network {
+        provider: ProviderKind::MusicBrainz,
+        message: if error.is_timeout() {
+            "request timed out".to_string()
+        } else {
+            error.to_string()
+        },
     }
 }
 
@@ -531,12 +545,13 @@ pub fn literal_field(field: &str, value: &str) -> String {
     format!("{field}:\"{}\"", escape_lucene(value))
 }
 
-/// Builds an unquoted all-terms field query such as `release:(Blue AND Moon)`.
+/// Builds an unquoted bare-terms field query such as `release:(Blue Moon)`.
 ///
-/// Each whitespace-separated word is escaped on its own. MusicBrainz searches
-/// default to OR between bare terms, so the words are joined with an explicit
-/// `AND`. A literal upper-case `AND`/`OR`/`NOT` word is lowered so Lucene does
-/// not read it as an operator.
+/// Each whitespace-separated word is escaped on its own and the words are
+/// separated by a single space. MusicBrainz ORs bare terms, so a remote title
+/// that lacks some of the words (such as a local "Remastered") still matches
+/// and relevance ranking favors the closest one. A literal upper-case
+/// `AND`/`OR`/`NOT` word is lowered so Lucene does not read it as an operator.
 fn terms_field(field: &str, value: &str) -> String {
     let terms: Vec<String> = value
         .split_whitespace()
@@ -545,7 +560,7 @@ fn terms_field(field: &str, value: &str) -> String {
             _ => escape_lucene(word),
         })
         .collect();
-    format!("{field}:({})", terms.join(" AND "))
+    format!("{field}:({})", terms.join(" "))
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,15 +1116,6 @@ mod tests {
 
         fn request_count(&self) -> usize {
             self.requests.lock().unwrap().len()
-        }
-
-        fn timestamps(&self) -> Vec<Instant> {
-            self.requests
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(_, at)| *at)
-                .collect()
         }
     }
 
@@ -1772,12 +1778,15 @@ mod tests {
         let adapter = MusicBrainzAdapter::with_config(config).unwrap();
 
         adapter.fetch_release(release_id()).await.unwrap();
-        let timestamps = server.timestamps();
-        assert_eq!(timestamps.len(), 2);
+        // Measured where `schedule` releases each attempt, not when the server
+        // happens to accept it, so a slow accept cannot eat the margin.
+        let released = lock(&adapter.released_at).clone();
+        assert_eq!(released.len(), 2, "every hop must pass through the limiter");
         assert!(
-            timestamps[1].duration_since(timestamps[0]) >= Duration::from_millis(80),
+            released[1].duration_since(released[0]) >= Duration::from_millis(80),
             "redirect bypassed request spacing"
         );
+        assert_eq!(server.request_count(), 2);
     }
 
     #[tokio::test]
@@ -1811,10 +1820,13 @@ mod tests {
         assert_eq!(server.request_count(), 1);
     }
 
-    /// Serves one truncated body (headers promise more than is sent, then the
-    /// socket closes) followed by complete responses. Returns the URL and the
+    /// Serves `truncated_attempts` truncated bodies (headers promise more than
+    /// is sent, then the socket closes) followed by complete responses. Returns the URL and the
     /// attempt counter.
-    fn start_truncating_server(complete_body: String) -> (String, Arc<Mutex<usize>>) {
+    fn start_truncating_server(
+        complete_body: String,
+        truncated_attempts: usize,
+    ) -> (String, Arc<Mutex<usize>>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind truncating server");
         let address = listener.local_addr().unwrap();
         let attempts = Arc::new(Mutex::new(0usize));
@@ -1834,7 +1846,7 @@ mod tests {
                     *attempts += 1;
                     *attempts
                 };
-                let payload = if attempt == 1 {
+                let payload = if attempt <= truncated_attempts {
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n{\"id\":"
                         .to_string()
                 } else {
@@ -1853,7 +1865,7 @@ mod tests {
     #[tokio::test]
     async fn retries_failures_while_reading_the_response_body() {
         let body = include_str!("../tests/fixtures/musicbrainz/release-single.json").to_string();
-        let (url, attempts) = start_truncating_server(body);
+        let (url, attempts) = start_truncating_server(body, 1);
         let adapter = MusicBrainzAdapter::with_config(MusicBrainzConfig {
             base_url: Url::parse(&url).unwrap(),
             min_interval: Duration::ZERO,
@@ -1878,6 +1890,8 @@ mod tests {
             .unwrap()
     }
 
+    /// Bare terms (MusicBrainz ORs them) per field, ANDed between fields.
+    const LOOSENED_QUERY: &str = "release:(Abbey Road Remastered) AND artist:(The Beatles)";
     const EMPTY_SEARCH: &str = r#"{"count":0,"offset":0,"releases":[]}"#;
     const ONE_HIT_SEARCH: &str = r#"{"count":1,"offset":0,"releases":[{"id":"76df3287-6cda-33eb-8e9a-044b5e15ffdd","title":"Abbey Road","artist-credit":[{"name":"The Beatles","joinphrase":""}]}]}"#;
 
@@ -1928,25 +1942,27 @@ mod tests {
     }
 
     #[test]
-    fn term_queries_require_every_escaped_word() {
+    fn term_queries_use_bare_escaped_words() {
         assert_eq!(
             terms_field("release", "  Abbey Road (Remastered) "),
-            "release:(Abbey AND Road AND \\(Remastered\\))"
+            "release:(Abbey Road \\(Remastered\\))"
         );
         // Lucene only treats upper-case words as operators.
         assert_eq!(
             terms_field("artist", "This AND That"),
-            "artist:(This AND and AND That)"
+            "artist:(This and That)"
         );
     }
 
     #[tokio::test]
     async fn loosens_title_artist_search_once_when_the_exact_phrase_finds_nothing() {
+        // The remote title is "Abbey Road", which lacks the local "Remastered":
+        // only a query that does not require every word can find it.
         let server = MockServer::start(|target| {
-            let body = if query_param(target).contains("release:\"") {
-                EMPTY_SEARCH
-            } else {
+            let body = if query_param(target) == LOOSENED_QUERY {
                 ONE_HIT_SEARCH
+            } else {
+                EMPTY_SEARCH
             };
             (200, Vec::new(), body.to_string())
         });
@@ -1969,13 +1985,55 @@ mod tests {
             queries,
             vec![
                 "release:\"Abbey Road Remastered\" AND artist:\"The Beatles\"".to_string(),
-                "release:(Abbey AND Road AND Remastered) AND artist:(The AND Beatles)".to_string(),
+                LOOSENED_QUERY.to_string(),
             ]
         );
 
         // The loosened result is cached under the original request.
         adapter.search(request).await.unwrap();
         assert_eq!(server.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn does_not_loosen_when_every_field_is_a_single_word() {
+        let server = MockServer::start(|_| (200, Vec::new(), EMPTY_SEARCH.to_string()));
+        let adapter = MusicBrainzAdapter::with_config(config(&server)).unwrap();
+
+        adapter.search(search_request("Blue")).await.unwrap();
+        assert_eq!(server.request_count(), 1);
+
+        let with_artist = SearchRequest {
+            strategy: SearchStrategy::TitleArtist {
+                title: "Blue".to_string(),
+                artist: Some("Madonna".to_string()),
+                release_group: None,
+            },
+            offset: 0,
+            limit: 50,
+        };
+        adapter.search(with_artist).await.unwrap();
+        assert_eq!(server.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn identical_built_queries_share_one_cached_search() {
+        let server = MockServer::start(|_| (200, Vec::new(), ONE_HIT_SEARCH.to_string()));
+        let adapter = MusicBrainzAdapter::with_config(config(&server)).unwrap();
+        let group: Mbid = "4642ee19-7790-3c8d-ab5e-d133de942db6".parse().unwrap();
+        let request = |artist: Option<&str>| SearchRequest {
+            strategy: SearchStrategy::TitleArtist {
+                title: "Blue".to_string(),
+                artist: artist.map(str::to_string),
+                release_group: Some(group),
+            },
+            offset: 0,
+            limit: 50,
+        };
+
+        // "title and artist" and "title only" both reduce to `rgid:"…"`.
+        adapter.search(request(Some("Test Artist"))).await.unwrap();
+        adapter.search(request(None)).await.unwrap();
+        assert_eq!(server.request_count(), 1);
     }
 
     #[tokio::test]
@@ -2001,6 +2059,25 @@ mod tests {
         let page = adapter.search(barcode).await.unwrap();
         assert!(page.hits.is_empty());
         assert_eq!(server.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn exhausted_body_failures_start_the_outage_cooldown() {
+        let (url, attempts) = start_truncating_server(String::new(), usize::MAX);
+        let adapter = MusicBrainzAdapter::with_config(MusicBrainzConfig {
+            base_url: Url::parse(&url).unwrap(),
+            min_interval: Duration::ZERO,
+            request_timeout: Duration::from_secs(5),
+            max_attempts: 1,
+        })
+        .unwrap();
+
+        let error = adapter.fetch_release(release_id()).await.unwrap_err();
+        assert!(matches!(error, ProviderError::Network { .. }), "{error}");
+        assert_eq!(*attempts.lock().unwrap(), 1);
+        tokio::time::pause();
+        expect_cooldown(adapter.fetch_release(release_id())).await;
+        assert_eq!(*attempts.lock().unwrap(), 1);
     }
 
     #[test]
