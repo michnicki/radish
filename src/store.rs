@@ -4277,21 +4277,18 @@ mod tests {
 
     #[tokio::test]
     async fn remove_tracks_under_refuses_volume_roots() {
+        for root in ["/", ""] {
+            assert_eq!(scope_param(Path::new(root)), None, "{root:?}");
+        }
         for root in [
-            "/",
-            "",
             r"C:\",
             "c:",
             "//server/share",
             r"\\server\share\",
             "//server",
         ] {
-            assert!(
-                is_volume_root(&scope_param(Path::new(root)).unwrap_or_default())
-                    || root.is_empty()
-                    || root == "/",
-                "{root:?}"
-            );
+            let normalized = scope_param(Path::new(root)).unwrap();
+            assert!(is_volume_root(&normalized), "{root:?}");
         }
         for root in ["C:/Music", "//server/share/music", "/music", "/m"] {
             assert!(!is_volume_root(root), "{root:?}");
