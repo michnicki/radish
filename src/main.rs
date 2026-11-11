@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use radish::output::Clean;
+use radish::output::{Clean, clean_path};
 use radish::progress::ImportProgress;
 use radish::providers::{ProviderKind, ReleaseId};
 use radish::{db, importer, outln, runner, store, watcher};
@@ -144,13 +144,38 @@ fn load_dotenv() {
     }
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
     // Set process configuration before Tokio starts any worker threads.
     load_dotenv();
-    tokio::runtime::Builder::new_multi_thread()
+    let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(run())
+        .build()
+        .map_err(anyhow::Error::from)
+        .and_then(|runtime| runtime.block_on(run()));
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            report_error(&error);
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Prints an error and its causes like `anyhow` does, but with every line
+/// escaped: error contexts can carry file names, which are untrusted.
+fn report_error(error: &anyhow::Error) {
+    eprintln!("Error: {}", Clean(&error.to_string()));
+    let causes: Vec<String> = error.chain().skip(1).map(ToString::to_string).collect();
+    if !causes.is_empty() {
+        eprintln!("\nCaused by:");
+        for (index, cause) in causes.iter().enumerate() {
+            if causes.len() == 1 {
+                eprintln!("    {}", Clean(cause));
+            } else {
+                eprintln!("    {index}: {}", Clean(cause));
+            }
+        }
+    }
 }
 
 async fn run() -> Result<()> {
@@ -264,7 +289,7 @@ fn canonical_scope(path: Option<&Path>) -> Result<Option<PathBuf>> {
     match path {
         Some(path) => {
             Ok(Some(path.canonicalize().with_context(|| {
-                format!("cannot resolve {}", path.display())
+                format!("cannot resolve {}", clean_path(path))
             })?))
         }
         None => Ok(None),
@@ -362,7 +387,7 @@ fn format_duration(secs: Option<f64>) -> String {
 
 async fn run_import(pool: &sqlx::SqlitePool, path: &std::path::Path) -> Result<PathBuf> {
     let path = path.canonicalize()?;
-    outln!("Scanning {}...", path.display());
+    outln!("Scanning {}...", clean_path(&path));
 
     let progress = ImportProgress::new();
     let summary = importer::sync_directory(pool, &path, &progress).await?;

@@ -1,3 +1,4 @@
+use crate::output::{Clean, clean_path};
 use crate::providers::Mbid;
 use anyhow::{Context, Result};
 use lofty::file::{AudioFile, TaggedFileExt};
@@ -206,7 +207,7 @@ pub fn eprint_warning(event: ScanEvent) {
         | ScanEvent::FileFinished {
             warning: Some(message),
             ..
-        } => eprintln!("{message}"),
+        } => eprintln!("{}", Clean(&message)),
         ScanEvent::Discovering | ScanEvent::Discovered { .. } | ScanEvent::FileFinished { .. } => {}
     }
 }
@@ -281,8 +282,10 @@ pub async fn scan_directory_incremental(
                 }
                 // walkdir's own text repeats the path for I/O errors, so show only the cause.
                 let message = match io_error {
-                    Some(io_error) => format!("warning: skipped {}: {io_error}", path.display()),
-                    None => format!("warning: skipped {}: {err}", path.display()),
+                    Some(io_error) => {
+                        format!("warning: skipped {}: {io_error}", clean_path(path))
+                    }
+                    None => format!("warning: skipped {}: {err}", clean_path(path)),
                 };
                 on_progress(ScanEvent::Warning { message });
             }
@@ -310,7 +313,7 @@ pub async fn scan_directory_incremental(
     run_bounded(
         to_read,
         read_limit(),
-        |path| read_tags(path).with_context(|| path.display().to_string()),
+        |path| read_tags(path).with_context(|| clean_path(path)),
         |path, outcome| {
             let warning = match outcome {
                 Ok(Ok(track)) => {
@@ -325,7 +328,7 @@ pub async fn scan_directory_incremental(
                     result.unreadable.push(path.to_path_buf());
                     Some(format!(
                         "warning: scan task panicked: {}: {err}",
-                        path.display()
+                        clean_path(path)
                     ))
                 }
             };

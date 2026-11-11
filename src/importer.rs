@@ -1,6 +1,7 @@
 //! The one import pipeline, shared by `radish import` and the watcher's
 //! initial sync.
 
+use crate::output::clean_path;
 use crate::progress::ImportProgress;
 use crate::scanner::{ScanEvent, ScanResult};
 use crate::{outln, scanner, store};
@@ -96,7 +97,7 @@ pub(crate) async fn sync_files(
 ) -> Result<ImportSummary> {
     // A missing directory would otherwise look like every file was deleted.
     if !tokio::fs::metadata(dir).await?.is_dir() {
-        bail!("{} is not a directory", dir.display());
+        bail!("{} is not a directory", clean_path(dir));
     }
     let known = store::known_tracks(pool, dir).await?;
     let ScanResult {
@@ -121,7 +122,7 @@ pub(crate) async fn sync_files(
     if tracks.is_empty() && unchanged.is_empty() && unreadable.is_empty() && !known.is_empty() {
         let message = format!(
             "warning: no audio files found under {}; keeping {} stored tracks (is the volume mounted?)",
-            dir.display(),
+            clean_path(dir),
             known.len()
         );
         emit(progress, ScanEvent::Warning { message });
