@@ -1,5 +1,9 @@
-use crate::matcher::{self, ArtistKind, Candidate, LocalRelease, LocalTrack, Mapping};
-use crate::scanner::ScannedTrack;
+use crate::matcher::{
+    self, ArtistKind, Candidate, EmbeddedReleaseEvidence, LocalRelease, LocalTrack, Mapping,
+    RemoteRelease, RemoteTrack,
+};
+use crate::providers::{GroupId, Mbid, ProviderKind, ReleaseId};
+use crate::scanner::{ObservedMusicBrainzIds, ScannedTrack};
 use anyhow::{Result, bail};
 use sqlx::SqlitePool;
 use std::collections::{BTreeMap, HashMap};
@@ -8,6 +12,9 @@ use std::path::Path;
 pub const STATUS_UNMATCHED: &str = "unmatched";
 pub const STATUS_MATCHED: &str = "matched";
 pub const STATUS_STALE: &str = "stale";
+
+/// Version stamped on new snapshots. Version 1 is the historical Discogs shape.
+pub const SNAPSHOT_VERSION: i64 = 2;
 
 // ---------------------------------------------------------------------------
 // Scanned-metadata storage
@@ -45,7 +52,7 @@ pub async fn upsert_album(
     Ok(id)
 }
 
-/// Writes observed tag metadata. Accepted Discogs metadata lives in separate
+/// Writes observed tag metadata. Accepted provider metadata lives in separate
 /// tables and is never touched here, so re-importing keeps an accepted match.
 pub async fn upsert_track(
     pool: &SqlitePool,
@@ -59,13 +66,15 @@ pub async fn upsert_track(
         _ => None,
     };
 
+    let musicbrainz_json = serde_json::to_string(&track.musicbrainz)?;
     let path_str = track.path.to_string_lossy().to_string();
     sqlx::query(
         "INSERT INTO tracks (
             path, title, artist, album_id, directory_id, track_number, duration_secs, modified_at,
-            album_artist, disc_number, barcode, catalog_number, discogs_release_id
+            album_artist, disc_number, barcode, catalog_number, discogs_release_id,
+            musicbrainz_ids_json
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT(path) DO UPDATE SET
             title = excluded.title,
             artist = excluded.artist,
@@ -78,7 +87,8 @@ pub async fn upsert_track(
             disc_number = excluded.disc_number,
             barcode = excluded.barcode,
             catalog_number = excluded.catalog_number,
-            discogs_release_id = excluded.discogs_release_id",
+            discogs_release_id = excluded.discogs_release_id,
+            musicbrainz_ids_json = excluded.musicbrainz_ids_json",
     )
     .bind(&path_str)
     .bind(&track.title)
@@ -93,6 +103,7 @@ pub async fn upsert_track(
     .bind(&track.barcode)
     .bind(&track.catalog_number)
     .bind(track.discogs_release_id)
+    .bind(musicbrainz_json)
     .execute(pool)
     .await?;
 
@@ -106,6 +117,127 @@ pub async fn remove_track_by_path(pool: &SqlitePool, path: &Path) -> Result<()> 
         .execute(pool)
         .await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Observed identifier helpers
+// ---------------------------------------------------------------------------
+
+fn split_ids(values: &[String]) -> (Vec<Mbid>, Vec<String>) {
+    let mut valid: Vec<Mbid> = Vec::new();
+    let mut invalid: Vec<String> = Vec::new();
+    for value in values {
+        match value.parse::<Mbid>() {
+            Ok(id) => valid.push(id),
+            Err(_) => invalid.push(value.clone()),
+        }
+    }
+    valid.sort();
+    valid.dedup();
+    invalid.sort();
+    invalid.dedup();
+    (valid, invalid)
+}
+
+/// One valid observed identifier, or an explicit problem. Never silently drops
+/// a conflicting value.
+fn single_identifier(values: &[String], label: &str, path: &str) -> (Option<Mbid>, Vec<String>) {
+    let (valid, invalid) = split_ids(values);
+    let mut problems = Vec::new();
+    if !invalid.is_empty() {
+        problems.push(format!(
+            "file '{path}' carries invalid {label} value(s): {}",
+            invalid.join(", ")
+        ));
+    }
+    if valid.len() > 1 {
+        problems.push(format!(
+            "file '{path}' carries {} different {label} values",
+            valid.len()
+        ));
+    }
+    let id = if valid.len() == 1 && invalid.is_empty() {
+        Some(valid[0])
+    } else {
+        None
+    };
+    (id, problems)
+}
+
+/// Release-level evidence from every member file.
+///
+/// A release ID must be the single valid value on every member. A group ID may
+/// narrow search with partial coverage, but never establishes an edition.
+fn release_musicbrainz_evidence(
+    members: &[&ObservedTrack],
+) -> (Option<Mbid>, Option<Mbid>, Vec<String>) {
+    let mut problems = Vec::new();
+    let mut per_file_release: Vec<Vec<Mbid>> = Vec::new();
+    let mut any_release_observation = false;
+    let mut group_values: Vec<Mbid> = Vec::new();
+    let mut group_invalid: Vec<String> = Vec::new();
+
+    for track in members {
+        let ids = track.musicbrainz();
+        let (valid, invalid) = split_ids(&ids.release);
+        if !valid.is_empty() || !invalid.is_empty() {
+            any_release_observation = true;
+        }
+        if !invalid.is_empty() {
+            problems.push(format!(
+                "file '{}' carries invalid MusicBrainz release ID value(s): {}",
+                track.path,
+                invalid.join(", ")
+            ));
+        }
+        per_file_release.push(valid);
+
+        let (group_valid, group_bad) = split_ids(&ids.release_group);
+        group_values.extend(group_valid);
+        group_invalid.extend(group_bad);
+    }
+
+    if !group_invalid.is_empty() {
+        group_invalid.sort();
+        group_invalid.dedup();
+        problems.push(format!(
+            "invalid MusicBrainz release-group ID value(s): {}",
+            group_invalid.join(", ")
+        ));
+    }
+
+    let release_id = if per_file_release.iter().all(|values| values.len() == 1) {
+        let first = per_file_release[0][0];
+        if per_file_release.iter().all(|values| values[0] == first) {
+            Some(first)
+        } else {
+            problems.push("local files disagree about the MusicBrainz release ID".to_string());
+            None
+        }
+    } else if any_release_observation {
+        problems
+            .push("not every file carries exactly one valid MusicBrainz release ID".to_string());
+        None
+    } else {
+        None
+    };
+
+    group_values.sort();
+    group_values.dedup();
+    let release_group_id = match group_values.len() {
+        0 => None,
+        1 => Some(group_values[0]),
+        _ => {
+            problems
+                .push("local files disagree about the MusicBrainz release-group ID".to_string());
+            None
+        }
+    };
+
+    problems.sort();
+    problems.dedup();
+
+    (release_id, release_group_id, problems)
 }
 
 // ---------------------------------------------------------------------------
@@ -127,6 +259,13 @@ pub struct ObservedTrack {
     pub barcode: Option<String>,
     pub catalog_number: Option<String>,
     pub discogs_release_id: Option<i64>,
+    pub musicbrainz_ids_json: String,
+}
+
+impl ObservedTrack {
+    pub fn musicbrainz(&self) -> ObservedMusicBrainzIds {
+        serde_json::from_str(&self.musicbrainz_ids_json).unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +279,9 @@ pub struct GroupedRelease {
     pub barcode: Option<String>,
     pub catalog_number: Option<String>,
     pub embedded_discogs_id: Option<u64>,
+    pub embedded_musicbrainz_release_id: Option<Mbid>,
+    pub embedded_musicbrainz_release_group_id: Option<Mbid>,
+    pub musicbrainz_problems: Vec<String>,
     pub is_compilation: bool,
     pub has_album_tag: bool,
     pub track_count: i64,
@@ -200,9 +342,11 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Deterministic revision over group membership and matching-relevant observed
-/// fields. Re-reading unchanged tags yields the same revision; adding, removing,
-/// or retagging a file changes it.
+/// Deterministic revision over group membership and every observed
+/// matching-relevant field, including the year and all four MusicBrainz
+/// identifier lists. Modification time and accepted overlay values are
+/// excluded. The `release-input-v2:` prefix makes the one-time revision
+/// upgrade explicit.
 fn revision_of(tracks: &[&ObservedTrack]) -> String {
     let mut rows: Vec<&ObservedTrack> = tracks.to_vec();
     rows.sort_by(|a, b| {
@@ -211,14 +355,16 @@ fn revision_of(tracks: &[&ObservedTrack]) -> String {
             .cmp(&b.path.to_ascii_lowercase())
     });
 
-    let mut payload = String::new();
+    let mut payload = String::from("release-input-v2:");
     for track in rows {
+        let ids = track.musicbrainz();
         let fields = [
             track.path.to_ascii_lowercase(),
             track.title.clone().unwrap_or_default(),
             track.artist.clone().unwrap_or_default(),
             track.album.clone().unwrap_or_default(),
             track.album_artist.clone().unwrap_or_default(),
+            track.year.map(|year| year.to_string()).unwrap_or_default(),
             track
                 .track_number
                 .map(|n| n.to_string())
@@ -234,12 +380,13 @@ fn revision_of(tracks: &[&ObservedTrack]) -> String {
                 .discogs_release_id
                 .map(|id| id.to_string())
                 .unwrap_or_default(),
+            serde_json::to_string(&ids).unwrap_or_default(),
         ];
         payload.push_str(&fields.join("\u{1f}"));
         payload.push('\u{1e}');
     }
 
-    format!("{:016x}", fnv1a64(payload.as_bytes()))
+    format!("release-input-v2:{:016x}", fnv1a64(payload.as_bytes()))
 }
 
 /// Groups observed tracks into local releases.
@@ -359,6 +506,12 @@ pub fn group_tracks(tracks: &[ObservedTrack]) -> Vec<GroupedRelease> {
             let embedded_discogs_id = consistent_value(embedded_values.iter().map(String::as_str))
                 .and_then(|value| value.parse::<u64>().ok());
 
+            let (
+                embedded_musicbrainz_release_id,
+                embedded_musicbrainz_release_group_id,
+                musicbrainz_problems,
+            ) = release_musicbrainz_evidence(&members);
+
             let revision = revision_of(&members);
             let has_album_tag = !album_title_norm.is_empty();
 
@@ -375,6 +528,9 @@ pub fn group_tracks(tracks: &[ObservedTrack]) -> Vec<GroupedRelease> {
                 barcode,
                 catalog_number,
                 embedded_discogs_id,
+                embedded_musicbrainz_release_id,
+                embedded_musicbrainz_release_group_id,
+                musicbrainz_problems,
                 is_compilation,
                 has_album_tag,
                 track_count: members.len() as i64,
@@ -391,7 +547,8 @@ async fn observed_tracks(pool: &SqlitePool, scope: Option<&Path>) -> Result<Vec<
                 a.title AS album, t.album_artist AS album_artist, a.year AS year,
                 t.track_number AS track_number, t.disc_number AS disc_number,
                 t.duration_secs AS duration_secs, t.barcode AS barcode,
-                t.catalog_number AS catalog_number, t.discogs_release_id AS discogs_release_id
+                t.catalog_number AS catalog_number, t.discogs_release_id AS discogs_release_id,
+                t.musicbrainz_ids_json AS musicbrainz_ids_json
          FROM tracks t
          LEFT JOIN albums a ON a.id = t.album_id
          ORDER BY t.path",
@@ -444,9 +601,10 @@ pub async fn rebuild_local_releases(pool: &SqlitePool, scope: Option<&Path>) -> 
             "INSERT INTO local_releases (
                 directory_path, album_title_norm, album_title, album_artist, artist_kind, year,
                 barcode, catalog_number, embedded_discogs_id, is_compilation, has_album_tag,
-                track_count, source_revision, status
+                track_count, source_revision, status, embedded_musicbrainz_release_id,
+                embedded_musicbrainz_release_group_id, musicbrainz_problems_json
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
              ON CONFLICT(directory_path, album_title_norm) DO UPDATE SET
                 album_title = excluded.album_title,
                 album_artist = excluded.album_artist,
@@ -459,6 +617,9 @@ pub async fn rebuild_local_releases(pool: &SqlitePool, scope: Option<&Path>) -> 
                 has_album_tag = excluded.has_album_tag,
                 track_count = excluded.track_count,
                 source_revision = excluded.source_revision,
+                embedded_musicbrainz_release_id = excluded.embedded_musicbrainz_release_id,
+                embedded_musicbrainz_release_group_id = excluded.embedded_musicbrainz_release_group_id,
+                musicbrainz_problems_json = excluded.musicbrainz_problems_json,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
                 status = CASE
                     WHEN local_releases.source_revision <> excluded.source_revision
@@ -483,6 +644,13 @@ pub async fn rebuild_local_releases(pool: &SqlitePool, scope: Option<&Path>) -> 
         .bind(&group.revision)
         // Existing status is preserved by the conflict branch above.
         .bind(STATUS_UNMATCHED)
+        .bind(group.embedded_musicbrainz_release_id.map(|id| id.to_string()))
+        .bind(
+            group
+                .embedded_musicbrainz_release_group_id
+                .map(|id| id.to_string()),
+        )
+        .bind(serde_json::to_string(&group.musicbrainz_problems)?)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -490,7 +658,7 @@ pub async fn rebuild_local_releases(pool: &SqlitePool, scope: Option<&Path>) -> 
             && previous_revision != &group.revision
         {
             sqlx::query(
-                "UPDATE discogs_matches SET stale = 1
+                "UPDATE release_matches SET stale = 1
                  WHERE local_release_id = ?1 AND stale = 0",
             )
             .bind(id)
@@ -536,6 +704,9 @@ struct LocalReleaseRow {
     barcode: Option<String>,
     catalog_number: Option<String>,
     embedded_discogs_id: Option<i64>,
+    embedded_musicbrainz_release_id: Option<String>,
+    embedded_musicbrainz_release_group_id: Option<String>,
+    musicbrainz_problems_json: String,
     is_compilation: bool,
     has_album_tag: bool,
     source_revision: String,
@@ -550,6 +721,40 @@ struct LocalTrackRow {
     track_number: Option<i64>,
     duration_secs: Option<f64>,
     local_release_id: i64,
+    musicbrainz_ids_json: String,
+}
+
+impl LocalTrackRow {
+    fn into_local_track(self) -> LocalTrack {
+        let ids: ObservedMusicBrainzIds =
+            serde_json::from_str(&self.musicbrainz_ids_json).unwrap_or_default();
+        let (release_track_id, mut problems) = single_identifier(
+            &ids.release_track,
+            "MusicBrainz release-track ID",
+            &self.path,
+        );
+        let (recording_id, recording_problems) =
+            single_identifier(&ids.recording, "MusicBrainz recording ID", &self.path);
+        problems.extend(recording_problems);
+        problems.sort();
+        problems.dedup();
+
+        LocalTrack {
+            id: self.id,
+            path: self.path,
+            title: self.title,
+            disc: self.disc_number,
+            track_number: self.track_number,
+            duration_secs: self.duration_secs,
+            release_track_id,
+            recording_id,
+            identifier_problems: problems,
+        }
+    }
+}
+
+fn parse_musicbrainz_problems(raw: &str) -> Vec<String> {
+    serde_json::from_str(raw).unwrap_or_default()
 }
 
 /// Loads persisted local releases (with their tracks) for matching.
@@ -559,8 +764,9 @@ pub async fn load_local_releases(
 ) -> Result<Vec<LocalRelease>> {
     let release_rows = sqlx::query_as::<_, LocalReleaseRow>(
         "SELECT id, directory_path, album_title, album_artist, artist_kind, year, barcode,
-                catalog_number, embedded_discogs_id, is_compilation, has_album_tag,
-                source_revision
+                catalog_number, embedded_discogs_id, embedded_musicbrainz_release_id,
+                embedded_musicbrainz_release_group_id, musicbrainz_problems_json,
+                is_compilation, has_album_tag, source_revision
          FROM local_releases
          ORDER BY directory_path, album_title_norm",
     )
@@ -568,7 +774,8 @@ pub async fn load_local_releases(
     .await?;
 
     let track_rows = sqlx::query_as::<_, LocalTrackRow>(
-        "SELECT id, path, title, disc_number, track_number, duration_secs, local_release_id
+        "SELECT id, path, title, disc_number, track_number, duration_secs, local_release_id,
+                musicbrainz_ids_json
          FROM tracks
          WHERE local_release_id IS NOT NULL
          ORDER BY path",
@@ -581,14 +788,7 @@ pub async fn load_local_releases(
         tracks_by_release
             .entry(row.local_release_id)
             .or_default()
-            .push(LocalTrack {
-                id: row.id,
-                path: row.path,
-                title: row.title,
-                disc: row.disc_number,
-                track_number: row.track_number,
-                duration_secs: row.duration_secs,
-            });
+            .push(row.into_local_track());
     }
 
     let mut releases = Vec::new();
@@ -616,6 +816,18 @@ pub async fn load_local_releases(
                 })
         });
 
+        let embedded_evidence = EmbeddedReleaseEvidence {
+            release_id: row
+                .embedded_musicbrainz_release_id
+                .as_deref()
+                .and_then(|value| value.parse::<Mbid>().ok()),
+            release_group_id: row
+                .embedded_musicbrainz_release_group_id
+                .as_deref()
+                .and_then(|value| value.parse::<Mbid>().ok()),
+            problems: parse_musicbrainz_problems(&row.musicbrainz_problems_json),
+        };
+
         releases.push(LocalRelease {
             id: row.id,
             directory: row.directory_path,
@@ -626,6 +838,7 @@ pub async fn load_local_releases(
             barcode: row.barcode,
             catalog_number: row.catalog_number,
             embedded_discogs_id: row.embedded_discogs_id.map(|id| id as u64),
+            embedded_evidence,
             is_compilation: row.is_compilation,
             has_album_tag: row.has_album_tag,
             revision: row.source_revision,
@@ -634,6 +847,21 @@ pub async fn load_local_releases(
     }
 
     Ok(releases)
+}
+
+/// Provider of every accepted overlay, keyed by local release.
+pub async fn accepted_matches_by_release(
+    pool: &SqlitePool,
+) -> Result<HashMap<i64, Option<ProviderKind>>> {
+    let rows = sqlx::query_as::<_, (i64, String)>(
+        "SELECT local_release_id, provider FROM release_matches",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, provider)| (id, ProviderKind::parse(&provider)))
+        .collect())
 }
 
 pub async fn status_by_id(pool: &SqlitePool) -> Result<HashMap<i64, String>> {
@@ -651,69 +879,85 @@ pub struct LocalReleaseStatus {
     pub album_artist: Option<String>,
     pub track_count: i64,
     pub status: String,
-    pub discogs_release_id: Option<i64>,
-    pub discogs_title: Option<String>,
-    pub queued: bool,
+    pub provider: Option<ProviderKind>,
+    pub remote_release_id: Option<String>,
+    pub remote_url: Option<String>,
+    pub remote_title: Option<String>,
+    pub stale: bool,
+    pub queued_providers: Vec<ProviderKind>,
+}
+
+impl LocalReleaseStatus {
+    pub fn queued(&self) -> bool {
+        !self.queued_providers.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct StatusRow {
+    id: i64,
+    directory_path: String,
+    album_title: Option<String>,
+    album_artist: Option<String>,
+    track_count: i64,
+    status: String,
+    provider: Option<String>,
+    remote_release_id: Option<String>,
+    remote_url: Option<String>,
+    remote_title: Option<String>,
+    stale: Option<i64>,
 }
 
 pub async fn list_local_releases(
     pool: &SqlitePool,
     scope: Option<&Path>,
 ) -> Result<Vec<LocalReleaseStatus>> {
-    let rows = sqlx::query_as::<
-        _,
-        (
-            i64,
-            String,
-            Option<String>,
-            Option<String>,
-            i64,
-            String,
-            Option<i64>,
-            Option<String>,
-            i64,
-        ),
-    >(
+    let rows = sqlx::query_as::<_, StatusRow>(
         "SELECT lr.id, lr.directory_path, lr.album_title, lr.album_artist, lr.track_count,
-                lr.status, m.discogs_release_id, m.title,
-                CASE WHEN r.id IS NULL THEN 0 ELSE 1 END AS queued
+                lr.status, m.provider AS provider, m.remote_release_id AS remote_release_id,
+                m.release_url AS remote_url, m.title AS remote_title, m.stale AS stale
          FROM local_releases lr
-         LEFT JOIN discogs_matches m ON m.local_release_id = lr.id
-         LEFT JOIN match_reviews r ON r.local_release_id = lr.id
+         LEFT JOIN release_matches m ON m.local_release_id = lr.id
          ORDER BY lr.directory_path, lr.album_title_norm",
     )
     .fetch_all(pool)
     .await?;
 
+    let queued = sqlx::query_as::<_, (i64, String)>(
+        "SELECT local_release_id, provider FROM match_reviews ORDER BY local_release_id, provider",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut queued_by_release: HashMap<i64, Vec<ProviderKind>> = HashMap::new();
+    for (local_release_id, provider) in queued {
+        if let Some(provider) = ProviderKind::parse(&provider) {
+            queued_by_release
+                .entry(local_release_id)
+                .or_default()
+                .push(provider);
+        }
+    }
+
     Ok(rows
         .into_iter()
         .filter(|row| match scope {
-            Some(scope) => path_within(&row.1, scope),
+            Some(scope) => path_within(&row.directory_path, scope),
             None => true,
         })
-        .map(
-            |(
-                id,
-                directory,
-                album_title,
-                album_artist,
-                track_count,
-                status,
-                discogs_release_id,
-                discogs_title,
-                queued,
-            )| LocalReleaseStatus {
-                id,
-                directory,
-                album_title,
-                album_artist,
-                track_count,
-                status,
-                discogs_release_id,
-                discogs_title,
-                queued: queued != 0,
-            },
-        )
+        .map(|row| LocalReleaseStatus {
+            id: row.id,
+            directory: row.directory_path,
+            album_title: row.album_title,
+            album_artist: row.album_artist,
+            track_count: row.track_count,
+            status: row.status,
+            provider: row.provider.as_deref().and_then(ProviderKind::parse),
+            remote_release_id: row.remote_release_id,
+            remote_url: row.remote_url,
+            remote_title: row.remote_title,
+            stale: row.stale.unwrap_or(0) != 0,
+            queued_providers: queued_by_release.remove(&row.id).unwrap_or_default(),
+        })
         .collect())
 }
 
@@ -736,15 +980,203 @@ impl AcceptanceMethod {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredCandidate {
-    pub release: matcher::RemoteRelease,
+    pub release: RemoteRelease,
     pub mapping: Mapping,
     pub score: matcher::ScoreBreakdown,
     pub auto_accept: bool,
     pub blockers: Vec<String>,
     pub warnings: Vec<String>,
     pub evidence: Vec<String>,
+}
+
+/// Immutable inputs an acceptance decision was based on. Reloading them inside
+/// the transaction prevents a stale review from replacing another decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchGuard {
+    pub source_revision: String,
+    pub accepted_match_id: Option<i64>,
+}
+
+pub async fn load_match_guard(pool: &SqlitePool, local_id: i64) -> Result<MatchGuard> {
+    let revision: Option<String> =
+        sqlx::query_scalar("SELECT source_revision FROM local_releases WHERE id = ?1")
+            .bind(local_id)
+            .fetch_optional(pool)
+            .await?;
+    let Some(source_revision) = revision else {
+        bail!("local release {local_id} no longer exists");
+    };
+    let accepted_match_id: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM release_matches WHERE local_release_id = ?1")
+            .bind(local_id)
+            .fetch_optional(pool)
+            .await?;
+
+    Ok(MatchGuard {
+        source_revision,
+        accepted_match_id,
+    })
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct LegacyRemoteTrack {
+    #[serde(default)]
+    position: Option<String>,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    artists: Vec<String>,
+    #[serde(default)]
+    duration_secs: Option<f64>,
+    #[serde(default = "default_entry_type")]
+    entry_type: matcher::TrackEntryType,
+}
+
+fn default_entry_type() -> matcher::TrackEntryType {
+    matcher::TrackEntryType::Track
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct LegacyRemoteRelease {
+    id: u64,
+    #[serde(default)]
+    master_id: Option<u64>,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    artists: Vec<String>,
+    #[serde(default)]
+    year: Option<i64>,
+    #[serde(default)]
+    country: Option<String>,
+    #[serde(default)]
+    labels: Vec<String>,
+    #[serde(default)]
+    catalog_numbers: Vec<String>,
+    #[serde(default)]
+    formats: Vec<String>,
+    #[serde(default)]
+    barcodes: Vec<String>,
+    #[serde(default)]
+    tracklist: Vec<LegacyRemoteTrack>,
+    #[serde(default)]
+    url: String,
+}
+
+impl From<LegacyRemoteRelease> for RemoteRelease {
+    fn from(legacy: LegacyRemoteRelease) -> Self {
+        Self {
+            id: ReleaseId::Discogs(legacy.id),
+            group_id: legacy.master_id.map(GroupId::DiscogsMaster),
+            title: legacy.title,
+            artists: legacy.artists,
+            year: legacy.year,
+            country: legacy.country,
+            labels: legacy.labels,
+            catalog_numbers: legacy.catalog_numbers,
+            formats: legacy.formats,
+            barcodes: legacy.barcodes,
+            tracklist: legacy
+                .tracklist
+                .into_iter()
+                .map(|track| RemoteTrack {
+                    position: track.position,
+                    title: track.title,
+                    artists: track.artists,
+                    duration_secs: track.duration_secs,
+                    entry_type: track.entry_type,
+                    medium_position: None,
+                    track_position: None,
+                    release_track_id: None,
+                    recording_id: None,
+                    artist_credit: None,
+                })
+                .collect(),
+            url: legacy.url,
+            lookup_aliases: Vec::new(),
+            artist_credit: None,
+            structure_issues: Vec::new(),
+            edition_notes: Vec::new(),
+            provider_metadata: serde_json::Value::Null,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct LegacyStoredCandidate {
+    release: LegacyRemoteRelease,
+    mapping: Mapping,
+    score: matcher::ScoreBreakdown,
+    #[serde(default)]
+    auto_accept: bool,
+    #[serde(default)]
+    blockers: Vec<String>,
+    #[serde(default)]
+    warnings: Vec<String>,
+    #[serde(default)]
+    evidence: Vec<String>,
+}
+
+/// Decodes a stored release snapshot. Version 1 is the historical numeric
+/// Discogs shape; version 2 is provider-qualified.
+pub fn decode_release_snapshot(
+    version: i64,
+    provider: ProviderKind,
+    json: &str,
+) -> Result<RemoteRelease> {
+    match version {
+        1 => {
+            if provider != ProviderKind::Discogs {
+                bail!("snapshot version 1 is only valid for Discogs rows");
+            }
+            let legacy: LegacyRemoteRelease = serde_json::from_str(json)?;
+            Ok(legacy.into())
+        }
+        2 => {
+            let release: RemoteRelease = serde_json::from_str(json)?;
+            if release.provider() != provider {
+                bail!(
+                    "snapshot says {} but the row is {}",
+                    release.provider(),
+                    provider
+                );
+            }
+            Ok(release)
+        }
+        other => bail!("unknown snapshot version {other}"),
+    }
+}
+
+/// Decodes a stored review candidate list, including version-1 Discogs rows.
+pub fn decode_stored_candidates(
+    version: i64,
+    provider: ProviderKind,
+    json: &str,
+) -> Result<Vec<StoredCandidate>> {
+    match version {
+        1 => {
+            if provider != ProviderKind::Discogs {
+                bail!("review version 1 is only valid for Discogs rows");
+            }
+            let legacy: Vec<LegacyStoredCandidate> = serde_json::from_str(json)?;
+            Ok(legacy
+                .into_iter()
+                .map(|candidate| StoredCandidate {
+                    release: candidate.release.into(),
+                    mapping: candidate.mapping,
+                    score: candidate.score,
+                    auto_accept: candidate.auto_accept,
+                    blockers: candidate.blockers,
+                    warnings: candidate.warnings,
+                    evidence: candidate.evidence,
+                })
+                .collect())
+        }
+        2 => Ok(serde_json::from_str(json)?),
+        other => bail!("unknown review snapshot version {other}"),
+    }
 }
 
 /// Remote values that are missing stay absent so the overlay falls back to the
@@ -765,26 +1197,38 @@ pub async fn accept_match(
     local_release_id: i64,
     candidate: &Candidate,
     method: AcceptanceMethod,
-    expected_revision: &str,
+    guard: &MatchGuard,
 ) -> Result<()> {
     if !candidate.mapping.complete {
         bail!("refusing to accept an incomplete track mapping");
     }
+    if candidate.release.has_unsupported_entries() {
+        bail!("refusing to accept a release with unsupported structure");
+    }
 
     let mut tx = pool.begin().await?;
 
-    let current: Option<String> =
-        sqlx::query_scalar("SELECT source_revision FROM local_releases WHERE id = ?1")
-            .bind(local_release_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+    let current: Option<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT lr.source_revision,
+                (SELECT id FROM release_matches m WHERE m.local_release_id = lr.id)
+         FROM local_releases lr WHERE lr.id = ?1",
+    )
+    .bind(local_release_id)
+    .fetch_optional(&mut *tx)
+    .await?;
 
-    let Some(current_revision) = current else {
+    let Some((current_revision, current_match_id)) = current else {
         bail!("local release {local_release_id} no longer exists");
     };
-    if current_revision != expected_revision {
+    if current_revision != guard.source_revision {
         bail!(
-            "local release {local_release_id} changed since it was evaluated (revision {current_revision} != {expected_revision})"
+            "local release {local_release_id} changed since it was evaluated (revision {current_revision} != {})",
+            guard.source_revision
+        );
+    }
+    if current_match_id != guard.accepted_match_id {
+        bail!(
+            "local release {local_release_id} was accepted by another decision while this one was pending"
         );
     }
 
@@ -795,32 +1239,36 @@ pub async fn accept_match(
     seen_ordinals.sort_unstable();
     seen_ordinals.dedup();
     if seen_ordinals.len() != candidate.mapping.assigned_count() {
-        bail!("refusing to accept a mapping that assigns one Discogs track twice");
+        bail!("refusing to accept a mapping that assigns one remote track twice");
     }
 
-    let metadata_json = serde_json::to_string(&candidate.release)?;
     let remote = &candidate.release;
+    let provider = remote.provider();
+    let metadata_json = serde_json::to_string(remote)?;
 
-    sqlx::query("DELETE FROM discogs_matches WHERE local_release_id = ?1")
+    sqlx::query("DELETE FROM release_matches WHERE local_release_id = ?1")
         .bind(local_release_id)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM discogs_track_matches WHERE local_release_id = ?1")
+    sqlx::query("DELETE FROM match_reviews WHERE local_release_id = ?1")
         .bind(local_release_id)
         .execute(&mut *tx)
         .await?;
 
-    sqlx::query(
-        "INSERT INTO discogs_matches (
-            local_release_id, discogs_release_id, discogs_master_id, release_url, title, artist,
-            year, country, label, catalog_number, format, barcode, score, algorithm_version,
-            acceptance_method, source_revision, stale, metadata_json
+    let match_id: i64 = sqlx::query_scalar(
+        "INSERT INTO release_matches (
+            local_release_id, provider, remote_release_id, remote_group_id, release_url, title,
+            artist, year, country, label, catalog_number, format, barcode, score,
+            algorithm_version, acceptance_method, source_revision, stale, snapshot_version,
+            metadata_json
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 0, ?17)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 0, ?18, ?19)
+         RETURNING id",
     )
     .bind(local_release_id)
-    .bind(remote.id as i64)
-    .bind(remote.master_id.map(|id| id as i64))
+    .bind(provider.as_str())
+    .bind(remote.id.storage_id())
+    .bind(remote.group_id.as_ref().map(GroupId::storage_id))
     .bind(&remote.url)
     .bind(non_empty(&remote.title))
     .bind(non_empty(&remote.artist_display()))
@@ -831,11 +1279,12 @@ pub async fn accept_match(
     .bind(remote.format_display())
     .bind(remote.barcodes.first())
     .bind(candidate.score.total)
-    .bind(matcher::ALGORITHM_VERSION)
+    .bind(matcher::algorithm_version(provider))
     .bind(method.as_str())
-    .bind(expected_revision)
+    .bind(&guard.source_revision)
+    .bind(SNAPSHOT_VERSION)
     .bind(&metadata_json)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
 
     let tracks = load_tracks_for_release(&mut tx, local_release_id).await?;
@@ -853,7 +1302,7 @@ pub async fn accept_match(
             bail!("mapping refers to a local track that is not part of the release");
         };
         let Some(remote_track) = remote.tracklist.get(remote_index) else {
-            bail!("mapping refers to a Discogs track that does not exist");
+            bail!("mapping refers to a remote track that does not exist");
         };
         let ordinal = ordinals
             .get(&remote_index)
@@ -862,23 +1311,28 @@ pub async fn accept_match(
         let track_artist = if remote_track.artists.is_empty() {
             remote.artist_display()
         } else {
-            remote_track.artists.join(", ")
+            remote_track.artist_display()
         };
 
         sqlx::query(
-            "INSERT INTO discogs_track_matches (
-                local_release_id, track_id, remote_ordinal, remote_position, remote_title,
-                remote_artist, remote_duration_secs
+            "INSERT INTO release_track_matches (
+                match_id, track_id, remote_ordinal, remote_position, remote_title,
+                remote_artist, remote_duration_secs, medium_position, track_position,
+                remote_track_id, remote_recording_id
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )
-        .bind(local_release_id)
+        .bind(match_id)
         .bind(local_track_id)
         .bind(ordinal)
         .bind(&remote_track.position)
         .bind(non_empty(&remote_track.title))
         .bind(non_empty(&track_artist))
         .bind(remote_track.duration_secs)
+        .bind(remote_track.medium_position.map(i64::from))
+        .bind(remote_track.track_position.map(i64::from))
+        .bind(remote_track.release_track_id.map(|id| id.to_string()))
+        .bind(remote_track.recording_id.map(|id| id.to_string()))
         .execute(&mut *tx)
         .await?;
     }
@@ -886,9 +1340,9 @@ pub async fn accept_match(
     // Files in the group must all participate in the accepted mapping.
     for track in &tracks {
         let mapped: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM discogs_track_matches WHERE local_release_id = ?1 AND track_id = ?2",
+            "SELECT COUNT(*) FROM release_track_matches WHERE match_id = ?1 AND track_id = ?2",
         )
-        .bind(local_release_id)
+        .bind(match_id)
         .bind(track.id)
         .fetch_one(&mut *tx)
         .await?;
@@ -906,11 +1360,6 @@ pub async fn accept_match(
     .execute(&mut *tx)
     .await?;
 
-    sqlx::query("DELETE FROM match_reviews WHERE local_release_id = ?1")
-        .bind(local_release_id)
-        .execute(&mut *tx)
-        .await?;
-
     tx.commit().await?;
 
     Ok(())
@@ -921,7 +1370,8 @@ async fn load_tracks_for_release(
     local_release_id: i64,
 ) -> Result<Vec<LocalTrack>> {
     let rows = sqlx::query_as::<_, LocalTrackRow>(
-        "SELECT id, path, title, disc_number, track_number, duration_secs, local_release_id
+        "SELECT id, path, title, disc_number, track_number, duration_secs, local_release_id,
+                musicbrainz_ids_json
          FROM tracks WHERE local_release_id = ?1
          ORDER BY path",
     )
@@ -931,32 +1381,22 @@ async fn load_tracks_for_release(
 
     Ok(rows
         .into_iter()
-        .map(|row| LocalTrack {
-            id: row.id,
-            path: row.path,
-            title: row.title,
-            disc: row.disc_number,
-            track_number: row.track_number,
-            duration_secs: row.duration_secs,
-        })
+        .map(LocalTrackRow::into_local_track)
         .collect())
 }
 
-/// Removes the accepted overlay and shows scanned metadata again.
+/// Removes the accepted overlay and all provider reviews, showing scanned
+/// metadata again. Never contacts a provider.
 pub async fn clear_match(pool: &SqlitePool, local_release_id: i64) -> Result<bool> {
     let mut tx = pool.begin().await?;
 
     let existing: Option<i64> =
-        sqlx::query_scalar("SELECT id FROM discogs_matches WHERE local_release_id = ?1")
+        sqlx::query_scalar("SELECT id FROM release_matches WHERE local_release_id = ?1")
             .bind(local_release_id)
             .fetch_optional(&mut *tx)
             .await?;
 
-    sqlx::query("DELETE FROM discogs_matches WHERE local_release_id = ?1")
-        .bind(local_release_id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM discogs_track_matches WHERE local_release_id = ?1")
+    sqlx::query("DELETE FROM release_matches WHERE local_release_id = ?1")
         .bind(local_release_id)
         .execute(&mut *tx)
         .await?;
@@ -978,11 +1418,15 @@ pub async fn clear_match(pool: &SqlitePool, local_release_id: i64) -> Result<boo
     Ok(existing.is_some())
 }
 
-/// Stores candidate summaries for later interactive review.
+/// Stores candidate summaries for later interactive review, one group per
+/// provider so a fallback group never overwrites the primary group.
+#[allow(clippy::too_many_arguments)]
 pub async fn queue_review(
     pool: &SqlitePool,
     local_release_id: i64,
+    provider: ProviderKind,
     source_revision: &str,
+    expected_match_id: Option<i64>,
     candidates: &[StoredCandidate],
     proposed_mapping: &Mapping,
     reasons: &[String],
@@ -993,10 +1437,13 @@ pub async fn queue_review(
 
     sqlx::query(
         "INSERT INTO match_reviews (
-            local_release_id, candidates_json, proposed_mapping_json, reasons_json, source_revision
+            local_release_id, provider, snapshot_version, expected_match_id, candidates_json,
+            proposed_mapping_json, reasons_json, source_revision
          )
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(local_release_id) DO UPDATE SET
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(local_release_id, provider) DO UPDATE SET
+            snapshot_version = excluded.snapshot_version,
+            expected_match_id = excluded.expected_match_id,
             candidates_json = excluded.candidates_json,
             proposed_mapping_json = excluded.proposed_mapping_json,
             reasons_json = excluded.reasons_json,
@@ -1004,6 +1451,9 @@ pub async fn queue_review(
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
     )
     .bind(local_release_id)
+    .bind(provider.as_str())
+    .bind(SNAPSHOT_VERSION)
+    .bind(expected_match_id)
     .bind(candidates_json)
     .bind(mapping_json)
     .bind(reasons_json)
@@ -1014,8 +1464,52 @@ pub async fn queue_review(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub struct StoredReview {
+    pub provider: ProviderKind,
+    pub snapshot_version: i64,
+    pub candidates: Vec<StoredCandidate>,
+    pub reasons: Vec<String>,
+    pub guard: MatchGuard,
+}
+
+pub async fn load_review(
+    pool: &SqlitePool,
+    local_id: i64,
+    provider: ProviderKind,
+) -> Result<Option<StoredReview>> {
+    let row: Option<(i64, Option<i64>, String, String, String)> = sqlx::query_as(
+        "SELECT snapshot_version, expected_match_id, candidates_json, reasons_json, source_revision
+         FROM match_reviews WHERE local_release_id = ?1 AND provider = ?2",
+    )
+    .bind(local_id)
+    .bind(provider.as_str())
+    .fetch_optional(pool)
+    .await?;
+
+    let Some((snapshot_version, expected_match_id, candidates_json, reasons_json, source_revision)) =
+        row
+    else {
+        return Ok(None);
+    };
+
+    let candidates = decode_stored_candidates(snapshot_version, provider, &candidates_json)?;
+    let reasons: Vec<String> = serde_json::from_str(&reasons_json).unwrap_or_default();
+
+    Ok(Some(StoredReview {
+        provider,
+        snapshot_version,
+        candidates,
+        reasons,
+        guard: MatchGuard {
+            source_revision,
+            accepted_match_id: expected_match_id,
+        },
+    }))
+}
+
 // ---------------------------------------------------------------------------
-// Effective metadata (accepted Discogs values with scanned fallback)
+// Effective metadata (accepted provider values with scanned fallback)
 // ---------------------------------------------------------------------------
 
 #[derive(sqlx::FromRow)]
@@ -1025,6 +1519,7 @@ pub struct TrackRow {
     pub artist: Option<String>,
     pub album: Option<String>,
     pub track_number: Option<i64>,
+    pub disc_number: Option<i64>,
     pub duration_secs: Option<f64>,
     pub stale: bool,
 }
@@ -1035,14 +1530,15 @@ pub async fn list_tracks(pool: &SqlitePool) -> Result<Vec<TrackRow>> {
                 COALESCE(tm.remote_title, t.title) AS title,
                 COALESCE(tm.remote_artist, t.artist) AS artist,
                 COALESCE(m.title, a.title) AS album,
-                COALESCE(tm.remote_ordinal, t.track_number) AS track_number,
+                COALESCE(tm.track_position, tm.remote_ordinal, t.track_number) AS track_number,
+                COALESCE(tm.medium_position, t.disc_number) AS disc_number,
                 t.duration_secs AS duration_secs,
                 (m.stale = 1) AS stale
          FROM tracks t
          LEFT JOIN albums a ON a.id = t.album_id
-         LEFT JOIN discogs_matches m ON m.local_release_id = t.local_release_id
-         LEFT JOIN discogs_track_matches tm ON tm.track_id = t.id
-         ORDER BY album, track_number, title",
+         LEFT JOIN release_matches m ON m.local_release_id = t.local_release_id
+         LEFT JOIN release_track_matches tm ON tm.track_id = t.id
+         ORDER BY album, disc_number, track_number, title",
     )
     .fetch_all(pool)
     .await?;
@@ -1056,17 +1552,18 @@ pub async fn search_tracks(pool: &SqlitePool, query: &str) -> Result<Vec<TrackRo
                 COALESCE(tm.remote_title, t.title) AS title,
                 COALESCE(tm.remote_artist, t.artist) AS artist,
                 COALESCE(m.title, a.title) AS album,
-                COALESCE(tm.remote_ordinal, t.track_number) AS track_number,
+                COALESCE(tm.track_position, tm.remote_ordinal, t.track_number) AS track_number,
+                COALESCE(tm.medium_position, t.disc_number) AS disc_number,
                 t.duration_secs AS duration_secs,
                 (m.stale = 1) AS stale
          FROM tracks t
          LEFT JOIN albums a ON a.id = t.album_id
-         LEFT JOIN discogs_matches m ON m.local_release_id = t.local_release_id
-         LEFT JOIN discogs_track_matches tm ON tm.track_id = t.id
+         LEFT JOIN release_matches m ON m.local_release_id = t.local_release_id
+         LEFT JOIN release_track_matches tm ON tm.track_id = t.id
          WHERE COALESCE(tm.remote_title, t.title) LIKE ?1 COLLATE NOCASE
             OR COALESCE(tm.remote_artist, t.artist) LIKE ?1 COLLATE NOCASE
             OR COALESCE(m.title, a.title) LIKE ?1 COLLATE NOCASE
-         ORDER BY album, track_number, title",
+         ORDER BY album, disc_number, track_number, title",
     )
     .bind(pattern)
     .fetch_all(pool)
@@ -1077,8 +1574,8 @@ pub async fn search_tracks(pool: &SqlitePool, query: &str) -> Result<Vec<TrackRo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matcher::{RemoteRelease, RemoteTrack, TrackEntryType};
-    use crate::scanner::{self, ScannedTrack};
+    use crate::matcher::{RemoteTrack, ScoreBreakdown, TrackEntryType};
+    use crate::scanner;
     use std::path::PathBuf;
 
     fn scanned(path: &str, album: Option<&str>, artist: Option<&str>, track: i64) -> ScannedTrack {
@@ -1094,6 +1591,7 @@ mod tests {
             barcode: None,
             catalog_number: None,
             discogs_release_id: None,
+            musicbrainz: ObservedMusicBrainzIds::default(),
             duration_secs: Some(180.0),
             modified_at: 1,
         }
@@ -1109,6 +1607,77 @@ mod tests {
             upsert_track(pool, track, directory_id).await.unwrap();
         }
         rebuild_local_releases(pool, None).await.unwrap();
+    }
+
+    fn mbid(value: &str) -> Mbid {
+        value.parse().unwrap()
+    }
+
+    fn remote_release() -> RemoteRelease {
+        RemoteRelease {
+            id: ReleaseId::Discogs(42),
+            group_id: None,
+            title: "Blue".to_string(),
+            artists: vec!["Artist".to_string()],
+            year: Some(2001),
+            country: Some("US".to_string()),
+            labels: vec!["Label".to_string()],
+            catalog_numbers: vec!["CAT-1".to_string()],
+            formats: vec!["CD".to_string()],
+            barcodes: vec!["0123456789012".to_string()],
+            tracklist: vec![RemoteTrack {
+                position: Some("1".to_string()),
+                title: "Remote Track 1".to_string(),
+                artists: Vec::new(),
+                duration_secs: Some(180.0),
+                entry_type: TrackEntryType::Track,
+                medium_position: None,
+                track_position: None,
+                release_track_id: None,
+                recording_id: None,
+                artist_credit: None,
+            }],
+            url: "https://www.discogs.com/release/42".to_string(),
+            lookup_aliases: Vec::new(),
+            artist_credit: None,
+            structure_issues: Vec::new(),
+            edition_notes: Vec::new(),
+            provider_metadata: serde_json::Value::Null,
+        }
+    }
+
+    fn musicbrainz_release() -> RemoteRelease {
+        let id = mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd");
+        RemoteRelease {
+            id: ReleaseId::MusicBrainz(id),
+            group_id: None,
+            title: "Blue".to_string(),
+            artists: vec!["Artist".to_string()],
+            year: Some(2001),
+            country: Some("US".to_string()),
+            labels: vec!["Label".to_string()],
+            catalog_numbers: vec!["CAT-1".to_string()],
+            formats: vec!["CD".to_string()],
+            barcodes: vec!["0123456789012".to_string()],
+            tracklist: vec![RemoteTrack {
+                position: Some("1".to_string()),
+                title: "MusicBrainz Track 1".to_string(),
+                artists: Vec::new(),
+                duration_secs: Some(180.0),
+                entry_type: TrackEntryType::Track,
+                medium_position: Some(1),
+                track_position: Some(1),
+                release_track_id: Some(mbid("11111111-1111-1111-1111-111111111111")),
+                recording_id: Some(mbid("22222222-2222-2222-2222-222222222222")),
+                artist_credit: Some("Artist".to_string()),
+            }],
+            url: format!("https://musicbrainz.org/release/{id}"),
+            lookup_aliases: Vec::new(),
+            artist_credit: Some("Artist".to_string()),
+            structure_issues: Vec::new(),
+            edition_notes: Vec::new(),
+            provider_metadata: serde_json::json!({ "schema_version": 1 }),
+        }
     }
 
     #[tokio::test]
@@ -1243,29 +1812,71 @@ mod tests {
             .revision
             .clone();
         assert_eq!(first, second);
+        assert!(first.starts_with("release-input-v2:"));
     }
 
-    fn remote_release() -> RemoteRelease {
-        RemoteRelease {
-            id: 42,
-            master_id: None,
-            title: "Blue".to_string(),
-            artists: vec!["Artist".to_string()],
-            year: Some(2001),
-            country: Some("US".to_string()),
-            labels: vec!["Label".to_string()],
-            catalog_numbers: vec!["CAT-1".to_string()],
-            formats: vec!["CD".to_string()],
-            barcodes: vec!["0123456789012".to_string()],
-            tracklist: vec![RemoteTrack {
-                position: Some("1".to_string()),
-                title: "Discogs Track 1".to_string(),
-                artists: Vec::new(),
-                duration_secs: Some(180.0),
-                entry_type: TrackEntryType::Track,
-            }],
-            url: "https://www.discogs.com/release/42".to_string(),
-        }
+    #[tokio::test]
+    async fn revision_changes_with_the_year_and_identifier_evidence() {
+        let pool = test_pool().await;
+        insert(
+            &pool,
+            "/music/a",
+            &[scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1)],
+        )
+        .await;
+        let first = load_local_releases(&pool, None).await.unwrap()[0]
+            .revision
+            .clone();
+
+        let mut retagged = scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1);
+        retagged.year = Some(2002);
+        retagged.musicbrainz.recording = vec!["76df3287-6cda-33eb-8e9a-044b5e15ffdd".to_string()];
+        insert(&pool, "/music/a", &[retagged]).await;
+
+        let second = load_local_releases(&pool, None).await.unwrap()[0]
+            .revision
+            .clone();
+        assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn consistent_release_ids_become_release_evidence() {
+        let pool = test_pool().await;
+        let id = "76df3287-6cda-33eb-8e9a-044b5e15ffdd";
+        let mut first = scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1);
+        first.musicbrainz.release = vec![id.to_string()];
+        first.musicbrainz.recording = vec!["22222222-2222-2222-2222-222222222222".to_string()];
+        let mut second = scanned("/music/a/02.flac", Some("Blue"), Some("Artist"), 2);
+        second.musicbrainz.release = vec![id.to_string()];
+        insert(&pool, "/music/a", &[first, second]).await;
+
+        let release = load_local_releases(&pool, None).await.unwrap().remove(0);
+        assert_eq!(release.embedded_evidence.release_id, Some(mbid(id)));
+        assert!(release.embedded_evidence.problems.is_empty());
+        assert_eq!(
+            release.tracks[0].recording_id,
+            Some(mbid("22222222-2222-2222-2222-222222222222"))
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicting_release_ids_are_reported_never_silently_dropped() {
+        let pool = test_pool().await;
+        let mut first = scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1);
+        first.musicbrainz.release = vec!["76df3287-6cda-33eb-8e9a-044b5e15ffdd".to_string()];
+        let mut second = scanned("/music/a/02.flac", Some("Blue"), Some("Artist"), 2);
+        second.musicbrainz.release = vec!["11111111-1111-1111-1111-111111111111".to_string()];
+        insert(&pool, "/music/a", &[first, second]).await;
+
+        let release = load_local_releases(&pool, None).await.unwrap().remove(0);
+        assert_eq!(release.embedded_evidence.release_id, None);
+        assert!(
+            release
+                .embedded_evidence
+                .problems
+                .iter()
+                .any(|problem| problem.contains("disagree"))
+        );
     }
 
     #[tokio::test]
@@ -1280,18 +1891,19 @@ mod tests {
 
         let release = load_local_releases(&pool, None).await.unwrap().remove(0);
         let candidate = Candidate::new(&release, remote_release());
+        let guard = load_match_guard(&pool, release.id).await.unwrap();
         accept_match(
             &pool,
             release.id,
             &candidate,
             AcceptanceMethod::Automatic,
-            &release.revision,
+            &guard,
         )
         .await
         .unwrap();
 
         let rows = list_tracks(&pool).await.unwrap();
-        assert_eq!(rows[0].title.as_deref(), Some("Discogs Track 1"));
+        assert_eq!(rows[0].title.as_deref(), Some("Remote Track 1"));
         assert!(!rows[0].stale);
 
         // Re-import with unchanged tags and rebuild grouping.
@@ -1301,18 +1913,18 @@ mod tests {
             &[scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1)],
         )
         .await;
-        let matches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM discogs_matches")
+        let matches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_matches")
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(matches, 1);
         let rows = list_tracks(&pool).await.unwrap();
-        assert_eq!(rows[0].title.as_deref(), Some("Discogs Track 1"));
+        assert_eq!(rows[0].title.as_deref(), Some("Remote Track 1"));
 
         assert!(clear_match(&pool, release.id).await.unwrap());
         let rows = list_tracks(&pool).await.unwrap();
         assert_eq!(rows[0].title.as_deref(), Some("Track 1"));
-        let matches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM discogs_matches")
+        let matches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_matches")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -1336,12 +1948,13 @@ mod tests {
         .await;
         let release = load_local_releases(&pool, None).await.unwrap().remove(0);
         let candidate = Candidate::new(&release, remote_release());
+        let guard = load_match_guard(&pool, release.id).await.unwrap();
         accept_match(
             &pool,
             release.id,
             &candidate,
             AcceptanceMethod::Manual,
-            &release.revision,
+            &guard,
         )
         .await
         .unwrap();
@@ -1369,6 +1982,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_guard_rejects_a_second_acceptance_without_changing_the_overlay() {
+        let pool = test_pool().await;
+        insert(
+            &pool,
+            "/music/a",
+            &[scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1)],
+        )
+        .await;
+        let release = load_local_releases(&pool, None).await.unwrap().remove(0);
+
+        let mut first_release = remote_release();
+        first_release.tracklist[0].title = "First".to_string();
+        let first = Candidate::new(&release, first_release);
+        let mut second_release = musicbrainz_release();
+        second_release.tracklist[0].title = "Second".to_string();
+        let second = Candidate::new(&release, second_release);
+
+        let before = list_tracks(&pool).await.unwrap();
+        let old_guard = load_match_guard(&pool, release.id).await.unwrap();
+        accept_match(
+            &pool,
+            release.id,
+            &first,
+            AcceptanceMethod::Manual,
+            &old_guard,
+        )
+        .await
+        .unwrap();
+        assert!(
+            accept_match(
+                &pool,
+                release.id,
+                &second,
+                AcceptanceMethod::Manual,
+                &old_guard
+            )
+            .await
+            .is_err()
+        );
+
+        let after = list_tracks(&pool).await.unwrap();
+        assert_eq!(
+            after[0].title,
+            Some(first.release.tracklist[0].title.clone())
+        );
+        assert_eq!(before[0].path, after[0].path);
+    }
+
+    #[tokio::test]
     async fn revision_change_during_review_rejects_application() {
         let pool = test_pool().await;
         insert(
@@ -1379,6 +2041,7 @@ mod tests {
         .await;
         let release = load_local_releases(&pool, None).await.unwrap().remove(0);
         let candidate = Candidate::new(&release, remote_release());
+        let guard = load_match_guard(&pool, release.id).await.unwrap();
 
         insert(
             &pool,
@@ -1395,13 +2058,13 @@ mod tests {
             release.id,
             &candidate,
             AcceptanceMethod::Manual,
-            &release.revision,
+            &guard,
         )
         .await
         .unwrap_err();
         assert!(error.to_string().contains("changed since it was evaluated"));
 
-        let matches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM discogs_matches")
+        let matches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_matches")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -1422,6 +2085,7 @@ mod tests {
         .await;
         let release = load_local_releases(&pool, None).await.unwrap().remove(0);
         let candidate = Candidate::new(&release, remote_release());
+        let guard = load_match_guard(&pool, release.id).await.unwrap();
         assert!(!candidate.mapping.complete);
 
         assert!(
@@ -1430,16 +2094,75 @@ mod tests {
                 release.id,
                 &candidate,
                 AcceptanceMethod::Manual,
-                &release.revision
+                &guard
             )
             .await
             .is_err()
         );
-        let matches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM discogs_track_matches")
+        let matches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_track_matches")
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(matches, 0);
+    }
+
+    #[tokio::test]
+    async fn accepted_musicbrainz_overlay_replaces_discogs_atomically() {
+        let pool = test_pool().await;
+        insert(
+            &pool,
+            "/music/a",
+            &[scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1)],
+        )
+        .await;
+        let release = load_local_releases(&pool, None).await.unwrap().remove(0);
+
+        let discogs = Candidate::new(&release, remote_release());
+        let guard = load_match_guard(&pool, release.id).await.unwrap();
+        accept_match(
+            &pool,
+            release.id,
+            &discogs,
+            AcceptanceMethod::Manual,
+            &guard,
+        )
+        .await
+        .unwrap();
+
+        let guard = load_match_guard(&pool, release.id).await.unwrap();
+        let musicbrainz = Candidate::new(&release, musicbrainz_release());
+        accept_match(
+            &pool,
+            release.id,
+            &musicbrainz,
+            AcceptanceMethod::Manual,
+            &guard,
+        )
+        .await
+        .unwrap();
+
+        let provider: String = sqlx::query_scalar("SELECT provider FROM release_matches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(provider, "musicbrainz");
+        let track: (Option<i64>, Option<i64>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT medium_position, track_position, remote_track_id, remote_recording_id
+             FROM release_track_matches",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(track.0, Some(1));
+        assert_eq!(track.1, Some(1));
+        assert_eq!(
+            track.2.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+        assert_eq!(
+            track.3.as_deref(),
+            Some("22222222-2222-2222-2222-222222222222")
+        );
     }
 
     #[tokio::test]
@@ -1453,18 +2176,19 @@ mod tests {
         .await;
         let release = load_local_releases(&pool, None).await.unwrap().remove(0);
         let candidate = Candidate::new(&release, remote_release());
+        let guard = load_match_guard(&pool, release.id).await.unwrap();
         accept_match(
             &pool,
             release.id,
             &candidate,
             AcceptanceMethod::Manual,
-            &release.revision,
+            &guard,
         )
         .await
         .unwrap();
 
         assert_eq!(
-            search_tracks(&pool, "Discogs Track 1").await.unwrap().len(),
+            search_tracks(&pool, "Remote Track 1").await.unwrap().len(),
             1
         );
         assert!(!search_tracks(&pool, "Blue").await.unwrap().is_empty());
@@ -1472,12 +2196,163 @@ mod tests {
 
         clear_match(&pool, release.id).await.unwrap();
         assert!(
-            search_tracks(&pool, "Discogs Track 1")
+            search_tracks(&pool, "Remote Track 1")
                 .await
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(search_tracks(&pool, "Track 1").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reviews_are_stored_per_provider_and_decode_offline() {
+        let pool = test_pool().await;
+        insert(
+            &pool,
+            "/music/a",
+            &[scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1)],
+        )
+        .await;
+        let release = load_local_releases(&pool, None).await.unwrap().remove(0);
+        let candidate = Candidate::new(&release, remote_release());
+        let stored = StoredCandidate {
+            release: candidate.release.clone(),
+            mapping: candidate.mapping.clone(),
+            score: candidate.score,
+            auto_accept: false,
+            blockers: vec!["review".to_string()],
+            warnings: Vec::new(),
+            evidence: Vec::new(),
+        };
+
+        queue_review(
+            &pool,
+            release.id,
+            ProviderKind::Discogs,
+            &release.revision,
+            None,
+            std::slice::from_ref(&stored),
+            &candidate.mapping,
+            &["primary uncertain".to_string()],
+        )
+        .await
+        .unwrap();
+        queue_review(
+            &pool,
+            release.id,
+            ProviderKind::MusicBrainz,
+            &release.revision,
+            None,
+            std::slice::from_ref(&stored),
+            &candidate.mapping,
+            &["fallback uncertain".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let queued = list_local_releases(&pool, None).await.unwrap();
+        assert_eq!(
+            queued[0].queued_providers,
+            vec![ProviderKind::Discogs, ProviderKind::MusicBrainz]
+        );
+
+        let review = load_review(&pool, release.id, ProviderKind::Discogs)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(review.snapshot_version, SNAPSHOT_VERSION);
+        assert_eq!(review.candidates.len(), 1);
+        assert_eq!(review.reasons, vec!["primary uncertain".to_string()]);
+        assert_eq!(review.guard.source_revision, release.revision);
+    }
+
+    #[test]
+    fn legacy_snapshots_decode_through_the_discogs_codec() {
+        let legacy = r#"{
+            "id": 42,
+            "master_id": 7,
+            "title": "Blue",
+            "artists": ["Artist"],
+            "year": 2001,
+            "country": "US",
+            "labels": ["Label"],
+            "catalog_numbers": ["CAT-1"],
+            "formats": ["CD"],
+            "barcodes": ["0123456789012"],
+            "tracklist": [
+                {"position": "1", "title": "One", "artists": [], "duration_secs": 180.0, "entry_type": "track"}
+            ],
+            "url": "https://www.discogs.com/release/42"
+        }"#;
+        let release = decode_release_snapshot(1, ProviderKind::Discogs, legacy).unwrap();
+        assert_eq!(release.id, ReleaseId::Discogs(42));
+        assert_eq!(release.group_id, Some(GroupId::DiscogsMaster(7)));
+        assert_eq!(release.tracklist[0].title, "One");
+        assert!(release.tracklist[0].release_track_id.is_none());
+        assert_eq!(release.provider_metadata, serde_json::Value::Null);
+        assert!(decode_release_snapshot(1, ProviderKind::MusicBrainz, legacy).is_err());
+    }
+
+    #[test]
+    fn round_trips_version_two_snapshots_and_rejects_mismatched_providers() {
+        let release = musicbrainz_release();
+        let json = serde_json::to_string(&release).unwrap();
+        let decoded = decode_release_snapshot(2, ProviderKind::MusicBrainz, &json).unwrap();
+        assert_eq!(decoded.id, release.id);
+        assert_eq!(
+            decoded.tracklist[0].release_track_id,
+            release.tracklist[0].release_track_id
+        );
+        assert!(decode_release_snapshot(2, ProviderKind::Discogs, &json).is_err());
+        assert!(decode_release_snapshot(9, ProviderKind::MusicBrainz, &json).is_err());
+    }
+
+    #[test]
+    fn legacy_candidates_decode_without_losing_scores() {
+        let legacy = r#"[{
+            "release": {
+                "id": 42,
+                "master_id": null,
+                "title": "Blue",
+                "artists": ["Artist"],
+                "year": 2001,
+                "country": "US",
+                "labels": [],
+                "catalog_numbers": [],
+                "formats": [],
+                "barcodes": [],
+                "tracklist": [],
+                "url": "https://www.discogs.com/release/42"
+            },
+            "mapping": {"pairs": [], "complete": false, "ambiguous": false, "notes": []},
+            "score": {"album_title": 1.0, "album_artist": 1.0, "track_titles": 0.0, "durations": 0.0, "year": 1.0, "total": 0.5},
+            "auto_accept": false,
+            "blockers": ["queue"],
+            "warnings": [],
+            "evidence": []
+        }]"#;
+        let candidates = decode_stored_candidates(1, ProviderKind::Discogs, legacy).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].release.id, ReleaseId::Discogs(42));
+        assert_eq!(
+            candidates[0].score,
+            ScoreBreakdown {
+                album_title: 1.0,
+                album_artist: 1.0,
+                track_titles: 0.0,
+                durations: 0.0,
+                year: 1.0,
+                total: 0.5,
+            }
+        );
+    }
+
+    #[test]
+    fn path_within_respects_component_boundaries() {
+        assert!(path_within("/music/Blue", Path::new("/music")));
+        assert!(path_within("/MUSIC/blue", Path::new("/music/")));
+        assert!(!path_within("/music/Bluegrass", Path::new("/music/Blue")));
+        assert!(!path_within("/other/Blue", Path::new("/music")));
     }
 
     fn write_wav(path: &Path) {
@@ -1519,12 +2394,13 @@ mod tests {
 
         let release = load_local_releases(&pool, None).await.unwrap().remove(0);
         let candidate = Candidate::new(&release, remote_release());
+        let guard = load_match_guard(&pool, release.id).await.unwrap();
         accept_match(
             &pool,
             release.id,
             &candidate,
             AcceptanceMethod::Manual,
-            &release.revision,
+            &guard,
         )
         .await
         .unwrap();
@@ -1537,13 +2413,5 @@ mod tests {
         assert_eq!(std::fs::read(&file).unwrap(), original);
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn path_within_respects_component_boundaries() {
-        assert!(path_within("/music/Blue", Path::new("/music")));
-        assert!(path_within("/MUSIC/blue", Path::new("/music/")));
-        assert!(!path_within("/music/Bluegrass", Path::new("/music/Blue")));
-        assert!(!path_within("/other/Blue", Path::new("/music")));
     }
 }
