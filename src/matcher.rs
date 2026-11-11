@@ -1976,6 +1976,31 @@ fn evaluate_at_scope(
     }
 }
 
+/// Primary score for judging whether a primary candidate is plausible enough
+/// to guard a fallback. Durations a release never published are unknown, not
+/// wrong, so they count as full agreement here; known mismatches still cost.
+fn plausibility_score(local: &LocalRelease, primary: &Candidate) -> f64 {
+    if local.tracks.is_empty() {
+        return primary.score.total;
+    }
+    let unknown = local
+        .tracks
+        .iter()
+        .enumerate()
+        .filter(|(index, track)| {
+            let remote_duration = primary
+                .mapping
+                .pairs
+                .get(*index)
+                .and_then(|pair| *pair)
+                .and_then(|remote_index| primary.release.tracklist.get(remote_index))
+                .and_then(|remote| remote.duration_secs);
+            track.duration_secs.is_none() || remote_duration.is_none()
+        })
+        .count();
+    primary.score.total + WEIGHT_DURATIONS * unknown as f64 / local.tracks.len() as f64
+}
+
 /// Cross-provider checks applied before automatic fallback acceptance.
 ///
 /// Scores, runner-up gaps, and mappings stay within one provider. This function
@@ -2013,7 +2038,9 @@ pub fn fallback_conflicts(
     }
 
     for primary in primary_candidates {
-        if !primary.mapping.complete || primary.score.total + 1e-9 < PLAUSIBLE_PRIMARY_SCORE {
+        if !primary.mapping.complete
+            || plausibility_score(local, primary) + 1e-9 < PLAUSIBLE_PRIMARY_SCORE
+        {
             continue;
         }
         let primary_qualifiers = remote_edition_qualifiers(&primary.release);
@@ -2826,6 +2853,28 @@ mod tests {
             conflicts
                 .iter()
                 .any(|conflict| conflict.contains("not resolved"))
+        );
+    }
+
+    #[test]
+    fn fallback_guard_treats_missing_primary_durations_as_neutral() {
+        let local = local_release(&["One", "Two", "Three", "Four"]);
+        let mut primary_release = remote_release(&["One", "Two", "Three", "Four"]);
+        primary_release.id = ReleaseId::MusicBrainz(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"));
+        primary_release.edition_notes = vec!["Live".to_string()];
+        for track in primary_release.tracklist.iter_mut().skip(2) {
+            track.duration_secs = None;
+        }
+        let primary = Candidate::new(&local, primary_release);
+        assert!(primary.score.total < PLAUSIBLE_PRIMARY_SCORE);
+
+        let fallback = Candidate::new(&local, remote_release(&["One", "Two", "Three", "Four"]));
+        let conflicts = fallback_conflicts(&local, &[primary], &fallback, true);
+        assert!(
+            conflicts
+                .iter()
+                .any(|conflict| conflict.contains("primary candidates describe")),
+            "{conflicts:?}"
         );
     }
 
