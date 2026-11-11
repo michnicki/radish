@@ -7,6 +7,10 @@
 //! conversion to the internal DTOs the matcher understands.
 
 use crate::matcher::{RemoteRelease, RemoteTrack, SearchSummary, TrackEntryType, parse_duration};
+use crate::providers::{
+    GroupId, MetadataProvider, ProviderError, ProviderKind, ReleaseId,
+    SearchPage as ProviderSearchPage, SearchRequest, SearchStrategy,
+};
 use discogger::{DiscogsClient, DiscogsError, PaginationParams, SearchParams, SearchType};
 use std::collections::HashMap;
 use std::fmt;
@@ -21,7 +25,7 @@ pub const BASE_URL_ENV: &str = "RADISH_DISCOGS_BASE_URL";
 /// Discogs search page size used for every strategy.
 pub const PER_PAGE: u32 = 50;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AdapterError {
     MissingToken,
     Auth(String),
@@ -29,6 +33,7 @@ pub enum AdapterError {
     Network(String),
     RateLimited(String),
     Malformed(String),
+    WrongProvider(String),
 }
 
 impl AdapterError {
@@ -48,6 +53,38 @@ impl fmt::Display for AdapterError {
             Self::Malformed(message) => {
                 write!(f, "Discogs returned an unusable response: {message}")
             }
+            Self::WrongProvider(message) => {
+                write!(f, "Discogs cannot serve this request: {message}")
+            }
+        }
+    }
+}
+
+impl From<AdapterError> for ProviderError {
+    fn from(error: AdapterError) -> Self {
+        let provider = ProviderKind::Discogs;
+        match error {
+            AdapterError::MissingToken => Self::Configuration {
+                provider,
+                message: format!("{TOKEN_ENV} is not set or empty"),
+            },
+            AdapterError::Auth(message) => Self::Authentication { provider, message },
+            AdapterError::NotFound(id) => Self::NotFound {
+                provider,
+                id: id.to_string(),
+            },
+            AdapterError::Network(message) => Self::Network { provider, message },
+            AdapterError::RateLimited(message) => Self::RateLimited {
+                provider,
+                message,
+                retry_after: None,
+            },
+            AdapterError::Malformed(message) => Self::Malformed { provider, message },
+            AdapterError::WrongProvider(message) => Self::Permanent {
+                provider,
+                status: None,
+                message,
+            },
         }
     }
 }
@@ -81,6 +118,7 @@ pub struct SearchPage {
     pub hits: Vec<SearchSummary>,
     pub page: u32,
     pub pages: u32,
+    pub total: Option<u64>,
 }
 
 impl SearchPage {
@@ -236,7 +274,7 @@ impl DiscogsAdapter {
     }
 
     /// Fetches a concrete release, deduplicating repeated requests in a run.
-    pub async fn fetch_release(&self, id: u64) -> Result<RemoteRelease, AdapterError> {
+    pub async fn fetch_discogs_release(&self, id: u64) -> Result<RemoteRelease, AdapterError> {
         if let Some(cached) = lock(&self.release_cache).get(&id) {
             return Ok(cached.clone());
         }
@@ -257,7 +295,7 @@ impl DiscogsAdapter {
 
     /// Searches concrete releases. Masters are never returned: accepted
     /// identities always reference concrete releases.
-    pub async fn search(
+    pub async fn search_params(
         &self,
         params: SearchParams,
         page: u32,
@@ -287,6 +325,7 @@ impl DiscogsAdapter {
             hits,
             page: result.pagination.page,
             pages: result.pagination.pages,
+            total: Some(u64::from(result.pagination.items)),
         };
 
         lock(&self.search_cache).insert(cache_key, page_info.clone());
@@ -388,12 +427,17 @@ impl RemoteRelease {
                     .collect(),
                 duration_secs: track.duration.as_deref().and_then(parse_duration),
                 entry_type: TrackEntryType::from_discogs(track.track_type.as_deref()),
+                medium_position: None,
+                track_position: None,
+                release_track_id: None,
+                recording_id: None,
+                artist_credit: None,
             })
             .collect();
 
         Self {
-            id: release.id,
-            master_id: release.master_id,
+            id: ReleaseId::Discogs(release.id),
+            group_id: release.master_id.map(GroupId::DiscogsMaster),
             title: release.title.unwrap_or_default(),
             artists,
             year: release.year.map(i64::from),
@@ -404,6 +448,11 @@ impl RemoteRelease {
             barcodes,
             tracklist,
             url: format!("https://www.discogs.com/release/{}", release.id),
+            lookup_aliases: Vec::new(),
+            artist_credit: None,
+            structure_issues: Vec::new(),
+            edition_notes: Vec::new(),
+            provider_metadata: serde_json::Value::Null,
         }
     }
 }
@@ -411,8 +460,10 @@ impl RemoteRelease {
 impl SearchSummary {
     fn from_discogs(hit: discogger::SearchResult) -> Self {
         Self {
-            id: hit.id,
+            id: ReleaseId::Discogs(hit.id),
             title: hit.title.unwrap_or_default(),
+            artists: Vec::new(),
+            artist_credit: None,
             year: hit.year.and_then(|value| value.parse::<i64>().ok()),
             country: hit.country,
             labels: hit.label,
@@ -421,6 +472,69 @@ impl SearchSummary {
             barcodes: hit.barcode,
             result_type: hit.result_type.unwrap_or_else(|| "release".to_string()),
         }
+    }
+}
+
+impl MetadataProvider for DiscogsAdapter {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Discogs
+    }
+
+    async fn search(&self, request: SearchRequest) -> Result<ProviderSearchPage, ProviderError> {
+        let SearchRequest {
+            strategy,
+            offset,
+            limit: _,
+        } = request;
+
+        let params = match strategy {
+            SearchStrategy::Barcode(barcode) if !barcode.trim().is_empty() => SearchParams::new()
+                .search_type(SearchType::Release)
+                .barcode(barcode),
+            SearchStrategy::CatalogNumber(catalog) if !catalog.trim().is_empty() => {
+                SearchParams::new()
+                    .search_type(SearchType::Release)
+                    .catno(catalog)
+            }
+            SearchStrategy::TitleArtist { title, artist, .. } if !title.trim().is_empty() => {
+                release_search_params(&title, artist.as_deref())
+            }
+            _ => {
+                return Err(ProviderError::Permanent {
+                    provider: ProviderKind::Discogs,
+                    status: None,
+                    message: "refusing an unusable empty search term".to_string(),
+                });
+            }
+        };
+
+        let page = u32::from(offset) / PER_PAGE + 1;
+        let result = self.search_params(params, page).await?;
+        let next_offset = if result.page < result.pages {
+            Some((u64::from(result.page) * u64::from(PER_PAGE)).min(u64::from(u16::MAX)) as u16)
+        } else {
+            None
+        };
+
+        Ok(ProviderSearchPage {
+            hits: result.hits,
+            total: result.total,
+            next_offset,
+        })
+    }
+
+    async fn fetch_release(&self, id: ReleaseId) -> Result<RemoteRelease, ProviderError> {
+        let ReleaseId::Discogs(numeric) = id else {
+            return Err(ProviderError::Permanent {
+                provider: ProviderKind::Discogs,
+                status: None,
+                message: "Discogs cannot fetch a MusicBrainz release".to_string(),
+            });
+        };
+
+        self.fetch_discogs_release(numeric)
+            .await
+            .map_err(Into::into)
     }
 }
 
@@ -562,8 +676,8 @@ mod tests {
             (200, release_json())
         });
         let adapter = adapter(&server.url, fast_policy());
-
-        let release = adapter.fetch_release(42).await.unwrap();
+        let release = adapter.fetch_discogs_release(42).await.unwrap();
+        assert_eq!(release.id, ReleaseId::Discogs(42));
         assert_eq!(release.title, "Blue");
         assert_eq!(release.year, Some(2001));
         assert_eq!(release.catalog_numbers, vec!["CAT-1".to_string()]);
@@ -580,8 +694,8 @@ mod tests {
         let server = MockServer::start(|_| (200, release_json()));
         let adapter = adapter(&server.url, fast_policy());
 
-        adapter.fetch_release(42).await.unwrap();
-        adapter.fetch_release(42).await.unwrap();
+        adapter.fetch_discogs_release(42).await.unwrap();
+        adapter.fetch_discogs_release(42).await.unwrap();
 
         assert_eq!(server.request_count(), 1);
     }
@@ -594,7 +708,7 @@ mod tests {
         });
         let adapter = adapter(&server.url, fast_policy());
 
-        let error = adapter.fetch_release(42).await.unwrap_err();
+        let error = adapter.fetch_discogs_release(42).await.unwrap_err();
         assert!(error.is_auth(), "{error}");
         assert!(!error.to_string().contains("test-token"));
         assert_eq!(server.request_count(), 1);
@@ -614,7 +728,7 @@ mod tests {
         });
         let adapter = adapter(&server.url, fast_policy());
 
-        assert!(adapter.fetch_release(42).await.is_ok());
+        assert!(adapter.fetch_discogs_release(42).await.is_ok());
         assert_eq!(server.request_count(), 3);
     }
 
@@ -623,7 +737,7 @@ mod tests {
         let server = MockServer::start(|_| (503, "{}".to_string()));
         let adapter = adapter(&server.url, fast_policy());
 
-        let error = adapter.fetch_release(42).await.unwrap_err();
+        let error = adapter.fetch_discogs_release(42).await.unwrap_err();
         assert!(matches!(error, AdapterError::Network(_)), "{error}");
         assert_eq!(server.request_count(), 3);
     }
@@ -641,7 +755,7 @@ mod tests {
         });
         let adapter = adapter(&server.url, fast_policy());
 
-        assert!(adapter.fetch_release(42).await.is_ok());
+        assert!(adapter.fetch_discogs_release(42).await.is_ok());
         assert_eq!(server.request_count(), 2);
     }
 
@@ -650,7 +764,7 @@ mod tests {
         let server = MockServer::start(|_| (200, "not json".to_string()));
         let adapter = adapter(&server.url, fast_policy());
 
-        let error = adapter.fetch_release(42).await.unwrap_err();
+        let error = adapter.fetch_discogs_release(42).await.unwrap_err();
         assert!(matches!(error, AdapterError::Malformed(_)), "{error}");
     }
 
@@ -667,7 +781,7 @@ mod tests {
         };
         let adapter = adapter(&server.url, policy);
 
-        let error = adapter.fetch_release(42).await.unwrap_err();
+        let error = adapter.fetch_discogs_release(42).await.unwrap_err();
         assert!(matches!(error, AdapterError::Network(_)), "{error}");
     }
 
@@ -681,8 +795,8 @@ mod tests {
         let adapter = adapter(&server.url, policy);
 
         let start = Instant::now();
-        adapter.fetch_release(1).await.unwrap();
-        adapter.fetch_release(2).await.unwrap();
+        adapter.fetch_discogs_release(1).await.unwrap();
+        adapter.fetch_discogs_release(2).await.unwrap();
         assert!(start.elapsed() >= Duration::from_millis(60));
     }
 
@@ -701,11 +815,11 @@ mod tests {
         let adapter = adapter(&server.url, fast_policy());
         let params = release_search_params("Blue", Some("Test Artist"));
 
-        let first = adapter.search(params.clone(), 1).await.unwrap();
+        let first = adapter.search_params(params.clone(), 1).await.unwrap();
         assert_eq!(first.hits.len(), 1);
         assert!(first.truncated());
 
-        let second = adapter.search(params, 2).await.unwrap();
+        let second = adapter.search_params(params, 2).await.unwrap();
         assert_eq!(second.page, 2);
         assert!(second.truncated());
     }
@@ -725,8 +839,11 @@ mod tests {
             .parse()
             .expect("RADISH_DISCOGS_RELEASE_ID must be numeric");
         let adapter = DiscogsAdapter::from_env().expect("set RADISH_DISCOGS_TOKEN");
-        let release = adapter.fetch_release(id).await.expect("fetch release");
-        assert_eq!(release.id, id);
+        let release = adapter
+            .fetch_discogs_release(id)
+            .await
+            .expect("fetch release");
+        assert_eq!(release.id, ReleaseId::Discogs(id));
         assert!(!release.tracklist.is_empty());
     }
 
