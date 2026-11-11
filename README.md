@@ -275,11 +275,15 @@ Albums are also grouped by the pair `(album title, artist)` for scanned-metadata
 
 Tag parsing runs in parallel; database updates happen afterward. A file that fails tag reading produces a warning and is skipped while other files continue importing. Every import rereads discovered files; the stored modification time is not used to skip unchanged files.
 
+When stderr is an interactive terminal, import shows a spinner during file discovery, completed/total counters while reading tags and saving tracks, and a spinner while rebuilding local-release groups. Failed tag reads count toward scan progress and still produce warnings. Live progress is hidden when stderr is redirected; stdout messages and the final import summary are unchanged. Progress clears before optional matching starts.
+
 Import adds and refreshes entries and refreshes local-release grouping. It does **not** remove database rows for files that have disappeared.
 
 ### Watch
 
 `watch` performs an initial import, then subscribes to recursive filesystem events using [Notify](https://github.com/notify-rs/notify). Handled file-creation, data-change, and rename events trigger tag reads and database updates. File-removal events delete the matching stored path. After each event, local-release grouping is recomputed so accepted matches become stale when matching inputs change. Stop watching with `Ctrl+C`.
+
+The initial import uses the same terminal progress display as `import`. Ongoing watch events continue to print individual sync and removal messages.
 
 Current synchronization limits:
 

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use radish::progress::ImportProgress;
 use radish::providers::{ProviderKind, ReleaseId};
 use radish::{db, outln, runner, scanner, store, watcher};
 use std::path::{Path, PathBuf};
@@ -309,14 +310,20 @@ async fn run_import(pool: &sqlx::SqlitePool, path: &std::path::Path) -> Result<P
     outln!("Scanning {}...", path.display());
 
     let directory_id = store::upsert_directory(pool, &path).await?;
-    let tracks = scanner::scan_directory(&path).await?;
+    let progress = ImportProgress::new();
+    let tracks =
+        scanner::scan_directory_with_progress(&path, |event| progress.scan_event(event)).await?;
     let count = tracks.len();
 
+    progress.saving(count);
     for track in &tracks {
         store::upsert_track(pool, track, directory_id).await?;
+        progress.saved();
     }
 
+    progress.grouping();
     let groups = store::rebuild_local_releases(pool, Some(&path)).await?;
+    drop(progress);
 
     outln!("Imported {count} tracks into {groups} local release(s).");
     Ok(path)

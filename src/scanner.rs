@@ -171,16 +171,52 @@ pub fn read_tags(path: &Path) -> Result<ScannedTrack> {
     })
 }
 
-/// Walks `root` and reads tags for every audio file found, spreading the
-/// (CPU-bound) tag parsing across the tokio blocking thread pool so large
-/// libraries scan in seconds instead of hours.
+/// Progress notifications, delivered synchronously by the collecting task.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ScanEvent {
+    Discovering,
+    Discovered {
+        total: usize,
+    },
+    /// Every attempted read counts, including failures and panicked tasks.
+    FileFinished {
+        completed: usize,
+        total: usize,
+        warning: Option<String>,
+    },
+}
+
+/// Reads audio tags in parallel, printing warnings for failed reads.
 pub async fn scan_directory(root: &Path) -> Result<Vec<ScannedTrack>> {
+    scan_directory_with_progress(root, |event| {
+        if let ScanEvent::FileFinished {
+            warning: Some(warning),
+            ..
+        } = event
+        {
+            eprintln!("{warning}");
+        }
+    })
+    .await
+}
+
+/// Walks `root` and reads audio tags on the Tokio blocking thread pool.
+///
+/// The callback receives discovery and read-completion events, and owns warning
+/// output. No warnings are printed separately by this entrypoint.
+pub async fn scan_directory_with_progress(
+    root: &Path,
+    mut on_progress: impl FnMut(ScanEvent),
+) -> Result<Vec<ScannedTrack>> {
+    on_progress(ScanEvent::Discovering);
     let files: Vec<PathBuf> = WalkDir::new(root)
         .into_iter()
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().is_file() && is_audio_file(entry.path()))
         .map(|entry| entry.path().to_path_buf())
         .collect();
+    let total = files.len();
+    on_progress(ScanEvent::Discovered { total });
 
     let mut set = tokio::task::JoinSet::new();
     for path in files {
@@ -188,12 +224,22 @@ pub async fn scan_directory(root: &Path) -> Result<Vec<ScannedTrack>> {
     }
 
     let mut tracks = Vec::new();
+    let mut completed = 0;
     while let Some(result) = set.join_next().await {
-        match result {
-            Ok(Ok(track)) => tracks.push(track),
-            Ok(Err(err)) => eprintln!("warning: failed to read tags: {err}"),
-            Err(err) => eprintln!("warning: scan task panicked: {err}"),
-        }
+        let warning = match result {
+            Ok(Ok(track)) => {
+                tracks.push(track);
+                None
+            }
+            Ok(Err(err)) => Some(format!("warning: failed to read tags: {err}")),
+            Err(err) => Some(format!("warning: scan task panicked: {err}")),
+        };
+        completed += 1;
+        on_progress(ScanEvent::FileFinished {
+            completed,
+            total,
+            warning,
+        });
     }
 
     Ok(tracks)

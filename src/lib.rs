@@ -17,6 +17,7 @@ pub mod discovery;
 pub mod matcher;
 pub mod musicbrainz;
 pub mod output;
+pub mod progress;
 pub mod providers;
 pub mod runner;
 pub mod scanner;

@@ -195,6 +195,61 @@ async fn explicit_discogs_mode_without_a_token_is_a_failure() {
 }
 
 #[tokio::test]
+async fn redirected_import_keeps_warnings_without_live_progress() {
+    let db = db_path("import-progress-redirected");
+    let music = temp_dir("import-progress-redirected-music");
+    write_wav(&music.join("good.wav"));
+    std::fs::write(music.join("broken.mp3"), b"not audio").unwrap();
+    std::fs::write(music.join("cover.jpg"), b"not audio").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_radish"))
+        .arg("--db")
+        .arg(&db)
+        .arg("import")
+        .arg(&music)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.starts_with("Scanning "), "{text}");
+    assert!(
+        text.contains("Imported 1 tracks into 1 local release(s)."),
+        "{text}"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(
+        stderr.starts_with("warning: failed to read tags:"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(['\r', '\x1b']), "{stderr:?}");
+    assert!(!text.contains(['\r', '\x1b']), "{text:?}");
+
+    let pool = radish::db::connect(&db).await.unwrap();
+    let tracks = store::list_tracks(&pool).await.unwrap();
+    assert_eq!(tracks.len(), 1);
+    pool.close().await;
+}
+
+#[test]
+fn redirected_empty_import_has_no_progress_output() {
+    let db = db_path("import-progress-empty");
+    let music = temp_dir("import-progress-empty-music");
+    let output = Command::new(env!("CARGO_BIN_EXE_radish"))
+        .arg("--db")
+        .arg(db)
+        .arg("import")
+        .arg(music)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert!(stdout(&output).contains("Imported 0 tracks into 0 local release(s)."));
+}
+
+#[tokio::test]
 async fn import_is_kept_when_matching_fails() {
     let db = db_path("import");
     let music = temp_dir("import-music");

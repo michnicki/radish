@@ -1,3 +1,4 @@
+use crate::progress::ImportProgress;
 use crate::{outln, scanner, store};
 use anyhow::Result;
 use notify::event::{CreateKind, ModifyKind, RemoveKind};
@@ -17,11 +18,17 @@ pub async fn watch_directory(pool: SqlitePool, root: &Path) -> Result<()> {
     let directory_id = store::upsert_directory(&pool, &root).await?;
 
     outln!("Doing initial scan of {}...", root.display());
-    let tracks = scanner::scan_directory(&root).await?;
+    let progress = ImportProgress::new();
+    let tracks =
+        scanner::scan_directory_with_progress(&root, |event| progress.scan_event(event)).await?;
+    progress.saving(tracks.len());
     for track in &tracks {
         store::upsert_track(&pool, track, directory_id).await?;
+        progress.saved();
     }
+    progress.grouping();
     store::rebuild_local_releases(&pool, Some(&root)).await?;
+    drop(progress);
     outln!(
         "Synced {} tracks. Watching for changes... (Ctrl+C to stop)",
         tracks.len()
