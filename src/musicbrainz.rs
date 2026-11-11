@@ -1,10 +1,9 @@
 //! MusicBrainz access behind a Radish-owned HTTP adapter.
 //!
 //! Search and lookup use the public JSON API. Radish owns the transport so it
-//! can inspect response headers and the raw document before typed conversion:
-//! the `musicbrainz_rs` release entity validates the document shape, while the
-//! conversion below retains pregap/data-track findings, headers, and every
-//! label/catalog pair that the typed model does not expose.
+//! can inspect response headers and the raw document: the conversion below
+//! reads the JSON directly and retains pregap/data-track findings and every
+//! label/catalog pair.
 //!
 //! All attempts, including redirect hops and retries, pass through one
 //! scheduler. No Discogs credential is read here.
@@ -478,17 +477,6 @@ pub fn literal_field(field: &str, value: &str) -> String {
 // Conversion
 // ---------------------------------------------------------------------------
 
-pub fn credited_artist(credits: &[musicbrainz_rs::entity::artist_credit::ArtistCredit]) -> String {
-    let mut text = String::new();
-    for credit in credits {
-        text.push_str(&credit.name);
-        if let Some(join) = &credit.joinphrase {
-            text.push_str(join);
-        }
-    }
-    text.trim().to_string()
-}
-
 fn text(value: &Value, key: &str) -> Option<String> {
     value
         .get(key)
@@ -576,20 +564,12 @@ fn is_unsupported_format(format: &str) -> bool {
 /// Converts one `/ws/2/release` document into the shared model.
 ///
 /// Raw structural findings are preserved as `structure_issues`; nothing is
-/// silently flattened. The typed `musicbrainz_rs` entity validates the document
-/// shape before conversion, but Radish owns every field it reads.
+/// silently flattened. Every field Radish reads is validated explicitly.
 pub fn decode_release_document(value: Value) -> Result<RemoteRelease, ProviderError> {
     let malformed = |message: String| ProviderError::Malformed {
         provider: ProviderKind::MusicBrainz,
         message,
     };
-
-    // Best-effort typed validation. `musicbrainz_rs` marks some fields required
-    // that valid MusicBrainz responses omit (for example `artist` inside an
-    // artist credit and `position` on a release track), so a typed failure is
-    // not by itself a malformed document. Every field Radish reads is validated
-    // explicitly below.
-    let _ = serde_json::from_value::<musicbrainz_rs::entity::release::Release>(value.clone());
 
     let id_text =
         text(&value, "id").ok_or_else(|| malformed("release document has no id".to_string()))?;
@@ -875,11 +855,11 @@ fn decode_search_page(value: &Value, offset: u16) -> Result<SearchPage, Provider
     let releases = value
         .get("releases")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+        .into_iter()
+        .flatten();
 
     let mut hits = Vec::new();
-    for release in &releases {
+    for release in releases {
         let Some(raw_id) = text(release, "id") else {
             continue;
         };
