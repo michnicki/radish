@@ -26,6 +26,9 @@ pub struct ImportSummary {
     /// Stored rows kept because their files, or a folder above them, could not
     /// be read this time.
     pub kept: usize,
+    /// Stored rows kept because the walk found no audio files at all, which
+    /// looks like an unmounted volume rather than a deleted library.
+    pub kept_no_audio: usize,
     pub rebuild: store::RebuildSummary,
 }
 
@@ -104,6 +107,7 @@ pub(crate) async fn sync_files(
         tracks,
         unchanged,
         unreadable,
+        quietly_skipped,
     } = scanner::scan_directory_incremental(
         dir,
         |path, modified_at| {
@@ -128,7 +132,7 @@ pub(crate) async fn sync_files(
         emit(progress, ScanEvent::Warning { message });
         return Ok(ImportSummary {
             directory_id,
-            kept: known.len(),
+            kept_no_audio: known.len(),
             ..ImportSummary::default()
         });
     }
@@ -180,6 +184,28 @@ pub(crate) async fn sync_files(
     }
     let removed = store::remove_tracks_by_paths(pool, &gone).await?;
 
+    // The scan stays quiet about a dangling link, so say what it is protecting.
+    for path in &quietly_skipped {
+        let blocked = store::path_key(path).trim_end_matches('/').to_string();
+        let protected = known
+            .keys()
+            .filter(|key| !seen.contains(*key))
+            .filter(|key| {
+                key.as_str() == blocked
+                    || key
+                        .strip_prefix(blocked.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+            .count();
+        if protected > 0 {
+            let message = format!(
+                "warning: kept {protected} stored tracks under {}: the folder is unreachable (broken link?)",
+                clean_path(path)
+            );
+            emit(progress, ScanEvent::Warning { message });
+        }
+    }
+
     Ok(ImportSummary {
         directory_id,
         scanned: tracks.len(),
@@ -187,6 +213,7 @@ pub(crate) async fn sync_files(
         saved,
         removed,
         kept,
+        kept_no_audio: 0,
         rebuild: store::RebuildSummary::default(),
     })
 }
@@ -411,7 +438,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(summary.removed, 0, "{summary:?}");
-        assert_eq!(summary.kept, 3, "{summary:?}");
+        assert_eq!(summary.kept_no_audio, 3, "{summary:?}");
+        assert_eq!(summary.kept, 0, "{summary:?}");
         assert_eq!(paths(&pool).await.len(), 3);
     }
 

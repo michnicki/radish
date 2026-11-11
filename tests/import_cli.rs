@@ -30,7 +30,7 @@ fn importing_an_emptied_directory_warns_and_keeps_the_library() {
     assert!(second.status.success(), "{second:?}");
     let stdout = String::from_utf8_lossy(&second.stdout);
     assert!(
-        stdout.contains("0 removed, 2 kept (unreadable)"),
+        stdout.contains("0 removed, 2 kept (no audio files found)"),
         "{stdout}"
     );
     let stderr = String::from_utf8_lossy(&second.stderr);
@@ -48,6 +48,62 @@ fn importing_an_emptied_directory_warns_and_keeps_the_library() {
 
 /// Paths come from untrusted folder and file names, so no output may carry a
 /// raw escape byte.
+#[cfg(unix)]
+#[test]
+fn a_broken_folder_link_warns_once_about_the_rows_it_protects() {
+    let db = db_path("import-dangling");
+    let music = temp_dir("import-dangling-music");
+    let share = temp_dir("import-dangling-share");
+    write_wav(&share.join("01.wav"));
+    write_wav(&share.join("02.wav"));
+    write_wav(&music.join("top.wav"));
+    std::os::unix::fs::symlink(&share, music.join("NAS")).unwrap();
+    let first = radish(&db, &["import".as_ref(), music.as_ref()]);
+    assert!(first.status.success(), "{first:?}");
+
+    std::fs::remove_dir_all(&share).unwrap();
+    let second = radish(&db, &["import".as_ref(), music.as_ref()]);
+
+    assert!(second.status.success(), "{second:?}");
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert_eq!(
+        stderr
+            .matches("warning: kept 2 stored tracks under")
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("NAS: the folder is unreachable (broken link?)"),
+        "{stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        stdout.contains("0 removed, 2 kept (unreadable)"),
+        "{stdout}"
+    );
+    // The rows are still protected, so the next import says so again.
+    let third = radish(&db, &["import".as_ref(), music.as_ref()]);
+    assert!(
+        String::from_utf8_lossy(&third.stderr).contains("kept 2 stored tracks"),
+        "{third:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_broken_link_to_a_non_audio_file_stays_silent() {
+    let db = db_path("import-dangling-cover");
+    let music = temp_dir("import-dangling-cover-music");
+    write_wav(&music.join("top.wav"));
+    std::os::unix::fs::symlink(music.join("missing.jpg"), music.join("cover.jpg")).unwrap();
+
+    let output = radish(&db, &["import".as_ref(), music.as_ref()]);
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
 #[cfg(unix)]
 #[test]
 fn importing_paths_with_escape_bytes_prints_no_raw_escape() {
