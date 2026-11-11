@@ -471,6 +471,7 @@ impl SearchSummary {
             formats: hit.format,
             barcodes: hit.barcode,
             result_type: hit.result_type.unwrap_or_else(|| "release".to_string()),
+            track_count: None,
         }
     }
 }

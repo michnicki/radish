@@ -960,6 +960,23 @@ fn decode_search_page(value: &Value, offset: u16) -> Result<SearchPage, Provider
         catalog_numbers.sort();
         catalog_numbers.dedup();
 
+        let media = credit_array(release.get("media"));
+        let mut formats: Vec<String> = Vec::new();
+        for format in media.iter().filter_map(|medium| text(medium, "format")) {
+            if !formats.contains(&format) {
+                formats.push(format);
+            }
+        }
+        let media_tracks: Vec<u64> = media
+            .iter()
+            .filter_map(|medium| medium.get("track-count").and_then(Value::as_u64))
+            .collect();
+        let track_count = release
+            .get("track-count")
+            .and_then(Value::as_u64)
+            .or_else(|| (!media_tracks.is_empty()).then(|| media_tracks.iter().sum()))
+            .and_then(|count| u32::try_from(count).ok());
+
         hits.push(SearchSummary {
             id: ReleaseId::MusicBrainz(id),
             title,
@@ -969,9 +986,10 @@ fn decode_search_page(value: &Value, offset: u16) -> Result<SearchPage, Provider
             country: text(release, "country"),
             labels,
             catalog_numbers,
-            formats: Vec::new(),
+            formats,
             barcodes: text(release, "barcode").into_iter().collect(),
             result_type: "release".to_string(),
+            track_count,
         });
     }
 
@@ -1822,6 +1840,39 @@ mod tests {
 
     const EMPTY_SEARCH: &str = r#"{"count":0,"offset":0,"releases":[]}"#;
     const ONE_HIT_SEARCH: &str = r#"{"count":1,"offset":0,"releases":[{"id":"76df3287-6cda-33eb-8e9a-044b5e15ffdd","title":"Abbey Road","artist-credit":[{"name":"The Beatles","joinphrase":""}]}]}"#;
+
+    #[test]
+    fn search_summaries_carry_formats_and_track_counts() {
+        let page = decode_search_page(
+            &json!({
+                "count": 2,
+                "releases": [
+                    {
+                        "id": "76df3287-6cda-33eb-8e9a-044b5e15ffdd",
+                        "title": "Blue",
+                        "track-count": 12,
+                        "media": [
+                            { "format": "CD", "track-count": 7 },
+                            { "format": "CD", "track-count": 5 },
+                            { "format": "DVD-Video", "track-count": 0 }
+                        ]
+                    },
+                    {
+                        "id": "12121212-1212-4212-8212-121212121212",
+                        "title": "Blue",
+                        "media": [{ "track-count": 9 }]
+                    }
+                ]
+            }),
+            0,
+        )
+        .unwrap();
+        assert_eq!(page.hits[0].formats, vec!["CD", "DVD-Video"]);
+        assert_eq!(page.hits[0].track_count, Some(12));
+        // Without a release-level count, the media counts are summed.
+        assert!(page.hits[1].formats.is_empty());
+        assert_eq!(page.hits[1].track_count, Some(9));
+    }
 
     #[test]
     fn known_release_group_is_searched_on_its_own() {
