@@ -1375,6 +1375,10 @@ pub async fn load_selected_releases(
     let scope = scope.and_then(scope_param);
     let scope = scope.as_deref();
 
+    // One read transaction, so the releases and their tracks come from the same
+    // snapshot even while an import or rebuild commits in between.
+    let mut tx = pool.begin().await?;
+
     let release_rows = sqlx::query_as::<_, LocalReleaseRow>(
         "SELECT lr.id, lr.directory_path, lr.album_title, lr.album_artist, lr.artist_kind,
                 lr.year, lr.barcode, lr.catalog_number, lr.embedded_discogs_id,
@@ -1391,7 +1395,7 @@ pub async fn load_selected_releases(
     )
     .bind(scope)
     .bind(id)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
 
     let track_rows = sqlx::query_as::<_, LocalTrackRow>(
@@ -1408,8 +1412,10 @@ pub async fn load_selected_releases(
     )
     .bind(scope)
     .bind(id)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     let mut tracks_by_release: HashMap<i64, Vec<LocalTrack>> = HashMap::new();
     for row in track_rows {
