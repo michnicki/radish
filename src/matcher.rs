@@ -375,12 +375,19 @@ pub fn normalize_artist_for(provider: ProviderKind, input: &str) -> String {
 /// Text that normalizes to nothing, such as `÷`, is compared by its original
 /// characters instead, so distinct symbol-only titles do not look identical.
 pub fn similarity(a: &str, b: &str) -> f64 {
-    let normalized_a = normalize_text(a);
-    let normalized_b = normalize_text(b);
-    if normalized_a.is_empty() || normalized_b.is_empty() {
+    similarity_of_normalized(a, &normalized_chars(a), b, &normalized_chars(b))
+}
+
+fn normalized_chars(text: &str) -> Vec<char> {
+    normalize_text(text).chars().collect()
+}
+
+/// [`similarity`] over titles that were normalized once by the caller.
+fn similarity_of_normalized(a: &str, a_chars: &[char], b: &str, b_chars: &[char]) -> f64 {
+    if a_chars.is_empty() || b_chars.is_empty() {
         return same_stripped_text(a, b);
     }
-    similarity_normalized(&normalized_a, &normalized_b)
+    similarity_chars(a_chars, b_chars)
 }
 
 /// 1.0 when both strings are non-empty and equal ignoring whitespace and case.
@@ -397,14 +404,18 @@ fn same_stripped_text(a: &str, b: &str) -> f64 {
 
 /// Empty text carries no evidence, so it is never similar to anything.
 fn similarity_normalized(a: &str, b: &str) -> f64 {
+    similarity_chars(
+        &a.chars().collect::<Vec<char>>(),
+        &b.chars().collect::<Vec<char>>(),
+    )
+}
+
+fn similarity_chars(a: &[char], b: &[char]) -> f64 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }
-
-    let a_chars: Vec<char> = a.chars().collect();
-    let b_chars: Vec<char> = b.chars().collect();
-    let distance = levenshtein(&a_chars, &b_chars);
-    let longest = a_chars.len().max(b_chars.len()) as f64;
+    let distance = levenshtein(a, b);
+    let longest = a.len().max(b.len()) as f64;
 
     (1.0 - distance as f64 / longest).clamp(0.0, 1.0)
 }
@@ -435,12 +446,9 @@ fn levenshtein(a: &[char], b: &[char]) -> usize {
 }
 
 pub fn artist_similarity(a: &str, b: &str) -> f64 {
-    let normalized_a = normalize_artist(a);
-    let normalized_b = normalize_artist(b);
-    if normalized_a.is_empty() || normalized_b.is_empty() {
-        return same_stripped_text(a, b);
-    }
-    similarity_normalized(&normalized_a, &normalized_b)
+    let a_chars: Vec<char> = normalize_artist(a).chars().collect();
+    let b_chars: Vec<char> = normalize_artist(b).chars().collect();
+    similarity_of_normalized(a, &a_chars, b, &b_chars)
 }
 
 /// `max(0, 1 - absolute_difference_seconds / 10)`.
@@ -593,9 +601,33 @@ pub struct Mapping {
     /// Two pairings were indistinguishable, so the result needs review.
     pub ambiguous: bool,
     pub notes: Vec<String>,
+    /// Title similarity of each assigned pair, indexed like `pairs`. Reviews
+    /// saved before this field existed decode to an empty vector, and readers
+    /// recompute whenever the vector does not line up with `pairs`.
+    #[serde(default)]
+    pub pair_similarity: Vec<Option<f64>>,
 }
 
 impl Mapping {
+    /// Title similarity between a local track and its assigned remote track,
+    /// or `None` when the local file has no title. Reuses the value recorded
+    /// by `map_tracks` and recomputes when it is missing or out of range.
+    fn title_similarity(
+        &self,
+        local_index: usize,
+        local_track: &LocalTrack,
+        remote_track: &RemoteTrack,
+    ) -> Option<f64> {
+        let title = local_track.title.as_deref()?;
+        if self.pair_similarity.len() == self.pairs.len()
+            && let Some(Some(recorded)) = self.pair_similarity.get(local_index)
+            && (0.0..=1.0).contains(recorded)
+        {
+            return Some(*recorded);
+        }
+        Some(similarity(title, &remote_track.title))
+    }
+
     pub fn assigned_pairs(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
         self.pairs
             .iter()
@@ -621,6 +653,7 @@ pub fn map_tracks(local: &LocalRelease, remote: &RemoteRelease) -> Mapping {
     let mut pairs: Vec<Option<usize>> = vec![None; local.tracks.len()];
     let mut used: Vec<bool> = vec![false; remote.tracklist.len()];
     let mut notes = Vec::new();
+    let mut titles = TitleMatrix::new(local, remote);
 
     // Pass 1: unique release-track IDs.
     let mut local_release_ids: HashMap<Mbid, Vec<usize>> = HashMap::new();
@@ -810,6 +843,7 @@ pub fn map_tracks(local: &LocalRelease, remote: &RemoteRelease) -> Mapping {
             let mut row = Vec::with_capacity(remaining_remote.len());
             for remote_index in &remaining_remote {
                 row.push(pair_cost(
+                    titles.get(*local_index, *remote_index),
                     &local.tracks[*local_index],
                     &remote.tracklist[*remote_index],
                 ));
@@ -881,19 +915,71 @@ pub fn map_tracks(local: &LocalRelease, remote: &RemoteRelease) -> Mapping {
         ));
     }
 
+    let pair_similarity = pairs
+        .iter()
+        .enumerate()
+        .map(|(local_index, pair)| {
+            pair.and_then(|remote_index| titles.get(local_index, remote_index))
+        })
+        .collect();
+
     Mapping {
         pairs,
         complete,
         ambiguous,
         notes,
+        pair_similarity,
     }
 }
 
-fn pair_cost(local: &LocalTrack, remote: &RemoteTrack) -> f64 {
-    let title = match &local.title {
-        Some(title) => similarity(title, &remote.title),
-        None => 0.0,
-    };
+/// Title similarities for one `map_tracks` call. Each title is normalized once
+/// and each pair is compared at most once, however many passes ask for it.
+struct TitleMatrix<'a> {
+    local: &'a LocalRelease,
+    remote: &'a RemoteRelease,
+    local_chars: Vec<Vec<char>>,
+    remote_chars: Vec<Vec<char>>,
+    cache: Vec<Vec<Option<f64>>>,
+}
+
+impl<'a> TitleMatrix<'a> {
+    fn new(local: &'a LocalRelease, remote: &'a RemoteRelease) -> Self {
+        Self {
+            local,
+            remote,
+            local_chars: local
+                .tracks
+                .iter()
+                .map(|track| normalized_chars(track.title.as_deref().unwrap_or_default()))
+                .collect(),
+            remote_chars: remote
+                .tracklist
+                .iter()
+                .map(|track| normalized_chars(&track.title))
+                .collect(),
+            cache: vec![vec![None; remote.tracklist.len()]; local.tracks.len()],
+        }
+    }
+
+    /// `None` when the local file has no title.
+    fn get(&mut self, local_index: usize, remote_index: usize) -> Option<f64> {
+        let title = self.local.tracks[local_index].title.as_deref()?;
+        if let Some(known) = self.cache[local_index][remote_index] {
+            return Some(known);
+        }
+        let value = similarity_of_normalized(
+            title,
+            &self.local_chars[local_index],
+            &self.remote.tracklist[remote_index].title,
+            &self.remote_chars[remote_index],
+        );
+        self.cache[local_index][remote_index] = Some(value);
+        Some(value)
+    }
+}
+
+fn pair_cost(title_similarity: Option<f64>, local: &LocalTrack, remote: &RemoteTrack) -> f64 {
+    let title = title_similarity.unwrap_or(0.0);
 
     let duration = match (local.duration_secs, remote.duration_secs) {
         (Some(a), Some(b)) => duration_similarity(a, b),
@@ -1060,8 +1146,8 @@ pub fn score(local: &LocalRelease, remote: &RemoteRelease, mapping: &Mapping) ->
             let Some(remote_track) = remote.tracklist.get(remote_index) else {
                 continue;
             };
-            if let Some(title) = &track.title {
-                total += similarity(title, &remote_track.title);
+            if let Some(similarity) = mapping.title_similarity(index, track, remote_track) {
+                total += similarity;
             }
         }
         total / local.tracks.len() as f64
@@ -1362,7 +1448,7 @@ pub fn evaluate_for_matching(
     );
     for other in alternatives {
         if other.release.id != candidate.release.id
-            && candidate.score.album_score() - other.score.album_score() + 1e-9 < RUNNER_UP_GAP
+            && within_gap(candidate.score.album_score() - other.score.album_score())
             && !equivalent_audio(candidate, other)
         {
             album.blockers.push(format!(
@@ -1373,6 +1459,12 @@ pub fn evaluate_for_matching(
     }
     album.auto_accept = album.blockers.is_empty();
     album
+}
+
+/// True when a score lead is too small to separate two alternatives. The
+/// boundary itself counts as close.
+pub(crate) fn within_gap(diff: f64) -> bool {
+    diff <= RUNNER_UP_GAP + TIE_EPSILON
 }
 
 /// Applies album gates after a high-confidence semantic agreement.
@@ -1391,8 +1483,7 @@ pub fn evaluate_ai_album(
     );
     for other in alternatives {
         if (!other.score.album_score().is_finite()
-            || candidate.score.album_score() - other.score.album_score()
-                <= RUNNER_UP_GAP + TIE_EPSILON)
+            || within_gap(candidate.score.album_score() - other.score.album_score()))
             && !compatible_album_audio(candidate, other)
         {
             album.blockers.push(format!(
@@ -1702,12 +1793,14 @@ fn evaluate_at_scope(
             }
         }
 
-        if let Some(title) = &local_track.title {
-            let score = similarity(title, &remote_track.title);
-            if score < worst_title {
-                worst_title = score;
-                worst_title_track = remote_track.title.clone();
-            }
+        if let Some(score) =
+            candidate
+                .mapping
+                .title_similarity(local_index, local_track, remote_track)
+            && score < worst_title
+        {
+            worst_title = score;
+            worst_title_track = remote_track.title.clone();
         }
 
         if let (Some(a), Some(b)) = (local_track.duration_secs, remote_track.duration_secs) {
@@ -2351,6 +2444,46 @@ mod tests {
             complete.score.durations,
             sparse.score.durations
         );
+    }
+
+    #[test]
+    fn mapping_records_the_similarity_of_each_assigned_pair() {
+        let local = local_release(&["One", "Two", "Three"]);
+        let remote = remote_release(&["Three", "Two", "Won"]);
+        let mapping = map_tracks(&local, &remote);
+        assert_eq!(mapping.pair_similarity.len(), mapping.pairs.len());
+        for (local_index, remote_index) in mapping.assigned_pairs() {
+            let expected = similarity(
+                local.tracks[local_index].title.as_deref().unwrap(),
+                &remote.tracklist[remote_index].title,
+            );
+            assert_eq!(mapping.pair_similarity[local_index], Some(expected));
+        }
+    }
+
+    #[test]
+    fn mappings_saved_without_pair_similarity_still_score_the_same() {
+        let local = local_release(&["One", "Two", "Three"]);
+        let remote = remote_release(&["One", "Two", "Tree"]);
+        let candidate = Candidate::new(&local, remote.clone());
+
+        let mut json = serde_json::to_value(&candidate.mapping).unwrap();
+        json.as_object_mut().unwrap().remove("pair_similarity");
+        let old: Mapping = serde_json::from_value(json).unwrap();
+        assert!(old.pair_similarity.is_empty());
+        assert_eq!(score(&local, &remote, &old), candidate.score);
+
+        let mut invalid = candidate.mapping.clone();
+        invalid.pair_similarity = vec![Some(f64::NAN), Some(7.0), Some(-1.0)];
+        assert_eq!(score(&local, &remote, &invalid), candidate.score);
+    }
+
+    #[test]
+    fn close_alternative_gap_includes_the_exact_boundary() {
+        assert!(within_gap(0.0));
+        assert!(within_gap(RUNNER_UP_GAP - 0.001));
+        assert!(within_gap(RUNNER_UP_GAP));
+        assert!(!within_gap(RUNNER_UP_GAP + 0.001));
     }
 
     #[test]
