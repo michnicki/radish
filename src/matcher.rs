@@ -403,13 +403,6 @@ fn same_stripped_text(a: &str, b: &str) -> f64 {
 }
 
 /// Empty text carries no evidence, so it is never similar to anything.
-fn similarity_normalized(a: &str, b: &str) -> f64 {
-    similarity_chars(
-        &a.chars().collect::<Vec<char>>(),
-        &b.chars().collect::<Vec<char>>(),
-    )
-}
-
 fn similarity_chars(a: &[char], b: &[char]) -> f64 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
@@ -448,7 +441,12 @@ fn levenshtein(a: &[char], b: &[char]) -> usize {
 pub fn artist_similarity(a: &str, b: &str) -> f64 {
     let a_chars: Vec<char> = normalize_artist(a).chars().collect();
     let b_chars: Vec<char> = normalize_artist(b).chars().collect();
-    similarity_of_normalized(a, &a_chars, b, &b_chars)
+    similarity_of_normalized(
+        &strip_disambiguator(a),
+        &a_chars,
+        &strip_disambiguator(b),
+        &b_chars,
+    )
 }
 
 /// `max(0, 1 - absolute_difference_seconds / 10)`.
@@ -1209,25 +1207,47 @@ fn album_artist_score(local: &LocalRelease, remote: &RemoteRelease) -> f64 {
     }
 
     let provider = remote.provider();
-    let local_normalized = normalize_artist_for(provider, artist);
-    let remote_normalized: Vec<String> = remote
+    // Names that normalize to nothing (such as `!!!`) fall back to their
+    // original text, with the Discogs disambiguator removed as normalization
+    // would have done.
+    let comparable = |name: &str| match provider {
+        ProviderKind::Discogs => strip_disambiguator(name),
+        ProviderKind::MusicBrainz => name.to_string(),
+    };
+    let local_original = comparable(artist);
+    let local_chars: Vec<char> = normalize_artist_for(provider, artist).chars().collect();
+    let remote_originals: Vec<String> =
+        remote.artists.iter().map(|name| comparable(name)).collect();
+    let remote_chars: Vec<Vec<char>> = remote
         .artists
         .iter()
-        .map(|name| normalize_artist_for(provider, name))
+        .map(|name| normalize_artist_for(provider, name).chars().collect())
         .collect();
 
     let various = matches!(local.artist_kind, ArtistKind::VariousArtists)
-        && remote_normalized
-            .iter()
-            .any(|name| name == "various" || name == "various artists");
+        && remote_chars.iter().any(|name| {
+            let name: String = name.iter().collect();
+            name == "various" || name == "various artists"
+        });
     if various {
         return 1.0;
     }
 
-    let joined = remote_normalized.join(" ");
-    let mut best = similarity_normalized(&local_normalized, &joined);
-    for name in &remote_normalized {
-        best = best.max(similarity_normalized(&local_normalized, name));
+    let joined_original = remote_originals.join(" ");
+    let joined_chars: Vec<char> = remote_chars.join(&' ');
+    let mut best = similarity_of_normalized(
+        &local_original,
+        &local_chars,
+        &joined_original,
+        &joined_chars,
+    );
+    for (original, chars) in remote_originals.iter().zip(&remote_chars) {
+        best = best.max(similarity_of_normalized(
+            &local_original,
+            &local_chars,
+            original,
+            chars,
+        ));
     }
     best
 }
@@ -2192,6 +2212,33 @@ mod tests {
         assert_eq!(similarity("", "Intro"), 0.0);
         assert_eq!(artist_similarity("!!!", "???"), 0.0);
         assert_eq!(artist_similarity("!!!", "!!!"), 1.0);
+    }
+
+    #[test]
+    fn symbol_only_album_artists_compare_by_their_original_text() {
+        let mut local = local_release(&["One"]);
+        local.album_artist = Some("!!!".to_string());
+        let mut remote = remote_release(&["One"]);
+        remote.artists = vec!["!!!".to_string()];
+        assert_eq!(
+            score(&local, &remote, &map_tracks(&local, &remote)).album_artist,
+            1.0
+        );
+
+        // Discogs numbers its disambiguations; they never count as text.
+        remote.artists = vec!["!!! (2)".to_string()];
+        assert_eq!(
+            score(&local, &remote, &map_tracks(&local, &remote)).album_artist,
+            1.0
+        );
+        assert_eq!(artist_similarity("!!! (2)", "!!!"), 1.0);
+        assert_eq!(artist_similarity("!!! (2)", "???"), 0.0);
+
+        remote.artists = vec!["???".to_string()];
+        assert_eq!(
+            score(&local, &remote, &map_tracks(&local, &remote)).album_artist,
+            0.0
+        );
     }
 
     #[test]
