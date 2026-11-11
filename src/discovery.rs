@@ -429,7 +429,7 @@ pub async fn discover<P: MetadataProvider>(
     let mut evidence: HashMap<ReleaseId, DiscoveryEvidence> = HashMap::new();
     for id in releases.keys() {
         let mut candidate_evidence = DiscoveryEvidence {
-            identifier_unique: unique,
+            identifier_unique: unique && identifiers_match(local, &releases[id]),
             identifier_search_truncated: identifier_applicable && !identifier_complete,
             embedded_release_resolved: embedded_resolved,
             identifier_summary_ids: identifier_ids.clone(),
@@ -646,6 +646,54 @@ mod tests {
         assert!(result.evidence[&chosen_id].unhydrated_ids.is_empty());
         assert!(result.evidence[&chosen_id].failed_ids.is_empty());
         assert!(!result.evidence[&other_id].identifier_unique);
+    }
+
+    #[tokio::test]
+    async fn identifier_uniqueness_is_not_copied_to_a_candidate_without_the_identifier() {
+        let barcoded = "11111111-1111-1111-1111-111111111111";
+        let other = "22222222-2222-2222-2222-222222222222";
+        let barcode_page = SearchPage {
+            hits: vec![summary(barcoded)],
+            total: Some(1),
+            next_offset: None,
+        };
+        let mut other_summary = summary(other);
+        other_summary.barcodes.clear();
+        let title_page = SearchPage {
+            hits: vec![other_summary],
+            total: Some(1),
+            next_offset: None,
+        };
+        let mut other_release = remote(other);
+        other_release.barcodes.clear();
+        let provider = FakeProvider::new(
+            ProviderKind::MusicBrainz,
+            vec![Ok(barcode_page), Ok(title_page)],
+            vec![Ok(remote(barcoded)), Ok(other_release)],
+        );
+
+        let local = local();
+        let result = discover(&provider, &local, None).await.unwrap();
+        let barcoded_id = ReleaseId::MusicBrainz(mbid(barcoded));
+        let other_id = ReleaseId::MusicBrainz(mbid(other));
+        assert!(result.evidence[&barcoded_id].identifier_unique);
+        assert!(!result.evidence[&other_id].identifier_unique);
+
+        let release = result
+            .releases
+            .iter()
+            .find(|release| release.id == other_id)
+            .unwrap()
+            .clone();
+        let candidate = matcher::Candidate::new(&local, release);
+        let evaluation = matcher::evaluate(&local, &candidate, None, &result.evidence[&other_id]);
+        assert!(!evaluation.auto_accept, "{:?}", evaluation.evidence);
+        assert!(
+            !evaluation
+                .evidence
+                .iter()
+                .any(|line| line.contains("uniquely identifies"))
+        );
     }
 
     #[tokio::test]

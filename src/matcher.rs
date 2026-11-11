@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v3";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v2";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v4";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v3";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -1747,6 +1747,7 @@ fn evaluate_at_scope(
         }
     }
 
+    let mut identifier_matched = false;
     if let Some(barcode) = &local.barcode {
         let local_digits = normalize_barcode(barcode);
         let remote_digits: Vec<String> = remote
@@ -1756,6 +1757,7 @@ fn evaluate_at_scope(
             .collect();
         if !local_digits.is_empty() && !remote_digits.is_empty() {
             if remote_digits.contains(&local_digits) {
+                identifier_matched = true;
                 evidence.push(format!("barcode {barcode} matches the release"));
             } else {
                 blockers.push(format!(
@@ -1775,6 +1777,7 @@ fn evaluate_at_scope(
             .collect();
         if !local_key.is_empty() && !remote_keys.is_empty() {
             if remote_keys.contains(&local_key) {
+                identifier_matched = true;
                 evidence.push(format!("catalog number {catalog} matches the release"));
             } else {
                 blockers.push(format!(
@@ -1803,7 +1806,7 @@ fn evaluate_at_scope(
         warnings.push("album and tracks matched; exact edition unconfirmed".to_string());
     } else if embedded_consistent {
         // Already recorded as evidence above.
-    } else if discovery.identifier_unique {
+    } else if discovery.identifier_unique && identifier_matched {
         evidence.push("barcode or catalog number uniquely identifies this release".to_string());
     } else {
         blockers.push(
@@ -2315,7 +2318,8 @@ mod tests {
 
     #[test]
     fn barcode_evidence_allows_acceptance() {
-        let local = local_release(&["One", "Two"]);
+        let mut local = local_release(&["One", "Two"]);
+        local.barcode = Some("0123456789012".to_string());
         let candidate = Candidate::new(&local, remote_release(&["One", "Two"]));
         let evaluation = evaluate(
             &local,
@@ -2327,6 +2331,28 @@ mod tests {
             },
         );
         assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+    }
+
+    #[test]
+    fn unique_identifier_flag_needs_a_matching_local_identifier() {
+        let local = local_release(&["One", "Two"]);
+        let candidate = Candidate::new(&local, remote_release(&["One", "Two"]));
+        let evaluation = evaluate(
+            &local,
+            &candidate,
+            None,
+            &DiscoveryEvidence {
+                identifier_unique: true,
+                ..DiscoveryEvidence::default()
+            },
+        );
+        assert!(!evaluation.auto_accept);
+        assert!(
+            !evaluation
+                .evidence
+                .iter()
+                .any(|line| line.contains("uniquely identifies"))
+        );
     }
 
     #[test]
@@ -2358,7 +2384,8 @@ mod tests {
 
     #[test]
     fn runner_up_gap_blocks_acceptance_unless_embedded_id_agrees() {
-        let local = local_release(&["One", "Two"]);
+        let mut local = local_release(&["One", "Two"]);
+        local.barcode = Some("0123456789012".to_string());
         let first = Candidate::new(&local, remote_release(&["One", "Two"]));
         let mut second_release = remote_release(&["One", "Two"]);
         second_release.id = ReleaseId::Discogs(43);
@@ -2474,7 +2501,8 @@ mod tests {
 
     #[test]
     fn edition_twins_and_incomplete_mappings_need_review() {
-        let local = local_release(&["One", "Two"]);
+        let mut local = local_release(&["One", "Two"]);
+        local.barcode = Some("0123456789012".to_string());
         let twin_release = |id: &str| {
             let mut release = remote_release(&["One", "Two"]);
             release.id = ReleaseId::MusicBrainz(mbid(id));
@@ -2563,10 +2591,10 @@ mod tests {
 
     #[test]
     fn algorithm_versions_are_provider_specific() {
-        assert_eq!(algorithm_version(ProviderKind::Discogs), "discogs-match-v3");
+        assert_eq!(algorithm_version(ProviderKind::Discogs), "discogs-match-v4");
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v2"
+            "musicbrainz-match-v3"
         );
     }
 
