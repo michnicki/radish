@@ -10,14 +10,15 @@
 
 use crate::matcher::{RemoteRelease, RemoteTrack, SearchSummary, TrackEntryType};
 use crate::providers::{
-    GroupId, Mbid, MetadataProvider, ProviderError, ProviderKind, ReleaseId, SearchPage,
-    SearchRequest, SearchStrategy,
+    BoundedCache, GroupId, Mbid, MetadataProvider, ProviderError, ProviderKind,
+    RELEASE_CACHE_CAPACITY, ReleaseId, SEARCH_CACHE_CAPACITY, SearchPage, SearchRequest,
+    SearchStrategy,
 };
 use reqwest::StatusCode;
 use reqwest::Url;
 use reqwest::header::{HeaderMap, LOCATION, RETRY_AFTER, USER_AGENT};
 use serde_json::{Map, Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -66,8 +67,8 @@ pub struct MusicBrainzAdapter {
     scheduler: Mutex<Option<Instant>>,
     /// Shared by searches and lookups; successful cache reads bypass this gate.
     cooldown_until: Mutex<Option<tokio::time::Instant>>,
-    release_cache: Mutex<HashMap<Mbid, RemoteRelease>>,
-    search_cache: Mutex<HashMap<String, SearchPage>>,
+    release_cache: Mutex<BoundedCache<Mbid, RemoteRelease>>,
+    search_cache: Mutex<BoundedCache<String, SearchPage>>,
 }
 
 impl MusicBrainzAdapter {
@@ -97,8 +98,8 @@ impl MusicBrainzAdapter {
             config,
             scheduler: Mutex::new(None),
             cooldown_until: Mutex::new(None),
-            release_cache: Mutex::new(HashMap::new()),
-            search_cache: Mutex::new(HashMap::new()),
+            release_cache: Mutex::new(BoundedCache::new(RELEASE_CACHE_CAPACITY)),
+            search_cache: Mutex::new(BoundedCache::new(SEARCH_CACHE_CAPACITY)),
         })
     }
 
@@ -401,7 +402,7 @@ impl MusicBrainzAdapter {
 
     async fn fetch_document(&self, id: Mbid) -> Result<RemoteRelease, ProviderError> {
         if let Some(cached) = lock(&self.release_cache).get(&id) {
-            return Ok(cached.clone());
+            return Ok(cached);
         }
 
         let mut url = self.endpoint(&format!("/ws/2/release/{id}"))?;
@@ -416,9 +417,16 @@ impl MusicBrainzAdapter {
             release.lookup_aliases.push(ReleaseId::MusicBrainz(id));
         }
 
-        if let Some(canonical) = release.id.mbid() {
-            lock(&self.release_cache).insert(canonical, release.clone());
+        // A merged or redirected ID answers with the canonical document, so
+        // both IDs must hit the cache next time.
+        let mut cache = lock(&self.release_cache);
+        if let Some(canonical) = release.id.mbid()
+            && canonical != id
+        {
+            cache.insert(canonical, release.clone());
         }
+        cache.insert(id, release.clone());
+        drop(cache);
 
         Ok(release)
     }
@@ -435,7 +443,7 @@ impl MetadataProvider for MusicBrainzAdapter {
             request.strategy, request.offset, request.limit
         );
         if let Some(cached) = lock(&self.search_cache).get(&key) {
-            return Ok(cached.clone());
+            return Ok(cached);
         }
 
         let query = self.query_for(&request.strategy)?;
@@ -1702,6 +1710,44 @@ mod tests {
         let release = adapter.fetch_release(release_id()).await.unwrap();
         assert_eq!(release.id.storage_id(), canonical);
         assert_eq!(release.lookup_aliases, vec![release_id()]);
+        assert_eq!(server.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn serves_a_merged_id_from_cache_on_the_second_fetch() {
+        let requested = "76df3287-6cda-33eb-8e9a-044b5e15ffdd";
+        let canonical = "12121212-1212-4212-8212-121212121212";
+        let body = include_str!("../tests/fixtures/musicbrainz/release-single.json")
+            .replace(requested, canonical);
+        let server = MockServer::start(move |target| {
+            if target.contains(requested) {
+                (
+                    302,
+                    vec![(
+                        "Location".to_string(),
+                        format!("/ws/2/release/{canonical}?fmt=json"),
+                    )],
+                    String::new(),
+                )
+            } else {
+                (200, Vec::new(), body.clone())
+            }
+        });
+        let adapter = MusicBrainzAdapter::with_config(config(&server)).unwrap();
+
+        let first = adapter.fetch_release(release_id()).await.unwrap();
+        // One redirect hop plus the canonical document.
+        assert_eq!(server.request_count(), 2);
+        let second = adapter.fetch_release(release_id()).await.unwrap();
+        assert_eq!(server.request_count(), 2);
+        assert_eq!(first, second);
+        assert_eq!(second.lookup_aliases, vec![release_id()]);
+
+        // The canonical ID is served from the same entry.
+        adapter
+            .fetch_release(ReleaseId::MusicBrainz(canonical.parse().unwrap()))
+            .await
+            .unwrap();
         assert_eq!(server.request_count(), 2);
     }
 

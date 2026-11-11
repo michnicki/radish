@@ -8,11 +8,11 @@
 
 use crate::matcher::{RemoteRelease, RemoteTrack, SearchSummary, TrackEntryType, parse_duration};
 use crate::providers::{
-    GroupId, MetadataProvider, ProviderError, ProviderKind, ReleaseId,
-    SearchPage as ProviderSearchPage, SearchRequest, SearchStrategy,
+    BoundedCache, GroupId, MetadataProvider, ProviderError, ProviderKind,
+    RELEASE_CACHE_CAPACITY, ReleaseId, SEARCH_CACHE_CAPACITY, SearchPage as ProviderSearchPage,
+    SearchRequest, SearchStrategy,
 };
 use discogger::{DiscogsClient, DiscogsError, PaginationParams, SearchParams, SearchType};
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -133,8 +133,8 @@ pub struct DiscogsAdapter {
     policy: RetryPolicy,
     token: String,
     last_request: Mutex<Option<Instant>>,
-    release_cache: Mutex<HashMap<u64, RemoteRelease>>,
-    search_cache: Mutex<HashMap<String, SearchPage>>,
+    release_cache: Mutex<BoundedCache<u64, RemoteRelease>>,
+    search_cache: Mutex<BoundedCache<String, SearchPage>>,
 }
 
 impl DiscogsAdapter {
@@ -173,8 +173,8 @@ impl DiscogsAdapter {
             policy,
             token,
             last_request: Mutex::new(None),
-            release_cache: Mutex::new(HashMap::new()),
-            search_cache: Mutex::new(HashMap::new()),
+            release_cache: Mutex::new(BoundedCache::new(RELEASE_CACHE_CAPACITY)),
+            search_cache: Mutex::new(BoundedCache::new(SEARCH_CACHE_CAPACITY)),
         })
     }
 
@@ -276,7 +276,7 @@ impl DiscogsAdapter {
     /// Fetches a concrete release, deduplicating repeated requests in a run.
     pub async fn fetch_discogs_release(&self, id: u64) -> Result<RemoteRelease, AdapterError> {
         if let Some(cached) = lock(&self.release_cache).get(&id) {
-            return Ok(cached.clone());
+            return Ok(cached);
         }
 
         let release = self
@@ -288,7 +288,16 @@ impl DiscogsAdapter {
             })?;
 
         let remote = RemoteRelease::from_discogs(release);
-        lock(&self.release_cache).insert(id, remote.clone());
+        // Discogs answers a merged release ID with the surviving release, so
+        // cache the document under both IDs.
+        let mut cache = lock(&self.release_cache);
+        if let Some(canonical) = remote.id.discogs_id()
+            && canonical != id
+        {
+            cache.insert(canonical, remote.clone());
+        }
+        cache.insert(id, remote.clone());
+        drop(cache);
 
         Ok(remote)
     }
@@ -302,7 +311,7 @@ impl DiscogsAdapter {
     ) -> Result<SearchPage, AdapterError> {
         let cache_key = format!("{params:?}|{page}");
         if let Some(cached) = lock(&self.search_cache).get(&cache_key) {
-            return Ok(cached.clone());
+            return Ok(cached);
         }
 
         let pagination = PaginationParams::new(page, PER_PAGE);
@@ -696,6 +705,20 @@ mod tests {
         let adapter = adapter(&server.url, fast_policy());
 
         adapter.fetch_discogs_release(42).await.unwrap();
+        adapter.fetch_discogs_release(42).await.unwrap();
+
+        assert_eq!(server.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn serves_a_merged_release_id_from_cache_under_both_ids() {
+        // Discogs answers a merged ID (7) with the surviving release (42).
+        let server = MockServer::start(|_| (200, release_json()));
+        let adapter = adapter(&server.url, fast_policy());
+
+        let release = adapter.fetch_discogs_release(7).await.unwrap();
+        assert_eq!(release.id, ReleaseId::Discogs(42));
+        adapter.fetch_discogs_release(7).await.unwrap();
         adapter.fetch_discogs_release(42).await.unwrap();
 
         assert_eq!(server.request_count(), 1);
