@@ -26,16 +26,21 @@ impl ImportProgress {
         match event {
             ScanEvent::Discovering => self.spinner("Discovering audio files"),
             ScanEvent::Discovered { total } => self.counter("Reading tags", total),
+            ScanEvent::Warning { message } => self.warn(&message),
             ScanEvent::FileFinished {
                 completed, warning, ..
             } => {
                 self.bar.set_position(completed as u64);
                 if let Some(warning) = warning {
-                    // Unlike ProgressBar::println, this also prints when hidden.
-                    self.bar.suspend(|| eprintln!("{warning}"));
+                    self.warn(&warning);
                 }
             }
         }
+    }
+
+    fn warn(&self, message: &str) {
+        // Unlike ProgressBar::println, this also prints when hidden.
+        self.bar.suspend(|| eprintln!("{message}"));
     }
 
     pub fn saving(&self, total: usize) {

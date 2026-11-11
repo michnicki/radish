@@ -25,10 +25,11 @@ pub mod scanner;
 pub mod store;
 pub mod watcher;
 
-/// Prints a line to stdout, treating a closed pipe as a clean end.
+/// Prints a line to stdout; a write failure ends the process.
 ///
 /// `println!` panics when the reader exits early (`radish list | head`); CLI
-/// output uses this macro so a closed pipe just stops the output.
+/// output uses this macro instead. On a closed pipe the process exits with
+/// status 0, and on any other write error it reports the error and exits 1.
 #[macro_export]
 macro_rules! outln {
     () => {
@@ -39,7 +40,10 @@ macro_rules! outln {
     };
 }
 
-/// Prints text to stdout without a trailing newline, tolerating a closed pipe.
+/// Prints text to stdout without a trailing newline.
+///
+/// Write failures end the process like [`outln!`]: status 0 on a closed pipe,
+/// status 1 on any other error.
 #[macro_export]
 macro_rules! out {
     ($($arg:tt)*) => {
