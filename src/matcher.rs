@@ -1,22 +1,27 @@
-//! Pure Discogs matching logic: normalization, track assignment, scoring, and
+//! Pure matching logic: normalization, track assignment, scoring, and
 //! automatic-acceptance gates.
 //!
-//! Nothing here touches the network or the database. The adapter converts
-//! Discogs responses into [`RemoteRelease`] values, storage loads
+//! Nothing here touches the network or the database. Adapters convert their
+//! service responses into [`RemoteRelease`] values, storage loads
 //! [`LocalRelease`] values, and this module decides what may be applied.
+//! Provider SDK types never reach this module.
 
+use crate::providers::{GroupId, Mbid, ProviderKind, ReleaseId};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-/// Bumped whenever normalization, mapping, scoring, or gates change, so stored
-/// decisions stay explainable.
-pub const ALGORITHM_VERSION: &str = "discogs-match-v1";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v2";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v1";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
 pub const TITLE_SIMILARITY_THRESHOLD: f64 = 0.90;
 pub const DURATION_TOLERANCE_SECS: f64 = 3.0;
+
+/// A primary candidate this close to the fallback is plausible evidence that
+/// both services describe the same edition, so discrepancies matter.
+pub const PLAUSIBLE_PRIMARY_SCORE: f64 = 0.95;
 
 pub const WEIGHT_ALBUM_TITLE: f64 = 0.25;
 pub const WEIGHT_ALBUM_ARTIST: f64 = 0.20;
@@ -29,6 +34,16 @@ const TIE_EPSILON: f64 = 1e-9;
 /// Similarity assigned to a duration comparison used only for assignment cost,
 /// where an unknown duration is neutral evidence rather than a penalty.
 const NEUTRAL_DURATION_SIMILARITY: f64 = 0.5;
+
+/// Bumped whenever normalization, mapping, scoring, or gates change, so stored
+/// decisions stay explainable. Historical `discogs-match-v1` rows keep their
+/// recorded value.
+pub fn algorithm_version(provider: ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::Discogs => DISCOGS_ALGORITHM_VERSION,
+        ProviderKind::MusicBrainz => MUSICBRAINZ_ALGORITHM_VERSION,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Input types
@@ -67,6 +82,18 @@ impl ArtistKind {
     }
 }
 
+/// MusicBrainz evidence embedded in the local files of one release.
+///
+/// A release ID present on every file identifies an edition. A group ID may
+/// narrow search but never establishes an edition. Problems retain malformed or
+/// conflicting observations for review instead of silently dropping them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddedReleaseEvidence {
+    pub release_id: Option<Mbid>,
+    pub release_group_id: Option<Mbid>,
+    pub problems: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalTrack {
     pub id: i64,
@@ -75,6 +102,11 @@ pub struct LocalTrack {
     pub disc: Option<i64>,
     pub track_number: Option<i64>,
     pub duration_secs: Option<f64>,
+    /// Set only when this file has exactly one valid observed value.
+    pub release_track_id: Option<Mbid>,
+    pub recording_id: Option<Mbid>,
+    /// Malformed or conflicting observed identifiers for this file.
+    pub identifier_problems: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +121,7 @@ pub struct LocalRelease {
     pub catalog_number: Option<String>,
     /// Embedded Discogs release ID, present only when every file agrees on one.
     pub embedded_discogs_id: Option<u64>,
+    pub embedded_evidence: EmbeddedReleaseEvidence,
     pub is_compilation: bool,
     pub has_album_tag: bool,
     pub revision: String,
@@ -124,18 +157,53 @@ pub struct RemoteTrack {
     #[serde(default)]
     pub duration_secs: Option<f64>,
     pub entry_type: TrackEntryType,
+    #[serde(default)]
+    pub medium_position: Option<u32>,
+    #[serde(default)]
+    pub track_position: Option<u32>,
+    #[serde(default)]
+    pub release_track_id: Option<Mbid>,
+    #[serde(default)]
+    pub recording_id: Option<Mbid>,
+    #[serde(default)]
+    pub artist_credit: Option<String>,
 }
 
 impl RemoteTrack {
     pub fn is_playable(&self) -> bool {
         self.entry_type == TrackEntryType::Track
     }
+
+    /// Prefers the exact service credit text, which keeps join phrases intact.
+    pub fn artist_display(&self) -> String {
+        if let Some(credit) = self.artist_credit.as_deref()
+            && !credit.trim().is_empty()
+        {
+            return credit.to_string();
+        }
+        self.artists.join(", ")
+    }
+
+    /// Explicit medium/track position, then a Discogs-style position string.
+    fn position_key(&self) -> Option<(u32, u32)> {
+        if let (Some(medium), Some(position)) = (self.medium_position, self.track_position) {
+            return Some((medium, position));
+        }
+        let raw = self.position.as_deref()?;
+        let parsed = parse_position(raw);
+        if parsed.side.is_some() {
+            return None;
+        }
+        parsed
+            .track
+            .map(|number| (parsed.disc.unwrap_or(1), number))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RemoteRelease {
-    pub id: u64,
-    pub master_id: Option<u64>,
+    pub id: ReleaseId,
+    pub group_id: Option<GroupId>,
     pub title: String,
     pub artists: Vec<String>,
     pub year: Option<i64>,
@@ -146,10 +214,29 @@ pub struct RemoteRelease {
     pub barcodes: Vec<String>,
     pub tracklist: Vec<RemoteTrack>,
     pub url: String,
+    /// Verified aliases (for example a merged release ID that redirects).
+    #[serde(default)]
+    pub lookup_aliases: Vec<ReleaseId>,
+    #[serde(default)]
+    pub artist_credit: Option<String>,
+    /// Structural findings from the raw document that block acceptance.
+    #[serde(default)]
+    pub structure_issues: Vec<String>,
+    /// Edition qualifiers taken from disambiguation and format descriptions.
+    #[serde(default)]
+    pub edition_notes: Vec<String>,
+    /// Radish-owned provider extension; null for Discogs snapshots.
+    #[serde(default)]
+    pub provider_metadata: serde_json::Value,
 }
 
 impl RemoteRelease {
     pub fn artist_display(&self) -> String {
+        if let Some(credit) = self.artist_credit.as_deref()
+            && !credit.trim().is_empty()
+        {
+            return credit.to_string();
+        }
         self.artists.join(", ")
     }
 
@@ -182,22 +269,31 @@ impl RemoteRelease {
             .collect()
     }
 
-    /// Index entries and unknown structures cannot be flattened or dropped, so
-    /// they block acceptance of a complete supported mapping.
+    /// Index entries, unknown structures, and raw-document findings cannot be
+    /// flattened or dropped, so they block acceptance of a complete mapping.
     pub fn has_unsupported_entries(&self) -> bool {
-        self.tracklist.iter().any(|track| {
-            matches!(
-                track.entry_type,
-                TrackEntryType::Index | TrackEntryType::Other
-            )
-        })
+        !self.structure_issues.is_empty()
+            || self.tracklist.iter().any(|track| {
+                matches!(
+                    track.entry_type,
+                    TrackEntryType::Index | TrackEntryType::Other
+                )
+            })
+    }
+
+    pub fn provider(&self) -> ProviderKind {
+        self.id.provider()
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchSummary {
-    pub id: u64,
+    pub id: ReleaseId,
     pub title: String,
+    #[serde(default)]
+    pub artists: Vec<String>,
+    #[serde(default)]
+    pub artist_credit: Option<String>,
     pub year: Option<i64>,
     pub country: Option<String>,
     pub labels: Vec<String>,
@@ -263,6 +359,15 @@ pub fn strip_disambiguator(input: &str) -> String {
 
 pub fn normalize_artist(input: &str) -> String {
     normalize_text(&strip_disambiguator(input))
+}
+
+/// MusicBrainz credits are compared as written; numeric disambiguation is a
+/// Discogs-only convention.
+pub fn normalize_artist_for(provider: ProviderKind, input: &str) -> String {
+    match provider {
+        ProviderKind::Discogs => normalize_artist(input),
+        ProviderKind::MusicBrainz => normalize_text(input),
+    }
 }
 
 /// Normalized Levenshtein similarity in `0.0..=1.0`.
@@ -440,6 +545,19 @@ pub fn edition_qualifiers(text: &str) -> BTreeSet<&'static str> {
         .collect()
 }
 
+/// Every qualifier a remote release asserts, across its title, formats, and
+/// typed edition notes.
+fn remote_edition_qualifiers(remote: &RemoteRelease) -> BTreeSet<&'static str> {
+    let mut qualifiers = edition_qualifiers(&remote.title);
+    for format in &remote.formats {
+        qualifiers.extend(edition_qualifiers(format));
+    }
+    for note in &remote.edition_notes {
+        qualifiers.extend(edition_qualifiers(note));
+    }
+    qualifiers
+}
+
 // ---------------------------------------------------------------------------
 // Track mapping
 // ---------------------------------------------------------------------------
@@ -471,64 +589,191 @@ impl Mapping {
 
 /// Maps local files to remote tracklist entries.
 ///
-/// Unique disc/track positions are matched first; everything else goes through
-/// a minimum-cost one-to-one assignment over normalized title similarity and
-/// duration, with ties broken deterministically and flagged as ambiguous.
+/// Strong identifiers anchor first: unique release-track IDs, then unique
+/// recording IDs, then unique `(medium, track)` positions. Everything else goes
+/// through a minimum-cost one-to-one assignment over normalized title
+/// similarity and duration, with ties broken deterministically and flagged as
+/// ambiguous. Repeated recording IDs are legal on a release, so they only
+/// anchor when both sides are unambiguous.
 pub fn map_tracks(local: &LocalRelease, remote: &RemoteRelease) -> Mapping {
     let playable = remote.playable_tracks();
     let mut pairs: Vec<Option<usize>> = vec![None; local.tracks.len()];
     let mut used: Vec<bool> = vec![false; remote.tracklist.len()];
     let mut notes = Vec::new();
 
-    // Pass 1: unique disc/track positions.
-    if playable.iter().all(|(_, track)| track.position.is_some()) {
-        use std::collections::HashMap;
-
-        let mut local_by_key: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
-        for (index, track) in local.tracks.iter().enumerate() {
-            if let Some(number) = track.track_number {
-                let disc = track.disc.unwrap_or(1);
-                local_by_key.entry((disc, number)).or_default().push(index);
-            }
+    // Pass 1: unique release-track IDs.
+    let mut local_release_ids: HashMap<Mbid, Vec<usize>> = HashMap::new();
+    for (index, track) in local.tracks.iter().enumerate() {
+        if let Some(id) = track.release_track_id {
+            local_release_ids.entry(id).or_default().push(index);
         }
+    }
+    let mut remote_release_ids: HashMap<Mbid, Vec<usize>> = HashMap::new();
+    for (release_index, track) in &playable {
+        if let Some(id) = track.release_track_id {
+            remote_release_ids
+                .entry(id)
+                .or_default()
+                .push(*release_index);
+        }
+    }
+    let mut anchors: Vec<(usize, usize)> = Vec::new();
+    for (id, local_indexes) in &local_release_ids {
+        if local_indexes.len() != 1 {
+            notes.push(format!(
+                "several local files claim release-track ID {id}; it cannot anchor a mapping"
+            ));
+            continue;
+        }
+        match remote_release_ids.get(id) {
+            Some(remote_indexes) if remote_indexes.len() == 1 => {
+                anchors.push((local_indexes[0], remote_indexes[0]));
+            }
+            Some(_) => notes.push(format!(
+                "release-track ID {id} appears on several remote tracks"
+            )),
+            None => notes.push(format!(
+                "release-track ID {id} from '{}' is not on the remote release",
+                local.tracks[local_indexes[0]]
+                    .title
+                    .as_deref()
+                    .unwrap_or(&local.tracks[local_indexes[0]].path)
+            )),
+        }
+    }
+    anchors.sort_unstable();
+    for (local_index, remote_index) in anchors {
+        pairs[local_index] = Some(remote_index);
+        used[remote_index] = true;
+    }
 
-        let mut remote_by_key: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
-        for (release_index, track) in &playable {
-            if let Some(position) = track.position.as_deref() {
-                let parsed = parse_position(position);
-                if parsed.side.is_none()
-                    && let Some(number) = parsed.track
-                {
-                    remote_by_key
-                        .entry((parsed.disc.unwrap_or(1), number))
-                        .or_default()
-                        .push(*release_index);
+    // Pass 2: unique recording IDs among what is left.
+    let mut local_recordings: HashMap<Mbid, Vec<usize>> = HashMap::new();
+    for (index, track) in local.tracks.iter().enumerate() {
+        if pairs[index].is_none()
+            && let Some(id) = track.recording_id
+        {
+            local_recordings.entry(id).or_default().push(index);
+        }
+    }
+    let mut remote_recordings: HashMap<Mbid, Vec<usize>> = HashMap::new();
+    for (release_index, track) in &playable {
+        if used[*release_index] {
+            continue;
+        }
+        if let Some(id) = track.recording_id {
+            remote_recordings
+                .entry(id)
+                .or_default()
+                .push(*release_index);
+        }
+    }
+    let mut recording_anchors: Vec<(usize, usize)> = Vec::new();
+    for (id, local_indexes) in &local_recordings {
+        if local_indexes.len() != 1 {
+            continue;
+        }
+        if let Some(remote_indexes) = remote_recordings.get(id)
+            && remote_indexes.len() == 1
+        {
+            recording_anchors.push((local_indexes[0], remote_indexes[0]));
+        }
+    }
+    recording_anchors.sort_unstable();
+    for (local_index, remote_index) in recording_anchors {
+        pairs[local_index] = Some(remote_index);
+        used[remote_index] = true;
+    }
+
+    // Pass 3: unique explicit medium/track positions.
+    let remaining_local: Vec<usize> = (0..local.tracks.len())
+        .filter(|index| pairs[*index].is_none())
+        .collect();
+    if !remaining_local.is_empty() {
+        let remaining_remote: Vec<usize> = playable
+            .iter()
+            .map(|(index, _)| *index)
+            .filter(|index| !used[*index])
+            .collect();
+
+        let all_keyed = remaining_local.iter().all(|index| {
+            let track = &local.tracks[*index];
+            track.track_number.is_some()
+        }) && remaining_remote
+            .iter()
+            .all(|index| remote.tracklist[*index].position_key().is_some());
+
+        if all_keyed {
+            let mut local_by_key: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+            for index in &remaining_local {
+                let track = &local.tracks[*index];
+                let disc = track.disc.unwrap_or(1).max(0) as u32;
+                let number = track.track_number.unwrap_or_default() as u32;
+                local_by_key.entry((disc, number)).or_default().push(*index);
+            }
+
+            let mut remote_by_key: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+            for index in &remaining_remote {
+                if let Some(key) = remote.tracklist[*index].position_key() {
+                    remote_by_key.entry(key).or_default().push(*index);
                 }
             }
-        }
 
-        let mut position_pairs: Vec<((i64, i64), usize, usize)> = Vec::new();
-        for (key, local_indexes) in &local_by_key {
-            if local_indexes.len() != 1 {
-                continue;
+            let mut position_pairs: Vec<((u32, u32), usize, usize)> = Vec::new();
+            for (key, local_indexes) in &local_by_key {
+                if local_indexes.len() != 1 {
+                    continue;
+                }
+                let Some(remote_indexes) = remote_by_key.get(key) else {
+                    continue;
+                };
+                if remote_indexes.len() != 1 {
+                    continue;
+                }
+                position_pairs.push((*key, local_indexes[0], remote_indexes[0]));
             }
-            let Some(remote_indexes) = remote_by_key.get(&(key.0 as u32, key.1 as u32)) else {
-                continue;
-            };
-            if remote_indexes.len() != 1 {
-                continue;
-            }
-            position_pairs.push((*key, local_indexes[0], remote_indexes[0]));
-        }
-        position_pairs.sort_by_key(|(key, _, _)| *key);
+            position_pairs.sort_by_key(|(key, _, _)| *key);
 
-        for (_, local_index, remote_index) in position_pairs {
-            pairs[local_index] = Some(remote_index);
-            used[remote_index] = true;
+            for (_, local_index, remote_index) in position_pairs {
+                pairs[local_index] = Some(remote_index);
+                used[remote_index] = true;
+            }
         }
     }
 
-    // Pass 2: minimum-cost assignment over what is left.
+    // Identifier anchors must not silently contradict tagged positions.
+    for (local_index, remote_index) in pairs
+        .iter()
+        .enumerate()
+        .filter_map(|(local, remote)| remote.map(|remote| (local, remote)))
+    {
+        let local_track = &local.tracks[local_index];
+        let remote_track = &remote.tracklist[remote_index];
+        let Some(remote_key) = remote_track.position_key() else {
+            continue;
+        };
+        let Some(local_number) = local_track.track_number else {
+            continue;
+        };
+        let local_key = (
+            local_track.disc.unwrap_or(1).max(0) as u32,
+            local_number.max(0) as u32,
+        );
+        if local_key != remote_key {
+            notes.push(format!(
+                "identifier for '{}' points to remote {} but its tags say {}-{}",
+                local_track.title.as_deref().unwrap_or(&local_track.path),
+                remote_track
+                    .position
+                    .clone()
+                    .unwrap_or_else(|| format!("{}-{}", remote_key.0, remote_key.1)),
+                local_key.0,
+                local_key.1
+            ));
+        }
+    }
+
+    // Pass 4: minimum-cost assignment over what is left.
     let remaining_local: Vec<usize> = (0..local.tracks.len())
         .filter(|index| pairs[*index].is_none())
         .collect();
@@ -574,7 +819,7 @@ pub fn map_tracks(local: &LocalRelease, remote: &RemoteRelease) -> Mapping {
                 .collect();
             if !tied.is_empty() {
                 notes.push(format!(
-                    "track '{}' ties with {} other Discogs entr{}",
+                    "track '{}' ties with {} other remote entr{}",
                     local.tracks[*local_index]
                         .title
                         .as_deref()
@@ -596,20 +841,20 @@ pub fn map_tracks(local: &LocalRelease, remote: &RemoteRelease) -> Mapping {
     unique_targets.dedup();
     if unique_targets.len() != assigned {
         complete = false;
-        notes.push("two files were mapped to the same Discogs track".to_string());
+        notes.push("two files were mapped to the same remote track".to_string());
     }
 
     if remote.has_unsupported_entries() {
         complete = false;
         notes.push(
-            "release contains index or unsupported tracklist entries that cannot be flattened"
+            "release contains index, unsupported, or structurally incomplete tracklist entries"
                 .to_string(),
         );
     }
 
     if local.tracks.len() != remote_count {
         notes.push(format!(
-            "{} local file(s) versus {} playable Discogs track(s)",
+            "{} local file(s) versus {} playable remote track(s)",
             local.tracks.len(),
             remote_count
         ));
@@ -842,11 +1087,12 @@ fn album_artist_score(local: &LocalRelease, remote: &RemoteRelease) -> f64 {
         return 0.0;
     }
 
-    let local_normalized = normalize_artist(artist);
+    let provider = remote.provider();
+    let local_normalized = normalize_artist_for(provider, artist);
     let remote_normalized: Vec<String> = remote
         .artists
         .iter()
-        .map(|name| normalize_artist(name))
+        .map(|name| normalize_artist_for(provider, name))
         .collect();
 
     let various = matches!(local.artist_kind, ArtistKind::VariousArtists)
@@ -877,7 +1123,7 @@ pub fn rank_search_summary(local: &LocalRelease, summary: &SearchSummary) -> f64
         rank += 0.5 * similarity(title, &summary.title);
     }
     if let Some(artist) = &local.album_artist {
-        rank += 0.3 * remote_artist_hint(artist, &summary.title);
+        rank += 0.3 * summary_artist_hint(artist, summary);
     }
     if let (Some(year), Some(remote_year)) = (local.year, summary.year)
         && year == remote_year
@@ -910,13 +1156,24 @@ pub fn rank_search_summary(local: &LocalRelease, summary: &SearchSummary) -> f64
     rank
 }
 
-/// Search summaries only carry `Artist - Title` strings, so the artist appears
-/// inside the title. Matching it there keeps ranking useful without pretending
-/// it is structured data.
-fn remote_artist_hint(local_artist: &str, summary_title: &str) -> f64 {
-    let (hint, _) = summary_title
+/// Structured credits win. Discogs search summaries only carry
+/// `Artist - Title` strings, so the fallback keeps ranking useful without
+/// pretending that string is structured data.
+fn summary_artist_hint(local_artist: &str, summary: &SearchSummary) -> f64 {
+    if let Some(credit) = summary
+        .artist_credit
+        .as_deref()
+        .filter(|c| !c.trim().is_empty())
+    {
+        return artist_similarity(local_artist, credit);
+    }
+    if !summary.artists.is_empty() {
+        return artist_similarity(local_artist, &summary.artists.join(" "));
+    }
+    let (hint, _) = summary
+        .title
         .split_once(" - ")
-        .unwrap_or(("", summary_title));
+        .unwrap_or(("", &summary.title));
     artist_similarity(local_artist, hint)
 }
 
@@ -950,13 +1207,42 @@ impl Candidate {
     }
 }
 
+/// One discovery strategy's outcome, kept candidate-specific so an incomplete
+/// identifier search cannot be mistaken for a resolved identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrategyOutcome {
+    pub label: String,
+    pub attempted: bool,
+    pub successful: bool,
+    pub complete: bool,
+}
+
+impl StrategyOutcome {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            attempted: false,
+            successful: false,
+            complete: false,
+        }
+    }
+}
+
 /// How candidate discovery went for one local release. Identifier discovery
-/// that was cut short, or identifiers that do not separate editions, keep a
-/// candidate out of automatic acceptance.
+/// that was cut short, unhydrated summaries, or identifiers that do not separate
+/// editions keep a candidate out of automatic acceptance.
 #[derive(Debug, Clone, Default)]
 pub struct DiscoveryEvidence {
-    pub identifier_search_truncated: bool,
+    /// Derived from the richer evidence, never supplied by callers of `evaluate`.
     pub identifier_unique: bool,
+    pub identifier_search_truncated: bool,
+    pub embedded_release_resolved: bool,
+    pub identifier_summary_ids: HashSet<ReleaseId>,
+    pub unhydrated_ids: HashSet<ReleaseId>,
+    pub failed_ids: HashSet<ReleaseId>,
+    pub strategies: Vec<StrategyOutcome>,
+    /// Explicit reasons discovery could not settle identity questions.
+    pub blockers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -971,8 +1257,10 @@ pub struct Evaluation {
 }
 
 impl Evaluation {
+    /// Manual acceptance can override score and identity uncertainty, but never
+    /// an incomplete or structurally unsupported mapping.
     pub fn can_apply(&self, candidate: &Candidate) -> bool {
-        candidate.mapping.complete
+        candidate.mapping.complete && !candidate.release.has_unsupported_entries()
     }
 }
 
@@ -987,14 +1275,19 @@ pub fn evaluate(
     let mut evidence = Vec::new();
 
     let remote = &candidate.release;
-    let embedded_consistent = local.embedded_discogs_id == Some(remote.id);
+    let provider = remote.provider();
+
+    let embedded_consistent = match &remote.id {
+        ReleaseId::Discogs(id) => local.embedded_discogs_id == Some(*id),
+        ReleaseId::MusicBrainz(id) => local.embedded_evidence.release_id == Some(*id),
+    };
 
     if !candidate.mapping.complete {
         blockers.push("track mapping is incomplete".to_string());
     }
     if remote.has_unsupported_entries() {
         blockers.push(
-            "release contains index or unsupported tracklist entries that cannot be flattened"
+            "release contains index, unsupported, or structurally incomplete tracklist entries that cannot be flattened"
                 .to_string(),
         );
     }
@@ -1056,19 +1349,58 @@ pub fn evaluate(
         && difference > DURATION_TOLERANCE_SECS
     {
         blockers.push(format!(
-            "track '{worst_duration_track}' differs by {difference:.1}s from the Discogs duration"
+            "track '{worst_duration_track}' differs by {difference:.1}s from the {provider} duration"
         ));
     }
 
-    // Identifier contradictions.
-    if let Some(embedded) = local.embedded_discogs_id {
-        if embedded == remote.id {
-            evidence.push(format!("embedded Discogs release ID {embedded} matches"));
-        } else {
-            blockers.push(format!(
-                "embedded Discogs release ID {embedded} conflicts with release {}",
-                remote.id
-            ));
+    // Embedded identifier contradictions. Provider IDs are only ever compared
+    // within their own namespace.
+    if provider == ProviderKind::MusicBrainz {
+        for problem in &local.embedded_evidence.problems {
+            blockers.push(problem.clone());
+        }
+        for track in &local.tracks {
+            for problem in &track.identifier_problems {
+                blockers.push(problem.clone());
+            }
+        }
+    }
+
+    match &remote.id {
+        ReleaseId::Discogs(id) => {
+            if let Some(embedded) = local.embedded_discogs_id {
+                if embedded == *id {
+                    evidence.push(format!("embedded Discogs release ID {embedded} matches"));
+                } else {
+                    blockers.push(format!(
+                        "embedded Discogs release ID {embedded} conflicts with release {id}"
+                    ));
+                }
+            }
+        }
+        ReleaseId::MusicBrainz(id) => {
+            if let Some(embedded) = local.embedded_evidence.release_id {
+                if embedded == *id {
+                    evidence.push(format!(
+                        "embedded MusicBrainz release ID {embedded} matches"
+                    ));
+                } else {
+                    blockers.push(format!(
+                        "embedded MusicBrainz release ID {embedded} conflicts with release {id}"
+                    ));
+                }
+            }
+            if let (Some(observed), Some(GroupId::MusicBrainzReleaseGroup(remote_group))) =
+                (local.embedded_evidence.release_group_id, &remote.group_id)
+            {
+                if observed == *remote_group {
+                    evidence.push(format!("observed release group {observed} matches"));
+                } else {
+                    blockers.push(format!(
+                        "observed release group {observed} conflicts with release group {remote_group}"
+                    ));
+                }
+            }
         }
     }
 
@@ -1113,16 +1445,17 @@ pub fn evaluate(
     // Edition qualifiers must agree; they change what the release is.
     if let Some(local_title) = &local.album_title {
         let local_qualifiers = edition_qualifiers(local_title);
-        let remote_qualifiers = edition_qualifiers(&remote.title);
+        let remote_qualifiers = remote_edition_qualifiers(remote);
         if local_qualifiers != remote_qualifiers {
             blockers.push(format!(
-                "edition qualifiers differ: local {:?} versus Discogs {:?}",
+                "edition qualifiers differ: local {:?} versus {provider} {:?}",
                 local_qualifiers, remote_qualifiers
             ));
         }
     }
 
     // Evidence identifying this specific release rather than an edition twin.
+    // A release group or an explicitly entered ID never counts on its own.
     if embedded_consistent {
         // Already recorded as evidence above.
     } else if discovery.identifier_unique {
@@ -1137,6 +1470,10 @@ pub fn evaluate(
         blockers.push("identifier search results were truncated".to_string());
     }
 
+    for blocker in &discovery.blockers {
+        blockers.push(blocker.clone());
+    }
+
     if local.is_compilation {
         warnings.push("local release looks like a compilation".to_string());
     }
@@ -1144,7 +1481,7 @@ pub fn evaluate(
         warnings.push("local release has no album title tag".to_string());
     }
     if remote.year.is_none() {
-        warnings.push("Discogs release has no year".to_string());
+        warnings.push(format!("{provider} release has no year"));
     }
 
     Evaluation {
@@ -1153,6 +1490,84 @@ pub fn evaluate(
         warnings,
         evidence,
     }
+}
+
+/// Cross-provider checks applied before automatic fallback acceptance.
+///
+/// Scores, runner-up gaps, and mappings stay within one provider. This function
+/// only asks whether the fallback contradicts the local edition or a complete,
+/// plausible primary candidate.
+pub fn fallback_conflicts(
+    local: &LocalRelease,
+    primary_candidates: &[Candidate],
+    fallback: &Candidate,
+    embedded_release_resolved: bool,
+) -> Vec<String> {
+    let mut conflicts = Vec::new();
+
+    for problem in &local.embedded_evidence.problems {
+        conflicts.push(problem.clone());
+    }
+
+    if local.embedded_evidence.release_id.is_some() && !embedded_release_resolved {
+        conflicts.push(
+            "an observed MusicBrainz release ID was not resolved, so another provider cannot settle the edition"
+                .to_string(),
+        );
+    }
+
+    let fallback_qualifiers = remote_edition_qualifiers(&fallback.release);
+    let mut fallback_durations: HashMap<usize, f64> = HashMap::new();
+    let mut fallback_titles: HashMap<usize, String> = HashMap::new();
+    for (local_index, remote_index) in fallback.mapping.assigned_pairs() {
+        if let Some(track) = fallback.release.tracklist.get(remote_index) {
+            fallback_titles.insert(local_index, track.title.clone());
+            if let Some(duration) = track.duration_secs {
+                fallback_durations.insert(local_index, duration);
+            }
+        }
+    }
+
+    for primary in primary_candidates {
+        if !primary.mapping.complete || primary.score.total + 1e-9 < PLAUSIBLE_PRIMARY_SCORE {
+            continue;
+        }
+        let primary_qualifiers = remote_edition_qualifiers(&primary.release);
+        if primary_qualifiers != fallback_qualifiers {
+            conflicts.push(format!(
+                "primary candidates describe {:?} but the fallback describes {:?}",
+                primary_qualifiers, fallback_qualifiers
+            ));
+        }
+        for (local_index, remote_index) in primary.mapping.assigned_pairs() {
+            let Some(primary_track) = primary.release.tracklist.get(remote_index) else {
+                continue;
+            };
+            if let Some(fallback_title) = fallback_titles.get(&local_index) {
+                let similarity = similarity(&primary_track.title, fallback_title);
+                if similarity < TITLE_SIMILARITY_THRESHOLD {
+                    conflicts.push(format!(
+                        "primary and fallback track titles differ for local track {} ('{}' versus '{}')",
+                        local_index + 1,
+                        primary_track.title,
+                        fallback_title
+                    ));
+                }
+            }
+            if let (Some(primary_duration), Some(fallback_duration)) = (
+                primary_track.duration_secs,
+                fallback_durations.get(&local_index).copied(),
+            ) && (primary_duration - fallback_duration).abs() > DURATION_TOLERANCE_SECS
+            {
+                conflicts.push(format!(
+                    "primary and fallback durations differ for local track {}",
+                    local_index + 1
+                ));
+            }
+        }
+    }
+
+    conflicts
 }
 
 #[cfg(test)]
@@ -1170,6 +1585,9 @@ mod tests {
                 disc: None,
                 track_number: Some(index as i64 + 1),
                 duration_secs: Some(180.0 + index as f64),
+                release_track_id: None,
+                recording_id: None,
+                identifier_problems: Vec::new(),
             })
             .collect();
 
@@ -1183,6 +1601,7 @@ mod tests {
             barcode: None,
             catalog_number: None,
             embedded_discogs_id: None,
+            embedded_evidence: EmbeddedReleaseEvidence::default(),
             is_compilation: false,
             has_album_tag: true,
             revision: "rev-1".to_string(),
@@ -1190,10 +1609,14 @@ mod tests {
         }
     }
 
+    fn mbid(value: &str) -> Mbid {
+        value.parse().unwrap()
+    }
+
     fn remote_release(titles: &[&str]) -> RemoteRelease {
         RemoteRelease {
-            id: 42,
-            master_id: None,
+            id: ReleaseId::Discogs(42),
+            group_id: None,
             title: "Test Album".to_string(),
             artists: vec!["Test Artist".to_string()],
             year: Some(2001),
@@ -1211,9 +1634,19 @@ mod tests {
                     artists: Vec::new(),
                     duration_secs: Some(180.0 + index as f64),
                     entry_type: TrackEntryType::Track,
+                    medium_position: None,
+                    track_position: None,
+                    release_track_id: None,
+                    recording_id: None,
+                    artist_credit: None,
                 })
                 .collect(),
             url: "https://www.discogs.com/release/42".to_string(),
+            lookup_aliases: Vec::new(),
+            artist_credit: None,
+            structure_issues: Vec::new(),
+            edition_notes: Vec::new(),
+            provider_metadata: serde_json::Value::Null,
         }
     }
 
@@ -1232,6 +1665,11 @@ mod tests {
             "Blink-182 (Deluxe Edition)"
         );
         assert_eq!(normalize_artist("Nirvana (2)"), normalize_artist("nirvana"));
+        // MusicBrainz credits keep their exact text.
+        assert_ne!(
+            normalize_artist_for(ProviderKind::MusicBrainz, "Nirvana (2)"),
+            normalize_artist_for(ProviderKind::MusicBrainz, "Nirvana")
+        );
     }
 
     #[test]
@@ -1310,6 +1748,79 @@ mod tests {
     }
 
     #[test]
+    fn release_track_ids_anchor_reordered_files_across_two_discs() {
+        // Remote order: One (1-1), Two (1-2), Three (2-1), Four (2-2).
+        // Local files carry the release-track IDs of remote indexes 2, 0, 3, 1.
+        let mut local = local_release(&["Three", "One", "Four", "Two"]);
+        let ids = [
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+            "33333333-3333-3333-3333-333333333333",
+            "44444444-4444-4444-4444-444444444444",
+        ];
+        let local_remote_indexes = [2, 0, 3, 1];
+        for (index, track) in local.tracks.iter_mut().enumerate() {
+            let remote_index = local_remote_indexes[index];
+            track.release_track_id = Some(mbid(ids[remote_index]));
+            track.disc = Some(if remote_index < 2 { 1 } else { 2 });
+            track.track_number = Some((remote_index % 2 + 1) as i64);
+        }
+
+        let mut remote = remote_release(&["One", "Two", "Three", "Four"]);
+        for (index, track) in remote.tracklist.iter_mut().enumerate() {
+            track.release_track_id = Some(mbid(ids[index]));
+            track.medium_position = Some(if index < 2 { 1 } else { 2 });
+            track.track_position = Some((index % 2 + 1) as u32);
+            track.position = None;
+        }
+
+        let mapping = map_tracks(&local, &remote);
+        assert!(mapping.complete, "{:?}", mapping.notes);
+        assert!(!mapping.ambiguous, "{:?}", mapping.notes);
+        assert_eq!(mapping.pairs, vec![Some(2), Some(0), Some(3), Some(1)]);
+    }
+
+    #[test]
+    fn repeated_recording_ids_do_not_collapse_duplicate_assignments() {
+        let mut local = local_release(&["One", "Two"]);
+        let recording = mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd");
+        for track in &mut local.tracks {
+            track.recording_id = Some(recording);
+            track.track_number = None;
+        }
+
+        let mut remote = remote_release(&["One", "Two"]);
+        for track in &mut remote.tracklist {
+            track.recording_id = Some(recording);
+            track.position = None;
+        }
+
+        let mapping = map_tracks(&local, &remote);
+        assert!(mapping.complete);
+        let mut targets: Vec<usize> = mapping.pairs.iter().filter_map(|p| *p).collect();
+        targets.sort_unstable();
+        targets.dedup();
+        assert_eq!(targets.len(), 2, "both files must map to distinct tracks");
+    }
+
+    #[test]
+    fn identifier_anchors_keep_position_conflicts_visible() {
+        let mut local = local_release(&["One", "Two"]);
+        // Second local file claims the release-track ID of remote track 1.
+        local.tracks[1].release_track_id = Some(mbid("11111111-1111-1111-1111-111111111111"));
+        let mut remote = remote_release(&["One", "Two"]);
+        remote.tracklist[0].release_track_id = Some(mbid("11111111-1111-1111-1111-111111111111"));
+
+        let mapping = map_tracks(&local, &remote);
+        assert!(mapping.ambiguous, "{:?}", mapping.notes);
+        assert!(
+            mapping.notes.iter().any(|note| note.contains("tags say")),
+            "{:?}",
+            mapping.notes
+        );
+    }
+
+    #[test]
     fn ignores_headings_and_refuses_index_entries() {
         let local = local_release(&["One", "Two"]);
         let mut remote = remote_release(&["One", "Two"]);
@@ -1321,6 +1832,11 @@ mod tests {
                 artists: Vec::new(),
                 duration_secs: None,
                 entry_type: TrackEntryType::Heading,
+                medium_position: None,
+                track_position: None,
+                release_track_id: None,
+                recording_id: None,
+                artist_credit: None,
             },
         );
         assert_eq!(remote.playable_tracks().len(), 2);
@@ -1333,10 +1849,28 @@ mod tests {
             artists: Vec::new(),
             duration_secs: None,
             entry_type: TrackEntryType::Index,
+            medium_position: None,
+            track_position: None,
+            release_track_id: None,
+            recording_id: None,
+            artist_credit: None,
         });
         let mapping = map_tracks(&local, &remote);
         assert!(!mapping.complete);
         assert!(remote.has_unsupported_entries());
+    }
+
+    #[test]
+    fn structure_issues_block_acceptance() {
+        let mut local = local_release(&["One"]);
+        local.embedded_evidence.release_id = Some(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"));
+        let mut remote = remote_release(&["One"]);
+        remote.id = ReleaseId::MusicBrainz(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"));
+        remote.structure_issues = vec!["medium 1 has a pregap track".to_string()];
+        let candidate = Candidate::new(&local, remote);
+        let evaluation = evaluate(&local, &candidate, None, &DiscoveryEvidence::default());
+        assert!(!evaluation.auto_accept);
+        assert!(!evaluation.can_apply(&candidate));
     }
 
     #[test]
@@ -1442,8 +1976,8 @@ mod tests {
             &candidate,
             None,
             &DiscoveryEvidence {
-                identifier_search_truncated: false,
                 identifier_unique: true,
+                ..DiscoveryEvidence::default()
             },
         );
         assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
@@ -1470,17 +2004,18 @@ mod tests {
             &DiscoveryEvidence {
                 identifier_search_truncated: true,
                 identifier_unique: true,
+                ..DiscoveryEvidence::default()
             },
         );
         assert!(!evaluation.auto_accept);
     }
 
     #[test]
-    fn runner_up_gap_blocks_acceptance_unless_embedded_id_disagrees() {
+    fn runner_up_gap_blocks_acceptance_unless_embedded_id_agrees() {
         let local = local_release(&["One", "Two"]);
         let first = Candidate::new(&local, remote_release(&["One", "Two"]));
         let mut second_release = remote_release(&["One", "Two"]);
-        second_release.id = 43;
+        second_release.id = ReleaseId::Discogs(43);
         let second = Candidate::new(&local, second_release);
 
         let evaluation = evaluate(
@@ -1488,8 +2023,8 @@ mod tests {
             &first,
             Some(&second),
             &DiscoveryEvidence {
-                identifier_search_truncated: false,
                 identifier_unique: true,
+                ..DiscoveryEvidence::default()
             },
         );
         assert!(!evaluation.auto_accept);
@@ -1531,8 +2066,10 @@ mod tests {
         let mut local = local_release(&["One"]);
         local.barcode = Some("0123456789012".to_string());
         let matching = SearchSummary {
-            id: 42,
+            id: ReleaseId::Discogs(42),
             title: "Test Artist - Test Album".to_string(),
+            artists: Vec::new(),
+            artist_credit: None,
             year: Some(2001),
             country: Some("US".to_string()),
             labels: vec!["Test Label".to_string()],
@@ -1546,5 +2083,144 @@ mod tests {
             ..matching.clone()
         };
         assert!(rank_search_summary(&local, &matching) > rank_search_summary(&local, &other));
+    }
+
+    #[test]
+    fn musicbrainz_credits_keep_join_phrases() {
+        let track = RemoteTrack {
+            position: None,
+            title: "One".to_string(),
+            artists: vec!["A".to_string(), "B".to_string()],
+            duration_secs: None,
+            entry_type: TrackEntryType::Track,
+            medium_position: Some(1),
+            track_position: Some(1),
+            release_track_id: None,
+            recording_id: None,
+            artist_credit: Some("A feat. B".to_string()),
+        };
+        assert_eq!(track.artist_display(), "A feat. B");
+    }
+
+    #[test]
+    fn release_group_identity_is_not_edition_evidence() {
+        let mut local = local_release(&["One", "Two"]);
+        let group = mbid("4642ee19-7790-3c8d-ab5e-d133de942db6");
+        local.embedded_evidence.release_group_id = Some(group);
+
+        let mut remote = remote_release(&["One", "Two"]);
+        remote.id = ReleaseId::MusicBrainz(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"));
+        remote.group_id = Some(GroupId::MusicBrainzReleaseGroup(group));
+        remote.url =
+            "https://musicbrainz.org/release/76df3287-6cda-33eb-8e9a-044b5e15ffdd".to_string();
+
+        let candidate = Candidate::new(&local, remote);
+        let group_only_evaluation =
+            evaluate(&local, &candidate, None, &DiscoveryEvidence::default());
+        assert!(!group_only_evaluation.auto_accept);
+        assert!(
+            group_only_evaluation
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("distinguishes this edition"))
+        );
+    }
+
+    #[test]
+    fn edition_twins_and_incomplete_mappings_need_review() {
+        let local = local_release(&["One", "Two"]);
+        let twin_release = |id: &str| {
+            let mut release = remote_release(&["One", "Two"]);
+            release.id = ReleaseId::MusicBrainz(mbid(id));
+            release.url = format!("https://musicbrainz.org/release/{id}");
+            release
+        };
+        let first = Candidate::new(&local, twin_release("11111111-1111-1111-1111-111111111111"));
+        let second = Candidate::new(&local, twin_release("22222222-2222-2222-2222-222222222222"));
+        let twin_evaluation = evaluate(
+            &local,
+            &first,
+            Some(&second),
+            &DiscoveryEvidence {
+                identifier_unique: true,
+                ..DiscoveryEvidence::default()
+            },
+        );
+        assert!(!twin_evaluation.auto_accept);
+
+        let incomplete_candidate = Candidate::new(&local, remote_release(&["One"]));
+        let incomplete_evaluation = evaluate(
+            &local,
+            &incomplete_candidate,
+            None,
+            &DiscoveryEvidence::default(),
+        );
+        assert!(!incomplete_evaluation.can_apply(&incomplete_candidate));
+    }
+
+    #[test]
+    fn embedded_musicbrainz_release_id_is_edition_evidence() {
+        let mut local = local_release(&["One", "Two"]);
+        let id = mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd");
+        local.embedded_evidence.release_id = Some(id);
+
+        let mut release = remote_release(&["One", "Two"]);
+        release.id = ReleaseId::MusicBrainz(id);
+        release.url = format!("https://musicbrainz.org/release/{id}");
+        let embedded_candidate = Candidate::new(&local, release);
+        let embedded_evaluation = evaluate(
+            &local,
+            &embedded_candidate,
+            None,
+            &DiscoveryEvidence::default(),
+        );
+        assert!(
+            embedded_evaluation.auto_accept,
+            "{:?}",
+            embedded_evaluation.blockers
+        );
+    }
+
+    #[test]
+    fn malformed_observed_identifiers_block_automatic_acceptance() {
+        let mut local = local_release(&["One", "Two"]);
+        local.embedded_evidence.release_id = Some(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"));
+        local.embedded_evidence.problems =
+            vec!["observed release ID 'not-an-mbid' is malformed".to_string()];
+
+        let mut release = remote_release(&["One", "Two"]);
+        release.id = ReleaseId::MusicBrainz(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"));
+        let candidate = Candidate::new(&local, release);
+        let evaluation = evaluate(&local, &candidate, None, &DiscoveryEvidence::default());
+        assert!(!evaluation.auto_accept);
+    }
+
+    #[test]
+    fn fallback_conflicts_report_edition_and_timing_disagreements() {
+        let mut local = local_release(&["One", "Two"]);
+        local.embedded_evidence.release_id = Some(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"));
+
+        let mut primary_release = remote_release(&["One", "Two"]);
+        primary_release.id = ReleaseId::MusicBrainz(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"));
+        primary_release.edition_notes = vec!["Live".to_string()];
+        let primary = Candidate::new(&local, primary_release);
+        assert!(primary.score.total >= PLAUSIBLE_PRIMARY_SCORE);
+
+        let fallback = Candidate::new(&local, remote_release(&["One", "Two"]));
+        let conflicts = fallback_conflicts(&local, &[primary], &fallback, false);
+        assert!(
+            conflicts
+                .iter()
+                .any(|conflict| conflict.contains("not resolved"))
+        );
+    }
+
+    #[test]
+    fn algorithm_versions_are_provider_specific() {
+        assert_eq!(algorithm_version(ProviderKind::Discogs), "discogs-match-v2");
+        assert_eq!(
+            algorithm_version(ProviderKind::MusicBrainz),
+            "musicbrainz-match-v1"
+        );
     }
 }
