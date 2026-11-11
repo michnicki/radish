@@ -1,9 +1,10 @@
 use crate::providers::Mbid;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::probe::Probe;
 use lofty::tag::{Accessor, ItemKey, ItemValue, Tag};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
@@ -178,6 +179,10 @@ pub enum ScanEvent {
     Discovered {
         total: usize,
     },
+    /// A path the walk could not visit; it is not counted in the totals.
+    Warning {
+        message: String,
+    },
     /// Every attempted read counts, including failures and panicked tasks.
     FileFinished {
         completed: usize,
@@ -188,14 +193,13 @@ pub enum ScanEvent {
 
 /// Reads audio tags in parallel, printing warnings for failed reads.
 pub async fn scan_directory(root: &Path) -> Result<Vec<ScannedTrack>> {
-    scan_directory_with_progress(root, |event| {
-        if let ScanEvent::FileFinished {
-            warning: Some(warning),
+    scan_directory_with_progress(root, |event| match event {
+        ScanEvent::Warning { message }
+        | ScanEvent::FileFinished {
+            warning: Some(message),
             ..
-        } = event
-        {
-            eprintln!("{warning}");
-        }
+        } => eprintln!("{message}"),
+        ScanEvent::Discovering | ScanEvent::Discovered { .. } | ScanEvent::FileFinished { .. } => {}
     })
     .await
 }
@@ -209,30 +213,49 @@ pub async fn scan_directory_with_progress(
     mut on_progress: impl FnMut(ScanEvent),
 ) -> Result<Vec<ScannedTrack>> {
     on_progress(ScanEvent::Discovering);
-    let files: Vec<PathBuf> = WalkDir::new(root)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_file() && is_audio_file(entry.path()))
-        .map(|entry| entry.path().to_path_buf())
-        .collect();
+    let mut files: Vec<PathBuf> = Vec::new();
+    // Following links lets symlinked libraries import; walkdir reports loops as errors.
+    for entry in WalkDir::new(root).follow_links(true) {
+        match entry {
+            Ok(entry) if entry.file_type().is_file() && is_audio_file(entry.path()) => {
+                files.push(entry.into_path());
+            }
+            Ok(_) => {}
+            Err(err) => {
+                let path = err.path().unwrap_or(root);
+                on_progress(ScanEvent::Warning {
+                    message: format!("warning: skipped {}: {err}", path.display()),
+                });
+            }
+        }
+    }
     let total = files.len();
     on_progress(ScanEvent::Discovered { total });
 
     let mut set = tokio::task::JoinSet::new();
+    let mut paths_by_task = HashMap::new();
     for path in files {
-        set.spawn_blocking(move || read_tags(&path));
+        let task_path = path.clone();
+        let handle = set
+            .spawn_blocking(move || read_tags(&path).with_context(|| path.display().to_string()));
+        paths_by_task.insert(handle.id(), task_path);
     }
 
     let mut tracks = Vec::new();
     let mut completed = 0;
-    while let Some(result) = set.join_next().await {
+    while let Some(result) = set.join_next_with_id().await {
         let warning = match result {
-            Ok(Ok(track)) => {
+            Ok((_, Ok(track))) => {
                 tracks.push(track);
                 None
             }
-            Ok(Err(err)) => Some(format!("warning: failed to read tags: {err}")),
-            Err(err) => Some(format!("warning: scan task panicked: {err}")),
+            Ok((_, Err(err))) => Some(format!("warning: failed to read tags: {err:#}")),
+            Err(err) => {
+                let path = paths_by_task
+                    .get(&err.id())
+                    .map_or_else(String::new, |path| format!("{}: ", path.display()));
+                Some(format!("warning: scan task panicked: {path}{err}"))
+            }
         };
         completed += 1;
         on_progress(ScanEvent::FileFinished {

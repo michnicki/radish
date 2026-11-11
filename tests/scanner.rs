@@ -89,3 +89,79 @@ async fn failed_tag_reads_advance_progress_and_leave_successful_tracks() {
     assert!(warnings[0].contains("failed to read tags"));
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unreadable_directories_produce_a_warning_naming_the_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_dir("scan-unreadable-dir");
+    let locked = root.join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    write_wav(&locked.join("hidden.wav"));
+    write_wav(&root.join("visible.wav"));
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Root ignores directory permissions, so the walk cannot fail there.
+    let blocked = std::fs::read_dir(&locked).is_err();
+
+    let mut events = Vec::new();
+    let result = scan_directory_with_progress(&root, |event| events.push(event)).await;
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tracks = result.unwrap();
+
+    if blocked {
+        let warning = events
+            .iter()
+            .find_map(|event| match event {
+                ScanEvent::Warning { message } => Some(message),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected a walk warning, got {events:?}"));
+        assert!(warning.starts_with("warning: skipped "), "{warning}");
+        assert!(warning.contains(locked.to_str().unwrap()), "{warning}");
+        assert_eq!(tracks.len(), 1);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_audio_files_are_imported() {
+    let root = temp_dir("scan-symlink-file");
+    let outside = temp_dir("scan-symlink-file-target");
+    write_wav(&outside.join("real.wav"));
+    std::os::unix::fs::symlink(outside.join("real.wav"), root.join("link.wav")).unwrap();
+
+    let tracks = scan_directory_with_progress(&root, |_| {}).await.unwrap();
+
+    assert_eq!(tracks.len(), 1);
+    assert_eq!(tracks[0].path, root.join("link.wav"));
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(outside).unwrap();
+}
+
+#[tokio::test]
+async fn corrupt_files_produce_a_warning_containing_their_path() {
+    let root = temp_dir("scan-corrupt-flac");
+    let broken = root.join("broken.flac");
+    std::fs::write(&broken, b"not audio").unwrap();
+    let mut events = Vec::new();
+
+    let tracks = scan_directory_with_progress(&root, |event| events.push(event))
+        .await
+        .unwrap();
+
+    assert!(tracks.is_empty());
+    let warning = events
+        .iter()
+        .find_map(|event| match event {
+            ScanEvent::FileFinished {
+                warning: Some(warning),
+                ..
+            } => Some(warning),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("expected a read warning, got {events:?}"));
+    assert!(warning.contains(broken.to_str().unwrap()), "{warning}");
+    std::fs::remove_dir_all(root).unwrap();
+}
