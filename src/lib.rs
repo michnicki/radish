@@ -15,6 +15,7 @@ pub mod clef;
 pub mod db;
 pub mod discogs;
 pub mod discovery;
+pub mod importer;
 pub mod matcher;
 pub mod musicbrainz;
 pub mod output;
@@ -23,6 +24,8 @@ pub mod providers;
 pub mod runner;
 pub mod scanner;
 pub mod store;
+#[cfg(test)]
+mod test_support;
 pub mod watcher;
 
 /// Prints a line to stdout; a write failure ends the process.
