@@ -4239,7 +4239,7 @@ mod tests {
             .await
             .unwrap();
 
-        let changed = upsert_tracks(&pool, &[renamed.clone()], directory_id)
+        let changed = upsert_tracks(&pool, std::slice::from_ref(&renamed), directory_id)
             .await
             .unwrap();
 
