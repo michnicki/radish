@@ -1068,6 +1068,7 @@ pub async fn rebuild_local_releases(
 
     for (group, target) in groups.iter().zip(&plan.targets) {
         let fields = ReleaseFields::of_group(group)?;
+        let mut membership_changed = false;
         let (id, previous_revision) = match *target {
             Target::Existing(id) => {
                 let row = stored_by_id[&id];
@@ -1079,6 +1080,10 @@ pub async fn rebuild_local_releases(
                 }
                 update_release(&mut tx, id, &fields).await?;
                 summary.updated += 1;
+                // The revision hashes tag values and paths, not track IDs. A
+                // file removed and re-added keeps the revision but loses its
+                // overlay row, so changed membership alone makes a match stale.
+                membership_changed = !same_members && row.has_match;
                 (id, Some(row.fields.revision.as_str()))
             }
             Target::Rekey(id) => {
@@ -1093,7 +1098,17 @@ pub async fn rebuild_local_releases(
             }
         };
 
-        if previous_revision.is_some_and(|previous| previous != fields.revision) {
+        if membership_changed {
+            sqlx::query(
+                "UPDATE local_releases SET status = 'stale' WHERE id = ?1 AND status = 'matched'",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        if membership_changed
+            || previous_revision.is_some_and(|previous| previous != fields.revision)
+        {
             let marked = sqlx::query(
                 "UPDATE release_matches SET stale = 1
                  WHERE local_release_id = ?1 AND stale = 0",
@@ -4184,5 +4199,32 @@ mod tests {
             .find(|r| r.path.ends_with("b/01.flac"))
             .unwrap();
         assert_eq!(red_row.title.as_deref(), Some("Red Remote"));
+    }
+
+    #[tokio::test]
+    async fn readded_file_with_unchanged_tags_marks_the_match_stale() {
+        let pool = test_pool().await;
+        let files = [
+            scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1),
+            scanned("/music/a/02.flac", Some("Blue"), Some("Artist"), 2),
+        ];
+        insert(&pool, "/music/a", &files).await;
+        let id = accept_manually(&pool, "Blue", &["R1", "R2"]).await;
+
+        // Same tags and path, new track ID: its overlay row went with the old one.
+        remove_track_by_path(&pool, Path::new("/music/a/02.flac"))
+            .await
+            .unwrap();
+        let summary = insert_summary(&pool, "/music/a", &files).await;
+
+        assert_eq!(summary.newly_stale, 1, "{summary:?}");
+        let status: String = sqlx::query_scalar("SELECT status FROM local_releases WHERE id = ?1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, STATUS_STALE);
+        let rows = list_tracks(&pool).await.unwrap();
+        assert!(rows.iter().all(|row| row.stale));
     }
 }
