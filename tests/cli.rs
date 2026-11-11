@@ -682,6 +682,38 @@ async fn non_loopback_service_overrides_are_rejected_without_any_request() {
 }
 
 #[tokio::test]
+async fn a_rejected_musicbrainz_override_fails_the_run_once_without_a_discogs_fallback() {
+    let db = db_path("evil-override-fails-once");
+    seed_directory(&db, "/music/blue", 2001).await;
+    seed_album(&db, "/music/green", "Green", 2002).await;
+    let server = MockServer::start(handler);
+    let variable = "RADISH_MUSICBRAINZ_BASE_URL";
+
+    let output = Command::new(env!("CARGO_BIN_EXE_radish"))
+        .arg("--db")
+        .arg(&db)
+        .arg("match")
+        .env("RADISH_DISCOGS_BASE_URL", &server.url)
+        .env(variable, "https://evil.example/secret-path")
+        .env("RADISH_DISCOGS_TOKEN", "test-token")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run radish");
+
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{all}");
+    assert_eq!(all.matches(variable).count(), 1, "{all}");
+    assert!(!all.contains("evil.example"), "{all}");
+    assert!(!all.contains("secret-path"), "{all}");
+    assert!(!all.contains("recovered the release"), "{all}");
+    assert_eq!(server.request_count(), 0, "{all}");
+}
+
+#[tokio::test]
 async fn partial_musicbrainz_lookup_failures_queue_a_discogs_fallback() {
     let db = db_path("partial-outage-fallback-queued");
     seed_library(&db).await;

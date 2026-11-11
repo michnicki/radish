@@ -18,6 +18,7 @@ use crate::store::{self, AcceptanceMethod, MatchGuard, StoredCandidate};
 use crate::{out, outln};
 use anyhow::{Context, Result, bail};
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
@@ -385,6 +386,22 @@ where
     }
 
     let mut musicbrainz_client: Option<M> = None;
+    // A MusicBrainz adapter that cannot be built is a configuration error, not
+    // an outage: every release would hit it again, and a Discogs fallback would
+    // look like a recovery from a stage that never ran. Fail once, up front.
+    // Explicit review works offline from saved reviews, so it builds lazily.
+    let needs_musicbrainz = !options.review
+        && selected.iter().any(|release| {
+            refresh_source(options, &statuses, &existing_matches, release.id)
+                .map_or(options.policy, ProviderPolicy::Only)
+                .allows(ProviderKind::MusicBrainz)
+        });
+    if needs_musicbrainz {
+        match make_musicbrainz() {
+            Ok(client) => musicbrainz_client = Some(client),
+            Err(error) => bail!("MusicBrainz is unusable: {}", Clean(&format!("{error:#}"))),
+        }
+    }
     let mut discogs_client: Option<D> = None;
     let mut discogs_disabled: Option<ProviderError> = None;
     let mut ai = AiState::Unbuilt;
@@ -404,15 +421,9 @@ where
             Clean(&label)
         );
 
-        // A stale match is refreshed from the provider that accepted it; a
-        // different source requires deliberate review.
         let mut release_policy = options.policy;
         let mut refreshing = false;
-        if !options.review
-            && statuses.get(&release.id).map(String::as_str) == Some(store::STATUS_STALE)
-            && let Some(provider) = existing_matches.get(&release.id).and_then(|p| *p)
-            && release_policy == ProviderPolicy::MusicBrainzThenDiscogs
-        {
+        if let Some(provider) = refresh_source(options, &statuses, &existing_matches, release.id) {
             outln!("  refreshing the stale {provider} match from its original source");
             release_policy = ProviderPolicy::Only(provider);
             refreshing = true;
@@ -503,6 +514,27 @@ where
     }
 
     Ok(summary)
+}
+
+/// The provider a stale match is refreshed from, when this run refreshes it.
+///
+/// A stale match is refreshed from the provider that accepted it; a different
+/// source requires deliberate review.
+fn refresh_source(
+    options: &MatchOptions,
+    statuses: &HashMap<i64, String>,
+    existing_matches: &HashMap<i64, Option<ProviderKind>>,
+    release_id: i64,
+) -> Option<ProviderKind> {
+    if options.review
+        || options.policy != ProviderPolicy::MusicBrainzThenDiscogs
+        || statuses.get(&release_id).map(String::as_str) != Some(store::STATUS_STALE)
+    {
+        return None;
+    }
+    existing_matches
+        .get(&release_id)
+        .and_then(|provider| *provider)
 }
 
 /// A primary stage that failed for a reason that says nothing about the
