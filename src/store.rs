@@ -2406,9 +2406,32 @@ mod tests {
         moved
     }
 
-    /// A unique scratch directory for file-backed databases. Removing it also
-    /// removes the `-wal` and `-shm` side files.
-    fn scratch_dir(label: &str) -> PathBuf {
+    /// A scratch directory that is removed when dropped, including when the
+    /// test panics. It also removes the `-wal` and `-shm` side files.
+    struct ScratchDir(std::path::PathBuf);
+
+    impl std::ops::Deref for ScratchDir {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for ScratchDir {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A unique scratch directory for file-backed databases.
+    fn scratch_dir(label: &str) -> ScratchDir {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
             "radish-store-{label}-{}-{}",
@@ -2417,7 +2440,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        ScratchDir(dir)
     }
 
     fn mbid(value: &str) -> Mbid {
@@ -3283,7 +3306,6 @@ mod tests {
 
         pool_a.close().await;
         pool_b.close().await;
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn remote_with(titles: &[&str]) -> RemoteRelease {
