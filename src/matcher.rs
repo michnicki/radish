@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v3";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v2";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v4";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v3";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -371,24 +371,44 @@ pub fn normalize_artist_for(provider: ProviderKind, input: &str) -> String {
 }
 
 /// Normalized Levenshtein similarity in `0.0..=1.0`.
+///
+/// Text that normalizes to nothing, such as `÷`, is compared by its original
+/// characters instead, so distinct symbol-only titles do not look identical.
 pub fn similarity(a: &str, b: &str) -> f64 {
-    let a = normalize_text(a);
-    let b = normalize_text(b);
-    similarity_normalized(&a, &b)
+    similarity_of_normalized(a, &normalized_chars(a), b, &normalized_chars(b))
 }
 
-fn similarity_normalized(a: &str, b: &str) -> f64 {
-    if a.is_empty() && b.is_empty() {
-        return 1.0;
+fn normalized_chars(text: &str) -> Vec<char> {
+    normalize_text(text).chars().collect()
+}
+
+/// [`similarity`] over titles that were normalized once by the caller.
+fn similarity_of_normalized(a: &str, a_chars: &[char], b: &str, b_chars: &[char]) -> f64 {
+    if a_chars.is_empty() || b_chars.is_empty() {
+        return same_stripped_text(a, b);
     }
+    similarity_chars(a_chars, b_chars)
+}
+
+/// 1.0 when both strings are non-empty and equal ignoring whitespace and case.
+fn same_stripped_text(a: &str, b: &str) -> f64 {
+    let strip = |text: &str| -> String {
+        text.chars()
+            .filter(|ch| !ch.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let (a, b) = (strip(a), strip(b));
+    if !a.is_empty() && a == b { 1.0 } else { 0.0 }
+}
+
+/// Empty text carries no evidence, so it is never similar to anything.
+fn similarity_chars(a: &[char], b: &[char]) -> f64 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }
-
-    let a_chars: Vec<char> = a.chars().collect();
-    let b_chars: Vec<char> = b.chars().collect();
-    let distance = levenshtein(&a_chars, &b_chars);
-    let longest = a_chars.len().max(b_chars.len()) as f64;
+    let distance = levenshtein(a, b);
+    let longest = a.len().max(b.len()) as f64;
 
     (1.0 - distance as f64 / longest).clamp(0.0, 1.0)
 }
@@ -419,7 +439,14 @@ fn levenshtein(a: &[char], b: &[char]) -> usize {
 }
 
 pub fn artist_similarity(a: &str, b: &str) -> f64 {
-    similarity_normalized(&normalize_artist(a), &normalize_artist(b))
+    let a_chars: Vec<char> = normalize_artist(a).chars().collect();
+    let b_chars: Vec<char> = normalize_artist(b).chars().collect();
+    similarity_of_normalized(
+        &strip_disambiguator(a),
+        &a_chars,
+        &strip_disambiguator(b),
+        &b_chars,
+    )
 }
 
 /// `max(0, 1 - absolute_difference_seconds / 10)`.
@@ -572,9 +599,35 @@ pub struct Mapping {
     /// Two pairings were indistinguishable, so the result needs review.
     pub ambiguous: bool,
     pub notes: Vec<String>,
+    /// Per local track, the assigned remote index and the title similarity
+    /// that `map_tracks` measured for it. A cache only: never serialized, so
+    /// decoded mappings start empty and readers recompute.
+    #[serde(skip)]
+    pub pair_similarity: Vec<Option<(usize, f64)>>,
 }
 
 impl Mapping {
+    /// Title similarity between a local track and the remote track it is being
+    /// scored against, or `None` when the local file has no title. Reuses the
+    /// recorded value only when it was measured for this same remote track, so
+    /// edited pairs are recomputed.
+    fn title_similarity(
+        &self,
+        local_index: usize,
+        remote_index: usize,
+        local_track: &LocalTrack,
+        remote_track: &RemoteTrack,
+    ) -> Option<f64> {
+        let title = local_track.title.as_deref()?;
+        if let Some(Some((recorded_remote, recorded))) = self.pair_similarity.get(local_index)
+            && *recorded_remote == remote_index
+            && (0.0..=1.0).contains(recorded)
+        {
+            return Some(*recorded);
+        }
+        Some(similarity(title, &remote_track.title))
+    }
+
     pub fn assigned_pairs(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
         self.pairs
             .iter()
@@ -600,6 +653,7 @@ pub fn map_tracks(local: &LocalRelease, remote: &RemoteRelease) -> Mapping {
     let mut pairs: Vec<Option<usize>> = vec![None; local.tracks.len()];
     let mut used: Vec<bool> = vec![false; remote.tracklist.len()];
     let mut notes = Vec::new();
+    let mut titles = TitleMatrix::new(local, remote);
 
     // Pass 1: unique release-track IDs.
     let mut local_release_ids: HashMap<Mbid, Vec<usize>> = HashMap::new();
@@ -789,6 +843,7 @@ pub fn map_tracks(local: &LocalRelease, remote: &RemoteRelease) -> Mapping {
             let mut row = Vec::with_capacity(remaining_remote.len());
             for remote_index in &remaining_remote {
                 row.push(pair_cost(
+                    titles.get(*local_index, *remote_index),
                     &local.tracks[*local_index],
                     &remote.tracklist[*remote_index],
                 ));
@@ -860,19 +915,72 @@ pub fn map_tracks(local: &LocalRelease, remote: &RemoteRelease) -> Mapping {
         ));
     }
 
+    let pair_similarity = pairs
+        .iter()
+        .enumerate()
+        .map(|(local_index, pair)| {
+            let remote_index = (*pair)?;
+            Some((remote_index, titles.get(local_index, remote_index)?))
+        })
+        .collect();
+
     Mapping {
         pairs,
         complete,
         ambiguous,
         notes,
+        pair_similarity,
     }
 }
 
-fn pair_cost(local: &LocalTrack, remote: &RemoteTrack) -> f64 {
-    let title = match &local.title {
-        Some(title) => similarity(title, &remote.title),
-        None => 0.0,
-    };
+/// Title similarities for one `map_tracks` call. Each title is normalized once
+/// and each pair is compared at most once, however many passes ask for it.
+struct TitleMatrix<'a> {
+    local: &'a LocalRelease,
+    remote: &'a RemoteRelease,
+    local_chars: Vec<Vec<char>>,
+    remote_chars: Vec<Vec<char>>,
+    cache: Vec<Vec<Option<f64>>>,
+}
+
+impl<'a> TitleMatrix<'a> {
+    fn new(local: &'a LocalRelease, remote: &'a RemoteRelease) -> Self {
+        Self {
+            local,
+            remote,
+            local_chars: local
+                .tracks
+                .iter()
+                .map(|track| normalized_chars(track.title.as_deref().unwrap_or_default()))
+                .collect(),
+            remote_chars: remote
+                .tracklist
+                .iter()
+                .map(|track| normalized_chars(&track.title))
+                .collect(),
+            cache: vec![vec![None; remote.tracklist.len()]; local.tracks.len()],
+        }
+    }
+
+    /// `None` when the local file has no title.
+    fn get(&mut self, local_index: usize, remote_index: usize) -> Option<f64> {
+        let title = self.local.tracks[local_index].title.as_deref()?;
+        if let Some(known) = self.cache[local_index][remote_index] {
+            return Some(known);
+        }
+        let value = similarity_of_normalized(
+            title,
+            &self.local_chars[local_index],
+            &self.remote.tracklist[remote_index].title,
+            &self.remote_chars[remote_index],
+        );
+        self.cache[local_index][remote_index] = Some(value);
+        Some(value)
+    }
+}
+
+fn pair_cost(title_similarity: Option<f64>, local: &LocalTrack, remote: &RemoteTrack) -> f64 {
+    let title = title_similarity.unwrap_or(0.0);
 
     let duration = match (local.duration_secs, remote.duration_secs) {
         (Some(a), Some(b)) => duration_similarity(a, b),
@@ -1039,15 +1147,16 @@ pub fn score(local: &LocalRelease, remote: &RemoteRelease, mapping: &Mapping) ->
             let Some(remote_track) = remote.tracklist.get(remote_index) else {
                 continue;
             };
-            if let Some(title) = &track.title {
-                total += similarity(title, &remote_track.title);
+            if let Some(similarity) =
+                mapping.title_similarity(index, remote_index, track, remote_track)
+            {
+                total += similarity;
             }
         }
         total / local.tracks.len() as f64
     };
 
     let mut duration_total = 0.0;
-    let mut duration_count = 0usize;
     for (local_index, remote_index) in mapping.assigned_pairs() {
         let Some(local_track) = local.tracks.get(local_index) else {
             continue;
@@ -1057,13 +1166,14 @@ pub fn score(local: &LocalRelease, remote: &RemoteRelease, mapping: &Mapping) ->
         };
         if let (Some(a), Some(b)) = (local_track.duration_secs, remote_track.duration_secs) {
             duration_total += duration_similarity(a, b);
-            duration_count += 1;
         }
     }
-    let durations = if duration_count == 0 {
+    // Unknown durations count as zero, so a release with few known durations
+    // cannot outscore one whose durations were all measured.
+    let durations = if local.tracks.is_empty() {
         0.0
     } else {
-        duration_total / duration_count as f64
+        duration_total / local.tracks.len() as f64
     };
 
     let year = match (local.year, remote.year) {
@@ -1097,25 +1207,47 @@ fn album_artist_score(local: &LocalRelease, remote: &RemoteRelease) -> f64 {
     }
 
     let provider = remote.provider();
-    let local_normalized = normalize_artist_for(provider, artist);
-    let remote_normalized: Vec<String> = remote
+    // Names that normalize to nothing (such as `!!!`) fall back to their
+    // original text, with the Discogs disambiguator removed as normalization
+    // would have done.
+    let comparable = |name: &str| match provider {
+        ProviderKind::Discogs => strip_disambiguator(name),
+        ProviderKind::MusicBrainz => name.to_string(),
+    };
+    let local_original = comparable(artist);
+    let local_chars: Vec<char> = normalize_artist_for(provider, artist).chars().collect();
+    let remote_originals: Vec<String> =
+        remote.artists.iter().map(|name| comparable(name)).collect();
+    let remote_chars: Vec<Vec<char>> = remote
         .artists
         .iter()
-        .map(|name| normalize_artist_for(provider, name))
+        .map(|name| normalize_artist_for(provider, name).chars().collect())
         .collect();
 
     let various = matches!(local.artist_kind, ArtistKind::VariousArtists)
-        && remote_normalized
-            .iter()
-            .any(|name| name == "various" || name == "various artists");
+        && remote_chars.iter().any(|name| {
+            let name: String = name.iter().collect();
+            name == "various" || name == "various artists"
+        });
     if various {
         return 1.0;
     }
 
-    let joined = remote_normalized.join(" ");
-    let mut best = similarity_normalized(&local_normalized, &joined);
-    for name in &remote_normalized {
-        best = best.max(similarity_normalized(&local_normalized, name));
+    let joined_original = remote_originals.join(" ");
+    let joined_chars: Vec<char> = remote_chars.join(&' ');
+    let mut best = similarity_of_normalized(
+        &local_original,
+        &local_chars,
+        &joined_original,
+        &joined_chars,
+    );
+    for (original, chars) in remote_originals.iter().zip(&remote_chars) {
+        best = best.max(similarity_of_normalized(
+            &local_original,
+            &local_chars,
+            original,
+            chars,
+        ));
     }
     best
 }
@@ -1341,7 +1473,7 @@ pub fn evaluate_for_matching(
     );
     for other in alternatives {
         if other.release.id != candidate.release.id
-            && candidate.score.album_score() - other.score.album_score() + 1e-9 < RUNNER_UP_GAP
+            && within_gap(candidate.score.album_score() - other.score.album_score())
             && !equivalent_audio(candidate, other)
         {
             album.blockers.push(format!(
@@ -1352,6 +1484,12 @@ pub fn evaluate_for_matching(
     }
     album.auto_accept = album.blockers.is_empty();
     album
+}
+
+/// True when a score lead is too small to separate two alternatives. The
+/// boundary itself counts as close.
+pub(crate) fn within_gap(diff: f64) -> bool {
+    diff <= RUNNER_UP_GAP + TIE_EPSILON
 }
 
 /// Applies album gates after a high-confidence semantic agreement.
@@ -1370,8 +1508,7 @@ pub fn evaluate_ai_album(
     );
     for other in alternatives {
         if (!other.score.album_score().is_finite()
-            || candidate.score.album_score() - other.score.album_score()
-                <= RUNNER_UP_GAP + TIE_EPSILON)
+            || within_gap(candidate.score.album_score() - other.score.album_score()))
             && !compatible_album_audio(candidate, other)
         {
             album.blockers.push(format!(
@@ -1491,6 +1628,14 @@ impl AcceptancePolicy {
             Self::Semantic => 0.50,
         }
     }
+}
+
+/// Track version qualifiers that distinguish recordings. A remastering is a
+/// different mastering of the same recording, so it never separates tracks.
+fn album_track_qualifiers(title: &str) -> BTreeSet<&'static str> {
+    let mut qualifiers = edition_qualifiers(title);
+    qualifiers.remove("remastered");
+    qualifiers
 }
 
 fn equivalent_audio(a: &Candidate, b: &Candidate) -> bool {
@@ -1654,6 +1799,14 @@ fn evaluate_at_scope(
                         .to_string(),
                 );
             }
+            if album_track_qualifiers(local_track.title.as_deref().unwrap_or_default())
+                != album_track_qualifiers(&remote_track.title)
+            {
+                blockers.push(format!(
+                    "track version qualifiers differ for '{}'",
+                    remote_track.title
+                ));
+            }
             if matches!((local_track.recording_id, remote_track.recording_id),
                 (Some(a), Some(b)) if a != b)
                 || matches!((local_track.release_track_id, remote_track.release_track_id),
@@ -1665,12 +1818,14 @@ fn evaluate_at_scope(
             }
         }
 
-        if let Some(title) = &local_track.title {
-            let score = similarity(title, &remote_track.title);
-            if score < worst_title {
-                worst_title = score;
-                worst_title_track = remote_track.title.clone();
-            }
+        if let Some(score) =
+            candidate
+                .mapping
+                .title_similarity(local_index, remote_index, local_track, remote_track)
+            && score < worst_title
+        {
+            worst_title = score;
+            worst_title_track = remote_track.title.clone();
         }
 
         if let (Some(a), Some(b)) = (local_track.duration_secs, remote_track.duration_secs) {
@@ -1747,6 +1902,7 @@ fn evaluate_at_scope(
         }
     }
 
+    let mut identifier_matched = false;
     if let Some(barcode) = &local.barcode {
         let local_digits = normalize_barcode(barcode);
         let remote_digits: Vec<String> = remote
@@ -1756,6 +1912,7 @@ fn evaluate_at_scope(
             .collect();
         if !local_digits.is_empty() && !remote_digits.is_empty() {
             if remote_digits.contains(&local_digits) {
+                identifier_matched = true;
                 evidence.push(format!("barcode {barcode} matches the release"));
             } else {
                 blockers.push(format!(
@@ -1775,6 +1932,7 @@ fn evaluate_at_scope(
             .collect();
         if !local_key.is_empty() && !remote_keys.is_empty() {
             if remote_keys.contains(&local_key) {
+                identifier_matched = true;
                 evidence.push(format!("catalog number {catalog} matches the release"));
             } else {
                 blockers.push(format!(
@@ -1803,7 +1961,7 @@ fn evaluate_at_scope(
         warnings.push("album and tracks matched; exact edition unconfirmed".to_string());
     } else if embedded_consistent {
         // Already recorded as evidence above.
-    } else if discovery.identifier_unique {
+    } else if discovery.identifier_unique && identifier_matched {
         evidence.push("barcode or catalog number uniquely identifies this release".to_string());
     } else {
         blockers.push(
@@ -1836,6 +1994,31 @@ fn evaluate_at_scope(
         warnings,
         evidence,
     }
+}
+
+/// Primary score for judging whether a primary candidate is plausible enough
+/// to guard a fallback. Durations a release never published are unknown, not
+/// wrong, so they count as full agreement here; known mismatches still cost.
+fn plausibility_score(local: &LocalRelease, primary: &Candidate) -> f64 {
+    if local.tracks.is_empty() {
+        return primary.score.total;
+    }
+    let unknown = local
+        .tracks
+        .iter()
+        .enumerate()
+        .filter(|(index, track)| {
+            let remote_duration = primary
+                .mapping
+                .pairs
+                .get(*index)
+                .and_then(|pair| *pair)
+                .and_then(|remote_index| primary.release.tracklist.get(remote_index))
+                .and_then(|remote| remote.duration_secs);
+            track.duration_secs.is_none() || remote_duration.is_none()
+        })
+        .count();
+    primary.score.total + WEIGHT_DURATIONS * unknown as f64 / local.tracks.len() as f64
 }
 
 /// Cross-provider checks applied before automatic fallback acceptance.
@@ -1875,7 +2058,9 @@ pub fn fallback_conflicts(
     }
 
     for primary in primary_candidates {
-        if !primary.mapping.complete || primary.score.total + 1e-9 < PLAUSIBLE_PRIMARY_SCORE {
+        if !primary.mapping.complete
+            || plausibility_score(local, primary) + 1e-9 < PLAUSIBLE_PRIMARY_SCORE
+        {
             continue;
         }
         let primary_qualifiers = remote_edition_qualifiers(&primary.release);
@@ -2015,6 +2200,44 @@ mod tests {
         assert_ne!(
             normalize_artist_for(ProviderKind::MusicBrainz, "Nirvana (2)"),
             normalize_artist_for(ProviderKind::MusicBrainz, "Nirvana")
+        );
+    }
+
+    #[test]
+    fn titles_that_normalize_to_nothing_compare_by_their_original_text() {
+        assert_eq!(similarity("÷", "×"), 0.0);
+        assert_eq!(similarity("÷", "÷"), 1.0);
+        assert_eq!(similarity("÷", " ÷ "), 1.0);
+        assert_eq!(similarity("", ""), 0.0);
+        assert_eq!(similarity("", "Intro"), 0.0);
+        assert_eq!(artist_similarity("!!!", "???"), 0.0);
+        assert_eq!(artist_similarity("!!!", "!!!"), 1.0);
+    }
+
+    #[test]
+    fn symbol_only_album_artists_compare_by_their_original_text() {
+        let mut local = local_release(&["One"]);
+        local.album_artist = Some("!!!".to_string());
+        let mut remote = remote_release(&["One"]);
+        remote.artists = vec!["!!!".to_string()];
+        assert_eq!(
+            score(&local, &remote, &map_tracks(&local, &remote)).album_artist,
+            1.0
+        );
+
+        // Discogs numbers its disambiguations; they never count as text.
+        remote.artists = vec!["!!! (2)".to_string()];
+        assert_eq!(
+            score(&local, &remote, &map_tracks(&local, &remote)).album_artist,
+            1.0
+        );
+        assert_eq!(artist_similarity("!!! (2)", "!!!"), 1.0);
+        assert_eq!(artist_similarity("!!! (2)", "???"), 0.0);
+
+        remote.artists = vec!["???".to_string()];
+        assert_eq!(
+            score(&local, &remote, &map_tracks(&local, &remote)).album_artist,
+            0.0
         );
     }
 
@@ -2278,6 +2501,100 @@ mod tests {
     }
 
     #[test]
+    fn missing_durations_lower_the_duration_score_instead_of_being_skipped() {
+        let titles: Vec<String> = (1..=12).map(|n| format!("Song {n}")).collect();
+        let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let local = local_release(&titles);
+
+        let mut sparse = remote_release(&titles);
+        for track in sparse.tracklist.iter_mut().skip(1) {
+            track.duration_secs = None;
+        }
+        let mut complete = remote_release(&titles);
+        for track in &mut complete.tracklist {
+            track.duration_secs = track.duration_secs.map(|secs| secs + 2.0);
+        }
+
+        let sparse = Candidate::new(&local, sparse);
+        let complete = Candidate::new(&local, complete);
+        assert!(
+            complete.score.durations > sparse.score.durations,
+            "complete {} vs sparse {}",
+            complete.score.durations,
+            sparse.score.durations
+        );
+    }
+
+    #[test]
+    fn mapping_records_the_similarity_of_each_assigned_pair() {
+        let local = local_release(&["One", "Two", "Three"]);
+        let remote = remote_release(&["Three", "Two", "Won"]);
+        let mapping = map_tracks(&local, &remote);
+        assert_eq!(mapping.pair_similarity.len(), mapping.pairs.len());
+        for (local_index, remote_index) in mapping.assigned_pairs() {
+            let expected = similarity(
+                local.tracks[local_index].title.as_deref().unwrap(),
+                &remote.tracklist[remote_index].title,
+            );
+            assert_eq!(
+                mapping.pair_similarity[local_index],
+                Some((remote_index, expected))
+            );
+        }
+    }
+
+    #[test]
+    fn mappings_round_trip_without_recorded_similarities_and_score_the_same() {
+        let local = local_release(&["One", "Two", "Three"]);
+        let remote = remote_release(&["One", "Two", "Tree"]);
+        let candidate = Candidate::new(&local, remote.clone());
+
+        let json = serde_json::to_value(&candidate.mapping).unwrap();
+        assert!(json.get("pair_similarity").is_none(), "{json}");
+        let decoded: Mapping = serde_json::from_value(json).unwrap();
+        assert!(decoded.pair_similarity.is_empty());
+        assert_eq!(score(&local, &remote, &decoded), candidate.score);
+    }
+
+    #[test]
+    fn recorded_similarities_are_recomputed_when_the_pairs_change() {
+        let mut local = local_release(&["Alpha", "Bravo"]);
+        local.barcode = Some("0123456789012".to_string());
+        let remote = remote_release(&["Alpha", "Bravo"]);
+        let mut candidate = Candidate::new(&local, remote.clone());
+        candidate.mapping.pairs = vec![Some(1), Some(0)];
+
+        let rescored = score(&local, &remote, &candidate.mapping);
+        assert!(rescored.track_titles < 0.5, "{}", rescored.track_titles);
+        let evaluation = evaluate(
+            &local,
+            &candidate,
+            None,
+            &DiscoveryEvidence {
+                identifier_unique: true,
+                ..DiscoveryEvidence::default()
+            },
+        );
+        assert!(!evaluation.auto_accept, "{:?}", evaluation.evidence);
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|reason| reason.contains("track title")),
+            "{:?}",
+            evaluation.blockers
+        );
+    }
+
+    #[test]
+    fn close_alternative_gap_includes_the_exact_boundary() {
+        assert!(within_gap(0.0));
+        assert!(within_gap(RUNNER_UP_GAP - 0.001));
+        assert!(within_gap(RUNNER_UP_GAP));
+        assert!(!within_gap(RUNNER_UP_GAP + 0.001));
+    }
+
+    #[test]
     fn scores_components_with_fixed_weights() {
         let local = local_release(&["One", "Two"]);
         let remote = remote_release(&["One", "Two"]);
@@ -2315,7 +2632,8 @@ mod tests {
 
     #[test]
     fn barcode_evidence_allows_acceptance() {
-        let local = local_release(&["One", "Two"]);
+        let mut local = local_release(&["One", "Two"]);
+        local.barcode = Some("0123456789012".to_string());
         let candidate = Candidate::new(&local, remote_release(&["One", "Two"]));
         let evaluation = evaluate(
             &local,
@@ -2327,6 +2645,28 @@ mod tests {
             },
         );
         assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+    }
+
+    #[test]
+    fn unique_identifier_flag_needs_a_matching_local_identifier() {
+        let local = local_release(&["One", "Two"]);
+        let candidate = Candidate::new(&local, remote_release(&["One", "Two"]));
+        let evaluation = evaluate(
+            &local,
+            &candidate,
+            None,
+            &DiscoveryEvidence {
+                identifier_unique: true,
+                ..DiscoveryEvidence::default()
+            },
+        );
+        assert!(!evaluation.auto_accept);
+        assert!(
+            !evaluation
+                .evidence
+                .iter()
+                .any(|line| line.contains("uniquely identifies"))
+        );
     }
 
     #[test]
@@ -2358,7 +2698,8 @@ mod tests {
 
     #[test]
     fn runner_up_gap_blocks_acceptance_unless_embedded_id_agrees() {
-        let local = local_release(&["One", "Two"]);
+        let mut local = local_release(&["One", "Two"]);
+        local.barcode = Some("0123456789012".to_string());
         let first = Candidate::new(&local, remote_release(&["One", "Two"]));
         let mut second_release = remote_release(&["One", "Two"]);
         second_release.id = ReleaseId::Discogs(43);
@@ -2474,7 +2815,8 @@ mod tests {
 
     #[test]
     fn edition_twins_and_incomplete_mappings_need_review() {
-        let local = local_release(&["One", "Two"]);
+        let mut local = local_release(&["One", "Two"]);
+        local.barcode = Some("0123456789012".to_string());
         let twin_release = |id: &str| {
             let mut release = remote_release(&["One", "Two"]);
             release.id = ReleaseId::MusicBrainz(mbid(id));
@@ -2562,11 +2904,33 @@ mod tests {
     }
 
     #[test]
+    fn fallback_guard_treats_missing_primary_durations_as_neutral() {
+        let local = local_release(&["One", "Two", "Three", "Four"]);
+        let mut primary_release = remote_release(&["One", "Two", "Three", "Four"]);
+        primary_release.id = ReleaseId::MusicBrainz(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"));
+        primary_release.edition_notes = vec!["Live".to_string()];
+        for track in primary_release.tracklist.iter_mut().skip(2) {
+            track.duration_secs = None;
+        }
+        let primary = Candidate::new(&local, primary_release);
+        assert!(primary.score.total < PLAUSIBLE_PRIMARY_SCORE);
+
+        let fallback = Candidate::new(&local, remote_release(&["One", "Two", "Three", "Four"]));
+        let conflicts = fallback_conflicts(&local, &[primary], &fallback, true);
+        assert!(
+            conflicts
+                .iter()
+                .any(|conflict| conflict.contains("primary candidates describe")),
+            "{conflicts:?}"
+        );
+    }
+
+    #[test]
     fn algorithm_versions_are_provider_specific() {
-        assert_eq!(algorithm_version(ProviderKind::Discogs), "discogs-match-v3");
+        assert_eq!(algorithm_version(ProviderKind::Discogs), "discogs-match-v4");
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v2"
+            "musicbrainz-match-v3"
         );
     }
 
@@ -2706,6 +3070,32 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("track title"))
         );
+    }
+
+    #[test]
+    fn album_scope_blocks_track_version_qualifier_mismatches() {
+        let local = local_release(&["Yesterday", "Michelle"]);
+        let remote = remote_release(&["Yesterday (Live)", "Michelle (Live)"]);
+        let candidate = Candidate::new(&local, remote);
+        let result = evaluate_ai_album(&local, &candidate, &[]);
+        assert!(!result.auto_accept);
+        assert!(
+            result
+                .blockers
+                .iter()
+                .any(|reason| reason.contains("track version qualifiers")),
+            "{:?}",
+            result.blockers
+        );
+    }
+
+    #[test]
+    fn album_scope_ignores_remastered_in_track_titles() {
+        let local = local_release(&["Here Comes the Sun", "Something"]);
+        let remote = remote_release(&["Here Comes the Sun (Remastered)", "Something"]);
+        let candidate = Candidate::new(&local, remote);
+        let result = evaluate_ai_album(&local, &candidate, &[]);
+        assert!(result.auto_accept, "{:?}", result.blockers);
     }
 
     #[test]
