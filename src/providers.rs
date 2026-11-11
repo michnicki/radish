@@ -11,6 +11,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::hash::Hash;
 use std::str::FromStr;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 /// Most release documents an adapter keeps for one run. A library import
@@ -19,6 +20,16 @@ use std::time::Duration;
 pub const RELEASE_CACHE_CAPACITY: usize = 256;
 /// Most search pages an adapter keeps for one run (same reasoning).
 pub const SEARCH_CACHE_CAPACITY: usize = 256;
+
+/// Locks a mutex, recovering the data if a panicking holder poisoned it.
+///
+/// Every guarded value here is plain bookkeeping that stays consistent after a
+/// panic, so continuing is safe.
+pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// A small least-recently-used cache: a map plus a recency queue.
 ///

@@ -8,9 +8,9 @@
 
 use crate::matcher::{RemoteRelease, RemoteTrack, SearchSummary, TrackEntryType, parse_duration};
 use crate::providers::{
-    BoundedCache, GroupId, MetadataProvider, ProviderError, ProviderKind,
-    RELEASE_CACHE_CAPACITY, ReleaseId, SEARCH_CACHE_CAPACITY, SearchPage as ProviderSearchPage,
-    SearchRequest, SearchStrategy,
+    BoundedCache, GroupId, MetadataProvider, ProviderError, ProviderKind, RELEASE_CACHE_CAPACITY,
+    ReleaseId, SEARCH_CACHE_CAPACITY, SearchPage as ProviderSearchPage, SearchRequest,
+    SearchStrategy, lock,
 };
 use discogger::{DiscogsClient, DiscogsError, PaginationParams, SearchParams, SearchType};
 use std::fmt;
@@ -341,12 +341,6 @@ impl DiscogsAdapter {
 
         Ok(page_info)
     }
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

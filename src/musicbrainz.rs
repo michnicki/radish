@@ -12,7 +12,7 @@ use crate::matcher::{RemoteRelease, RemoteTrack, SearchSummary, TrackEntryType};
 use crate::providers::{
     BoundedCache, GroupId, Mbid, MetadataProvider, ProviderError, ProviderKind,
     RELEASE_CACHE_CAPACITY, ReleaseId, SEARCH_CACHE_CAPACITY, SearchPage, SearchRequest,
-    SearchStrategy,
+    SearchStrategy, lock,
 };
 use reqwest::StatusCode;
 use reqwest::Url;
@@ -476,12 +476,6 @@ impl MetadataProvider for MusicBrainzAdapter {
 
         self.fetch_document(mbid).await
     }
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn backoff(index: u32) -> Duration {
@@ -1940,7 +1934,10 @@ mod tests {
             "release:(Abbey AND Road AND \\(Remastered\\))"
         );
         // Lucene only treats upper-case words as operators.
-        assert_eq!(terms_field("artist", "This AND That"), "artist:(This AND and AND That)");
+        assert_eq!(
+            terms_field("artist", "This AND That"),
+            "artist:(This AND and AND That)"
+        );
     }
 
     #[tokio::test]
