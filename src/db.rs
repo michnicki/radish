@@ -1,7 +1,11 @@
 use anyhow::Result;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
+};
 use std::path::Path;
+#[cfg(test)]
 use std::str::FromStr;
+use std::time::Duration;
 
 /// The original, pre-migration schema. It is applied before migrations so that
 /// existing databases keep their current shape and fresh databases start from
@@ -10,34 +14,59 @@ const LEGACY_SCHEMA: &str = include_str!("schema.sql");
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
-pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
-    let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", db_path.display()))?
-        .create_if_missing(true)
-        .foreign_keys(true);
+/// How long a connection waits for another writer's lock before giving up.
+///
+/// Matching holds no write lock while it talks to providers, so contention is
+/// limited to short import, rebuild and accept transactions. Fifteen seconds
+/// is long enough for a large import batch to finish and short enough that a
+/// wedged process is reported instead of hanging forever.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
-    connect_with_options(options).await
+/// Connections for file databases. Concurrent readers and one writer is the
+/// usual shape: the watcher, an import and a match run can overlap.
+const FILE_POOL_CONNECTIONS: u32 = 8;
+
+/// Opens the library database at `db_path`, creating it when missing.
+///
+/// The path is passed as a file name, never spliced into a URL, so characters
+/// such as `?`, `#` and `%` are safe. File databases use WAL with
+/// `synchronous = NORMAL`, so readers do not block the writer.
+pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
+    let options = SqliteConnectOptions::new()
+        .filename(db_path)
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(BUSY_TIMEOUT);
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(FILE_POOL_CONNECTIONS)
+        .connect_with(options)
+        .await?;
+    initialize(&pool).await?;
+
+    Ok(pool)
 }
 
 /// Opens an in-memory database, used by tests.
+///
+/// Every connection to a private in-memory database is a separate database, so
+/// the pool holds exactly one connection and never recycles it. WAL does not
+/// apply to memory databases, and shared-cache locking reports `SQLITE_LOCKED`,
+/// which `busy_timeout` does not wait on.
 #[cfg(test)]
 pub async fn connect_in_memory() -> Result<SqlitePool> {
     let options = SqliteConnectOptions::from_str("sqlite::memory:")?
         .foreign_keys(true)
         .create_if_missing(true);
 
-    connect_with_options(options).await
-}
-
-async fn connect_with_options(options: SqliteConnectOptions) -> Result<SqlitePool> {
     let pool = SqlitePoolOptions::new()
-        .max_connections(if options.get_filename() == Path::new(":memory:") {
-            1
-        } else {
-            8
-        })
+        .max_connections(1)
+        .idle_timeout(None)
+        .max_lifetime(None)
         .connect_with(options)
         .await?;
-
     initialize(&pool).await?;
 
     Ok(pool)
@@ -128,6 +157,77 @@ mod tests {
         .await
         .unwrap();
         pool
+    }
+
+    /// A unique scratch directory for file-backed databases. Removing it also
+    /// removes the `-wal` and `-shm` side files.
+    fn scratch_dir(label: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "radish-db-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn connect_opens_paths_with_url_metacharacters() {
+        let dir = scratch_dir("meta");
+        let path = dir.join("lib ?#%.db");
+
+        let pool = connect(&path).await.unwrap();
+        sqlx::query("INSERT INTO directories (path) VALUES ('/music')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        assert!(
+            path.exists(),
+            "the database must be created at the exact path"
+        );
+        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        assert!(
+            entries.iter().all(|entry| entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("lib ?#%.db")),
+            "no stray database files expected: {entries:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn file_databases_use_wal_and_normal_sync() {
+        let dir = scratch_dir("wal");
+        let pool = connect(&dir.join("library.db")).await.unwrap();
+
+        let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(journal, "wal");
+        assert_eq!(synchronous, 1, "NORMAL");
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn in_memory_pools_hold_a_single_connection() {
+        let pool = connect_in_memory().await.unwrap();
+        assert_eq!(pool.options().get_max_connections(), 1);
+        assert_eq!(pool.options().get_idle_timeout(), None);
+        assert_eq!(pool.options().get_max_lifetime(), None);
     }
 
     #[tokio::test]

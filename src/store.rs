@@ -5,7 +5,7 @@ use crate::matcher::{
 use crate::providers::{GroupId, Mbid, ProviderKind, ReleaseId};
 use crate::scanner::{ObservedMusicBrainzIds, ScannedTrack};
 use anyhow::{Result, bail};
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
@@ -19,6 +19,17 @@ pub const SNAPSHOT_VERSION: i64 = 2;
 // ---------------------------------------------------------------------------
 // Scanned-metadata storage
 // ---------------------------------------------------------------------------
+
+/// Starts a write transaction that takes the database write lock immediately.
+///
+/// A deferred transaction that reads first and writes later can fail with
+/// `SQLITE_BUSY` the moment it tries to upgrade, which `busy_timeout` cannot
+/// retry. Taking the lock up front makes concurrent writers queue instead.
+/// Helpers called inside the transaction must take the connection, never the
+/// pool: the in-memory test pool has exactly one connection.
+async fn begin_write(pool: &SqlitePool) -> Result<Transaction<'static, Sqlite>> {
+    Ok(pool.begin_with("BEGIN IMMEDIATE").await?)
+}
 
 pub async fn upsert_directory(pool: &SqlitePool, path: &Path) -> Result<i64> {
     let path_str = path.to_string_lossy().to_string();
@@ -541,7 +552,10 @@ pub fn group_tracks(tracks: &[ObservedTrack]) -> Vec<GroupedRelease> {
         .collect()
 }
 
-async fn observed_tracks(pool: &SqlitePool, scope: Option<&Path>) -> Result<Vec<ObservedTrack>> {
+async fn observed_tracks(
+    conn: &mut SqliteConnection,
+    scope: Option<&Path>,
+) -> Result<Vec<ObservedTrack>> {
     let mut rows = sqlx::query_as::<_, ObservedTrack>(
         "SELECT t.id AS id, t.path AS path, t.title AS title, t.artist AS artist,
                 a.title AS album, t.album_artist AS album_artist, a.year AS year,
@@ -553,7 +567,7 @@ async fn observed_tracks(pool: &SqlitePool, scope: Option<&Path>) -> Result<Vec<
          LEFT JOIN albums a ON a.id = t.album_id
          ORDER BY t.path",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
 
     if let Some(scope) = scope {
@@ -583,10 +597,12 @@ pub fn path_within(candidate: &str, root: &Path) -> bool {
 /// Recomputes grouping for the selected scope and persists it. Existing track
 /// IDs are preserved, and unchanged revisions keep accepted matches intact.
 pub async fn rebuild_local_releases(pool: &SqlitePool, scope: Option<&Path>) -> Result<usize> {
-    let tracks = observed_tracks(pool, scope).await?;
+    // Observe and write inside one write transaction, so a concurrent writer
+    // can never leave this rebuild grouping stale data.
+    let mut tx = begin_write(pool).await?;
+    let tracks = observed_tracks(&mut tx, scope).await?;
     let groups = group_tracks(&tracks);
 
-    let mut tx = pool.begin().await?;
     for group in &groups {
         let existing = sqlx::query_as::<_, (i64, String, String)>(
             "SELECT id, source_revision, status FROM local_releases
@@ -1259,7 +1275,7 @@ async fn accept_recorded_match(
         bail!("refusing to accept a release with unsupported structure");
     }
 
-    let mut tx = pool.begin().await?;
+    let mut tx = begin_write(pool).await?;
 
     let current: Option<(String, Option<i64>)> = sqlx::query_as(
         "SELECT lr.source_revision,
@@ -1453,7 +1469,7 @@ async fn load_tracks_for_release(
 /// Removes the accepted overlay and all provider reviews, showing scanned
 /// metadata again. Never contacts a provider.
 pub async fn clear_match(pool: &SqlitePool, local_release_id: i64) -> Result<bool> {
-    let mut tx = pool.begin().await?;
+    let mut tx = begin_write(pool).await?;
 
     let existing: Option<i64> =
         sqlx::query_scalar("SELECT id FROM release_matches WHERE local_release_id = ?1")
@@ -1674,6 +1690,20 @@ mod tests {
             upsert_track(pool, track, directory_id).await.unwrap();
         }
         rebuild_local_releases(pool, None).await.unwrap();
+    }
+
+    /// A unique scratch directory for file-backed databases. Removing it also
+    /// removes the `-wal` and `-shm` side files.
+    fn scratch_dir(label: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "radish-store-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     fn mbid(value: &str) -> Mbid {
@@ -2491,6 +2521,54 @@ mod tests {
         rebuild_local_releases(&pool, None).await.unwrap();
         assert_eq!(std::fs::read(&file).unwrap(), original);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[tokio::test]
+    async fn rebuild_waits_for_a_concurrent_writer_and_sees_its_rows() {
+        let dir = scratch_dir("rebuild-wait");
+        let path = dir.join("library.db");
+        let pool_a = crate::db::connect(&path).await.unwrap();
+        let pool_b = crate::db::connect(&path).await.unwrap();
+
+        let directory_id = upsert_directory(&pool_a, Path::new("/music/a"))
+            .await
+            .unwrap();
+        upsert_track(
+            &pool_a,
+            &scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1),
+            directory_id,
+        )
+        .await
+        .unwrap();
+        rebuild_local_releases(&pool_a, None).await.unwrap();
+
+        // Writer A holds the write lock and has an uncommitted second track.
+        let mut writer = begin_write(&pool_a).await.unwrap();
+        sqlx::query(
+            "INSERT INTO tracks (path, title, album_id, directory_id, track_number, modified_at)
+             SELECT '/music/a/02.flac', 'Track 2', album_id, directory_id, 2, 1
+             FROM tracks WHERE path = '/music/a/01.flac'",
+        )
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+
+        let rebuilding = {
+            let pool_b = pool_b.clone();
+            tokio::spawn(async move { rebuild_local_releases(&pool_b, None).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        writer.commit().await.unwrap();
+
+        rebuilding.await.unwrap().unwrap();
+        let track_count: i64 = sqlx::query_scalar("SELECT track_count FROM local_releases")
+            .fetch_one(&pool_b)
+            .await
+            .unwrap();
+        assert_eq!(track_count, 2, "the rebuild must observe the committed row");
+
+        pool_a.close().await;
+        pool_b.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
