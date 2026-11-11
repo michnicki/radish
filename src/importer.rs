@@ -90,6 +90,24 @@ pub(crate) async fn sync_files(
     )
     .await?;
 
+    // An empty answer for a library that has rows is more likely an unmounted
+    // volume or a wiped share than a deliberate delete-everything.
+    if tracks.is_empty() && unchanged.is_empty() && unreadable.is_empty() && !known.is_empty() {
+        let message = format!(
+            "warning: no audio files found under {}; keeping {} stored tracks (is the volume mounted?)",
+            dir.display(),
+            known.len()
+        );
+        match progress {
+            Some(progress) => progress.scan_event(ScanEvent::Warning { message }),
+            None => eprintln!("{message}"),
+        }
+        return Ok(ImportSummary {
+            kept: known.len(),
+            ..ImportSummary::default()
+        });
+    }
+
     if let Some(progress) = progress {
         progress.saving(tracks.len());
     }
@@ -369,5 +387,29 @@ mod tests {
         // The share is gone, but nothing says its tracks are: keep them.
         assert_eq!(summary.removed, 0, "{summary:?}");
         assert_eq!(summary.kept, 2, "{summary:?}");
+    }
+
+    #[tokio::test]
+    async fn an_emptied_root_keeps_its_rows() {
+        let pool = db::connect_in_memory().await.unwrap();
+        let music = ScratchDir::new("importer-emptied");
+        for name in ["a.wav", "b.wav", "c.wav"] {
+            write_wav(&music.path().join(name));
+        }
+        let progress = ImportProgress::new();
+        sync_directory(&pool, music.path(), &progress)
+            .await
+            .unwrap();
+
+        for name in ["a.wav", "b.wav", "c.wav"] {
+            std::fs::remove_file(music.path().join(name)).unwrap();
+        }
+        let summary = sync_directory(&pool, music.path(), &progress)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.removed, 0, "{summary:?}");
+        assert_eq!(summary.kept, 3, "{summary:?}");
+        assert_eq!(paths(&pool).await.len(), 3);
     }
 }
