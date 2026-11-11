@@ -552,3 +552,67 @@ async fn matching_output_escapes_control_sequences_from_tags_and_provider_data()
         assert!(all.contains("Matching local release"), "{all:?}");
     }
 }
+
+#[tokio::test]
+async fn an_explicit_discogs_run_fails_every_release_after_a_rejected_token() {
+    let db = db_path("discogs-explicit-token-rejected");
+    seed_directory(&db, "/music/blue", 2001).await;
+    seed_directory(&db, "/music/blue-again", 2001).await;
+    let server = MockServer::start(|target| {
+        if target.contains("/database/search") || target.contains("/releases/") {
+            return (401, r#"{"message":"Invalid consumer token."}"#.into());
+        }
+        handler(target)
+    });
+
+    let output = run(
+        &db,
+        &server,
+        &["match", "--provider", "discogs"],
+        Some("rejected-token"),
+    );
+
+    assert!(!output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("Failed: 2"), "{text}");
+    assert!(text.contains("Skipped: 0"), "{text}");
+    assert_eq!(server.requests_matching("/database/search"), 1, "{text}");
+}
+
+#[tokio::test]
+async fn a_stale_refresh_after_a_rejected_token_is_skipped_not_called_unmatched() {
+    let db = db_path("stale-refresh-token-rejected");
+    seed_directory(&db, "/music/blue", 2001).await;
+    seed_directory(&db, "/music/blue-again", 2001).await;
+    let rejected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = rejected.clone();
+    let server = MockServer::start(move |target| {
+        if flag.load(std::sync::atomic::Ordering::SeqCst)
+            && (target.contains("/database/search") || target.contains("/releases/"))
+        {
+            return (401, r#"{"message":"Invalid consumer token."}"#.into());
+        }
+        handler(target)
+    });
+    let accepted = run(
+        &db,
+        &server,
+        &["match", "--provider", "discogs"],
+        Some("good"),
+    );
+    assert!(stdout(&accepted).contains("Accepted: 2"), "{accepted:?}");
+    // Both accepted matches go stale, then the token stops working.
+    seed_directory(&db, "/music/blue", 2002).await;
+    seed_directory(&db, "/music/blue-again", 2002).await;
+    rejected.store(true, std::sync::atomic::Ordering::SeqCst);
+    let before = server.request_count();
+
+    let output = run(&db, &server, &["match"], Some("revoked"));
+
+    assert!(!output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("Failed: 1"), "{text}");
+    assert!(text.contains("Skipped: 1"), "{text}");
+    assert!(text.contains("Unmatched: 0"), "{text}");
+    assert_eq!(server.request_count() - before, 1, "{text}");
+}

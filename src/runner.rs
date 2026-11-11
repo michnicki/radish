@@ -375,7 +375,7 @@ where
 
     let mut musicbrainz_client: Option<M> = None;
     let mut discogs_client: Option<D> = None;
-    let mut discogs_disabled: Option<String> = None;
+    let mut discogs_disabled: Option<ProviderError> = None;
     let mut ai = AiState::Unbuilt;
 
     for release in &selected {
@@ -524,7 +524,7 @@ async fn process_release<M, D>(
     policy: ProviderPolicy,
     musicbrainz_client: &mut Option<M>,
     discogs_client: &mut Option<D>,
-    discogs_disabled: &mut Option<String>,
+    discogs_disabled: &mut Option<ProviderError>,
     ai: &mut AiState,
     refreshing: bool,
     make_musicbrainz: impl Fn() -> Result<M>,
@@ -577,8 +577,19 @@ where
                 attempts.push(attempt_provider(client, release, direct.clone()).await);
             }
             ProviderKind::Discogs => {
-                if let Some(reason) = discogs_disabled.as_ref() {
-                    fallback_skip = Some(reason.clone());
+                if let Some(error) = discogs_disabled.as_ref() {
+                    if policy.is_explicit() && !refreshing {
+                        // The user asked for Discogs, so a release it cannot
+                        // serve is a failure, whichever release met the error.
+                        attempts.push(ProviderAttempt::failed(
+                            ProviderKind::Discogs,
+                            error.clone(),
+                        ));
+                    } else {
+                        fallback_skip = Some(format!(
+                            "Discogs is disabled for the rest of this run: {error}"
+                        ));
+                    }
                     break;
                 }
                 if discogs_client.is_none() {
@@ -605,11 +616,10 @@ where
                                         .to_string(),
                                 );
                             } else {
-                                let reason = format!(
-                                    "configured Discogs credentials are unusable: {error:#}"
-                                );
-                                *discogs_disabled = Some(reason.clone());
-                                fallback_skip = Some(reason);
+                                let error = provider_error_from(ProviderKind::Discogs, error);
+                                fallback_skip =
+                                    Some(format!("Discogs fallback was skipped: {error}"));
+                                *discogs_disabled = Some(error);
                                 eprintln!("  Disabling Discogs fallback for the rest of this run");
                             }
                             break;
@@ -620,10 +630,7 @@ where
                 let attempt = attempt_provider(client, release, direct.clone()).await;
                 // A rejected credential rejects every later release too.
                 if attempt.error.as_ref().is_some_and(ProviderError::is_auth) {
-                    *discogs_disabled = Some(
-                        "Discogs rejected its credentials earlier in this run; Discogs was skipped"
-                            .to_string(),
-                    );
+                    *discogs_disabled = attempt.error.clone();
                     eprintln!("  Disabling Discogs for the rest of this run");
                 }
                 attempts.push(attempt);
