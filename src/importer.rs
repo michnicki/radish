@@ -20,6 +20,9 @@ pub struct ImportSummary {
     pub saved: u64,
     /// Track rows deleted because their files are gone.
     pub removed: u64,
+    /// Stored rows kept because their files, or a folder above them, could not
+    /// be read this time.
+    pub kept: usize,
     pub rebuild: store::RebuildSummary,
 }
 
@@ -60,7 +63,11 @@ pub(crate) async fn sync_files(
         bail!("{} is not a directory", dir.display());
     }
     let known = store::known_tracks(pool, dir).await?;
-    let ScanResult { tracks, unchanged } = scanner::scan_directory_incremental(
+    let ScanResult {
+        tracks,
+        unchanged,
+        unreadable,
+    } = scanner::scan_directory_incremental(
         dir,
         |path, modified_at| {
             known
@@ -103,11 +110,31 @@ pub(crate) async fn sync_files(
         .chain(unchanged.iter().map(PathBuf::as_path))
         .map(store::path_key)
         .collect();
-    let gone: Vec<String> = known
+    let unreadable_keys: Vec<String> = unreadable
         .iter()
-        .filter(|(key, _)| !seen.contains(*key))
-        .map(|(_, known)| known.path.clone())
+        .map(|path| store::path_key(path).trim_end_matches('/').to_string())
         .collect();
+    // A file or folder the scan could not read says nothing about its rows.
+    let is_unreadable = |key: &str| {
+        unreadable_keys.iter().any(|blocked| {
+            key == blocked
+                || key
+                    .strip_prefix(blocked.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    };
+    let mut gone = Vec::new();
+    let mut kept = 0;
+    for (key, known) in &known {
+        if seen.contains(key) {
+            continue;
+        }
+        if is_unreadable(key) {
+            kept += 1;
+        } else {
+            gone.push(known.path.clone());
+        }
+    }
     let removed = store::remove_tracks_by_paths(pool, &gone).await?;
 
     Ok(ImportSummary {
@@ -115,6 +142,7 @@ pub(crate) async fn sync_files(
         unchanged: unchanged.len(),
         saved,
         removed,
+        kept,
         rebuild: store::RebuildSummary::default(),
     })
 }
@@ -231,5 +259,115 @@ mod tests {
         let tracks = store::list_tracks(&pool).await.unwrap();
         assert_eq!(tracks.len(), 1);
         assert!(tracks[0].path.ends_with("Keep.wav"), "{:?}", tracks[0].path);
+    }
+
+    /// Gives a directory its permissions back so the scratch directory can go.
+    #[cfg(unix)]
+    struct RestorePermissions(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    async fn paths(pool: &SqlitePool) -> Vec<String> {
+        let mut paths: Vec<String> = store::list_tracks(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|track| track.path)
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[tokio::test]
+    async fn a_file_that_stops_reading_keeps_its_row() {
+        let pool = db::connect_in_memory().await.unwrap();
+        let music = ScratchDir::new("importer-corrupt");
+        write_wav(&music.path().join("a.wav"));
+        write_wav(&music.path().join("b.wav"));
+        let progress = ImportProgress::new();
+        sync_directory(&pool, music.path(), &progress)
+            .await
+            .unwrap();
+
+        // Corrupt content with a newer modification time, so it is read again.
+        let b = music.path().join("b.wav");
+        std::fs::write(&b, b"not audio").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&b)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        let summary = sync_directory(&pool, music.path(), &progress)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.removed, 0, "{summary:?}");
+        assert_eq!(summary.kept, 1, "{summary:?}");
+        assert_eq!(paths(&pool).await.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_folder_keeps_its_rows() {
+        use std::os::unix::fs::PermissionsExt;
+        let pool = db::connect_in_memory().await.unwrap();
+        let music = ScratchDir::new("importer-chmod");
+        let album = music.path().join("Album");
+        std::fs::create_dir(&album).unwrap();
+        write_wav(&album.join("01.wav"));
+        write_wav(&album.join("02.wav"));
+        write_wav(&music.path().join("top.wav"));
+        let progress = ImportProgress::new();
+        sync_directory(&pool, music.path(), &progress)
+            .await
+            .unwrap();
+
+        std::fs::set_permissions(&album, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _restore = RestorePermissions(album.clone());
+        if std::fs::read_dir(&album).is_ok() {
+            return; // running as root: permissions do not apply
+        }
+        let summary = sync_directory(&pool, music.path(), &progress)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.removed, 0, "{summary:?}");
+        assert_eq!(summary.kept, 2, "{summary:?}");
+        assert_eq!(paths(&pool).await.len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dangling_linked_folder_keeps_its_rows() {
+        let pool = db::connect_in_memory().await.unwrap();
+        let music = ScratchDir::new("importer-dangling");
+        let holder = ScratchDir::new("importer-dangling-share");
+        let share = holder.path().join("share");
+        std::fs::create_dir(&share).unwrap();
+        write_wav(&share.join("01.wav"));
+        write_wav(&share.join("02.wav"));
+        write_wav(&music.path().join("top.wav"));
+        std::os::unix::fs::symlink(&share, music.path().join("NAS")).unwrap();
+        let progress = ImportProgress::new();
+        let first = sync_directory(&pool, music.path(), &progress)
+            .await
+            .unwrap();
+        assert_eq!(first.scanned, 3);
+
+        std::fs::rename(&share, holder.path().join("gone")).unwrap();
+        let summary = sync_directory(&pool, music.path(), &progress)
+            .await
+            .unwrap();
+
+        // The share is gone, but nothing says its tracks are: keep them.
+        assert_eq!(summary.removed, 0, "{summary:?}");
+        assert_eq!(summary.kept, 2, "{summary:?}");
     }
 }

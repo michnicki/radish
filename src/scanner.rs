@@ -218,6 +218,11 @@ pub struct ScanResult {
     pub tracks: Vec<ScannedTrack>,
     /// Files skipped because `is_unchanged` accepted their modification time.
     pub unchanged: Vec<PathBuf>,
+    /// Paths the scan could not get an answer for: files whose tags failed to
+    /// read, and every file or folder the walk could not visit, including
+    /// ones skipped without a warning. A caller must not conclude that
+    /// anything at or below these paths was deleted.
+    pub unreadable: Vec<PathBuf>,
 }
 
 /// Walks `root` and reads audio tags on the Tokio blocking thread pool.
@@ -246,6 +251,7 @@ pub async fn scan_directory_incremental(
     mut on_progress: impl FnMut(ScanEvent),
 ) -> Result<ScanResult> {
     on_progress(ScanEvent::Discovering);
+    let mut result = ScanResult::default();
     let mut files: Vec<(PathBuf, Option<i64>)> = Vec::new();
     // Following links lets symlinked libraries import; walkdir reports loops as errors.
     for entry in WalkDir::new(root).follow_links(true) {
@@ -261,6 +267,7 @@ pub async fn scan_directory_incremental(
             Ok(_) => {}
             Err(err) => {
                 let path = err.path().unwrap_or(root);
+                result.unreadable.push(path.to_path_buf());
                 let io_error = err.io_error();
                 // A dangling link to a non-audio file (a cover image) is not worth a warning.
                 if io_error.is_some_and(|e| e.kind() == ErrorKind::NotFound) && !is_audio_file(path)
@@ -280,7 +287,6 @@ pub async fn scan_directory_incremental(
     on_progress(ScanEvent::Discovered { total });
 
     let mut completed = 0;
-    let mut result = ScanResult::default();
     let mut to_read = Vec::new();
     for (path, mtime) in files {
         if mtime.is_some_and(|mtime| is_unchanged(&path, mtime)) {
@@ -306,11 +312,17 @@ pub async fn scan_directory_incremental(
                     result.tracks.push(track);
                     None
                 }
-                Ok(Err(err)) => Some(format!("warning: failed to read tags: {err:#}")),
-                Err(err) => Some(format!(
-                    "warning: scan task panicked: {}: {err}",
-                    path.display()
-                )),
+                Ok(Err(err)) => {
+                    result.unreadable.push(path.to_path_buf());
+                    Some(format!("warning: failed to read tags: {err:#}"))
+                }
+                Err(err) => {
+                    result.unreadable.push(path.to_path_buf());
+                    Some(format!(
+                        "warning: scan task panicked: {}: {err}",
+                        path.display()
+                    ))
+                }
             };
             completed += 1;
             on_progress(ScanEvent::FileFinished {

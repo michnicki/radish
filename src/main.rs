@@ -340,8 +340,12 @@ async fn run_import(pool: &sqlx::SqlitePool, path: &std::path::Path) -> Result<P
     let summary = importer::sync_directory(pool, &path, &progress).await?;
     drop(progress);
 
+    let kept = match summary.kept {
+        0 => String::new(),
+        kept => format!(", {kept} kept (unreadable)"),
+    };
     outln!(
-        "Imported {} new or changed tracks ({} unchanged, {} removed) into {} local release(s).",
+        "Imported {} new or changed tracks ({} unchanged, {} removed{kept}) into {} local release(s).",
         summary.saved,
         summary.unchanged,
         summary.removed,
