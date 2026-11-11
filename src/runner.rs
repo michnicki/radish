@@ -594,7 +594,16 @@ where
                     }
                 }
                 let client = discogs_client.as_ref().expect("client initialized");
-                attempts.push(attempt_provider(client, release, direct.clone()).await);
+                let attempt = attempt_provider(client, release, direct.clone()).await;
+                // A rejected credential rejects every later release too.
+                if attempt.error.as_ref().is_some_and(ProviderError::is_auth) {
+                    *discogs_disabled = Some(
+                        "Discogs rejected its credentials earlier in this run; Discogs was skipped"
+                            .to_string(),
+                    );
+                    eprintln!("  Disabling Discogs for the rest of this run");
+                }
+                attempts.push(attempt);
             }
         }
     }

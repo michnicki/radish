@@ -29,8 +29,12 @@ async fn seed_library(db: &Path) -> i64 {
 }
 
 async fn seed_library_year(db: &Path, year: i64) -> i64 {
+    seed_directory(db, "/music/blue", year).await
+}
+
+async fn seed_directory(db: &Path, directory: &str, year: i64) -> i64 {
     let pool = radish::db::connect(db).await.unwrap();
-    let directory = Path::new("/music/blue");
+    let directory = Path::new(directory);
     let directory_id = store::upsert_directory(&pool, directory).await.unwrap();
 
     for number in 1..=2i64 {
@@ -445,5 +449,31 @@ async fn refreshing_a_stale_discogs_match_without_a_token_is_skipped_not_failed(
         server.request_count(),
         before,
         "no provider may be contacted"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_discogs_token_is_not_retried_for_later_releases() {
+    let db = db_path("discogs-token-rejected");
+    seed_directory(&db, "/music/blue", 2001).await;
+    seed_directory(&db, "/music/blue-again", 2001).await;
+    let server = MockServer::start(|target| {
+        if target.contains("/database/search") || target.contains("/releases/") {
+            return (401, r#"{"message":"Invalid consumer token."}"#.into());
+        }
+        handler(target)
+    });
+
+    let output = run(&db, &server, &["match"], Some("rejected-token"));
+
+    // The release that met the rejection fails; later ones skip the fallback.
+    assert!(!output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("Failed: 1"), "{text}");
+    assert!(text.contains("Unmatched: 1"), "{text}");
+    assert_eq!(
+        server.requests_matching("/database/search"),
+        1,
+        "the second release must not contact Discogs: {text}"
     );
 }
