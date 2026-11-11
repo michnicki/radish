@@ -371,16 +371,32 @@ pub fn normalize_artist_for(provider: ProviderKind, input: &str) -> String {
 }
 
 /// Normalized Levenshtein similarity in `0.0..=1.0`.
+///
+/// Text that normalizes to nothing, such as `÷`, is compared by its original
+/// characters instead, so distinct symbol-only titles do not look identical.
 pub fn similarity(a: &str, b: &str) -> f64 {
-    let a = normalize_text(a);
-    let b = normalize_text(b);
-    similarity_normalized(&a, &b)
+    let normalized_a = normalize_text(a);
+    let normalized_b = normalize_text(b);
+    if normalized_a.is_empty() || normalized_b.is_empty() {
+        return same_stripped_text(a, b);
+    }
+    similarity_normalized(&normalized_a, &normalized_b)
 }
 
+/// 1.0 when both strings are non-empty and equal ignoring whitespace and case.
+fn same_stripped_text(a: &str, b: &str) -> f64 {
+    let strip = |text: &str| -> String {
+        text.chars()
+            .filter(|ch| !ch.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let (a, b) = (strip(a), strip(b));
+    if !a.is_empty() && a == b { 1.0 } else { 0.0 }
+}
+
+/// Empty text carries no evidence, so it is never similar to anything.
 fn similarity_normalized(a: &str, b: &str) -> f64 {
-    if a.is_empty() && b.is_empty() {
-        return 1.0;
-    }
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }
@@ -419,7 +435,12 @@ fn levenshtein(a: &[char], b: &[char]) -> usize {
 }
 
 pub fn artist_similarity(a: &str, b: &str) -> f64 {
-    similarity_normalized(&normalize_artist(a), &normalize_artist(b))
+    let normalized_a = normalize_artist(a);
+    let normalized_b = normalize_artist(b);
+    if normalized_a.is_empty() || normalized_b.is_empty() {
+        return same_stripped_text(a, b);
+    }
+    similarity_normalized(&normalized_a, &normalized_b)
 }
 
 /// `max(0, 1 - absolute_difference_seconds / 10)`.
@@ -2035,6 +2056,17 @@ mod tests {
             normalize_artist_for(ProviderKind::MusicBrainz, "Nirvana (2)"),
             normalize_artist_for(ProviderKind::MusicBrainz, "Nirvana")
         );
+    }
+
+    #[test]
+    fn titles_that_normalize_to_nothing_compare_by_their_original_text() {
+        assert_eq!(similarity("÷", "×"), 0.0);
+        assert_eq!(similarity("÷", "÷"), 1.0);
+        assert_eq!(similarity("÷", " ÷ "), 1.0);
+        assert_eq!(similarity("", ""), 0.0);
+        assert_eq!(similarity("", "Intro"), 0.0);
+        assert_eq!(artist_similarity("!!!", "???"), 0.0);
+        assert_eq!(artist_similarity("!!!", "!!!"), 1.0);
     }
 
     #[test]
