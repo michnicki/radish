@@ -373,13 +373,35 @@ fn directory_of(path: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The key two album titles or artist names are compared by.
+///
+/// Blank values have no identity. Names that normalize to nothing, such as
+/// "÷" or "!!!", keep a distinct key built from the lowercased,
+/// whitespace-collapsed original. That key starts with `~`, which
+/// `normalize_text` never emits, so it cannot collide with a normal key.
+fn identity_key(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = matcher::normalize_text(trimmed);
+    if !normalized.is_empty() {
+        return Some(normalized);
+    }
+    let collapsed = trimmed
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    Some(format!("~{collapsed}"))
+}
+
 fn most_common_value(values: impl Iterator<Item = String>) -> Option<(String, String)> {
     let mut counts: HashMap<String, (usize, String)> = HashMap::new();
     for value in values {
-        let normalized = matcher::normalize_text(&value);
-        if normalized.is_empty() {
+        let Some(normalized) = identity_key(&value) else {
             continue;
-        }
+        };
         let entry = counts
             .entry(normalized)
             .or_insert_with(|| (0, value.clone()));
@@ -481,7 +503,7 @@ pub fn group_tracks(tracks: &[ObservedTrack]) -> Vec<GroupedRelease> {
             .as_deref()
             .map(str::trim)
             .filter(|title| !title.is_empty());
-        let album_title_norm = album_title.map(matcher::normalize_text).unwrap_or_default();
+        let album_title_norm = album_title.and_then(identity_key).unwrap_or_default();
 
         groups
             .entry((directory.to_ascii_lowercase(), album_title_norm))
@@ -501,7 +523,7 @@ pub fn group_tracks(tracks: &[ObservedTrack]) -> Vec<GroupedRelease> {
                 .iter()
                 .filter_map(|track| track.album.as_deref())
                 .map(str::trim)
-                .find(|title| matcher::normalize_text(title) == album_title_norm)
+                .find(|title| identity_key(title).as_deref() == Some(album_title_norm.as_str()))
                 .map(str::to_string);
 
             let album_artist_tag = most_common_value(
@@ -518,7 +540,7 @@ pub fn group_tracks(tracks: &[ObservedTrack]) -> Vec<GroupedRelease> {
             let distinct_track_artists: Vec<String> = {
                 let mut distinct: Vec<String> = track_artists
                     .iter()
-                    .map(|artist| matcher::normalize_text(artist))
+                    .filter_map(|artist| identity_key(artist))
                     .collect();
                 distinct.sort();
                 distinct.dedup();
@@ -3100,5 +3122,38 @@ mod tests {
         assert!(upsert_tracks(&pool, &tracks, 999).await.is_err());
         assert_eq!(count(&pool, "tracks").await, 0);
         assert_eq!(count(&pool, "albums").await, 0);
+    }
+
+    #[tokio::test]
+    async fn symbol_only_titles_and_artists_keep_their_identity() {
+        let pool = test_pool().await;
+        insert(
+            &pool,
+            "/music/a",
+            &[
+                scanned("/music/a/01.flac", Some("÷"), Some("!!!"), 1),
+                scanned("/music/a/02.flac", None, None, 2),
+            ],
+        )
+        .await;
+
+        let releases = load_local_releases(&pool, None).await.unwrap();
+        assert_eq!(releases.len(), 2);
+        let tagged = releases
+            .iter()
+            .find(|release| release.has_album_tag)
+            .expect("the symbol-titled album keeps its album tag");
+        assert_eq!(tagged.album_title.as_deref(), Some("÷"));
+        assert_eq!(tagged.album_artist.as_deref(), Some("!!!"));
+        assert_eq!(tagged.tracks.len(), 1);
+    }
+
+    #[test]
+    fn identity_keys_keep_symbol_only_names_apart() {
+        assert_eq!(identity_key("   "), None);
+        assert_eq!(identity_key("Blue"), Some(matcher::normalize_text("Blue")));
+        assert_eq!(identity_key("÷"), Some("~÷".to_string()));
+        assert_eq!(identity_key("!!!"), identity_key("  !!!  "));
+        assert_ne!(identity_key("!!!"), identity_key("???"));
     }
 }
