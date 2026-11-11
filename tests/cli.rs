@@ -664,6 +664,8 @@ async fn non_loopback_service_overrides_are_rejected_without_any_request() {
             .env("RADISH_DISCOGS_TOKEN", "test-token")
             .env("HTTPS_PROXY", &server.url)
             .env("https_proxy", &server.url)
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
             .stdin(Stdio::null())
             .output()
             .expect("run radish");

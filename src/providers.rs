@@ -539,8 +539,7 @@ pub trait MetadataProvider: Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::loopback_override_value;
-
+    use super::*;
     #[test]
     fn loopback_override_treats_unset_and_blank_values_as_absent() {
         for raw in [None, Some(""), Some("   ")] {
@@ -582,8 +581,6 @@ mod tests {
             assert!(!error.contains("evil"), "{error}");
         }
     }
-
-    use super::*;
 
     #[test]
     fn an_unavailable_provider_is_a_transient_failure_that_names_its_service() {

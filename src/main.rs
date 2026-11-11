@@ -131,15 +131,32 @@ const DOTENV_KEYS: [&str; 4] = [
 ];
 
 /// Loads allowed keys from `./.env` in the current directory only, never from a
-/// parent. Existing environment variables win; a missing or malformed file is
-/// ignored quietly.
+/// parent. Existing environment variables win. Anything but a readable regular
+/// file (absent, a directory such as a virtualenv, a FIFO) is ignored quietly,
+/// and so are malformed lines.
 fn load_dotenv() {
-    if let Ok(entries) = dotenvy::from_path_iter(".env") {
-        for (key, value) in entries.flatten() {
-            if DOTENV_KEYS.contains(&key.as_str()) && std::env::var_os(&key).is_none() {
-                // SAFETY: still single-threaded; Tokio has not started.
-                unsafe { std::env::set_var(key, value) }
+    // Opening a directory succeeds but every read fails, which would make the
+    // line iterator yield errors forever.
+    if !std::fs::metadata(".env").is_ok_and(|metadata| metadata.is_file()) {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(".env") else {
+        return;
+    };
+    // Some editors and PowerShell 5 write a UTF-8 byte order mark, which
+    // would otherwise become part of the first key.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    for entry in dotenvy::from_read_iter(text.as_bytes()) {
+        match entry {
+            Ok((key, value)) => {
+                if DOTENV_KEYS.contains(&key.as_str()) && std::env::var_os(&key).is_none() {
+                    // SAFETY: still single-threaded; Tokio has not started.
+                    unsafe { std::env::set_var(key, value) }
+                }
             }
+            // A malformed line is skipped; a read error would repeat forever.
+            Err(dotenvy::Error::Io(_)) => break,
+            Err(_) => {}
         }
     }
 }

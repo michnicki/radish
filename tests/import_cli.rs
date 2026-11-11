@@ -46,8 +46,6 @@ fn importing_an_emptied_directory_warns_and_keeps_the_library() {
     );
 }
 
-/// Paths come from untrusted folder and file names, so no output may carry a
-/// raw escape byte.
 #[cfg(unix)]
 #[test]
 fn a_broken_folder_link_warns_once_about_the_rows_it_protects() {
@@ -104,6 +102,8 @@ fn a_broken_link_to_a_non_audio_file_stays_silent() {
     assert!(output.stderr.is_empty(), "{output:?}");
 }
 
+/// Paths come from untrusted folder and file names, so no output may carry a
+/// raw escape byte.
 #[cfg(unix)]
 #[test]
 fn importing_paths_with_escape_bytes_prints_no_raw_escape() {

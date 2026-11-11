@@ -81,7 +81,7 @@ Radish also reads settings from a file named `.env` in the **current directory o
 - `RADISH_CLOUDFLARE_MODEL`
 - `RADISH_DISCOGS_TOKEN`
 
-Variables already set in the environment always win over the file. A missing or malformed `.env` is ignored without a message. Service endpoints cannot be set from `.env` (see [Test-server overrides](#test-server-overrides)).
+Variables already set in the environment always win over the file. Only a regular file named `.env` is read: a missing file, a directory of that name (as in a Python virtualenv), or an unreadable file is ignored without a message. Malformed lines are skipped, and valid keys after them still load. A leading UTF-8 byte order mark is ignored. Service endpoints cannot be set from `.env` (see [Test-server overrides](#test-server-overrides)).
 
 ### Commands
 
@@ -270,7 +270,7 @@ Cloudflare is contacted only with `--ai-match` (or its alias), after normal matc
 
 ### Known limits
 
-- **Renames and splits drop accepted matches.** Splitting a release across new album titles, or renaming a directory or file, changes which files form the local release, so its accepted match is dropped (the import output reports it) and the release must be matched again.
+- **Splits, moves and folder renames drop accepted matches.** A local release is identified by its containing folder plus its album title. Splitting a release across new album titles, renaming or moving its folder, or moving its files to another folder therefore creates different releases, so the accepted match is dropped (the import output reports it) and the release must be matched again. Renaming files within the same folder keeps the release; its membership changed, so the match is marked stale.
 - **Retagging an album title keeps the match.** Changing the album title of a whole release keeps its accepted match and marks it stale, because the files are the same; review or refresh it.
 - **No fingerprinting or AcoustID.** Matching relies on tags, embedded IDs, barcode, catalog number, titles, artists, years, and durations.
 - **Edition twins:** equivalent editions may be accepted as an album match, but their exact pressing stays unconfirmed. Conflicting recordings or tracklists still require review.
@@ -305,7 +305,7 @@ RADISH_DISCOGS_BASE_URL=http://127.0.0.1:PORT
 RADISH_CLOUDFLARE_BASE_URL=http://127.0.0.1:PORT
 ```
 
-These overrides exist for tests only. Each accepts only an `http` or `https` URL on `localhost`, `127.0.0.0/8` or `::1`; any other value is rejected with an error that names the variable but not its value, so a stray setting cannot send your credentials to another host. `RADISH_CLOUDFLARE_BASE_URL` otherwise accepts only `https://api.cloudflare.com`. None of them is read from `.env`, set by Radish, or required for normal use.
+These overrides exist for tests only. An unset or empty variable means the normal public service. Otherwise each accepts only an `http` or `https` URL on `localhost`, `127.0.0.0/8` or `::1`; any other value is rejected with an error that names the variable but not its value, so a stray setting cannot send your credentials to another host. `RADISH_CLOUDFLARE_BASE_URL` additionally accepts exactly `https://api.cloudflare.com`. None of them is read from `.env`, set by Radish, or required for normal use.
 
 ## Local data model
 
