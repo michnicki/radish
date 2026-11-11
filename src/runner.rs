@@ -549,19 +549,8 @@ fn primary_failed_transiently(attempts: &[ProviderAttempt]) -> bool {
             .error
             .iter()
             .chain(&attempt.partial_failures)
-            .any(is_transient_failure)
+            .any(ProviderError::is_transient)
     })
-}
-
-/// An outage-like failure. A malformed response is deterministic for that
-/// release and starts no cooldown, so it is not an outage.
-fn is_transient_failure(error: &ProviderError) -> bool {
-    matches!(
-        error,
-        ProviderError::Network { .. }
-            | ProviderError::RateLimited { .. }
-            | ProviderError::Unavailable { .. }
-    )
 }
 
 const TRANSIENT_PRIMARY_NOTE: &str =
