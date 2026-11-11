@@ -359,11 +359,17 @@ impl MusicBrainzAdapter {
     /// The bare-terms fallback for a title/artist search whose first query
     /// found nothing. It is built from the title and artist alone, so when a
     /// release group ID was searched first, the exact title phrase is skipped
-    /// and this is the second query. Identifier lookups are never loosened, and
-    /// neither is a search where every field is a single word, since the
-    /// bare-terms form would match exactly what the phrase did.
+    /// and this is the second query. Identifier lookups are never loosened.
+    /// Neither is a phrase search where every field is a single word, since the
+    /// bare-terms form would match exactly what the phrase did; that skip does
+    /// not apply after a release group search, which sent no phrase.
     fn loosened_query_for(&self, strategy: &SearchStrategy) -> Option<String> {
-        let SearchStrategy::TitleArtist { title, artist, .. } = strategy else {
+        let SearchStrategy::TitleArtist {
+            title,
+            artist,
+            release_group,
+        } = strategy
+        else {
             return None;
         };
         let artist = artist.as_deref().filter(|value| !value.trim().is_empty());
@@ -371,7 +377,7 @@ impl MusicBrainzAdapter {
             .into_iter()
             .flatten()
             .any(|value| value.split_whitespace().count() > 1);
-        if title.trim().is_empty() || !has_extra_words {
+        if title.trim().is_empty() || (release_group.is_none() && !has_extra_words) {
             return None;
         }
         let mut parts = vec![terms_field("release", title)];
@@ -1821,8 +1827,8 @@ mod tests {
     }
 
     /// Serves `truncated_attempts` truncated bodies (headers promise more than
-    /// is sent, then the socket closes) followed by complete responses. Returns the URL and the
-    /// attempt counter.
+    /// is sent, then the socket closes) followed by complete responses.
+    /// Returns the URL and the attempt counter.
     fn start_truncating_server(
         complete_body: String,
         truncated_attempts: usize,
@@ -2013,6 +2019,41 @@ mod tests {
         };
         adapter.search(with_artist).await.unwrap();
         assert_eq!(server.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn loosens_a_stale_release_group_search_with_single_word_fields() {
+        // The group ID matches nothing (stale or merged), and no phrase query
+        // was ever sent, so the bare-terms query is the only fallback.
+        let server = MockServer::start(|target| {
+            let body = if query_param(target) == "release:(Blue) AND artist:(Madonna)" {
+                ONE_HIT_SEARCH
+            } else {
+                EMPTY_SEARCH
+            };
+            (200, Vec::new(), body.to_string())
+        });
+        let adapter = MusicBrainzAdapter::with_config(config(&server)).unwrap();
+        let request = SearchRequest {
+            strategy: SearchStrategy::TitleArtist {
+                title: "Blue".to_string(),
+                artist: Some("Madonna".to_string()),
+                release_group: Some("4642ee19-7790-3c8d-ab5e-d133de942db6".parse().unwrap()),
+            },
+            offset: 0,
+            limit: 50,
+        };
+
+        let page = adapter.search(request).await.unwrap();
+        assert_eq!(page.hits.len(), 1);
+        let queries: Vec<String> = server.targets().iter().map(|t| query_param(t)).collect();
+        assert_eq!(
+            queries,
+            vec![
+                "rgid:\"4642ee19-7790-3c8d-ab5e-d133de942db6\"".to_string(),
+                "release:(Blue) AND artist:(Madonna)".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]
