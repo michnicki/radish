@@ -175,22 +175,22 @@ impl ClefClient {
         authorization.set_sensitive(true);
         let mut endpoint =
             Url::parse(origin).map_err(|_| anyhow!("AI review API origin is invalid"))?;
-        let loopback = endpoint.host_str().is_some_and(|host| {
-            host == "localhost"
-                || host
-                    .trim_matches(['[', ']'])
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        });
-        if !(endpoint.scheme() == "https" || endpoint.scheme() == "http" && loopback)
-            || endpoint.host_str().is_none()
+        // The origin receives the API token, so only Cloudflare itself or a
+        // local test server is acceptable.
+        let cloudflare = endpoint.scheme() == "https"
+            && endpoint.host_str() == Some("api.cloudflare.com")
+            && endpoint.port().is_none();
+        let trusted = cloudflare || crate::providers::is_loopback_url(&endpoint);
+        if !trusted
             || !endpoint.username().is_empty()
             || endpoint.password().is_some()
             || endpoint.path() != "/"
             || endpoint.query().is_some()
             || endpoint.fragment().is_some()
         {
-            bail!("AI review API origin must be an HTTPS origin (HTTP is allowed for loopback)");
+            bail!(
+                "AI review API origin must be https://api.cloudflare.com (or a loopback http(s) origin for tests)"
+            );
         }
         endpoint.set_path(&format!(
             "/client/v4/accounts/{account}/ai/run/@cf/cloudflare/{model}"
@@ -1757,6 +1757,27 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn accepts_only_the_cloudflare_origin_or_a_loopback_origin() {
+        let error = ClefClient::configured(
+            "test-account",
+            "fake-api-token",
+            "https://evil.example",
+            DEFAULT_MODEL,
+        )
+        .err()
+        .expect("an arbitrary HTTPS host would receive the real token")
+        .to_string();
+        assert!(!error.contains("evil.example"), "{error}");
+        for origin in ["https://api.cloudflare.com", "http://127.0.0.1:8787"] {
+            assert!(
+                ClefClient::configured("test-account", "fake-api-token", origin, DEFAULT_MODEL)
+                    .is_ok(),
+                "{origin}"
+            );
+        }
     }
 
     #[tokio::test]

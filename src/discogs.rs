@@ -10,7 +10,7 @@ use crate::matcher::{RemoteRelease, RemoteTrack, SearchSummary, TrackEntryType, 
 use crate::providers::{
     BoundedCache, GroupId, MetadataProvider, ProviderError, ProviderKind, RELEASE_CACHE_CAPACITY,
     ReleaseId, SEARCH_CACHE_CAPACITY, SearchPage as ProviderSearchPage, SearchRequest,
-    SearchStrategy, lock,
+    SearchStrategy, lock, loopback_override,
 };
 use discogger::{DiscogsClient, DiscogsError, PaginationParams, SearchParams, SearchType};
 use std::fmt;
@@ -28,6 +28,8 @@ pub const PER_PAGE: u32 = 50;
 #[derive(Debug, Clone)]
 pub enum AdapterError {
     MissingToken,
+    /// A setting is unusable; the message never contains the rejected value.
+    Configuration(String),
     Auth(String),
     NotFound(u64),
     Network(String),
@@ -46,6 +48,7 @@ impl fmt::Display for AdapterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingToken => write!(f, "Discogs token is not set ({TOKEN_ENV})"),
+            Self::Configuration(message) => write!(f, "Discogs is not configured: {message}"),
             Self::Auth(message) => write!(f, "Discogs authentication failed: {message}"),
             Self::NotFound(id) => write!(f, "Discogs release {id} was not found"),
             Self::Network(message) => write!(f, "Discogs request failed: {message}"),
@@ -68,6 +71,7 @@ impl From<AdapterError> for ProviderError {
                 provider,
                 message: format!("{TOKEN_ENV} is not set or empty"),
             },
+            AdapterError::Configuration(message) => Self::Configuration { provider, message },
             AdapterError::Auth(message) => Self::Authentication { provider, message },
             AdapterError::NotFound(id) => Self::NotFound {
                 provider,
@@ -146,9 +150,10 @@ impl DiscogsAdapter {
             return Err(AdapterError::MissingToken);
         }
 
-        let base_url = std::env::var(BASE_URL_ENV)
-            .ok()
-            .filter(|url| !url.trim().is_empty());
+        let base_url = loopback_override(BASE_URL_ENV)
+            .map_err(|error| AdapterError::Configuration(error.to_string()))?
+            // The client appends request paths directly to its base URL.
+            .map(|url| url.as_str().trim_end_matches('/').to_string());
 
         Self::build(token.trim().to_string(), RetryPolicy::default(), base_url)
     }

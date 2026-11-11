@@ -642,3 +642,39 @@ async fn a_permanent_musicbrainz_error_still_recovers_through_the_fallback() {
     assert!(text.contains("Accepted: 1"), "{text}");
     assert_eq!(row_count(&db, "release_matches").await, 1);
 }
+
+#[tokio::test]
+async fn non_loopback_service_overrides_are_rejected_without_any_request() {
+    for (provider, variable) in [
+        ("musicbrainz", "RADISH_MUSICBRAINZ_BASE_URL"),
+        ("discogs", "RADISH_DISCOGS_BASE_URL"),
+    ] {
+        let db = db_path(&format!("evil-override-{provider}"));
+        seed_library(&db).await;
+        let server = MockServer::start(handler);
+        // If the override were honored, traffic would flow through this local
+        // proxy and be recorded; nothing may reach the network either way.
+        let output = Command::new(env!("CARGO_BIN_EXE_radish"))
+            .arg("--db")
+            .arg(&db)
+            .args(["match", "--provider", provider])
+            .env("RADISH_MUSICBRAINZ_BASE_URL", &server.url)
+            .env("RADISH_DISCOGS_BASE_URL", &server.url)
+            .env(variable, "https://evil.example/secret-path")
+            .env("RADISH_DISCOGS_TOKEN", "test-token")
+            .env("HTTPS_PROXY", &server.url)
+            .env("https_proxy", &server.url)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run radish");
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(all.contains(variable), "{provider}: {all}");
+        assert!(!all.contains("evil.example"), "{provider}: {all}");
+        assert!(!all.contains("secret-path"), "{provider}: {all}");
+        assert_eq!(server.request_count(), 0, "{provider}: {all}");
+    }
+}
