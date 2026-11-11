@@ -452,12 +452,16 @@ async fn strong_ai_match_accepts_album_metadata_with_auditable_evidence() {
         "SELECT match_scope, algorithm_version, acceptance_method, year, country, metadata_json FROM release_matches"
     ).fetch_one(&pool).await.unwrap();
     assert_eq!(row.0, "album");
-    assert_eq!(row.1, "musicbrainz-clef-album-v1");
+    assert_eq!(row.1, "musicbrainz-clef-album-v2");
     assert_eq!(row.2, "automatic");
     assert_eq!(row.3, None);
     assert_eq!(row.4, None);
     let metadata: serde_json::Value = serde_json::from_str(&row.5).unwrap();
     assert_eq!(metadata["radish_ai_decision"]["advice"]["confidence"], 1.0);
+    assert_eq!(
+        metadata["radish_ai_decision"]["policy_version"],
+        "clef-album-v2"
+    );
     assert_eq!(
         metadata["radish_ai_decision"]["advice"]["prompt_version"],
         "radish-clef-album-v3"

@@ -239,7 +239,7 @@ Accepted: 1
 Queued for review: 0
 ```
 
-When an AI recommendation cannot be applied, output and the saved queue explain the failed acceptance checks. Model confidence is an uncalibrated signal, not a measured success rate; the thresholds above are conservative heuristics rather than an accuracy guarantee. Scores retain their original text/duration values. Accepted AI matches store a distinct algorithm version (`musicbrainz-clef-album-v1` or `discogs-clef-album-v1`) and the model, prompt version, choice, probabilities, and confidence in the accepted snapshot. Scanned tags and audio remain unchanged. Use `radish match --clear ID` to remove an accepted overlay.
+When an AI recommendation cannot be applied, output and the saved queue explain the failed acceptance checks. Model confidence is an uncalibrated signal, not a measured success rate; the thresholds above are conservative heuristics rather than an accuracy guarantee. Scores retain their original text/duration values. Accepted AI matches store a distinct algorithm version (`musicbrainz-clef-album-v2` or `discogs-clef-album-v2`) and the model, prompt version, choice, probabilities, and confidence in the accepted snapshot. Scanned tags and audio remain unchanged. Use `radish match --clear ID` to remove an accepted overlay.
 
 Unresolved recommendations are saved with the queue. `radish match --review` displays them offline without Cloudflare credentials; saved reviews stay offline even with `--ai-match`. Run normal matching with `--ai-match` to refresh an unresolved assessment. Old advisory prompt results are never reused for automatic acceptance.
 

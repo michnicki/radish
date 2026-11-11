@@ -1978,9 +1978,9 @@ async fn accept_recorded_match(
     let mut metadata = serde_json::to_value(remote)?;
     let algorithm_version = if let Some(advice) = ai_advice {
         metadata["radish_ai_decision"] = serde_json::json!({
-            "policy_version": "clef-album-v1", "advice": advice,
+            "policy_version": crate::clef::POLICY_VERSION, "advice": advice,
         });
-        format!("{provider}-clef-album-v1")
+        format!("{provider}-{}", crate::clef::POLICY_VERSION)
     } else {
         matcher::algorithm_version(provider).to_string()
     };
