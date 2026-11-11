@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use radish::output::Clean;
 use radish::progress::ImportProgress;
 use radish::providers::{ProviderKind, ReleaseId};
 use radish::{db, outln, runner, scanner, store, watcher};
@@ -249,8 +250,6 @@ fn canonical_scope(path: Option<&Path>) -> Result<Option<PathBuf>> {
 }
 
 fn print_releases(rows: &[store::LocalReleaseStatus]) {
-    use radish::output::Clean;
-
     if rows.is_empty() {
         outln!("No local releases found.");
         return;
@@ -298,8 +297,6 @@ fn print_releases(rows: &[store::LocalReleaseStatus]) {
 }
 
 fn print_tracks(rows: &[store::TrackRow]) {
-    use radish::output::Clean;
-
     if rows.is_empty() {
         outln!("No tracks found.");
         return;

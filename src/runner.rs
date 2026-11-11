@@ -18,6 +18,7 @@ use crate::store::{self, AcceptanceMethod, MatchGuard, StoredCandidate};
 use crate::{out, outln};
 use anyhow::{Context, Result, bail};
 use sqlx::SqlitePool;
+use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
@@ -402,6 +403,7 @@ where
         // A stale match is refreshed from the provider that accepted it; a
         // different source requires deliberate review.
         let mut release_policy = options.policy;
+        let mut refreshing = false;
         if !options.review
             && statuses.get(&release.id).map(String::as_str) == Some(store::STATUS_STALE)
             && let Some(provider) = existing_matches.get(&release.id).and_then(|p| *p)
@@ -409,6 +411,7 @@ where
         {
             outln!("  refreshing the stale {provider} match from its original source");
             release_policy = ProviderPolicy::Only(provider);
+            refreshing = true;
         }
 
         let guard = match store::load_match_guard(pool, release.id).await {
@@ -467,7 +470,7 @@ where
             &mut discogs_client,
             &mut discogs_disabled,
             &mut ai,
-            release_policy != options.policy,
+            refreshing,
             &make_musicbrainz,
             &make_discogs,
             &guard,
@@ -1373,34 +1376,58 @@ where
 }
 
 fn print_release_header(release: &LocalRelease) {
-    outln!(
+    out!("{}", render_release_header(release));
+}
+
+fn render_release_header(release: &LocalRelease) -> String {
+    let mut text = String::new();
+    let _ = writeln!(
+        text,
         "  local release {} — {} ({} file(s))",
         release.id,
         Clean(release.album_title.as_deref().unwrap_or("(no album tag)")),
         release.tracks.len()
     );
-    outln!(
+    let _ = writeln!(
+        text,
         "  artist: {}   folder: {}",
         Clean(release.album_artist.as_deref().unwrap_or("(unknown)")),
         Clean(&release.directory)
     );
     if !release.embedded_evidence.problems.is_empty() {
         for problem in &release.embedded_evidence.problems {
-            outln!("  identifier problem: {}", Clean(problem));
+            let _ = writeln!(text, "  identifier problem: {}", Clean(problem));
         }
     }
+    text
 }
 
 fn print_candidate(
-    _local: &LocalRelease,
+    local: &LocalRelease,
     provider: ProviderKind,
     index: usize,
     candidate: &Candidate,
     evaluation: &Evaluation,
     stage_error: Option<&ProviderError>,
 ) {
+    out!(
+        "{}",
+        render_candidate(local, provider, index, candidate, evaluation, stage_error)
+    );
+}
+
+fn render_candidate(
+    local: &LocalRelease,
+    provider: ProviderKind,
+    index: usize,
+    candidate: &Candidate,
+    evaluation: &Evaluation,
+    stage_error: Option<&ProviderError>,
+) -> String {
+    let mut text = String::new();
     let release = &candidate.release;
-    outln!(
+    let _ = writeln!(
+        text,
         "\n  [{}] {} release {} — score {:.3}{}",
         index + 1,
         provider,
@@ -1412,8 +1439,8 @@ fn print_candidate(
             " [review]"
         }
     );
-    outln!("      {}", Clean(&release.artist_display()));
-    outln!("      {}", Clean(&release.url));
+    let _ = writeln!(text, "      {}", Clean(&release.artist_display()));
+    let _ = writeln!(text, "      {}", Clean(&release.url));
     let mut details = Vec::new();
     if let Some(year) = release.year {
         details.push(format!("year {year}"));
@@ -1434,15 +1461,16 @@ fn print_candidate(
         details.push(format!("edition: {}", release.edition_notes.join(", ")));
     }
     if !details.is_empty() {
-        outln!("      {}", Clean(&details.join(" · ")));
+        let _ = writeln!(text, "      {}", Clean(&details.join(" · ")));
     }
     if !release.structure_issues.is_empty() {
         for issue in &release.structure_issues {
-            outln!("      structure: {}", Clean(issue));
+            let _ = writeln!(text, "      structure: {}", Clean(issue));
         }
     }
     if !release.lookup_aliases.is_empty() {
-        outln!(
+        let _ = writeln!(
+            text,
             "      aliases: {}",
             release
                 .lookup_aliases
@@ -1469,28 +1497,30 @@ fn print_candidate(
             Some(format!("{name} {value:.2}×{weight:.2}"))
         })
         .collect();
-    outln!("      score: {}", components.join("  "));
-    outln!(
+    let _ = writeln!(text, "      score: {}", components.join("  "));
+    let _ = writeln!(
+        text,
         "      mapping: {}/{} files mapped",
         candidate.mapping.assigned_count(),
-        _local.tracks.len()
+        local.tracks.len()
     );
 
     for note in &evaluation.evidence {
-        outln!("      evidence: {}", Clean(note));
+        let _ = writeln!(text, "      evidence: {}", Clean(note));
     }
     for blocker in &evaluation.blockers {
-        outln!("      blocker: {}", Clean(blocker));
+        let _ = writeln!(text, "      blocker: {}", Clean(blocker));
     }
     for warning in &evaluation.warnings {
-        outln!("      warning: {}", Clean(warning));
+        let _ = writeln!(text, "      warning: {}", Clean(warning));
     }
     for note in &candidate.mapping.notes {
-        outln!("      mapping: {}", Clean(note));
+        let _ = writeln!(text, "      mapping: {}", Clean(note));
     }
     if let Some(error) = stage_error {
-        outln!("      stage error: {}", Clean(&error.to_string()));
+        let _ = writeln!(text, "      stage error: {}", Clean(&error.to_string()));
     }
+    text
 }
 
 fn prompt(message: &str) -> Result<String> {
@@ -2143,5 +2173,67 @@ mod tests {
             }
         )));
         assert!(!primary_failed_transiently(&[]));
+    }
+
+    #[test]
+    fn rendered_candidates_and_headers_escape_every_untrusted_field() {
+        let (mut local, mut remote) = ai_album_fixture();
+        local.album_title = Some("title\x1b[2Jlocal".into());
+        local.album_artist = Some("artist\x1b[3Jlocal".into());
+        local.directory = "/music/\x1b]0;folder\x07".into();
+        remote.artists = vec!["remote\x1b[31martist".into()];
+        remote.url = "https://example.invalid/\x1b]0;url\x07".into();
+        remote.country = Some("country\x1b[4J".into());
+        remote.edition_notes = vec!["edition\u{202e}note".into()];
+        remote.structure_issues = vec!["structure\x1b[5J".into()];
+        let candidate = Candidate::new(&local, remote);
+        let mut evaluation = matcher::evaluate(
+            &local,
+            &candidate,
+            None,
+            &matcher::DiscoveryEvidence::default(),
+        );
+        evaluation.blockers.push("blocker\x1b[6J".into());
+        let error = ProviderError::Network {
+            provider: ProviderKind::Discogs,
+            message: "stage\x1b[7J".into(),
+        };
+
+        let text = format!(
+            "{}{}",
+            render_release_header(&local),
+            render_candidate(
+                &local,
+                ProviderKind::Discogs,
+                0,
+                &candidate,
+                &evaluation,
+                Some(&error)
+            )
+        );
+
+        for (line_start, escaped) in [
+            ("      remote", "remote\\u{1b}[31martist"),
+            (
+                "      https://",
+                "https://example.invalid/\\u{1b}]0;url\\u{7}",
+            ),
+            ("  artist: ", "artist\\u{1b}[3Jlocal"),
+            ("  local release", "title\\u{1b}[2Jlocal"),
+            ("      structure:", "structure\\u{1b}[5J"),
+            ("      blocker:", "blocker\\u{1b}[6J"),
+            ("      stage error:", "stage\\u{1b}[7J"),
+        ] {
+            assert!(
+                text.lines()
+                    .any(|line| line.starts_with(line_start) && line.contains(escaped)),
+                "no escaped {line_start:?} line in {text:?}"
+            );
+        }
+        assert!(
+            !text.chars().any(|c| c != '\n' && c.is_control()),
+            "{text:?}"
+        );
+        assert!(!text.contains('\u{202e}'), "{text:?}");
     }
 }
