@@ -366,6 +366,11 @@ pub enum ProviderError {
         provider: ProviderKind,
         message: String,
     },
+    /// The adapter is pausing requests after repeated transient failures.
+    Unavailable {
+        provider: ProviderKind,
+        retry_after: Duration,
+    },
     Malformed {
         provider: ProviderKind,
         message: String,
@@ -385,6 +390,7 @@ impl ProviderError {
             | Self::NotFound { provider, .. }
             | Self::RateLimited { provider, .. }
             | Self::Network { provider, .. }
+            | Self::Unavailable { provider, .. }
             | Self::Malformed { provider, .. }
             | Self::Permanent { provider, .. } => *provider,
         }
@@ -407,7 +413,10 @@ impl ProviderError {
     pub fn is_transient(&self) -> bool {
         matches!(
             self,
-            Self::RateLimited { .. } | Self::Network { .. } | Self::Malformed { .. }
+            Self::RateLimited { .. }
+                | Self::Network { .. }
+                | Self::Unavailable { .. }
+                | Self::Malformed { .. }
         )
     }
 }
@@ -438,6 +447,14 @@ impl fmt::Display for ProviderError {
             Self::Network { provider, message } => {
                 write!(f, "{provider} request failed: {message}")
             }
+            Self::Unavailable {
+                provider,
+                retry_after,
+            } => write!(
+                f,
+                "{provider} is temporarily unavailable after transient failures; retry in {}s",
+                retry_after.as_secs()
+            ),
             Self::Malformed { provider, message } => {
                 write!(f, "{provider} returned an unusable response: {message}")
             }
@@ -475,6 +492,18 @@ pub trait MetadataProvider: Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unavailable_provider_is_a_transient_failure_that_names_its_service() {
+        let error = ProviderError::Unavailable {
+            provider: ProviderKind::MusicBrainz,
+            retry_after: Duration::from_secs(7),
+        };
+        assert!(error.is_transient());
+        assert!(!error.is_auth());
+        assert_eq!(error.provider(), ProviderKind::MusicBrainz);
+        assert!(error.to_string().contains("retry in 7s"), "{error}");
+    }
 
     #[test]
     fn canonicalizes_mbids_without_accepting_other_identifier_shapes() {

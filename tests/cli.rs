@@ -25,8 +25,20 @@ fn handler(target: &str) -> (u16, String) {
 }
 
 async fn seed_library(db: &Path) -> i64 {
+    seed_library_year(db, 2001).await
+}
+
+async fn seed_library_year(db: &Path, year: i64) -> i64 {
+    seed_directory(db, "/music/blue", year).await
+}
+
+async fn seed_directory(db: &Path, directory: &str, year: i64) -> i64 {
+    seed_album(db, directory, "Blue", year).await
+}
+
+async fn seed_album(db: &Path, directory: &str, album: &str, year: i64) -> i64 {
     let pool = radish::db::connect(db).await.unwrap();
-    let directory = Path::new("/music/blue");
+    let directory = Path::new(directory);
     let directory_id = store::upsert_directory(&pool, directory).await.unwrap();
 
     for number in 1..=2i64 {
@@ -34,9 +46,9 @@ async fn seed_library(db: &Path) -> i64 {
             path: directory.join(format!("0{number}.flac")),
             title: Some(format!("Track {number}")),
             artist: Some("Test Artist".to_string()),
-            album: Some("Blue".to_string()),
+            album: Some(album.to_string()),
             album_artist: Some("Test Artist".to_string()),
-            year: Some(2001),
+            year: Some(year),
             track_number: Some(number),
             disc_number: None,
             barcode: None,
@@ -392,4 +404,241 @@ fn list_fails_when_stdout_cannot_be_written() {
         stderr.contains("error: failed to write output:"),
         "{stderr}"
     );
+}
+
+#[tokio::test]
+async fn musicbrainz_outage_queues_a_discogs_fallback_instead_of_accepting_it() {
+    let db = db_path("outage-fallback-queued");
+    seed_library(&db).await;
+    // Discogs offers a complete, otherwise auto-acceptable release.
+    let server = MockServer::start(|target| {
+        if target.contains("/ws/2/") {
+            return (503, "{}".into());
+        }
+        handler(target)
+    });
+    let output = run(&db, &server, &["match"], Some("test-token"));
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("Queued for review: 1"), "{text}");
+    assert!(text.contains("Accepted: 0"), "{text}");
+    assert!(!text.contains("recovered the release"), "{text}");
+    assert!(
+        text.contains("MusicBrainz stage failed transiently; fallback candidates need review"),
+        "{text}"
+    );
+    assert_eq!(row_count(&db, "release_matches").await, 0);
+    assert_eq!(row_count(&db, "match_reviews").await, 1);
+}
+
+#[tokio::test]
+async fn refreshing_a_stale_discogs_match_without_a_token_is_skipped_not_failed() {
+    let db = db_path("stale-discogs-no-token");
+    seed_library(&db).await;
+    let server = MockServer::start(handler);
+    let accepted = run(
+        &db,
+        &server,
+        &["match", "--provider", "discogs"],
+        Some("test-token"),
+    );
+    assert!(stdout(&accepted).contains("Accepted: 1"), "{accepted:?}");
+    // An observed tag change makes the accepted match stale.
+    seed_library_year(&db, 2002).await;
+    let before = server.request_count();
+
+    let output = run(&db, &server, &["match"], None);
+
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("Skipped: 1"), "{text}");
+    assert!(text.contains("Failed: 0"), "{text}");
+    assert!(
+        text.contains("needs RADISH_DISCOGS_TOKEN to refresh"),
+        "{text}"
+    );
+    assert_eq!(
+        server.request_count(),
+        before,
+        "no provider may be contacted"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_discogs_token_is_not_retried_for_later_releases() {
+    let db = db_path("discogs-token-rejected");
+    seed_directory(&db, "/music/blue", 2001).await;
+    seed_directory(&db, "/music/blue-again", 2001).await;
+    let server = MockServer::start(|target| {
+        if target.contains("/database/search") || target.contains("/releases/") {
+            return (401, r#"{"message":"Invalid consumer token."}"#.into());
+        }
+        handler(target)
+    });
+
+    let output = run(&db, &server, &["match"], Some("rejected-token"));
+
+    // The release that met the rejection fails; later ones skip the fallback.
+    assert!(!output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("Failed: 1"), "{text}");
+    assert!(text.contains("Unmatched: 1"), "{text}");
+    assert_eq!(
+        server.requests_matching("/database/search"),
+        1,
+        "the second release must not contact Discogs: {text}"
+    );
+}
+
+#[tokio::test]
+async fn listings_escape_terminal_control_sequences_from_tags() {
+    let db = db_path("hostile-tags");
+    let pool = radish::db::connect(&db).await.unwrap();
+    let directory = Path::new("/music/hostile\x1b[2J");
+    let directory_id = store::upsert_directory(&pool, directory).await.unwrap();
+    let track = ScannedTrack {
+        path: directory.join("01.flac"),
+        title: Some("\x1b]0;PWNED\x07".to_string()),
+        artist: Some("Artist\x1b[31m".to_string()),
+        album: Some("Album\u{202e}".to_string()),
+        album_artist: Some("Artist\x1b[31m".to_string()),
+        year: Some(2001),
+        track_number: Some(1),
+        disc_number: None,
+        barcode: None,
+        catalog_number: None,
+        discogs_release_id: None,
+        musicbrainz: ObservedMusicBrainzIds::default(),
+        duration_secs: Some(180.0),
+        modified_at: 1,
+    };
+    store::upsert_track(&pool, &track, directory_id)
+        .await
+        .unwrap();
+    store::rebuild_local_releases(&pool, None).await.unwrap();
+    pool.close().await;
+    let server = MockServer::start(handler);
+
+    for args in [&["list"][..], &["search", "Artist"], &["releases"]] {
+        let output = run(&db, &server, args, None);
+        assert!(output.status.success(), "{output:?}");
+        let text = stdout(&output);
+        assert!(
+            !text.contains(['\x1b', '\x07', '\u{202e}']),
+            "{args:?}: {text:?}"
+        );
+        assert!(text.contains("\\u{1b}"), "{args:?}: {text:?}");
+    }
+}
+
+#[tokio::test]
+async fn matching_output_escapes_control_sequences_from_tags_and_provider_data() {
+    let db = db_path("hostile-matching");
+    seed_album(&db, "/music/blue", "Blue\x1b]0;PWNED\x07", 2001).await;
+    let server = MockServer::start(|target| {
+        if target.contains("/releases/42") {
+            let mut release: serde_json::Value =
+                serde_json::from_str(&discogs_release_json()).unwrap();
+            release["title"] = "Blue\u{1b}[2J".into();
+            release["tracklist"][0]["title"] = "Track\u{1b}[31m 1".into();
+            return (200, release.to_string());
+        }
+        handler(target)
+    });
+
+    for args in [
+        &["match", "--dry-run", "--provider", "discogs"][..],
+        &["match", "--provider", "discogs"],
+    ] {
+        let output = run(&db, &server, args, Some("test-token"));
+        let all = format!(
+            "{}{}",
+            stdout(&output),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!all.contains(['\x1b', '\x07']), "{args:?}: {all:?}");
+        assert!(all.contains("Matching local release"), "{all:?}");
+    }
+}
+
+#[tokio::test]
+async fn an_explicit_discogs_run_fails_every_release_after_a_rejected_token() {
+    let db = db_path("discogs-explicit-token-rejected");
+    seed_directory(&db, "/music/blue", 2001).await;
+    seed_directory(&db, "/music/blue-again", 2001).await;
+    let server = MockServer::start(|target| {
+        if target.contains("/database/search") || target.contains("/releases/") {
+            return (401, r#"{"message":"Invalid consumer token."}"#.into());
+        }
+        handler(target)
+    });
+
+    let output = run(
+        &db,
+        &server,
+        &["match", "--provider", "discogs"],
+        Some("rejected-token"),
+    );
+
+    assert!(!output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("Failed: 2"), "{text}");
+    assert!(text.contains("Skipped: 0"), "{text}");
+    assert_eq!(server.requests_matching("/database/search"), 1, "{text}");
+}
+
+#[tokio::test]
+async fn a_stale_refresh_after_a_rejected_token_is_skipped_not_called_unmatched() {
+    let db = db_path("stale-refresh-token-rejected");
+    seed_directory(&db, "/music/blue", 2001).await;
+    seed_directory(&db, "/music/blue-again", 2001).await;
+    let rejected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = rejected.clone();
+    let server = MockServer::start(move |target| {
+        if flag.load(std::sync::atomic::Ordering::SeqCst)
+            && (target.contains("/database/search") || target.contains("/releases/"))
+        {
+            return (401, r#"{"message":"Invalid consumer token."}"#.into());
+        }
+        handler(target)
+    });
+    let accepted = run(
+        &db,
+        &server,
+        &["match", "--provider", "discogs"],
+        Some("good"),
+    );
+    assert!(stdout(&accepted).contains("Accepted: 2"), "{accepted:?}");
+    // Both accepted matches go stale, then the token stops working.
+    seed_directory(&db, "/music/blue", 2002).await;
+    seed_directory(&db, "/music/blue-again", 2002).await;
+    rejected.store(true, std::sync::atomic::Ordering::SeqCst);
+    let before = server.request_count();
+
+    let output = run(&db, &server, &["match"], Some("revoked"));
+
+    assert!(!output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("Failed: 1"), "{text}");
+    assert!(text.contains("Skipped: 1"), "{text}");
+    assert!(text.contains("Unmatched: 0"), "{text}");
+    assert_eq!(server.request_count() - before, 1, "{text}");
+}
+
+#[tokio::test]
+async fn a_permanent_musicbrainz_error_still_recovers_through_the_fallback() {
+    let db = db_path("permanent-primary-recovers");
+    seed_library(&db).await;
+    let server = MockServer::start(|target| {
+        if target.contains("/ws/2/") {
+            return (400, r#"{"error":"bad request"}"#.into());
+        }
+        handler(target)
+    });
+    let output = run(&db, &server, &["match"], Some("test-token"));
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("recovered the release"), "{text}");
+    assert!(text.contains("Accepted: 1"), "{text}");
+    assert_eq!(row_count(&db, "release_matches").await, 1);
 }

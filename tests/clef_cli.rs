@@ -12,8 +12,12 @@ const MBID: &str = "76df3287-6cda-33eb-8e9a-044b5e15ffdd";
 const TOKEN: &str = "synthetic-cloudflare-token";
 
 async fn seed(db: &Path, exact_titles: bool) -> i64 {
+    seed_in(db, "/music/private-library/blue", exact_titles).await
+}
+
+async fn seed_in(db: &Path, directory: &str, exact_titles: bool) -> i64 {
     let pool = radish::db::connect(db).await.unwrap();
-    let directory = Path::new("/music/private-library/blue");
+    let directory = Path::new(directory);
     let directory_id = store::upsert_directory(&pool, directory).await.unwrap();
     for number in 1..=2 {
         let title = if exact_titles {
@@ -256,9 +260,285 @@ async fn missing_ai_credentials_preserve_the_review_queue() {
         false,
     );
     assert!(output.status.success(), "{output:?}");
-    assert!(stdout(&output).contains("AI review unavailable"));
+    assert!(stdout(&output).contains("AI review disabled for this run"));
     assert!(stdout(&output).contains("Queued for review: 1"));
     assert_eq!(server.requests_matching("/ai/run/"), 0);
+}
+
+#[tokio::test]
+async fn a_rejected_ai_credential_disables_ai_for_the_rest_of_the_run() {
+    let db = db_path("clef-run-shutoff");
+    seed_in(&db, "/music/private-library/blue", false).await;
+    seed_in(&db, "/music/private-library/blue-again", false).await;
+    let server = server(401, "none");
+    let output = run(
+        &db,
+        &server,
+        &["match", "--provider", "musicbrainz", "--ai-review"],
+        true,
+    );
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("Queued for review: 2"), "{text}");
+    assert_eq!(
+        text.matches("AI review disabled for this run").count(),
+        1,
+        "{text}"
+    );
+    assert_eq!(server.requests_matching("/ai/run/"), 1, "{text}");
+    assert!(!format!("{output:?}").contains(TOKEN));
+    // The run summary repeats it, since the first message scrolled away.
+    let summary = text.split("\nAccepted:").nth(1).unwrap();
+    assert!(
+        summary.contains("AI review was disabled during this run: AI review returned HTTP 401"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn missing_ai_credentials_are_reported_once_per_run() {
+    let db = db_path("clef-missing-credentials-once");
+    seed_in(&db, "/music/private-library/blue", false).await;
+    seed_in(&db, "/music/private-library/blue-again", false).await;
+    let server = server(200, "none");
+    let output = run(
+        &db,
+        &server,
+        &["match", "--provider", "musicbrainz", "--ai-review"],
+        false,
+    );
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("Queued for review: 2"), "{text}");
+    assert_eq!(
+        text.matches("AI review disabled for this run").count(),
+        1,
+        "{text}"
+    );
+    assert_eq!(server.requests_matching("/ai/run/"), 0);
+}
+
+#[tokio::test]
+async fn unchanged_queued_releases_reuse_saved_advice_instead_of_paying_again() {
+    let db = db_path("clef-reuse");
+    let id = seed(&db, false).await;
+    let server = server(200, &format!("musicbrainz:{MBID}"));
+    let args = ["match", "--provider", "musicbrainz", "--ai-review"];
+
+    let first = run(&db, &server, &args, true);
+    assert!(first.status.success(), "{first:?}");
+    assert_eq!(server.requests_matching("/ai/run/"), 1);
+
+    let second = run(&db, &server, &args, true);
+    assert!(second.status.success(), "{second:?}");
+    let text = stdout(&second);
+    assert_eq!(server.requests_matching("/ai/run/"), 1, "{text}");
+    assert!(text.contains("AI advice"), "{text}");
+    assert!(text.contains("saved"), "{text}");
+    let pool = radish::db::connect(&db).await.unwrap();
+    let review = store::load_review(&pool, id, ProviderKind::MusicBrainz)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(review.candidates[0].ai_advice.is_some());
+}
+
+#[tokio::test]
+async fn an_edited_remote_tracklist_invalidates_saved_advice_under_the_same_ids() {
+    let db = db_path("clef-reuse-remote-edit");
+    seed(&db, false).await;
+    let edited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = edited.clone();
+    let candidate = format!("musicbrainz:{MBID}");
+    let server = MockServer::start(move |target| {
+        if target.contains("/ai/run/") {
+            return (
+                200,
+                serde_json::json!({
+                    "success": true,
+                    "result": {"model": "clef-flash", "answers": {"match": {
+                        "type": "choice", "choice": "none",
+                        "probabilities": {candidate.clone(): 0.0, "none": 1.0, "equivalent_editions": 0.0},
+                        "confidence": 1.0
+                    }}}
+                })
+                .to_string(),
+            );
+        }
+        if target.contains(&format!("/ws/2/release/{MBID}")) {
+            let durations = if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                [200.0, 201.0]
+            } else {
+                [180.0, 181.0]
+            };
+            return (
+                200,
+                musicbrainz_release_json(MBID, &["Track 1!", "Track 2!"], &durations),
+            );
+        }
+        (200, musicbrainz_empty_search())
+    });
+    let args = ["match", "--provider", "musicbrainz", "--ai-review"];
+
+    assert!(run(&db, &server, &args, true).status.success());
+    assert!(run(&db, &server, &args, true).status.success());
+    assert_eq!(server.requests_matching("/ai/run/"), 1, "identical request");
+
+    // The provider corrects durations; the IDs and the local files are unchanged.
+    edited.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(run(&db, &server, &args, true).status.success());
+    assert_eq!(server.requests_matching("/ai/run/"), 2, "edited evidence");
+}
+
+#[tokio::test]
+async fn an_unreadable_saved_review_is_a_cache_miss_not_a_failure() {
+    let db = db_path("clef-reuse-corrupt-review");
+    seed(&db, false).await;
+    let server = server(200, &format!("musicbrainz:{MBID}"));
+    let args = ["match", "--provider", "musicbrainz", "--ai-review"];
+    assert!(run(&db, &server, &args, true).status.success());
+    let pool = radish::db::connect(&db).await.unwrap();
+    sqlx::query("UPDATE match_reviews SET candidates_json = 'not json'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let output = run(&db, &server, &args, true);
+
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("Failed: 0"), "{text}");
+    assert!(text.contains("Queued for review: 1"), "{text}");
+    assert_eq!(server.requests_matching("/ai/run/"), 2, "{text}");
+}
+
+#[tokio::test]
+async fn changed_files_invalidate_saved_advice() {
+    let db = db_path("clef-reuse-changed");
+    seed(&db, false).await;
+    let server = server(200, &format!("musicbrainz:{MBID}"));
+    let args = ["match", "--provider", "musicbrainz", "--ai-review"];
+    assert!(run(&db, &server, &args, true).status.success());
+    assert_eq!(server.requests_matching("/ai/run/"), 1);
+
+    // A retag changes the release revision, so the old answer no longer applies.
+    let pool = radish::db::connect(&db).await.unwrap();
+    let directory = Path::new("/music/private-library/blue");
+    let directory_id = store::upsert_directory(&pool, directory).await.unwrap();
+    store::upsert_track(
+        &pool,
+        &ScannedTrack {
+            path: directory.join("1.flac"),
+            title: Some("Another title".into()),
+            artist: Some("Test Artist".into()),
+            album: Some("Blue".into()),
+            album_artist: Some("Test Artist".into()),
+            year: Some(2001),
+            track_number: Some(1),
+            disc_number: None,
+            barcode: None,
+            catalog_number: None,
+            discogs_release_id: None,
+            musicbrainz: ObservedMusicBrainzIds {
+                release: vec![MBID.into()],
+                ..Default::default()
+            },
+            duration_secs: Some(180.0),
+            modified_at: 2,
+        },
+        directory_id,
+    )
+    .await
+    .unwrap();
+    store::rebuild_local_releases(&pool, None).await.unwrap();
+    pool.close().await;
+
+    assert!(run(&db, &server, &args, true).status.success());
+    assert_eq!(server.requests_matching("/ai/run/"), 2);
+}
+
+fn outage_server(ai_choice: &'static str) -> MockServer {
+    MockServer::start(move |target| {
+        if target.contains("/ai/run/") {
+            return (
+                200,
+                serde_json::json!({
+                    "success": true,
+                    "result": {
+                        "model": "clef-flash",
+                        "answers": {"match": {
+                            "type": "choice", "choice": ai_choice,
+                            "probabilities": {ai_choice: 1.0, "none": 0.0, "equivalent_editions": 0.0},
+                            "confidence": 1.0
+                        }}
+                    }
+                })
+                .to_string(),
+            );
+        }
+        if target.contains("/ws/2/") {
+            return (503, "{}".into());
+        }
+        if target.contains("/database/search") {
+            return (200, discogs_search_json());
+        }
+        if target.contains("/releases/42") {
+            return (200, discogs_release_json());
+        }
+        (404, "{}".into())
+    })
+}
+
+fn run_with_discogs(db: &Path, server: &MockServer, args: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_radish"));
+    command
+        .arg("--db")
+        .arg(db)
+        .args(args)
+        .env("RADISH_MUSICBRAINZ_BASE_URL", &server.url)
+        .env("RADISH_DISCOGS_BASE_URL", &server.url)
+        .env("RADISH_DISCOGS_TOKEN", "test-token")
+        .env("RADISH_CLOUDFLARE_BASE_URL", &server.url)
+        .env("RADISH_CLOUDFLARE_MODEL", "clef-flash")
+        .env(
+            "RADISH_CLOUDFLARE_ACCOUNT_ID",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .env("RADISH_CLOUDFLARE_API_TOKEN", TOKEN)
+        .stdin(Stdio::null());
+    command.output().unwrap()
+}
+
+async fn release_match_rows(db: &Path) -> i64 {
+    let pool = radish::db::connect(db).await.unwrap();
+    let count = sqlx::query_scalar("SELECT count(*) FROM release_matches")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    count
+}
+
+#[tokio::test]
+async fn ai_cannot_accept_a_discogs_fallback_after_a_transient_musicbrainz_failure() {
+    let db = db_path("clef-outage-fallback");
+    seed(&db, true).await;
+    // Without an observed MusicBrainz ID nothing else blocks the fallback.
+    let pool = radish::db::connect(&db).await.unwrap();
+    sqlx::query("UPDATE tracks SET musicbrainz_ids_json = '{}'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let server = outage_server("discogs:42");
+    let output = run_with_discogs(&db, &server, &["match", "--ai-review"]);
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert_eq!(server.requests_matching("/ai/run/"), 1, "{text}");
+    assert!(text.contains("Queued for review: 1"), "{text}");
+    assert!(text.contains("Accepted: 0"), "{text}");
+    assert_eq!(release_match_rows(&db).await, 0, "{text}");
 }
 
 #[tokio::test]
@@ -331,12 +611,16 @@ async fn strong_ai_match_accepts_album_metadata_with_auditable_evidence() {
         "SELECT match_scope, algorithm_version, acceptance_method, year, country, metadata_json FROM release_matches"
     ).fetch_one(&pool).await.unwrap();
     assert_eq!(row.0, "album");
-    assert_eq!(row.1, "musicbrainz-clef-album-v1");
+    assert_eq!(row.1, "musicbrainz-clef-album-v2");
     assert_eq!(row.2, "automatic");
     assert_eq!(row.3, None);
     assert_eq!(row.4, None);
     let metadata: serde_json::Value = serde_json::from_str(&row.5).unwrap();
     assert_eq!(metadata["radish_ai_decision"]["advice"]["confidence"], 1.0);
+    assert_eq!(
+        metadata["radish_ai_decision"]["policy_version"],
+        "clef-album-v2"
+    );
     assert_eq!(
         metadata["radish_ai_decision"]["advice"]["prompt_version"],
         "radish-clef-album-v3"

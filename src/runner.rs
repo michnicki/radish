@@ -5,18 +5,20 @@
 //! unsatisfactory MusicBrainz stage and only when a token is available. An
 //! explicit provider or direct selector uses one service and no fallback.
 
-use crate::clef::{Advice, AdviceChoice, ClefClient, ReviewCandidate};
+use crate::clef::{Advice, AdviceChoice, ClefClient, ReviewCandidate, choice_key};
 use crate::discogs::{AdapterError, DiscogsAdapter};
 use crate::discovery::{self, DiscoveryResult};
 use crate::matcher::{
     self, Candidate, DiscoveryEvidence, Evaluation, LocalRelease, MatchScope, RemoteRelease,
 };
 use crate::musicbrainz::MusicBrainzAdapter;
+use crate::output::Clean;
 use crate::providers::{MetadataProvider, ProviderError, ProviderKind, ProviderPolicy, ReleaseId};
 use crate::store::{self, AcceptanceMethod, MatchGuard, StoredCandidate};
 use crate::{out, outln};
 use anyhow::{Context, Result, bail};
 use sqlx::SqlitePool;
+use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
@@ -41,6 +43,8 @@ pub struct MatchSummary {
     pub skipped: usize,
     pub failed: usize,
     pub dry_run: bool,
+    /// Why AI review was turned off partway through the run, if it was.
+    pub ai_disabled: Option<String>,
 }
 
 impl MatchSummary {
@@ -60,6 +64,41 @@ impl MatchSummary {
             self.skipped,
             self.failed
         );
+        if let Some(reason) = &self.ai_disabled {
+            outln!("AI review was disabled during this run: {}", Clean(reason));
+        }
+    }
+}
+
+/// The run's single AI client. It is built on first use so a run that never
+/// needs AI never reports missing credentials, and a failure that would repeat
+/// for every release turns AI off once instead of being retried and re-reported.
+enum AiState {
+    Unbuilt,
+    Ready(ClefClient),
+    /// Off for the rest of the run, with the reason for the final summary.
+    Disabled(String),
+}
+
+impl AiState {
+    /// The client, or `None` once the run has turned AI off. Building can fail
+    /// (for example, missing credentials); that is reported once.
+    fn client(&mut self) -> Option<&ClefClient> {
+        if matches!(self, Self::Unbuilt) {
+            *self = match ClefClient::from_env() {
+                Ok(client) => Self::Ready(client),
+                Err(error) => {
+                    outln!(
+                        "  AI review disabled for this run: {error}; continuing without AI matching"
+                    );
+                    Self::Disabled(error.to_string())
+                }
+            };
+        }
+        match self {
+            Self::Ready(client) => Some(client),
+            Self::Unbuilt | Self::Disabled(_) => None,
+        }
     }
 }
 
@@ -343,7 +382,8 @@ where
 
     let mut musicbrainz_client: Option<M> = None;
     let mut discogs_client: Option<D> = None;
-    let mut discogs_disabled: Option<String> = None;
+    let mut discogs_disabled: Option<ProviderError> = None;
+    let mut ai = AiState::Unbuilt;
 
     for release in &selected {
         let label = format!(
@@ -354,11 +394,16 @@ where
                 .unwrap_or("(unknown artist)"),
             release.album_title.as_deref().unwrap_or("(no album tag)")
         );
-        outln!("\nMatching local release {} ({label})", release.id);
+        outln!(
+            "\nMatching local release {} ({})",
+            release.id,
+            Clean(&label)
+        );
 
         // A stale match is refreshed from the provider that accepted it; a
         // different source requires deliberate review.
         let mut release_policy = options.policy;
+        let mut refreshing = false;
         if !options.review
             && statuses.get(&release.id).map(String::as_str) == Some(store::STATUS_STALE)
             && let Some(provider) = existing_matches.get(&release.id).and_then(|p| *p)
@@ -366,6 +411,7 @@ where
         {
             outln!("  refreshing the stale {provider} match from its original source");
             release_policy = ProviderPolicy::Only(provider);
+            refreshing = true;
         }
 
         let guard = match store::load_match_guard(pool, release.id).await {
@@ -404,7 +450,11 @@ where
                 Ok(Outcome::Quit) => return Ok(summary),
                 Ok(_) => summary.failed += 1,
                 Err(error) => {
-                    eprintln!("failed to review local release {}: {error:#}", release.id);
+                    eprintln!(
+                        "failed to review local release {}: {}",
+                        release.id,
+                        Clean(&format!("{error:#}"))
+                    );
                     summary.failed += 1;
                 }
             }
@@ -419,11 +469,16 @@ where
             &mut musicbrainz_client,
             &mut discogs_client,
             &mut discogs_disabled,
+            &mut ai,
+            refreshing,
             &make_musicbrainz,
             &make_discogs,
             &guard,
         )
         .await;
+        if let AiState::Disabled(reason) = &ai {
+            summary.ai_disabled = Some(reason.clone());
+        }
 
         match outcome {
             Ok(Outcome::Accepted) => summary.accepted += 1,
@@ -434,13 +489,39 @@ where
             Ok(Outcome::Quit) => return Ok(summary),
             Err(error) => {
                 summary.failed += 1;
-                eprintln!("failed to match local release {}: {error:#}", release.id);
+                eprintln!(
+                    "failed to match local release {}: {}",
+                    release.id,
+                    Clean(&format!("{error:#}"))
+                );
             }
         }
     }
 
     Ok(summary)
 }
+
+/// A primary stage that failed for a reason that says nothing about the
+/// release means a fallback candidate was never compared against what the
+/// primary would have found, so it must be reviewed rather than accepted.
+fn primary_failed_transiently(attempts: &[ProviderAttempt]) -> bool {
+    attempts
+        .first()
+        .and_then(|attempt| attempt.error.as_ref())
+        .is_some_and(|error| {
+            // A malformed response is deterministic for that release and starts
+            // no cooldown, so it is not an outage.
+            matches!(
+                error,
+                ProviderError::Network { .. }
+                    | ProviderError::RateLimited { .. }
+                    | ProviderError::Unavailable { .. }
+            )
+        })
+}
+
+const TRANSIENT_PRIMARY_NOTE: &str =
+    "MusicBrainz stage failed transiently; fallback candidates need review";
 
 async fn load_saved_reviews(
     pool: &SqlitePool,
@@ -467,7 +548,9 @@ async fn process_release<M, D>(
     policy: ProviderPolicy,
     musicbrainz_client: &mut Option<M>,
     discogs_client: &mut Option<D>,
-    discogs_disabled: &mut Option<String>,
+    discogs_disabled: &mut Option<ProviderError>,
+    ai: &mut AiState,
+    refreshing: bool,
     make_musicbrainz: impl Fn() -> Result<M>,
     make_discogs: impl Fn() -> Result<D>,
     guard: &MatchGuard,
@@ -497,7 +580,7 @@ where
             } else {
                 "primary candidates did not settle the edition".to_string()
             };
-            outln!("  Discogs fallback: {reason}");
+            outln!("  Discogs fallback: {}", Clean(&reason));
         }
 
         match provider {
@@ -518,8 +601,19 @@ where
                 attempts.push(attempt_provider(client, release, direct.clone()).await);
             }
             ProviderKind::Discogs => {
-                if let Some(reason) = discogs_disabled.as_ref() {
-                    fallback_skip = Some(reason.clone());
+                if let Some(error) = discogs_disabled.as_ref() {
+                    if policy.is_explicit() && !refreshing {
+                        // The user asked for Discogs, so a release it cannot
+                        // serve is a failure, whichever release met the error.
+                        attempts.push(ProviderAttempt::failed(
+                            ProviderKind::Discogs,
+                            error.clone(),
+                        ));
+                    } else {
+                        fallback_skip = Some(format!(
+                            "Discogs is disabled for the rest of this run: {error}"
+                        ));
+                    }
                     break;
                 }
                 if discogs_client.is_none() {
@@ -527,6 +621,14 @@ where
                         Ok(client) => *discogs_client = Some(client),
                         Err(error) => {
                             let missing = is_missing_discogs_token(&error);
+                            if refreshing && missing {
+                                // The release is not at fault and nothing was
+                                // tried, so this is neither a failure nor a miss.
+                                outln!(
+                                    "  stale Discogs match needs RADISH_DISCOGS_TOKEN to refresh"
+                                );
+                                return Ok(Outcome::Skipped);
+                            }
                             if policy.is_explicit() {
                                 attempts.push(ProviderAttempt::failed(
                                     ProviderKind::Discogs,
@@ -538,11 +640,10 @@ where
                                         .to_string(),
                                 );
                             } else {
-                                let reason = format!(
-                                    "configured Discogs credentials are unusable: {error:#}"
-                                );
-                                *discogs_disabled = Some(reason.clone());
-                                fallback_skip = Some(reason);
+                                let error = provider_error_from(ProviderKind::Discogs, error);
+                                fallback_skip =
+                                    Some(format!("Discogs fallback was skipped: {error}"));
+                                *discogs_disabled = Some(error);
                                 eprintln!("  Disabling Discogs fallback for the rest of this run");
                             }
                             break;
@@ -550,21 +651,31 @@ where
                     }
                 }
                 let client = discogs_client.as_ref().expect("client initialized");
-                attempts.push(attempt_provider(client, release, direct.clone()).await);
+                let attempt = attempt_provider(client, release, direct.clone()).await;
+                // A rejected credential rejects every later release too.
+                if attempt.error.as_ref().is_some_and(ProviderError::is_auth) {
+                    *discogs_disabled = attempt.error.clone();
+                    eprintln!("  Disabling Discogs for the rest of this run");
+                }
+                attempts.push(attempt);
             }
         }
     }
 
     for attempt in &attempts {
         for note in &attempt.notes {
-            eprintln!("  note ({}): {note}", attempt.provider);
+            eprintln!("  note ({}): {}", attempt.provider, Clean(note));
         }
         if let Some(error) = &attempt.error {
-            eprintln!("  {} stage error: {error}", attempt.provider);
+            eprintln!(
+                "  {} stage error: {}",
+                attempt.provider,
+                Clean(&error.to_string())
+            );
         }
     }
     if let Some(reason) = &fallback_skip {
-        outln!("  {reason}");
+        outln!("  {}", Clean(reason));
     }
 
     // A settled primary result stops discovery and never touches Discogs.
@@ -601,6 +712,18 @@ where
         .await;
     }
 
+    // A fallback that would have settled is held for review, and says why.
+    if attempts.len() > 1
+        && attempts[1]
+            .evaluations
+            .first()
+            .is_some_and(|evaluation| evaluation.auto_accept)
+        && primary_failed_transiently(&attempts)
+    {
+        outln!("  {TRANSIENT_PRIMARY_NOTE}");
+        attempts[1].notes.push(TRANSIENT_PRIMARY_NOTE.to_string());
+    }
+
     // A fallback candidate is accepted only when it settles its own gates and
     // does not contradict the local edition or a plausible primary candidate.
     if attempts.len() > 1
@@ -608,6 +731,7 @@ where
         && let (Some(candidate), Some(evaluation)) =
             (fallback.candidates.first(), fallback.evaluations.first())
         && evaluation.auto_accept
+        && !primary_failed_transiently(&attempts)
     {
         let primary = &attempts[0];
         let conflicts = matcher::fallback_conflicts(
@@ -618,7 +742,10 @@ where
         );
         if conflicts.is_empty() && direct.is_none() && !options.review {
             if let Some(error) = &primary.error {
-                outln!("  recovered the release from a failed MusicBrainz stage: {error}");
+                outln!(
+                    "  recovered the release from a failed MusicBrainz stage: {}",
+                    Clean(&error.to_string())
+                );
             }
             return accept(
                 pool,
@@ -634,7 +761,7 @@ where
             .await;
         }
         for conflict in &conflicts {
-            outln!("  fallback conflict: {conflict}");
+            outln!("  fallback conflict: {}", Clean(conflict));
         }
         attempts[1].notes.extend(conflicts);
     }
@@ -648,7 +775,7 @@ where
 
     if has_candidates {
         if options.ai_review {
-            add_ai_advice(release, &mut attempts).await;
+            add_ai_advice(pool, release, guard, &mut attempts, ai).await;
         }
         if !options.review
             && direct.is_none()
@@ -671,7 +798,7 @@ where
                 }
                 Err(reason) => {
                     let note = format!("AI match not applied: {reason}");
-                    outln!("  {note}");
+                    outln!("  {}", Clean(&note));
                     for attempt in &mut attempts {
                         if !attempt.candidates.is_empty() {
                             attempt.notes.push(note.clone());
@@ -710,24 +837,32 @@ where
     // No usable candidates. A completed-empty stage means no match; an
     // unrecovered attempted-stage failure must not be disguised as one.
     if let Some(error) = attempts.iter().find_map(|attempt| attempt.error.clone()) {
-        eprintln!("  {error}");
+        eprintln!("  {}", Clean(&error.to_string()));
         if fallback_failed {
             eprintln!("  the fallback stage also failed; the release outcome is a failure");
         }
         return Ok(Outcome::Failed);
     }
 
-    outln!(
-        "  no {} candidates found",
-        attempts
-            .first()
-            .map(|a| a.provider)
-            .unwrap_or(ProviderKind::MusicBrainz)
-    );
+    // Nothing was attempted (the reason was printed above), so there is no
+    // search result to call a miss.
+    let Some(first) = attempts.first() else {
+        return Ok(Outcome::Skipped);
+    };
+    outln!("  no {} candidates found", first.provider);
     Ok(Outcome::Unmatched)
 }
 
-async fn add_ai_advice(release: &LocalRelease, attempts: &mut [ProviderAttempt]) {
+async fn add_ai_advice(
+    pool: &SqlitePool,
+    release: &LocalRelease,
+    guard: &MatchGuard,
+    attempts: &mut [ProviderAttempt],
+    ai: &mut AiState,
+) {
+    let Some(client) = ai.client() else {
+        return;
+    };
     let candidates: Vec<ReviewCandidate<'_>> = attempts
         .iter()
         .flat_map(|attempt| {
@@ -743,9 +878,21 @@ async fn add_ai_advice(release: &LocalRelease, attempts: &mut [ProviderAttempt])
         })
         .collect();
 
-    let result = match ClefClient::from_env() {
-        Ok(client) => client.advise(release, &candidates).await,
-        Err(error) => Err(error),
+    // Paid advice is reused while everything it was based on is unchanged.
+    let saved = match saved_advice(pool, release, guard, attempts, client, &candidates).await {
+        Ok(saved) => saved,
+        Err(_) => {
+            // A damaged saved review only costs a new request.
+            outln!("  saved AI advice could not be read; asking again");
+            None
+        }
+    };
+    let result = match saved {
+        Some(advice) => {
+            outln!("  reusing saved AI advice; no new request was made");
+            Ok(advice)
+        }
+        None => client.advise(release, &candidates).await,
     };
     match result {
         Ok(advice) => {
@@ -766,8 +913,45 @@ async fn add_ai_advice(release: &LocalRelease, attempts: &mut [ProviderAttempt])
                 }
             }
         }
+        Err(error) if error.disables_run() => {
+            outln!("  AI review disabled for this run: {error}; continuing without AI matching");
+            *ai = AiState::Disabled(error.to_string());
+        }
         Err(error) => outln!("  AI review unavailable: {error}; continuing without AI matching"),
     }
+}
+
+/// Advice stored with a queued review, if it still answers the question that
+/// would be asked now: unchanged files and edition, same candidates, same
+/// model and prompt.
+async fn saved_advice(
+    pool: &SqlitePool,
+    release: &LocalRelease,
+    guard: &MatchGuard,
+    attempts: &[ProviderAttempt],
+    client: &ClefClient,
+    candidates: &[ReviewCandidate<'_>],
+) -> Result<Option<Advice>> {
+    let Ok(digest) = client.request_digest(release, candidates) else {
+        return Ok(None);
+    };
+    for attempt in attempts {
+        let Some(saved) = store::load_review(pool, release.id, attempt.provider).await? else {
+            continue;
+        };
+        if saved.guard != *guard {
+            continue;
+        }
+        let advice = saved
+            .candidates
+            .into_iter()
+            .filter_map(|candidate| candidate.ai_advice)
+            .find(|advice| advice.answers(client.model(), &digest));
+        if advice.is_some() {
+            return Ok(advice);
+        }
+    }
+    Ok(None)
 }
 
 fn print_ai_advice(advice: &Advice) {
@@ -775,11 +959,9 @@ fn print_ai_advice(advice: &Advice) {
 }
 
 fn advice_assessed(advice: &Advice, candidate: &Candidate) -> bool {
-    advice.probabilities.contains_key(&format!(
-        "{}:{}",
-        candidate.release.provider(),
-        candidate.release.id.storage_id()
-    ))
+    advice
+        .probabilities
+        .contains_key(&choice_key(&candidate.release.id))
 }
 
 fn choose_ai_match(
@@ -790,6 +972,7 @@ fn choose_ai_match(
         .iter()
         .find_map(|attempt| attempt.ai_advice.as_ref())
         .ok_or_else(|| "no model assessment is available".to_string())?;
+    let primary_provider = attempts.first().map(|attempt| attempt.provider);
     if matches!(advice.choice, AdviceChoice::NoMatch) {
         return Err("the model found no supported match".into());
     }
@@ -825,6 +1008,11 @@ fn choose_ai_match(
         }
         AdviceChoice::NoMatch => unreachable!(),
     };
+    if primary_failed_transiently(attempts)
+        && Some(candidate.release.provider()) != primary_provider
+    {
+        return Err(TRANSIENT_PRIMARY_NOTE.to_string());
+    }
     // Include candidates outside the model budget when checking ambiguity.
     let alternatives: Vec<Candidate> = attempts
         .iter()
@@ -837,8 +1025,7 @@ fn choose_ai_match(
     // The model cannot supply semantic agreement for evidence it never saw.
     if let Some(other) = alternatives.iter().find(|other| {
         !advice_assessed(advice, other)
-            && candidate.score.album_score() - other.score.album_score()
-                <= matcher::RUNNER_UP_GAP + 1e-9
+            && matcher::within_gap(candidate.score.album_score() - other.score.album_score())
             && !matcher::equivalent_unassessed_audio(candidate, other)
     }) {
         return Err(format!(
@@ -892,7 +1079,7 @@ async fn accept(
         outln!(
             "  cannot accept {provider} release {}: the track mapping is invalid or incomplete ({})",
             candidate.release.id,
-            candidate.mapping.notes.join("; ")
+            Clean(&candidate.mapping.notes.join("; "))
         );
         return Ok(Outcome::Skipped);
     }
@@ -930,7 +1117,7 @@ async fn accept(
                 method.as_str()
             );
             outln!("    {} {}", provider, candidate.release.id.storage_id());
-            outln!("    {}", candidate.release.url);
+            outln!("    {}", Clean(&candidate.release.url));
             if ai_advice.is_some() {
                 outln!("    AI-supported album match; decision evidence saved");
             }
@@ -944,7 +1131,10 @@ async fn accept(
             Ok(Outcome::Skipped)
         }
         Err(error) => {
-            eprintln!("  could not apply the match: {error:#}");
+            eprintln!(
+                "  could not apply the match: {}",
+                Clean(&format!("{error:#}"))
+            );
             Ok(Outcome::Failed)
         }
     }
@@ -1027,7 +1217,7 @@ async fn queue_attempts(
     }
 
     let reason = review_reason_summary(attempts);
-    outln!("  queued for review: {reason}");
+    outln!("  queued for review: {}", Clean(&reason));
     Ok(())
 }
 
@@ -1186,34 +1376,58 @@ where
 }
 
 fn print_release_header(release: &LocalRelease) {
-    outln!(
+    out!("{}", render_release_header(release));
+}
+
+fn render_release_header(release: &LocalRelease) -> String {
+    let mut text = String::new();
+    let _ = writeln!(
+        text,
         "  local release {} — {} ({} file(s))",
         release.id,
-        release.album_title.as_deref().unwrap_or("(no album tag)"),
+        Clean(release.album_title.as_deref().unwrap_or("(no album tag)")),
         release.tracks.len()
     );
-    outln!(
+    let _ = writeln!(
+        text,
         "  artist: {}   folder: {}",
-        release.album_artist.as_deref().unwrap_or("(unknown)"),
-        release.directory
+        Clean(release.album_artist.as_deref().unwrap_or("(unknown)")),
+        Clean(&release.directory)
     );
     if !release.embedded_evidence.problems.is_empty() {
         for problem in &release.embedded_evidence.problems {
-            outln!("  identifier problem: {problem}");
+            let _ = writeln!(text, "  identifier problem: {}", Clean(problem));
         }
     }
+    text
 }
 
 fn print_candidate(
-    _local: &LocalRelease,
+    local: &LocalRelease,
     provider: ProviderKind,
     index: usize,
     candidate: &Candidate,
     evaluation: &Evaluation,
     stage_error: Option<&ProviderError>,
 ) {
+    out!(
+        "{}",
+        render_candidate(local, provider, index, candidate, evaluation, stage_error)
+    );
+}
+
+fn render_candidate(
+    local: &LocalRelease,
+    provider: ProviderKind,
+    index: usize,
+    candidate: &Candidate,
+    evaluation: &Evaluation,
+    stage_error: Option<&ProviderError>,
+) -> String {
+    let mut text = String::new();
     let release = &candidate.release;
-    outln!(
+    let _ = writeln!(
+        text,
         "\n  [{}] {} release {} — score {:.3}{}",
         index + 1,
         provider,
@@ -1225,8 +1439,8 @@ fn print_candidate(
             " [review]"
         }
     );
-    outln!("      {}", release.artist_display());
-    outln!("      {}", release.url);
+    let _ = writeln!(text, "      {}", Clean(&release.artist_display()));
+    let _ = writeln!(text, "      {}", Clean(&release.url));
     let mut details = Vec::new();
     if let Some(year) = release.year {
         details.push(format!("year {year}"));
@@ -1247,15 +1461,16 @@ fn print_candidate(
         details.push(format!("edition: {}", release.edition_notes.join(", ")));
     }
     if !details.is_empty() {
-        outln!("      {}", details.join(" · "));
+        let _ = writeln!(text, "      {}", Clean(&details.join(" · ")));
     }
     if !release.structure_issues.is_empty() {
         for issue in &release.structure_issues {
-            outln!("      structure: {issue}");
+            let _ = writeln!(text, "      structure: {}", Clean(issue));
         }
     }
     if !release.lookup_aliases.is_empty() {
-        outln!(
+        let _ = writeln!(
+            text,
             "      aliases: {}",
             release
                 .lookup_aliases
@@ -1282,28 +1497,30 @@ fn print_candidate(
             Some(format!("{name} {value:.2}×{weight:.2}"))
         })
         .collect();
-    outln!("      score: {}", components.join("  "));
-    outln!(
+    let _ = writeln!(text, "      score: {}", components.join("  "));
+    let _ = writeln!(
+        text,
         "      mapping: {}/{} files mapped",
         candidate.mapping.assigned_count(),
-        _local.tracks.len()
+        local.tracks.len()
     );
 
     for note in &evaluation.evidence {
-        outln!("      evidence: {note}");
+        let _ = writeln!(text, "      evidence: {}", Clean(note));
     }
     for blocker in &evaluation.blockers {
-        outln!("      blocker: {blocker}");
+        let _ = writeln!(text, "      blocker: {}", Clean(blocker));
     }
     for warning in &evaluation.warnings {
-        outln!("      warning: {warning}");
+        let _ = writeln!(text, "      warning: {}", Clean(warning));
     }
     for note in &candidate.mapping.notes {
-        outln!("      mapping: {note}");
+        let _ = writeln!(text, "      mapping: {}", Clean(note));
     }
     if let Some(error) = stage_error {
-        outln!("      stage error: {error}");
+        let _ = writeln!(text, "      stage error: {}", Clean(&error.to_string()));
     }
+    text
 }
 
 fn prompt(message: &str) -> Result<String> {
@@ -1392,7 +1609,7 @@ where
                 if !evaluation.can_apply(candidate) {
                     outln!(
                         "cannot accept: the track mapping is invalid, incomplete, or structurally unsupported ({})",
-                        candidate.mapping.notes.join("; ")
+                        Clean(&candidate.mapping.notes.join("; "))
                     );
                     continue;
                 }
@@ -1400,11 +1617,11 @@ where
                 if !evaluation.auto_accept {
                     outln!("manual acceptance overrides these automatic checks:");
                     for blocker in &evaluation.blockers {
-                        outln!("  - {blocker}");
+                        outln!("  - {}", Clean(blocker));
                     }
                 }
                 for warning in &evaluation.warnings {
-                    outln!("  warning: {warning}");
+                    outln!("  warning: {}", Clean(warning));
                 }
 
                 let confirm = prompt("accept this release? [y/N] > ")?;
@@ -1430,7 +1647,7 @@ where
                 let id = match parse_entered_id(provider, &raw) {
                     Ok(id) => id,
                     Err(error) => {
-                        outln!("invalid release ID: {error}");
+                        outln!("invalid release ID: {}", Clean(&error.to_string()));
                         continue;
                     }
                 };
@@ -1448,7 +1665,7 @@ where
                         groups.push((provider, vec![candidate], vec![evaluation]));
                         outln!("  candidate added to this review");
                     }
-                    Err(error) => outln!("could not fetch release: {error}"),
+                    Err(error) => outln!("could not fetch release: {}", Clean(&error.to_string())),
                 }
             }
             "s" => return Ok(ReviewOutcome::Skip),
@@ -1471,7 +1688,7 @@ fn print_decision(attempt: &ProviderAttempt) {
             index + 1,
             attempt.provider,
             candidate.release.id.storage_id(),
-            candidate.release.title,
+            Clean(&candidate.release.title),
             evaluation.match_scope.score(&candidate.score),
             if evaluation.auto_accept {
                 " [auto-acceptable]"
@@ -1480,10 +1697,10 @@ fn print_decision(attempt: &ProviderAttempt) {
             }
         );
         for blocker in &evaluation.blockers {
-            outln!("       blocked: {blocker}");
+            outln!("       blocked: {}", Clean(blocker));
         }
         for warning in &evaluation.warnings {
-            outln!("       note: {warning}");
+            outln!("       note: {}", Clean(warning));
         }
     }
     if let (Some(candidate), Some(evaluation)) =
@@ -1711,6 +1928,7 @@ mod tests {
                     .chain([("none".into(), 0.0), ("equivalent_editions".into(), 0.0)])
                     .collect(),
                 confidence: 1.0,
+                request_digest: None,
             });
             assert!(
                 choose_ai_match(&local, std::slice::from_ref(&attempt)).is_err(),
@@ -1915,5 +2133,107 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(outcome, Outcome::Skipped), "{outcome:?}");
+    }
+
+    #[test]
+    fn only_outage_failures_count_as_a_transient_primary_failure() {
+        let failed = |error| [ProviderAttempt::failed(ProviderKind::MusicBrainz, error)];
+        let provider = ProviderKind::MusicBrainz;
+        assert!(primary_failed_transiently(&failed(
+            ProviderError::Network {
+                provider,
+                message: "down".into(),
+            }
+        )));
+        assert!(primary_failed_transiently(&failed(
+            ProviderError::RateLimited {
+                provider,
+                message: "slow down".into(),
+                retry_after: None,
+            }
+        )));
+        assert!(primary_failed_transiently(&failed(
+            ProviderError::Unavailable {
+                provider,
+                retry_after: std::time::Duration::from_secs(5),
+            }
+        )));
+        // A malformed response is deterministic for that release, and starts no cooldown.
+        assert!(!primary_failed_transiently(&failed(
+            ProviderError::Malformed {
+                provider,
+                message: "bad json".into(),
+            }
+        )));
+        assert!(!primary_failed_transiently(&failed(
+            ProviderError::Permanent {
+                provider,
+                status: Some(400),
+                message: "bad".into(),
+            }
+        )));
+        assert!(!primary_failed_transiently(&[]));
+    }
+
+    #[test]
+    fn rendered_candidates_and_headers_escape_every_untrusted_field() {
+        let (mut local, mut remote) = ai_album_fixture();
+        local.album_title = Some("title\x1b[2Jlocal".into());
+        local.album_artist = Some("artist\x1b[3Jlocal".into());
+        local.directory = "/music/\x1b]0;folder\x07".into();
+        remote.artists = vec!["remote\x1b[31martist".into()];
+        remote.url = "https://example.invalid/\x1b]0;url\x07".into();
+        remote.country = Some("country\x1b[4J".into());
+        remote.edition_notes = vec!["edition\u{202e}note".into()];
+        remote.structure_issues = vec!["structure\x1b[5J".into()];
+        let candidate = Candidate::new(&local, remote);
+        let mut evaluation = matcher::evaluate(
+            &local,
+            &candidate,
+            None,
+            &matcher::DiscoveryEvidence::default(),
+        );
+        evaluation.blockers.push("blocker\x1b[6J".into());
+        let error = ProviderError::Network {
+            provider: ProviderKind::Discogs,
+            message: "stage\x1b[7J".into(),
+        };
+
+        let text = format!(
+            "{}{}",
+            render_release_header(&local),
+            render_candidate(
+                &local,
+                ProviderKind::Discogs,
+                0,
+                &candidate,
+                &evaluation,
+                Some(&error)
+            )
+        );
+
+        for (line_start, escaped) in [
+            ("      remote", "remote\\u{1b}[31martist"),
+            (
+                "      https://",
+                "https://example.invalid/\\u{1b}]0;url\\u{7}",
+            ),
+            ("  artist: ", "artist\\u{1b}[3Jlocal"),
+            ("  local release", "title\\u{1b}[2Jlocal"),
+            ("      structure:", "structure\\u{1b}[5J"),
+            ("      blocker:", "blocker\\u{1b}[6J"),
+            ("      stage error:", "stage\\u{1b}[7J"),
+        ] {
+            assert!(
+                text.lines()
+                    .any(|line| line.starts_with(line_start) && line.contains(escaped)),
+                "no escaped {line_start:?} line in {text:?}"
+            );
+        }
+        assert!(
+            !text.chars().any(|c| c != '\n' && c.is_control()),
+            "{text:?}"
+        );
+        assert!(!text.contains('\u{202e}'), "{text:?}");
     }
 }

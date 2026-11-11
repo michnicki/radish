@@ -161,11 +161,10 @@ impl MusicBrainzAdapter {
             *until = None;
             return Ok(());
         }
-        let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0);
-        Err(ProviderError::Network {
+        Err(ProviderError::Unavailable {
             provider: ProviderKind::MusicBrainz,
-            message: format!(
-                "temporarily unavailable after transient failures; retry in {seconds}s"
+            retry_after: Duration::from_secs(
+                remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0),
             ),
         })
     }
@@ -1178,7 +1177,11 @@ mod tests {
             .await
             .expect("cooldown must return immediately")
             .unwrap_err();
-        assert!(matches!(error, ProviderError::Network { .. }), "{error}");
+        assert!(
+            matches!(error, ProviderError::Unavailable { .. }),
+            "{error}"
+        );
+        assert!(error.is_transient(), "{error}");
         assert!(
             error.to_string().contains("temporarily unavailable"),
             "{error}"
