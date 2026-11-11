@@ -2,7 +2,7 @@
 //! initial sync.
 
 use crate::progress::ImportProgress;
-use crate::scanner::ScanResult;
+use crate::scanner::{ScanEvent, ScanResult};
 use crate::{scanner, store};
 use anyhow::{Result, bail};
 use sqlx::SqlitePool;
@@ -38,25 +38,57 @@ pub async fn sync_directory(
     root: &Path,
     progress: &ImportProgress,
 ) -> Result<ImportSummary> {
-    // A missing root would otherwise look like every file was deleted.
-    if !tokio::fs::metadata(root).await?.is_dir() {
-        bail!("{} is not a directory", root.display());
-    }
     let directory_id = store::upsert_directory(pool, root).await?;
-    let known = store::known_modified_times(pool, root).await?;
+    let mut summary = sync_files(pool, root, directory_id, Some(progress)).await?;
+    progress.grouping();
+    summary.rebuild = store::rebuild_local_releases(pool, Some(root)).await?;
+    Ok(summary)
+}
+
+/// [`sync_directory`] without the rebuild: syncs the files under `dir` into
+/// the rows of the library directory `directory_id`. The watcher uses it for
+/// a folder that appeared inside the watched root, and rebuilds once per batch.
+/// Without a `progress` display, warnings go to stderr.
+pub(crate) async fn sync_files(
+    pool: &SqlitePool,
+    dir: &Path,
+    directory_id: i64,
+    progress: Option<&ImportProgress>,
+) -> Result<ImportSummary> {
+    // A missing directory would otherwise look like every file was deleted.
+    if !tokio::fs::metadata(dir).await?.is_dir() {
+        bail!("{} is not a directory", dir.display());
+    }
+    let known = store::known_modified_times(pool, dir).await?;
     let ScanResult { tracks, unchanged } = scanner::scan_directory_incremental(
-        root,
+        dir,
         |path, modified_at| known.get(&store::path_key(path)) == Some(&modified_at),
-        |event| progress.scan_event(event),
+        |event| match progress {
+            Some(progress) => progress.scan_event(event),
+            None => match event {
+                ScanEvent::Warning { message }
+                | ScanEvent::FileFinished {
+                    warning: Some(message),
+                    ..
+                } => eprintln!("{message}"),
+                ScanEvent::Discovering
+                | ScanEvent::Discovered { .. }
+                | ScanEvent::FileFinished { .. } => {}
+            },
+        },
     )
     .await?;
 
-    progress.saving(tracks.len());
+    if let Some(progress) = progress {
+        progress.saving(tracks.len());
+    }
     let mut saved = 0;
     for chunk in tracks.chunks(store::UPSERT_BATCH_SIZE) {
         saved += store::upsert_tracks(pool, chunk, directory_id).await?;
         for _ in chunk {
-            progress.saved();
+            if let Some(progress) = progress {
+                progress.saved();
+            }
         }
     }
 
@@ -73,14 +105,12 @@ pub async fn sync_directory(
         removed += store::remove_tracks_under(pool, Path::new(key)).await?;
     }
 
-    progress.grouping();
-    let rebuild = store::rebuild_local_releases(pool, Some(root)).await?;
     Ok(ImportSummary {
         scanned: tracks.len(),
         unchanged: unchanged.len(),
         saved,
         removed,
-        rebuild,
+        rebuild: store::RebuildSummary::default(),
     })
 }
 

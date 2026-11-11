@@ -333,24 +333,22 @@ Albums are also grouped by the pair `(album title, artist)` for scanned-metadata
 
 `import` walks the selected directory, filters files by extension, and reads each file's primary tag, falling back to its first available tag. It stores title, artist, album, album-artist, year, track number, disc number, barcode, catalog number, all four MusicBrainz identifier values, duration, and modification time. Missing tag fields are stored as SQL `NULL`. Format inference from the audio codec is not performed.
 
-Tag parsing runs in parallel; database updates happen afterward. A file that fails tag reading produces a warning and is skipped while other files continue importing. Every import rereads discovered files; the stored modification time is not used to skip unchanged files.
+Tag parsing runs in parallel; database updates happen afterward. A file that fails tag reading produces a warning and is skipped while other files continue importing. Files whose modification time matches the stored one are not read again, so a repeat import of an unchanged library reads no tags.
 
 When stderr is an interactive terminal, import shows a spinner during file discovery, completed/total counters while reading tags and saving tracks, and a spinner while rebuilding local-release groups. Failed tag reads count toward scan progress and still produce warnings. Live progress is hidden when stderr is redirected; stdout messages and the final import summary are unchanged. Progress clears before optional matching starts.
 
-Import adds and refreshes entries and refreshes local-release grouping. It does **not** remove database rows for files that have disappeared.
+Import adds and refreshes entries, removes the rows of files that have disappeared from the imported directory, and refreshes local-release grouping. It prints how many tracks were new or changed, unchanged, and removed, and warns when an accepted match was dropped or became stale.
 
 ### Watch
 
-`watch` performs an initial import, then subscribes to recursive filesystem events using [Notify](https://github.com/notify-rs/notify). Handled file-creation, data-change, and rename events trigger tag reads and database updates. File-removal events delete the matching stored path. After each event, local-release grouping is recomputed so accepted matches become stale when matching inputs change. Stop watching with `Ctrl+C`.
+`watch` performs the same incremental import as `import`, then subscribes to recursive filesystem events using [Notify](https://github.com/notify-rs/notify), and starts listening before the initial import so changes made during it are not missed. After the first event it collects events for 500 ms and handles them as one batch. What is on disk decides what happens to each affected path, whatever the event kind: a directory is scanned, an audio file has its tags read, and a missing path has its stored tracks removed (every track under it, for a directory). Renames, folders moved in or out, and the generic event kinds some platforms report are handled the same way. Reads, metadata-only changes, and the database's own `-wal`, `-shm` and `-journal` files are ignored, so a database inside the watched directory is safe. Local-release grouping is recomputed once per batch, and only when rows changed, so accepted matches become stale when matching inputs change. If the backend reports that it lost events, the watcher runs a full sync. If the watched directory itself is removed, the watcher says so and exits. Stop watching with `Ctrl+C`.
 
-The initial import uses the same terminal progress display as `import`. Ongoing watch events continue to print individual sync and removal messages.
+The initial import uses the same terminal progress display as `import`. Ongoing watch events print `synced:` and `removed:` lines for real changes only.
 
 Current synchronization limits:
 
-- Changes made while the watcher is stopped are not replayed. Starting it again refreshes existing files through the initial import, but missing files remain in the database.
-- A rename can add the new path while leaving the old entry behind unless a separate removal event clears it.
-- Deleting a directory does not recursively remove its stored tracks.
-- Watch registration happens after the initial scan, so changes during startup can be missed.
+- Changes made while the watcher is stopped are replayed by the initial import, which also removes rows for files that disappeared.
+- A change that only touches a file's modification time is not picked up until the next import, because metadata-only events are ignored.
 
 ## Storage and output
 

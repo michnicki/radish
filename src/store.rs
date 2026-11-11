@@ -187,15 +187,6 @@ async fn write_track(
     Ok(result.rows_affected())
 }
 
-pub async fn remove_track_by_path(pool: &SqlitePool, path: &Path) -> Result<()> {
-    let path_str = path.to_string_lossy().to_string();
-    sqlx::query("DELETE FROM tracks WHERE path = ?1 COLLATE NOCASE")
-        .bind(path_str)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
 /// The comparison key for a file path: forward slashes and ASCII lowercase,
 /// matching how the path columns compare. Use it to look paths up in the
 /// result of [`known_modified_times`].
@@ -3380,7 +3371,7 @@ mod tests {
         let guard = load_match_guard(&pool, release.id).await.unwrap();
 
         // The same file is removed and re-added: same revision, new track ID.
-        remove_track_by_path(&pool, Path::new("/music/a/01.flac"))
+        remove_tracks_under(&pool, Path::new("/music/a/01.flac"))
             .await
             .unwrap();
         insert(&pool, "/music/a", &[file]).await;
@@ -4263,7 +4254,7 @@ mod tests {
         let id = accept_manually(&pool, "Blue", &["R1", "R2"]).await;
 
         // Same tags and path, new track ID: its overlay row went with the old one.
-        remove_track_by_path(&pool, Path::new("/music/a/02.flac"))
+        remove_tracks_under(&pool, Path::new("/music/a/02.flac"))
             .await
             .unwrap();
         let summary = insert_summary(&pool, "/music/a", &files).await;

@@ -1,10 +1,11 @@
 use crate::progress::ImportProgress;
 use crate::{importer, outln, scanner, store};
 use anyhow::Result;
-use notify::event::{CreateKind, ModifyKind, RemoveKind};
+use notify::event::ModifyKind;
 use notify::{EventKind, RecursiveMode, Watcher};
 use sqlx::SqlitePool;
 use std::collections::BTreeMap;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -107,16 +108,10 @@ impl Scope {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Action {
-    Upsert,
-    Remove,
-}
-
 #[derive(Default)]
 struct Plan {
     /// Paths worth looking at, once each, keyed by their comparison key.
-    paths: BTreeMap<String, (PathBuf, Action)>,
+    paths: BTreeMap<String, PathBuf>,
     /// The backend lost track of events, so only a full sync is safe.
     rescan: bool,
 }
@@ -137,19 +132,10 @@ fn plan_batch(scope: &Scope, events: &[notify::Event]) -> Plan {
         ) {
             continue;
         }
-        let action = match event.kind {
-            EventKind::Create(CreateKind::File)
-            | EventKind::Modify(ModifyKind::Data(_))
-            | EventKind::Modify(ModifyKind::Name(_)) => Action::Upsert,
-            EventKind::Remove(RemoveKind::File) | EventKind::Remove(RemoveKind::Any) => {
-                Action::Remove
-            }
-            _ => continue,
-        };
         for path in &event.paths {
             let key = store::path_key(path);
             if scope.contains(&key) && !scope.is_ignored(&key) {
-                plan.paths.insert(key, (path.clone(), action));
+                plan.paths.insert(key, path.clone());
             }
         }
     }
@@ -187,6 +173,12 @@ struct BatchOutcome {
     root_gone: bool,
 }
 
+/// Applies one batch of events to the database.
+///
+/// What is on disk now decides what happens to each path, whatever the event
+/// said: a directory is scanned, an audio file is read, and a missing path
+/// loses its rows. That makes renames, moves and the generic event kinds some
+/// platforms report all come out right.
 async fn handle_events(
     pool: &SqlitePool,
     scope: &Scope,
@@ -212,41 +204,56 @@ async fn handle_events(
         }
         return Ok(outcome);
     }
-    for (path, action) in plan.paths.values() {
-        match action {
-            Action::Upsert => {
-                if path.is_file() && scanner::is_audio_file(path) {
-                    let read = tokio::task::spawn_blocking({
-                        let path = path.clone();
-                        move || scanner::read_tags(&path)
-                    })
-                    .await?;
-                    match read {
-                        Ok(track) => {
-                            let changed = store::upsert_tracks(
-                                pool,
-                                std::slice::from_ref(&track),
-                                directory_id,
-                            )
-                            .await?;
-                            outcome.synced += changed;
-                            if changed > 0 {
-                                outln!("synced: {}", path.display());
-                            }
-                        }
-                        Err(err) => eprintln!("warning: failed to tag {}: {err}", path.display()),
-                    }
+
+    for (key, path) in &plan.paths {
+        match tokio::fs::metadata(path).await {
+            Ok(metadata) if metadata.is_dir() => {
+                let summary = importer::sync_files(pool, path, directory_id, None).await?;
+                outcome.synced += summary.saved;
+                outcome.removed += summary.removed;
+                if summary.saved > 0 {
+                    outln!("synced: {} ({} tracks)", path.display(), summary.saved);
+                }
+                if summary.removed > 0 {
+                    outln!("removed: {} ({} tracks)", path.display(), summary.removed);
                 }
             }
-            Action::Remove => {
+            Ok(metadata) if metadata.is_file() && scanner::is_audio_file(path) => {
+                let read = tokio::task::spawn_blocking({
+                    let path = path.clone();
+                    move || scanner::read_tags(&path)
+                })
+                .await?;
+                match read {
+                    Ok(track) => {
+                        let changed =
+                            store::upsert_tracks(pool, std::slice::from_ref(&track), directory_id)
+                                .await?;
+                        outcome.synced += changed;
+                        if changed > 0 {
+                            outln!("synced: {}", path.display());
+                        }
+                    }
+                    Err(err) => eprintln!("warning: failed to tag {}: {err}", path.display()),
+                }
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                if *key == scope.root_key {
+                    // Keep the rows: an unmounted library should not empty the DB.
+                    outcome.root_gone = true;
+                    return Ok(outcome);
+                }
                 let removed = store::remove_tracks_under(pool, path).await?;
                 outcome.removed += removed;
                 if removed > 0 {
                     outln!("removed: {}", path.display());
                 }
             }
+            Err(err) => eprintln!("warning: failed to inspect {}: {err}", path.display()),
         }
     }
+
     // Refresh grouping so membership changes mark accepted matches stale while
     // leaving their overlay in place. Nothing changed means nothing to refresh.
     if outcome.synced + outcome.removed > 0 {
@@ -260,7 +267,9 @@ mod tests {
     use super::*;
     use crate::db;
     use crate::importer::test_support::{ScratchDir, write_wav};
-    use notify::event::{AccessKind, AccessMode, DataChange, MetadataKind};
+    use notify::event::{
+        AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, RemoveKind, RenameMode,
+    };
 
     fn event(kind: EventKind, paths: &[&Path]) -> notify::Event {
         let mut event = notify::Event::new(kind);
@@ -461,5 +470,184 @@ mod tests {
         assert_eq!(outcome.synced, 2, "{outcome:?}");
         assert!(outcome.rebuild.is_some());
         assert_eq!(fixture.track_count().await, 2);
+    }
+
+    async fn track_paths(fixture: &Fixture) -> Vec<String> {
+        let mut paths: Vec<String> = store::list_tracks(&fixture.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|track| track.path)
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    async fn import(fixture: &Fixture, names: &[&str]) {
+        let events: Vec<_> = names
+            .iter()
+            .map(|name| event(EventKind::Create(CreateKind::File), &[&fixture.path(name)]))
+            .collect();
+        fixture.handle(&events).await;
+    }
+
+    #[tokio::test]
+    async fn a_rename_leaves_one_row_at_the_new_path() {
+        let fixture = Fixture::new("watcher-rename").await;
+        write_wav(&fixture.path("old.wav"));
+        import(&fixture, &["old.wav"]).await;
+        let (old, new) = (fixture.path("old.wav"), fixture.path("new.wav"));
+        std::fs::rename(&old, &new).unwrap();
+
+        let outcome = fixture
+            .handle(&[event(
+                EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+                &[&old, &new],
+            )])
+            .await;
+
+        assert_eq!(track_paths(&fixture).await, [new.display().to_string()]);
+        assert!(outcome.rebuild.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_rename_reported_as_two_events_leaves_one_row() {
+        let fixture = Fixture::new("watcher-rename-split").await;
+        write_wav(&fixture.path("old.wav"));
+        import(&fixture, &["old.wav"]).await;
+        let (old, new) = (fixture.path("old.wav"), fixture.path("new.wav"));
+        std::fs::rename(&old, &new).unwrap();
+
+        fixture
+            .handle(&[
+                event(
+                    EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+                    &[&old],
+                ),
+                event(EventKind::Modify(ModifyKind::Name(RenameMode::To)), &[&new]),
+            ])
+            .await;
+
+        assert_eq!(track_paths(&fixture).await, [new.display().to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_folder_moved_into_the_root_is_scanned() {
+        let fixture = Fixture::new("watcher-folder-in").await;
+        let album = fixture.path("Album");
+        std::fs::create_dir(&album).unwrap();
+        write_wav(&album.join("01.wav"));
+        write_wav(&album.join("02.wav"));
+
+        let outcome = fixture
+            .handle(&[event(
+                EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+                &[&album],
+            )])
+            .await;
+
+        assert_eq!(outcome.synced, 2, "{outcome:?}");
+        assert_eq!(fixture.track_count().await, 2);
+        assert!(outcome.rebuild.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_file_moved_out_of_the_root_is_removed() {
+        let fixture = Fixture::new("watcher-file-out").await;
+        write_wav(&fixture.path("a.wav"));
+        import(&fixture, &["a.wav"]).await;
+        std::fs::remove_file(fixture.path("a.wav")).unwrap();
+
+        let outcome = fixture
+            .handle(&[event(
+                EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+                &[&fixture.path("a.wav")],
+            )])
+            .await;
+
+        assert_eq!(outcome.removed, 1, "{outcome:?}");
+        assert_eq!(fixture.track_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn removing_a_directory_removes_every_row_under_it() {
+        let fixture = Fixture::new("watcher-dir-removed").await;
+        let album = fixture.path("Album");
+        std::fs::create_dir(&album).unwrap();
+        write_wav(&album.join("01.wav"));
+        write_wav(&album.join("02.wav"));
+        write_wav(&fixture.path("Album2.wav"));
+        fixture
+            .handle(&[event(EventKind::Create(CreateKind::Folder), &[&album])])
+            .await;
+        import(&fixture, &["Album2.wav"]).await;
+        assert_eq!(fixture.track_count().await, 3);
+        std::fs::remove_dir_all(&album).unwrap();
+
+        // The backend reports the folder in a different letter case.
+        let reported = fixture.path("ALBUM");
+        let outcome = fixture
+            .handle(&[event(EventKind::Remove(RemoveKind::Folder), &[&reported])])
+            .await;
+
+        assert_eq!(outcome.removed, 2, "{outcome:?}");
+        assert_eq!(
+            track_paths(&fixture).await,
+            [fixture.path("Album2.wav").display().to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_create_event_of_unknown_kind_syncs_a_new_file() {
+        let fixture = Fixture::new("watcher-create-any").await;
+        write_wav(&fixture.path("a.wav"));
+        std::fs::write(fixture.path("cover.jpg"), b"not audio").unwrap();
+
+        let outcome = fixture
+            .handle(&[
+                event(
+                    EventKind::Create(CreateKind::Any),
+                    &[&fixture.path("a.wav")],
+                ),
+                event(
+                    EventKind::Modify(ModifyKind::Any),
+                    &[&fixture.path("cover.jpg")],
+                ),
+            ])
+            .await;
+
+        assert_eq!(outcome.synced, 1, "{outcome:?}");
+        assert_eq!(fixture.track_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn paths_outside_the_root_are_ignored() {
+        let fixture = Fixture::new("watcher-outside").await;
+        let sibling = PathBuf::from(format!("{}-other/a.wav", fixture.music.path().display()));
+
+        let plan = plan_batch(
+            &fixture.scope,
+            &[event(EventKind::Remove(RemoveKind::File), &[&sibling])],
+        );
+
+        assert!(plan.paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn removing_the_root_stops_the_watch_and_keeps_the_rows() {
+        let fixture = Fixture::new("watcher-root-gone").await;
+        write_wav(&fixture.path("a.wav"));
+        import(&fixture, &["a.wav"]).await;
+        std::fs::remove_dir_all(fixture.music.path()).unwrap();
+
+        let outcome = fixture
+            .handle(&[event(
+                EventKind::Remove(RemoveKind::Folder),
+                &[fixture.music.path()],
+            )])
+            .await;
+
+        assert!(outcome.root_gone, "{outcome:?}");
+        assert_eq!(fixture.track_count().await, 1);
     }
 }
