@@ -351,18 +351,7 @@ async fn run_import(pool: &sqlx::SqlitePool, path: &std::path::Path) -> Result<P
         summary.removed,
         summary.rebuild.groups
     );
-    if summary.rebuild.dropped_matches > 0 {
-        outln!(
-            "warning: {} accepted match(es) were dropped because their files were split or removed",
-            summary.rebuild.dropped_matches
-        );
-    }
-    if summary.rebuild.newly_stale > 0 {
-        outln!(
-            "warning: {} accepted match(es) are now stale because their files changed",
-            summary.rebuild.newly_stale
-        );
-    }
+    importer::report_rebuild(&summary.rebuild);
     Ok(path)
 }
 

@@ -3,7 +3,7 @@
 
 use crate::progress::ImportProgress;
 use crate::scanner::{ScanEvent, ScanResult};
-use crate::{scanner, store};
+use crate::{outln, scanner, store};
 use anyhow::{Result, bail};
 use sqlx::SqlitePool;
 use std::collections::HashSet;
@@ -24,6 +24,31 @@ pub struct ImportSummary {
     /// be read this time.
     pub kept: usize,
     pub rebuild: store::RebuildSummary,
+}
+
+/// The warnings a rebuild deserves: accepted matches it dropped or staled.
+pub fn rebuild_warnings(rebuild: &store::RebuildSummary) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if rebuild.dropped_matches > 0 {
+        warnings.push(format!(
+            "warning: {} accepted match(es) were dropped because their files were split or removed",
+            rebuild.dropped_matches
+        ));
+    }
+    if rebuild.newly_stale > 0 {
+        warnings.push(format!(
+            "warning: {} accepted match(es) are now stale because their files changed",
+            rebuild.newly_stale
+        ));
+    }
+    warnings
+}
+
+/// Prints [`rebuild_warnings`] to stdout, one line each.
+pub fn report_rebuild(rebuild: &store::RebuildSummary) {
+    for warning in rebuild_warnings(rebuild) {
+        outln!("{warning}");
+    }
 }
 
 /// Brings the database in line with the audio files under `root`.
@@ -232,6 +257,22 @@ mod tests {
             .fetch_all(pool)
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn rebuild_warnings_name_dropped_and_stale_matches() {
+        assert!(rebuild_warnings(&store::RebuildSummary::default()).is_empty());
+        let rebuild = store::RebuildSummary {
+            dropped_matches: 2,
+            newly_stale: 3,
+            ..store::RebuildSummary::default()
+        };
+
+        let warnings = rebuild_warnings(&rebuild);
+
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("2 accepted match(es) were dropped"));
+        assert!(warnings[1].contains("3 accepted match(es) are now stale"));
     }
 
     #[tokio::test]

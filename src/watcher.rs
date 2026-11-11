@@ -48,6 +48,7 @@ pub async fn watch_directory(pool: SqlitePool, root: &Path, db_path: &Path) -> R
         summary.unchanged,
         summary.removed
     );
+    importer::report_rebuild(&summary.rebuild);
 
     while let Some(batch) = collect_batch(&mut rx, DEBOUNCE).await {
         let mut events = Vec::new();
@@ -193,6 +194,7 @@ async fn handle_events(
         let summary = importer::sync_directory(pool, &scope.root, &progress).await?;
         outcome.synced = summary.saved;
         outcome.removed = summary.removed;
+        importer::report_rebuild(&summary.rebuild);
         outcome.rebuild = Some(summary.rebuild);
         if summary.saved + summary.removed > 0 {
             outln!(
@@ -257,7 +259,9 @@ async fn handle_events(
     // Refresh grouping so membership changes mark accepted matches stale while
     // leaving their overlay in place. Nothing changed means nothing to refresh.
     if outcome.synced + outcome.removed > 0 {
-        outcome.rebuild = Some(store::rebuild_local_releases(pool, Some(&scope.root)).await?);
+        let rebuild = store::rebuild_local_releases(pool, Some(&scope.root)).await?;
+        importer::report_rebuild(&rebuild);
+        outcome.rebuild = Some(rebuild);
     }
     Ok(outcome)
 }
