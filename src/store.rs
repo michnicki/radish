@@ -769,6 +769,28 @@ impl LocalTrackRow {
     }
 }
 
+/// Puts a release's tracks in the one order every consumer indexes by: disc
+/// (missing counts as 1), track number (missing sorts last), then
+/// case-insensitive path. Mapping pairs are positions in this order, so the
+/// loader and the accept transaction must agree on it.
+pub fn order_release_tracks(tracks: &mut [LocalTrack]) {
+    tracks.sort_by(|a, b| {
+        a.disc
+            .unwrap_or(1)
+            .cmp(&b.disc.unwrap_or(1))
+            .then(
+                a.track_number
+                    .unwrap_or(i64::MAX)
+                    .cmp(&b.track_number.unwrap_or(i64::MAX)),
+            )
+            .then_with(|| {
+                a.path
+                    .to_ascii_lowercase()
+                    .cmp(&b.path.to_ascii_lowercase())
+            })
+    });
+}
+
 fn parse_musicbrainz_problems(raw: &str) -> Vec<String> {
     serde_json::from_str(raw).unwrap_or_default()
 }
@@ -816,21 +838,7 @@ pub async fn load_local_releases(
         }
 
         let mut tracks = tracks_by_release.remove(&row.id).unwrap_or_default();
-        tracks.sort_by(|a, b| {
-            a.disc
-                .unwrap_or(1)
-                .cmp(&b.disc.unwrap_or(1))
-                .then(
-                    a.track_number
-                        .unwrap_or(i64::MAX)
-                        .cmp(&b.track_number.unwrap_or(i64::MAX)),
-                )
-                .then_with(|| {
-                    a.path
-                        .to_ascii_lowercase()
-                        .cmp(&b.path.to_ascii_lowercase())
-                })
-        });
+        order_release_tracks(&mut tracks);
 
         let embedded_evidence = EmbeddedReleaseEvidence {
             release_id: row
@@ -1023,6 +1031,31 @@ pub struct MatchGuard {
     pub accepted_match_id: Option<i64>,
 }
 
+/// The local release an acceptance decision was based on no longer looks the
+/// way it did when it was loaded: it was removed, regrouped, or its files
+/// changed. The caller should re-run matching rather than retry.
+#[derive(Debug)]
+pub struct SnapshotChanged {
+    pub local_release_id: i64,
+    pub reason: String,
+}
+
+impl std::fmt::Display for SnapshotChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for SnapshotChanged {}
+
+fn snapshot_changed(local_release_id: i64, reason: String) -> anyhow::Error {
+    SnapshotChanged {
+        local_release_id,
+        reason,
+    }
+    .into()
+}
+
 pub async fn load_match_guard(pool: &SqlitePool, local_id: i64) -> Result<MatchGuard> {
     let revision: Option<String> =
         sqlx::query_scalar("SELECT source_revision FROM local_releases WHERE id = ?1")
@@ -1030,7 +1063,10 @@ pub async fn load_match_guard(pool: &SqlitePool, local_id: i64) -> Result<MatchG
             .fetch_optional(pool)
             .await?;
     let Some(source_revision) = revision else {
-        bail!("local release {local_id} no longer exists");
+        return Err(snapshot_changed(
+            local_id,
+            format!("local release {local_id} no longer exists"),
+        ));
     };
     let accepted_match_id: Option<i64> =
         sqlx::query_scalar("SELECT id FROM release_matches WHERE local_release_id = ?1")
@@ -1220,35 +1256,26 @@ fn non_empty(value: &str) -> Option<String> {
 /// failure leaves no partial state behind.
 pub async fn accept_match(
     pool: &SqlitePool,
-    local_release_id: i64,
+    release: &LocalRelease,
     candidate: &Candidate,
     method: AcceptanceMethod,
     match_scope: MatchScope,
     guard: &MatchGuard,
 ) -> Result<()> {
-    accept_recorded_match(
-        pool,
-        local_release_id,
-        candidate,
-        method,
-        match_scope,
-        guard,
-        None,
-    )
-    .await
+    accept_recorded_match(pool, release, candidate, method, match_scope, guard, None).await
 }
 
 /// Applies an AI-supported album overlay while retaining the decision evidence.
 pub async fn accept_ai_match(
     pool: &SqlitePool,
-    local_release_id: i64,
+    release: &LocalRelease,
     candidate: &Candidate,
     guard: &MatchGuard,
     advice: &crate::clef::Advice,
 ) -> Result<()> {
     accept_recorded_match(
         pool,
-        local_release_id,
+        release,
         candidate,
         AcceptanceMethod::Automatic,
         MatchScope::Album,
@@ -1261,18 +1288,38 @@ pub async fn accept_ai_match(
 #[allow(clippy::too_many_arguments)]
 async fn accept_recorded_match(
     pool: &SqlitePool,
-    local_release_id: i64,
+    release: &LocalRelease,
     candidate: &Candidate,
     method: AcceptanceMethod,
     match_scope: MatchScope,
     guard: &MatchGuard,
     ai_advice: Option<&crate::clef::Advice>,
 ) -> Result<()> {
+    let local_release_id = release.id;
     if !candidate.mapping.complete {
         bail!("refusing to accept an incomplete track mapping");
     }
     if candidate.release.has_unsupported_entries() {
         bail!("refusing to accept a release with unsupported structure");
+    }
+    if candidate.mapping.pairs.len() != release.tracks.len() {
+        return Err(snapshot_changed(
+            local_release_id,
+            format!(
+                "local release {local_release_id} has {} tracks but the mapping covers {}",
+                release.tracks.len(),
+                candidate.mapping.pairs.len()
+            ),
+        ));
+    }
+    if guard.source_revision != release.revision {
+        return Err(snapshot_changed(
+            local_release_id,
+            format!(
+                "local release {local_release_id} changed since it was evaluated (revision {} != {})",
+                release.revision, guard.source_revision
+            ),
+        ));
     }
 
     let mut tx = begin_write(pool).await?;
@@ -1287,18 +1334,42 @@ async fn accept_recorded_match(
     .await?;
 
     let Some((current_revision, current_match_id)) = current else {
-        bail!("local release {local_release_id} no longer exists");
+        return Err(snapshot_changed(
+            local_release_id,
+            format!("local release {local_release_id} no longer exists"),
+        ));
     };
     if current_revision != guard.source_revision {
-        bail!(
-            "local release {local_release_id} changed since it was evaluated (revision {current_revision} != {})",
-            guard.source_revision
-        );
+        return Err(snapshot_changed(
+            local_release_id,
+            format!(
+                "local release {local_release_id} changed since it was evaluated (revision {current_revision} != {})",
+                guard.source_revision
+            ),
+        ));
     }
     if current_match_id != guard.accepted_match_id {
         bail!(
             "local release {local_release_id} was accepted by another decision while this one was pending"
         );
+    }
+
+    // Revisions hash tag values and paths, not track IDs. A file that was
+    // removed and re-added keeps the revision but gets a new ID, and the
+    // mapping indexes the old snapshot, so membership must match exactly.
+    let mut current_members: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM tracks WHERE local_release_id = ?1")
+            .bind(local_release_id)
+            .fetch_all(&mut *tx)
+            .await?;
+    current_members.sort_unstable();
+    let mut snapshot_members: Vec<i64> = release.tracks.iter().map(|track| track.id).collect();
+    snapshot_members.sort_unstable();
+    if current_members != snapshot_members {
+        return Err(snapshot_changed(
+            local_release_id,
+            format!("local release {local_release_id} changed membership since it was evaluated"),
+        ));
     }
 
     let mut seen_ordinals: Vec<usize> = Vec::new();
@@ -1367,10 +1438,7 @@ async fn accept_recorded_match(
     .fetch_one(&mut *tx)
     .await?;
 
-    let tracks = load_tracks_for_release(&mut tx, local_release_id).await?;
-    if tracks.len() != candidate.mapping.pairs.len() {
-        bail!("local release membership changed while accepting");
-    }
+    let tracks = &release.tracks;
     let mut ordinals: HashMap<usize, i64> = HashMap::new();
     let playable = remote.playable_tracks();
     for (ordinal, (tracklist_index, _)) in playable.iter().enumerate() {
@@ -1419,7 +1487,7 @@ async fn accept_recorded_match(
     }
 
     // Files in the group must all participate in the accepted mapping.
-    for track in &tracks {
+    for track in tracks {
         let mapped: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM release_track_matches WHERE match_id = ?1 AND track_id = ?2",
         )
@@ -1444,26 +1512,6 @@ async fn accept_recorded_match(
     tx.commit().await?;
 
     Ok(())
-}
-
-async fn load_tracks_for_release(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    local_release_id: i64,
-) -> Result<Vec<LocalTrack>> {
-    let rows = sqlx::query_as::<_, LocalTrackRow>(
-        "SELECT id, path, title, disc_number, track_number, duration_secs, local_release_id,
-                musicbrainz_ids_json
-         FROM tracks WHERE local_release_id = ?1
-         ORDER BY path",
-    )
-    .bind(local_release_id)
-    .fetch_all(&mut **tx)
-    .await?;
-
-    Ok(rows
-        .into_iter()
-        .map(LocalTrackRow::into_local_track)
-        .collect())
 }
 
 /// Removes the accepted overlay and all provider reviews, showing scanned
@@ -1991,7 +2039,7 @@ mod tests {
         let guard = load_match_guard(&pool, release.id).await.unwrap();
         accept_match(
             &pool,
-            release.id,
+            &release,
             &candidate,
             AcceptanceMethod::Automatic,
             MatchScope::Edition,
@@ -2049,7 +2097,7 @@ mod tests {
         let guard = load_match_guard(&pool, release.id).await.unwrap();
         accept_match(
             &pool,
-            release.id,
+            &release,
             &candidate,
             AcceptanceMethod::Manual,
             MatchScope::Edition,
@@ -2102,7 +2150,7 @@ mod tests {
         let old_guard = load_match_guard(&pool, release.id).await.unwrap();
         accept_match(
             &pool,
-            release.id,
+            &release,
             &first,
             AcceptanceMethod::Manual,
             MatchScope::Edition,
@@ -2113,7 +2161,7 @@ mod tests {
         assert!(
             accept_match(
                 &pool,
-                release.id,
+                &release,
                 &second,
                 AcceptanceMethod::Manual,
                 MatchScope::Edition,
@@ -2156,7 +2204,7 @@ mod tests {
 
         let error = accept_match(
             &pool,
-            release.id,
+            &release,
             &candidate,
             AcceptanceMethod::Manual,
             MatchScope::Edition,
@@ -2193,7 +2241,7 @@ mod tests {
         assert!(
             accept_match(
                 &pool,
-                release.id,
+                &release,
                 &candidate,
                 AcceptanceMethod::Manual,
                 MatchScope::Edition,
@@ -2224,7 +2272,7 @@ mod tests {
         let guard = load_match_guard(&pool, release.id).await.unwrap();
         accept_match(
             &pool,
-            release.id,
+            &release,
             &discogs,
             AcceptanceMethod::Manual,
             MatchScope::Edition,
@@ -2237,7 +2285,7 @@ mod tests {
         let musicbrainz = Candidate::new(&release, musicbrainz_release());
         accept_match(
             &pool,
-            release.id,
+            &release,
             &musicbrainz,
             AcceptanceMethod::Manual,
             MatchScope::Edition,
@@ -2284,7 +2332,7 @@ mod tests {
         let guard = load_match_guard(&pool, release.id).await.unwrap();
         accept_match(
             &pool,
-            release.id,
+            &release,
             &candidate,
             AcceptanceMethod::Manual,
             MatchScope::Edition,
@@ -2505,7 +2553,7 @@ mod tests {
         let guard = load_match_guard(&pool, release.id).await.unwrap();
         accept_match(
             &pool,
-            release.id,
+            &release,
             &candidate,
             AcceptanceMethod::Manual,
             MatchScope::Edition,
@@ -2570,5 +2618,148 @@ mod tests {
         pool_a.close().await;
         pool_b.close().await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn remote_with(titles: &[&str]) -> RemoteRelease {
+        let mut release = remote_release();
+        release.tracklist = titles
+            .iter()
+            .enumerate()
+            .map(|(index, title)| RemoteTrack {
+                position: Some((index + 1).to_string()),
+                title: title.to_string(),
+                artists: Vec::new(),
+                duration_secs: Some(180.0),
+                entry_type: TrackEntryType::Track,
+                medium_position: None,
+                track_position: None,
+                release_track_id: None,
+                recording_id: None,
+                artist_credit: None,
+            })
+            .collect();
+        release
+    }
+
+    #[tokio::test]
+    async fn accepted_overlay_follows_track_numbers_not_path_order() {
+        let pool = test_pool().await;
+        let mut intro = scanned("/music/a/Intro.flac", Some("Blue"), Some("Artist"), 1);
+        intro.title = Some("Intro".into());
+        let mut song = scanned("/music/a/Song.flac", Some("Blue"), Some("Artist"), 2);
+        song.title = Some("Song".into());
+        let mut outro = scanned("/music/a/Outro.flac", Some("Blue"), Some("Artist"), 3);
+        outro.title = Some("Outro".into());
+        insert(&pool, "/music/a", &[intro, song, outro]).await;
+        let release = load_local_releases(&pool, None).await.unwrap().remove(0);
+        let candidate = Candidate::new(&release, remote_with(&["Intro", "Song", "Outro"]));
+        let guard = load_match_guard(&pool, release.id).await.unwrap();
+        accept_match(
+            &pool,
+            &release,
+            &candidate,
+            AcceptanceMethod::Automatic,
+            MatchScope::Edition,
+            &guard,
+        )
+        .await
+        .unwrap();
+
+        let rows = list_tracks(&pool).await.unwrap();
+        for (file, title) in [("Intro", "Intro"), ("Song", "Song"), ("Outro", "Outro")] {
+            let row = rows
+                .iter()
+                .find(|row| row.path.ends_with(&format!("{file}.flac")))
+                .unwrap();
+            assert_eq!(row.title.as_deref(), Some(title), "{file}.flac");
+        }
+    }
+
+    async fn count(pool: &SqlitePool, table: &str) -> i64 {
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn acceptance_rejects_a_snapshot_whose_member_ids_changed() {
+        let pool = test_pool().await;
+        let file = scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1);
+        insert(&pool, "/music/a", std::slice::from_ref(&file)).await;
+        let release = load_local_releases(&pool, None).await.unwrap().remove(0);
+        let candidate = Candidate::new(&release, remote_release());
+        let guard = load_match_guard(&pool, release.id).await.unwrap();
+
+        // The same file is removed and re-added: same revision, new track ID.
+        remove_track_by_path(&pool, Path::new("/music/a/01.flac"))
+            .await
+            .unwrap();
+        insert(&pool, "/music/a", &[file]).await;
+        let current = load_local_releases(&pool, None).await.unwrap().remove(0);
+        assert_eq!(current.revision, release.revision);
+        assert_ne!(current.tracks[0].id, release.tracks[0].id);
+
+        let error = accept_match(
+            &pool,
+            &release,
+            &candidate,
+            AcceptanceMethod::Manual,
+            MatchScope::Edition,
+            &guard,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.downcast_ref::<SnapshotChanged>().is_some(),
+            "expected SnapshotChanged, got: {error:#}"
+        );
+        assert_eq!(count(&pool, "release_matches").await, 0);
+        assert_eq!(count(&pool, "release_track_matches").await, 0);
+    }
+
+    #[tokio::test]
+    async fn acceptance_rejects_a_snapshot_older_than_its_guard() {
+        let pool = test_pool().await;
+        insert(
+            &pool,
+            "/music/a",
+            &[scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1)],
+        )
+        .await;
+        let old = load_local_releases(&pool, None).await.unwrap().remove(0);
+        let candidate = Candidate::new(&old, remote_release());
+
+        let mut retagged = scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1);
+        retagged.title = Some("Renamed".into());
+        insert(&pool, "/music/a", &[retagged]).await;
+        // The guard is loaded after the change, but the release is the old one.
+        let guard = load_match_guard(&pool, old.id).await.unwrap();
+
+        let error = accept_match(
+            &pool,
+            &old,
+            &candidate,
+            AcceptanceMethod::Manual,
+            MatchScope::Edition,
+            &guard,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.downcast_ref::<SnapshotChanged>().is_some(),
+            "{error:#}"
+        );
+        assert_eq!(count(&pool, "release_matches").await, 0);
+    }
+
+    #[tokio::test]
+    async fn guard_for_a_missing_release_is_a_snapshot_change() {
+        let pool = test_pool().await;
+        let error = load_match_guard(&pool, 99).await.unwrap_err();
+        assert!(
+            error.downcast_ref::<SnapshotChanged>().is_some(),
+            "{error:#}"
+        );
     }
 }

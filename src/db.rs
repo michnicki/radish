@@ -265,7 +265,101 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(applied, 3);
+        assert_eq!(applied, 4);
+    }
+
+    /// A database migrated up to and including the album-matching migration.
+    async fn pool_before_store_integrity() -> SqlitePool {
+        let pool = legacy_pool().await;
+        for migration in [
+            include_str!("../migrations/20260101000000_discogs_matching.sql"),
+            include_str!("../migrations/20261111000000_musicbrainz_matching.sql"),
+            include_str!("../migrations/20261111000001_album_matching.sql"),
+        ] {
+            sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+        }
+        pool
+    }
+
+    #[tokio::test]
+    async fn migration_marks_misordered_matches_stale() {
+        let pool = pool_before_store_integrity().await;
+        let mut seed = String::from(
+            "INSERT INTO directories (id, path) VALUES (1, '/m');
+             INSERT INTO albums (id, title, artist, year) VALUES (1, 'Blue', 'Artist', 2001);",
+        );
+        // Release 1: path order differs from track order. Release 2: they agree.
+        // Release 3: a single track.
+        for (release, dir, tracks) in [
+            (1, "one", vec![(10, "A.flac", 2), (11, "B.flac", 1)]),
+            (2, "two", vec![(20, "A.flac", 1), (21, "B.flac", 2)]),
+            (3, "three", vec![(30, "A.flac", 1)]),
+        ] {
+            seed.push_str(&format!(
+                "INSERT INTO local_releases (id, directory_path, album_title_norm, source_revision, status, track_count)
+                 VALUES ({release}, '/m/{dir}', 'blue', 'rev', 'matched', {});
+                 INSERT INTO release_matches (id, local_release_id, provider, remote_release_id, release_url, score,
+                    algorithm_version, acceptance_method, source_revision, snapshot_version, metadata_json)
+                 VALUES ({release}, {release}, 'discogs', '42', 'https://example.test', 1.0, 'v', 'manual', 'rev', 2, '{{}}');",
+                tracks.len()
+            ));
+            for (id, file, number) in tracks {
+                seed.push_str(&format!(
+                    "INSERT INTO tracks (id, path, album_id, directory_id, track_number, modified_at, local_release_id)
+                     VALUES ({id}, '/m/{dir}/{file}', 1, 1, {number}, 1, {release});
+                     INSERT INTO release_track_matches (match_id, track_id, remote_ordinal, remote_title)
+                     VALUES ({release}, {id}, {number}, 'Remote {number}');"
+                ));
+            }
+        }
+        // An overlay row whose track no longer belongs to the match's release.
+        seed.push_str(
+            "INSERT INTO tracks (id, path, album_id, directory_id, track_number, modified_at, local_release_id)
+             VALUES (40, '/m/elsewhere/A.flac', 1, 1, 1, 1, NULL);
+             INSERT INTO release_track_matches (match_id, track_id, remote_ordinal, remote_title)
+             VALUES (3, 40, 9, 'Orphan');",
+        );
+        sqlx::raw_sql(sqlx::AssertSqlSafe(seed))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(include_str!(
+            "../migrations/20261112000000_store_integrity.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rows: Vec<(i64, String, bool)> = sqlx::query_as(
+            "SELECT lr.id, lr.status, m.stale
+             FROM local_releases lr JOIN release_matches m ON m.local_release_id = lr.id
+             ORDER BY lr.id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "stale".to_string(), true),
+                (2, "matched".to_string(), false),
+                (3, "matched".to_string(), false),
+            ]
+        );
+
+        let orphans: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM release_track_matches WHERE remote_title = 'Orphan'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(orphans, 0, "overlay rows for foreign tracks are removed");
+        let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_track_matches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept, 5);
     }
 
     #[tokio::test]

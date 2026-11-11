@@ -886,11 +886,11 @@ async fn accept(
     }
 
     let result = if let Some(advice) = ai_advice {
-        store::accept_ai_match(pool, release.id, candidate, guard, advice).await
+        store::accept_ai_match(pool, release, candidate, guard, advice).await
     } else {
         store::accept_match(
             pool,
-            release.id,
+            release,
             candidate,
             method,
             evaluation.match_scope,
