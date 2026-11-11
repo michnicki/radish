@@ -338,6 +338,53 @@ async fn unchanged_queued_releases_reuse_saved_advice_instead_of_paying_again() 
 }
 
 #[tokio::test]
+async fn an_edited_remote_tracklist_invalidates_saved_advice_under_the_same_ids() {
+    let db = db_path("clef-reuse-remote-edit");
+    seed(&db, false).await;
+    let edited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = edited.clone();
+    let candidate = format!("musicbrainz:{MBID}");
+    let server = MockServer::start(move |target| {
+        if target.contains("/ai/run/") {
+            return (
+                200,
+                serde_json::json!({
+                    "success": true,
+                    "result": {"model": "clef-flash", "answers": {"match": {
+                        "type": "choice", "choice": "none",
+                        "probabilities": {candidate.clone(): 0.0, "none": 1.0, "equivalent_editions": 0.0},
+                        "confidence": 1.0
+                    }}}
+                })
+                .to_string(),
+            );
+        }
+        if target.contains(&format!("/ws/2/release/{MBID}")) {
+            let durations = if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                [200.0, 201.0]
+            } else {
+                [180.0, 181.0]
+            };
+            return (
+                200,
+                musicbrainz_release_json(MBID, &["Track 1!", "Track 2!"], &durations),
+            );
+        }
+        (200, musicbrainz_empty_search())
+    });
+    let args = ["match", "--provider", "musicbrainz", "--ai-review"];
+
+    assert!(run(&db, &server, &args, true).status.success());
+    assert!(run(&db, &server, &args, true).status.success());
+    assert_eq!(server.requests_matching("/ai/run/"), 1, "identical request");
+
+    // The provider corrects durations; the IDs and the local files are unchanged.
+    edited.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(run(&db, &server, &args, true).status.success());
+    assert_eq!(server.requests_matching("/ai/run/"), 2, "edited evidence");
+}
+
+#[tokio::test]
 async fn changed_files_invalidate_saved_advice() {
     let db = db_path("clef-reuse-changed");
     seed(&db, false).await;

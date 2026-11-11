@@ -21,6 +21,10 @@ pub struct Advice {
     pub choice: AdviceChoice,
     pub probabilities: BTreeMap<String, f64>,
     pub confidence: f64,
+    /// Digest of the exact request this advice answered. Advice stored before
+    /// digests existed has none and is never reused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -60,16 +64,12 @@ impl Advice {
             })
     }
 
-    /// True when this saved advice answers the question a client with `model`
-    /// would ask now: same model, same prompt, same offered candidates.
-    pub fn answers(&self, model: &str, offered: &BTreeSet<String>) -> bool {
+    /// True when this saved advice answers exactly the request a client with
+    /// `model` would send now: same model, prompt and request content.
+    pub fn answers(&self, model: &str, request_digest: &str) -> bool {
         self.model == model
             && self.prompt_version == PROMPT_VERSION
-            && self
-                .probabilities
-                .keys()
-                .filter(|key| !matches!(key.as_str(), "none" | "equivalent_editions"))
-                .eq(offered.iter())
+            && self.request_digest.as_deref() == Some(request_digest)
     }
 
     pub fn summary(&self) -> String {
@@ -214,15 +214,16 @@ impl ClefClient {
         self.model
     }
 
-    /// Choice keys a request for these candidates would offer, computed
-    /// offline. Candidates that do not fit the request budget are left out.
-    pub fn offered_choices(
+    /// Digest of the request these candidates would produce, computed offline.
+    /// It covers the model, instructions, local evidence and every offered
+    /// candidate, so equal digests mean the same question.
+    pub fn request_digest(
         &self,
         local: &LocalRelease,
         candidates: &[ReviewCandidate<'_>],
-    ) -> Result<BTreeSet<String>, ClefError> {
+    ) -> Result<String, ClefError> {
         let prepared = prepare_request(local, candidates, MAX_REQUEST_BYTES, self.model)?;
-        Ok(prepared.choices.into_keys().collect())
+        Ok(digest(&prepared.body))
     }
 
     pub async fn advise(
@@ -232,6 +233,7 @@ impl ClefClient {
     ) -> Result<Advice, ClefError> {
         let PreparedRequest { body, choices } =
             prepare_request(local, candidates, MAX_REQUEST_BYTES, self.model)?;
+        let request_digest = digest(&body);
         let mut response = self
             .http
             .post(self.endpoint.clone())
@@ -262,8 +264,19 @@ impl ClefClient {
             }
             bytes.extend_from_slice(&chunk);
         }
-        Ok(parse_advice(&bytes, &choices, self.model)?)
+        let mut advice = parse_advice(&bytes, &choices, self.model)?;
+        advice.request_digest = Some(request_digest);
+        Ok(advice)
     }
+}
+
+/// FNV-1a over the bytes, as fixed-width hex. Stable across builds and
+/// platforms, which a `Hasher` from the standard library does not promise.
+fn digest(bytes: &[u8]) -> String {
+    let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    format!("fnv1a64:{hash:016x}")
 }
 
 struct PreparedRequest {
@@ -708,6 +721,7 @@ fn parse_advice(
         choice,
         probabilities: answer.probabilities,
         confidence: answer.confidence,
+        request_digest: None,
     })
 }
 
@@ -1298,6 +1312,7 @@ mod tests {
                 ("equivalent_editions".into(), 0.0),
             ]),
             confidence: 0.99,
+            request_digest: None,
         };
         assert!(advice.can_automate());
         advice.confidence = 0.8;
@@ -2056,29 +2071,25 @@ mod tests {
     }
 
     #[test]
-    fn saved_advice_answers_only_the_same_model_prompt_and_offered_choices() {
+    fn saved_advice_answers_only_the_same_model_prompt_and_request() {
         let advice = Advice {
             model: "clef-flash".into(),
             prompt_version: PROMPT_VERSION.into(),
             choice: AdviceChoice::NoMatch,
-            probabilities: [
-                ("discogs:1", 0.0),
-                ("none", 1.0),
-                ("equivalent_editions", 0.0),
-            ]
-            .into_iter()
-            .map(|(key, value)| (key.to_string(), value))
-            .collect(),
+            probabilities: [("none".to_string(), 1.0)].into(),
             confidence: 1.0,
+            request_digest: Some(digest(b"request")),
         };
-        let offered: BTreeSet<String> = ["discogs:1".to_string()].into();
-        assert!(advice.answers("clef-flash", &offered));
-        assert!(!advice.answers("clef", &offered));
-        assert!(!advice.answers("clef-flash", &BTreeSet::new()));
-        let more: BTreeSet<String> = ["discogs:1".to_string(), "discogs:2".to_string()].into();
-        assert!(!advice.answers("clef-flash", &more));
+        let same = digest(b"request");
+        assert!(advice.answers("clef-flash", &same));
+        assert!(!advice.answers("clef", &same));
+        assert!(!advice.answers("clef-flash", &digest(b"another request")));
         let mut old = advice.clone();
         old.prompt_version = "radish-clef-album-v2".into();
-        assert!(!old.answers("clef-flash", &offered));
+        assert!(!old.answers("clef-flash", &same));
+        // Advice saved before digests existed is never reused.
+        let mut legacy = advice;
+        legacy.request_digest = None;
+        assert!(!legacy.answers("clef-flash", &same));
     }
 }

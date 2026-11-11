@@ -882,7 +882,7 @@ async fn saved_advice(
     client: &ClefClient,
     candidates: &[ReviewCandidate<'_>],
 ) -> Result<Option<Advice>> {
-    let Ok(offered) = client.offered_choices(release, candidates) else {
+    let Ok(digest) = client.request_digest(release, candidates) else {
         return Ok(None);
     };
     for attempt in attempts {
@@ -896,7 +896,7 @@ async fn saved_advice(
             .candidates
             .into_iter()
             .filter_map(|candidate| candidate.ai_advice)
-            .find(|advice| advice.answers(client.model(), &offered));
+            .find(|advice| advice.answers(client.model(), &digest));
         if advice.is_some() {
             return Ok(advice);
         }
@@ -1853,6 +1853,7 @@ mod tests {
                     .chain([("none".into(), 0.0), ("equivalent_editions".into(), 0.0)])
                     .collect(),
                 confidence: 1.0,
+                request_digest: None,
             });
             assert!(
                 choose_ai_match(&local, std::slice::from_ref(&attempt)).is_err(),
