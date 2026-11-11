@@ -121,10 +121,32 @@ fn parse_direct(musicbrainz: Option<&str>, discogs: Option<u64>) -> Result<Optio
     }
 }
 
+/// The only keys read from `.env`. Endpoint overrides are deliberately excluded
+/// so a stray `.env` can never redirect real credentials to another host.
+const DOTENV_KEYS: [&str; 4] = [
+    "RADISH_CLOUDFLARE_ACCOUNT_ID",
+    "RADISH_CLOUDFLARE_API_TOKEN",
+    "RADISH_CLOUDFLARE_MODEL",
+    "RADISH_DISCOGS_TOKEN",
+];
+
+/// Loads allowed keys from `./.env` in the current directory only, never from a
+/// parent. Existing environment variables win; a missing or malformed file is
+/// ignored quietly.
+fn load_dotenv() {
+    if let Ok(entries) = dotenvy::from_path_iter(".env") {
+        for (key, value) in entries.flatten() {
+            if DOTENV_KEYS.contains(&key.as_str()) && std::env::var_os(&key).is_none() {
+                // SAFETY: still single-threaded; Tokio has not started.
+                unsafe { std::env::set_var(key, value) }
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
-    // Set process configuration before Tokio starts any worker threads. Existing
-    // environment variables take precedence; missing or invalid files stay quiet.
-    let _ = dotenvy::dotenv();
+    // Set process configuration before Tokio starts any worker threads.
+    load_dotenv();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?

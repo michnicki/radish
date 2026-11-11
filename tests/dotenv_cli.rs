@@ -112,9 +112,11 @@ async fn loads_fake_ai_credentials_from_working_directory_dotenv() {
     seed(&db).await;
     let server = server();
     std::fs::write(cwd.join(".env"), format!(
-        "RADISH_CLOUDFLARE_ACCOUNT_ID={FILE_ACCOUNT}\nRADISH_CLOUDFLARE_API_TOKEN={FILE_TOKEN}\nRADISH_CLOUDFLARE_BASE_URL={}\nRADISH_CLOUDFLARE_MODEL=clef\n", server.url
+        "RADISH_CLOUDFLARE_ACCOUNT_ID={FILE_ACCOUNT}\nRADISH_CLOUDFLARE_API_TOKEN={FILE_TOKEN}\nRADISH_CLOUDFLARE_MODEL=clef\n"
     )).unwrap();
+    // The base URL is not an allowed .env key, so the mock comes from the real environment.
     let output = command(&cwd, &db, &server)
+        .env("RADISH_CLOUDFLARE_BASE_URL", &server.url)
         .args(["match", "--provider", "musicbrainz", "--ai-review"])
         .output()
         .unwrap();
@@ -128,7 +130,7 @@ async fn loads_fake_ai_credentials_from_working_directory_dotenv() {
 }
 
 #[tokio::test]
-async fn finds_dotenv_in_parent_of_working_directory() {
+async fn ignores_dotenv_in_parent_of_working_directory() {
     let parent = temp_dir("dotenv-parent");
     let cwd = parent.join("nested");
     std::fs::create_dir(&cwd).unwrap();
@@ -136,13 +138,55 @@ async fn finds_dotenv_in_parent_of_working_directory() {
     seed(&db).await;
     let server = server();
     std::fs::write(parent.join(".env"), format!(
-        "RADISH_CLOUDFLARE_ACCOUNT_ID={FILE_ACCOUNT}\nRADISH_CLOUDFLARE_API_TOKEN={FILE_TOKEN}\nRADISH_CLOUDFLARE_BASE_URL={}\n", server.url
+        "RADISH_CLOUDFLARE_ACCOUNT_ID={FILE_ACCOUNT}\nRADISH_CLOUDFLARE_API_TOKEN={FILE_TOKEN}\n"
     )).unwrap();
     let output = command(&cwd, &db, &server)
+        .env("RADISH_CLOUDFLARE_BASE_URL", &server.url)
         .args(["match", "--provider", "musicbrainz", "--ai-review"])
         .output()
         .unwrap();
-    assert_reviewed(&output, &server, FILE_ACCOUNT);
+    // Without credentials the AI review cannot start, so no AI request is made.
+    let text = String::from_utf8_lossy(&output.stdout);
+    let errors = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(server.requests_matching("/ai/run/"), 0, "{text}\n{errors}");
+    assert!(!text.contains("AI advice"), "{text}");
+}
+
+#[tokio::test]
+async fn dotenv_loads_only_allowed_keys_and_ignores_endpoint_overrides() {
+    let cwd = temp_dir("dotenv-allowlist");
+    let db = cwd.join("library.db");
+    seed(&db).await;
+    let server = server();
+    // Route HTTPS through the mock: if the file's base URL were ignored, the
+    // default Cloudflare origin is contacted via this proxy and recorded here
+    // instead of reaching the network.
+    std::fs::write(cwd.join(".env"), format!(
+        "RADISH_CLOUDFLARE_ACCOUNT_ID={FILE_ACCOUNT}\nRADISH_CLOUDFLARE_API_TOKEN={FILE_TOKEN}\nRADISH_CLOUDFLARE_BASE_URL={}\nRADISH_DISCOGS_BASE_URL=https://evil.example\nRADISH_MUSICBRAINZ_BASE_URL=https://evil.example\n", server.url
+    )).unwrap();
+    let output = command(&cwd, &db, &server)
+        .env("HTTPS_PROXY", &server.url)
+        .env("https_proxy", &server.url)
+        .args(["match", "--provider", "musicbrainz", "--ai-review"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    let errors = String::from_utf8_lossy(&output.stderr);
+    // The file's endpoint override was not applied: no AI request reached the
+    // mock as an origin-form path, only a proxy tunnel to the default origin.
+    assert_eq!(server.requests_matching("/ai/run/"), 0, "{text}\n{errors}");
+    assert!(
+        server
+            .targets()
+            .iter()
+            .any(|target| target.starts_with("api.cloudflare.com")),
+        "the credential from .env was not used for the default origin: {:?}",
+        server.targets()
+    );
+    // The Discogs and MusicBrainz overrides in the file did not replace the real environment.
+    assert!(!format!("{output:?}").contains("evil.example"));
+    assert!(!text.contains(FILE_TOKEN));
+    assert!(!errors.contains(FILE_TOKEN));
 }
 
 #[tokio::test]
