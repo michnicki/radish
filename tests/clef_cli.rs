@@ -287,6 +287,12 @@ async fn a_rejected_ai_credential_disables_ai_for_the_rest_of_the_run() {
     );
     assert_eq!(server.requests_matching("/ai/run/"), 1, "{text}");
     assert!(!format!("{output:?}").contains(TOKEN));
+    // The run summary repeats it, since the first message scrolled away.
+    let summary = text.split("\nAccepted:").nth(1).unwrap();
+    assert!(
+        summary.contains("AI review was disabled during this run: AI review returned HTTP 401"),
+        "{text}"
+    );
 }
 
 #[tokio::test]

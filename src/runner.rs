@@ -42,6 +42,8 @@ pub struct MatchSummary {
     pub skipped: usize,
     pub failed: usize,
     pub dry_run: bool,
+    /// Why AI review was turned off partway through the run, if it was.
+    pub ai_disabled: Option<String>,
 }
 
 impl MatchSummary {
@@ -61,6 +63,9 @@ impl MatchSummary {
             self.skipped,
             self.failed
         );
+        if let Some(reason) = &self.ai_disabled {
+            outln!("AI review was disabled during this run: {}", Clean(reason));
+        }
     }
 }
 
@@ -70,7 +75,8 @@ impl MatchSummary {
 enum AiState {
     Unbuilt,
     Ready(ClefClient),
-    Disabled,
+    /// Off for the rest of the run, with the reason for the final summary.
+    Disabled(String),
 }
 
 impl AiState {
@@ -84,13 +90,13 @@ impl AiState {
                     outln!(
                         "  AI review disabled for this run: {error}; continuing without AI matching"
                     );
-                    Self::Disabled
+                    Self::Disabled(error.to_string())
                 }
             };
         }
         match self {
             Self::Ready(client) => Some(client),
-            Self::Unbuilt | Self::Disabled => None,
+            Self::Unbuilt | Self::Disabled(_) => None,
         }
     }
 }
@@ -467,6 +473,9 @@ where
             &guard,
         )
         .await;
+        if let AiState::Disabled(reason) = &ai {
+            summary.ai_disabled = Some(reason.clone());
+        }
 
         match outcome {
             Ok(Outcome::Accepted) => summary.accepted += 1,
@@ -903,7 +912,7 @@ async fn add_ai_advice(
         }
         Err(error) if error.disables_run() => {
             outln!("  AI review disabled for this run: {error}; continuing without AI matching");
-            *ai = AiState::Disabled;
+            *ai = AiState::Disabled(error.to_string());
         }
         Err(error) => outln!("  AI review unavailable: {error}; continuing without AI matching"),
     }
