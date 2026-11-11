@@ -298,13 +298,27 @@ impl MusicBrainzAdapter {
                 });
             }
 
-            let body = response
-                .text()
-                .await
-                .map_err(|error| ProviderError::Network {
-                    provider: ProviderKind::MusicBrainz,
-                    message: error.to_string(),
-                })?;
+            // A connection that drops mid-body is as transient as one that
+            // fails before the headers, so it gets the same retry budget.
+            let body = match response.text().await {
+                Ok(body) => body,
+                Err(error) => {
+                    if attempt >= self.config.max_attempts {
+                        self.start_cooldown(None);
+                        return Err(ProviderError::Network {
+                            provider: ProviderKind::MusicBrainz,
+                            message: if error.is_timeout() {
+                                "request timed out".to_string()
+                            } else {
+                                error.to_string()
+                            },
+                        });
+                    }
+                    tokio::time::sleep(backoff(backoff_index)).await;
+                    backoff_index += 1;
+                    continue;
+                }
+            };
 
             return serde_json::from_str(&body).map_err(|error| ProviderError::Malformed {
                 provider: ProviderKind::MusicBrainz,
@@ -1647,6 +1661,62 @@ mod tests {
         tokio::time::pause();
         expect_cooldown(adapter.search(search_request("Another album"))).await;
         assert_eq!(server.request_count(), 1);
+    }
+
+    /// Serves one truncated body (headers promise more than is sent, then the
+    /// socket closes) followed by complete responses. Returns the URL and the
+    /// attempt counter.
+    fn start_truncating_server(complete_body: String) -> (String, Arc<Mutex<usize>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind truncating server");
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(Mutex::new(0usize));
+        let counter = attempts.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let attempt = {
+                    let mut attempts = counter.lock().unwrap();
+                    *attempts += 1;
+                    *attempts
+                };
+                let payload = if attempt == 1 {
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n{\"id\":"
+                        .to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{complete_body}",
+                        complete_body.len()
+                    )
+                };
+                let _ = stream.write_all(payload.as_bytes());
+                // Dropping the stream closes it mid-body on the first attempt.
+            }
+        });
+        (format!("http://{address}"), attempts)
+    }
+
+    #[tokio::test]
+    async fn retries_failures_while_reading_the_response_body() {
+        let body = include_str!("../tests/fixtures/musicbrainz/release-single.json").to_string();
+        let (url, attempts) = start_truncating_server(body);
+        let adapter = MusicBrainzAdapter::with_config(MusicBrainzConfig {
+            base_url: Url::parse(&url).unwrap(),
+            min_interval: Duration::ZERO,
+            request_timeout: Duration::from_secs(5),
+            max_attempts: 3,
+        })
+        .unwrap();
+
+        let release = adapter.fetch_release(release_id()).await.unwrap();
+        assert_eq!(release.title, "Blue");
+        assert_eq!(*attempts.lock().unwrap(), 2);
     }
 
     #[test]
