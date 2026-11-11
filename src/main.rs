@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use radish::progress::ImportProgress;
 use radish::providers::{ProviderKind, ReleaseId};
-use radish::{db, outln, runner, scanner, store, watcher};
+use radish::{db, importer, outln, runner, store, watcher};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -336,27 +336,29 @@ async fn run_import(pool: &sqlx::SqlitePool, path: &std::path::Path) -> Result<P
     let path = path.canonicalize()?;
     outln!("Scanning {}...", path.display());
 
-    let directory_id = store::upsert_directory(pool, &path).await?;
     let progress = ImportProgress::new();
-    let tracks =
-        scanner::scan_directory_with_progress(&path, |event| progress.scan_event(event)).await?;
-    let count = tracks.len();
-
-    progress.saving(count);
-    for chunk in tracks.chunks(store::UPSERT_BATCH_SIZE) {
-        store::upsert_tracks(pool, chunk, directory_id).await?;
-        for _ in chunk {
-            progress.saved();
-        }
-    }
-
-    progress.grouping();
-    let groups = store::rebuild_local_releases(pool, Some(&path))
-        .await?
-        .groups;
+    let summary = importer::sync_directory(pool, &path, &progress).await?;
     drop(progress);
 
-    outln!("Imported {count} tracks into {groups} local release(s).");
+    outln!(
+        "Imported {} new or changed tracks ({} unchanged, {} removed) into {} local release(s).",
+        summary.saved,
+        summary.unchanged,
+        summary.removed,
+        summary.rebuild.groups
+    );
+    if summary.rebuild.dropped_matches > 0 {
+        outln!(
+            "warning: {} accepted match(es) were dropped because their files were split or removed",
+            summary.rebuild.dropped_matches
+        );
+    }
+    if summary.rebuild.newly_stale > 0 {
+        outln!(
+            "warning: {} accepted match(es) are now stale because their files changed",
+            summary.rebuild.newly_stale
+        );
+    }
     Ok(path)
 }
 

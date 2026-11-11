@@ -230,7 +230,9 @@ async fn redirected_import_keeps_warnings_without_live_progress() {
     let text = stdout(&output);
     assert!(text.starts_with("Scanning "), "{text}");
     assert!(
-        text.contains("Imported 1 tracks into 1 local release(s)."),
+        text.contains(
+            "Imported 1 new or changed tracks (0 unchanged, 0 removed) into 1 local release(s)."
+        ),
         "{text}"
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
@@ -262,7 +264,9 @@ fn redirected_empty_import_has_no_progress_output() {
 
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
-    assert!(stdout(&output).contains("Imported 0 tracks into 0 local release(s)."));
+    assert!(stdout(&output).contains(
+        "Imported 0 new or changed tracks (0 unchanged, 0 removed) into 0 local release(s)."
+    ));
 }
 
 #[tokio::test]
@@ -290,7 +294,7 @@ async fn import_is_kept_when_matching_fails() {
 
     assert!(!output.status.success(), "matching failure must be nonzero");
     let text = stdout(&output);
-    assert!(text.contains("Imported 1 tracks"), "{text}");
+    assert!(text.contains("Imported 1 new or changed tracks"), "{text}");
 
     let list = run(&db, &server, &["list"], None);
     assert!(list.status.success());
@@ -313,7 +317,7 @@ async fn default_import_requires_no_discogs_token() {
 
     assert!(output.status.success(), "{:?}", output);
     let text = stdout(&output);
-    assert!(text.contains("Imported 1 tracks"), "{text}");
+    assert!(text.contains("Imported 1 new or changed tracks"), "{text}");
     assert_eq!(server.requests_matching("/database/search"), 0);
 }
 

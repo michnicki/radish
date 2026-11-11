@@ -15,6 +15,7 @@ pub mod clef;
 pub mod db;
 pub mod discogs;
 pub mod discovery;
+pub mod importer;
 pub mod matcher;
 pub mod musicbrainz;
 pub mod output;

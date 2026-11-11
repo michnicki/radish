@@ -1,5 +1,5 @@
 use crate::progress::ImportProgress;
-use crate::{outln, scanner, store};
+use crate::{importer, outln, scanner, store};
 use anyhow::Result;
 use notify::event::{CreateKind, ModifyKind, RemoveKind};
 use notify::{EventKind, RecursiveMode, Watcher};
@@ -19,21 +19,13 @@ pub async fn watch_directory(pool: SqlitePool, root: &Path) -> Result<()> {
 
     outln!("Doing initial scan of {}...", root.display());
     let progress = ImportProgress::new();
-    let tracks =
-        scanner::scan_directory_with_progress(&root, |event| progress.scan_event(event)).await?;
-    progress.saving(tracks.len());
-    for chunk in tracks.chunks(store::UPSERT_BATCH_SIZE) {
-        store::upsert_tracks(&pool, chunk, directory_id).await?;
-        for _ in chunk {
-            progress.saved();
-        }
-    }
-    progress.grouping();
-    store::rebuild_local_releases(&pool, Some(&root)).await?;
+    let summary = importer::sync_directory(&pool, &root, &progress).await?;
     drop(progress);
     outln!(
-        "Synced {} tracks. Watching for changes... (Ctrl+C to stop)",
-        tracks.len()
+        "Synced {} tracks ({} unchanged, {} removed). Watching for changes... (Ctrl+C to stop)",
+        summary.scanned + summary.unchanged,
+        summary.unchanged,
+        summary.removed
     );
 
     let (tx, rx) = mpsc::channel();
