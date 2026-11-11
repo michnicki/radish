@@ -1,135 +1,29 @@
 //! End-to-end CLI behavior against a mock Discogs server.
 //!
-//! These tests never touch the network: the adapter's test-server override
-//! points at a local listener, and the token is a placeholder.
+//! These tests never touch the network: both provider base URLs point at local
+//! listeners, and Discogs tokens are placeholders supplied only where a test
+//! deliberately exercises the fallback or explicit Discogs mode.
 
-use radish::scanner::ScannedTrack;
+mod support;
+
+use radish::scanner::{ObservedMusicBrainzIds, ScannedTrack};
 use radish::store;
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
+use support::*;
 
-struct MockServer {
-    url: String,
-    shutdown: Arc<AtomicBool>,
-}
-
-impl MockServer {
-    fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock discogs");
-        let address = listener.local_addr().unwrap();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let flag = shutdown.clone();
-
-        thread::spawn(move || {
-            for stream in listener.incoming() {
-                if flag.load(Ordering::SeqCst) {
-                    break;
-                }
-                let Ok(mut stream) = stream else { continue };
-
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut request_line = String::new();
-                if reader.read_line(&mut request_line).is_err() {
-                    continue;
-                }
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                        break;
-                    }
-                }
-
-                let path = request_line
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap_or("/")
-                    .to_string();
-
-                let body = if path.contains("/database/search") {
-                    search_json()
-                } else if path.contains("/releases/42") {
-                    release_json()
-                } else {
-                    "{}".to_string()
-                };
-
-                let payload = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(payload.as_bytes());
-            }
-        });
-
-        Self {
-            url: format!("http://{address}"),
-            shutdown,
-        }
+fn handler(target: &str) -> (u16, String) {
+    if target.contains("/database/search") {
+        (200, discogs_search_json())
+    } else if target.contains("/releases/42") {
+        (200, discogs_release_json())
+    } else if target.contains("/ws/2/release") {
+        (200, musicbrainz_empty_search())
+    } else {
+        (404, "{}".to_string())
     }
 }
 
-impl Drop for MockServer {
-    fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-    }
-}
-
-fn search_json() -> String {
-    r#"{
-        "pagination": {"page": 1, "pages": 1, "per_page": 50, "items": 1},
-        "results": [{
-            "id": 42,
-            "type": "release",
-            "title": "Test Artist - Blue",
-            "year": "2001",
-            "country": "US",
-            "format": ["CD"],
-            "label": ["Label"],
-            "catno": "CAT-1",
-            "barcode": []
-        }]
-    }"#
-    .to_string()
-}
-
-fn release_json() -> String {
-    r#"{
-        "id": 42,
-        "title": "Blue",
-        "year": 2001,
-        "country": "US",
-        "artists": [{"id": 1, "name": "Test Artist"}],
-        "labels": [{"id": 2, "name": "Label", "catno": "CAT-1"}],
-        "formats": [{"name": "CD", "descriptions": ["Album"]}],
-        "identifiers": [],
-        "tracklist": [
-            {"position": "1", "title": "Track 1", "duration": "3:00", "type_": "track"},
-            {"position": "2", "title": "Track 2", "duration": "3:01", "type_": "track"}
-        ]
-    }"#
-    .to_string()
-}
-
-fn temp_dir(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("radish-cli-{name}-{}", std::process::id()))
-}
-
-fn db_path(name: &str) -> PathBuf {
-    let dir = temp_dir(name);
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("radish.db");
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(dir.join("radish.db-wal"));
-    let _ = std::fs::remove_file(dir.join("radish.db-shm"));
-    path
-}
-
-/// Seeds two tagged tracks so the library has one local release with two files.
 async fn seed_library(db: &Path) -> i64 {
     let pool = radish::db::connect(db).await.unwrap();
     let directory = Path::new("/music/blue");
@@ -148,6 +42,7 @@ async fn seed_library(db: &Path) -> i64 {
             barcode: None,
             catalog_number: None,
             discogs_release_id: None,
+            musicbrainz: ObservedMusicBrainzIds::default(),
             duration_secs: Some(180.0 + number as f64),
             modified_at: 1,
         };
@@ -162,26 +57,34 @@ async fn seed_library(db: &Path) -> i64 {
     release_id
 }
 
-fn run(db: &Path, server: &MockServer, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_radish"))
+fn run(db: &Path, server: &MockServer, args: &[&str], token: Option<&str>) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_radish"));
+    command
         .arg("--db")
         .arg(db)
         .args(args)
-        .env("RADISH_DISCOGS_TOKEN", "test-token")
+        .env("RADISH_MUSICBRAINZ_BASE_URL", &server.url)
         .env("RADISH_DISCOGS_BASE_URL", &server.url)
-        .stdin(Stdio::null())
-        .output()
-        .expect("run radish")
+        .stdin(Stdio::null());
+    match token {
+        Some(token) => {
+            command.env("RADISH_DISCOGS_TOKEN", token);
+        }
+        None => {
+            command.env_remove("RADISH_DISCOGS_TOKEN");
+        }
+    }
+    command.output().expect("run radish")
 }
 
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
-async fn match_row_count(db: &Path, table: &str) -> i64 {
+async fn row_count(db: &Path, table: &str) -> i64 {
     let pool = radish::db::connect(db).await.unwrap();
     let count: i64 = match table {
-        "discogs_matches" => sqlx::query_scalar("SELECT COUNT(*) FROM discogs_matches")
+        "release_matches" => sqlx::query_scalar("SELECT COUNT(*) FROM release_matches")
             .fetch_one(&pool)
             .await
             .unwrap(),
@@ -199,38 +102,50 @@ async fn match_row_count(db: &Path, table: &str) -> i64 {
 async fn noninteractive_match_queues_candidates_instead_of_accepting() {
     let db = db_path("queue");
     seed_library(&db).await;
-    let server = MockServer::start();
+    let server = MockServer::start(handler);
 
-    let output = run(&db, &server, &["match"]);
+    let output = run(
+        &db,
+        &server,
+        &["match", "--provider", "discogs"],
+        Some("test-token"),
+    );
     assert!(output.status.success(), "{:?}", output);
 
     let text = stdout(&output);
     assert!(text.contains("Queued for review"), "{text}");
-    assert_eq!(match_row_count(&db, "discogs_matches").await, 0);
-    assert_eq!(match_row_count(&db, "match_reviews").await, 1);
+    assert_eq!(row_count(&db, "release_matches").await, 0);
+    assert_eq!(row_count(&db, "match_reviews").await, 1);
+    // Explicit provider mode never contacts MusicBrainz.
+    assert_eq!(server.requests_matching("/ws/2/"), 0);
 }
 
 #[tokio::test]
 async fn dry_run_reports_without_persisting() {
     let db = db_path("dry-run");
     seed_library(&db).await;
-    let server = MockServer::start();
+    let server = MockServer::start(handler);
 
-    let output = run(&db, &server, &["match", "--dry-run"]);
+    let output = run(
+        &db,
+        &server,
+        &["match", "--dry-run", "--provider", "discogs"],
+        Some("test-token"),
+    );
     assert!(output.status.success(), "{:?}", output);
 
     let text = stdout(&output);
     assert!(text.contains("Dry run"), "{text}");
     assert!(text.contains("would"), "{text}");
-    assert_eq!(match_row_count(&db, "discogs_matches").await, 0);
-    assert_eq!(match_row_count(&db, "match_reviews").await, 0);
+    assert_eq!(row_count(&db, "release_matches").await, 0);
+    assert_eq!(row_count(&db, "match_reviews").await, 0);
 }
 
 #[tokio::test]
 async fn direct_release_selection_still_requires_review() {
     let db = db_path("direct");
     let release_id = seed_library(&db).await;
-    let server = MockServer::start();
+    let server = MockServer::start(handler);
 
     let output = run(
         &db,
@@ -242,65 +157,104 @@ async fn direct_release_selection_still_requires_review() {
             "--discogs-release",
             "42",
         ],
+        Some("test-token"),
     );
     assert!(output.status.success(), "{:?}", output);
 
     let text = stdout(&output);
     assert!(text.contains("Queued for review"), "{text}");
-    assert_eq!(match_row_count(&db, "discogs_matches").await, 0);
+    assert_eq!(row_count(&db, "release_matches").await, 0);
+    assert_eq!(server.requests_matching("/ws/2/"), 0);
+}
+
+#[tokio::test]
+async fn default_match_skips_fallback_without_a_token_and_never_contacts_discogs() {
+    let db = db_path("default-no-token");
+    seed_library(&db).await;
+    let server = MockServer::start(handler);
+
+    let output = run(&db, &server, &["match"], None);
+    assert!(output.status.success(), "{:?}", output);
+    let text = stdout(&output);
+    assert!(text.contains("Unmatched: 1"), "{text}");
+    assert!(text.contains("Discogs token is not set"), "{text}");
+    assert_eq!(server.requests_matching("/ws/2/release"), 1);
+    assert_eq!(server.requests_matching("/database/search"), 0);
+    assert_eq!(server.requests_matching("/releases/"), 0);
+}
+
+#[tokio::test]
+async fn explicit_discogs_mode_without_a_token_is_a_failure() {
+    let db = db_path("explicit-no-token");
+    seed_library(&db).await;
+    let server = MockServer::start(handler);
+
+    let output = run(&db, &server, &["match", "--provider", "discogs"], None);
+    assert!(!output.status.success());
+    assert_eq!(server.requests_matching("/database/search"), 0);
 }
 
 #[tokio::test]
 async fn import_is_kept_when_matching_fails() {
     let db = db_path("import");
-    let music = temp_dir("import").join("music");
-    std::fs::create_dir_all(&music).unwrap();
+    let music = temp_dir("import-music");
+    let file = music.join("01.wav");
+    write_wav(&file);
+    let server = MockServer::start(handler);
 
-    // A minimal PCM WAV file; no tags, but a valid audio file for the scanner.
-    let bytes: Vec<u8> = {
-        let data = [0u8; 32];
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"RIFF");
-        bytes.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(b"WAVE");
-        bytes.extend_from_slice(b"fmt ");
-        bytes.extend_from_slice(&16u32.to_le_bytes());
-        bytes.extend_from_slice(&1u16.to_le_bytes());
-        bytes.extend_from_slice(&1u16.to_le_bytes());
-        bytes.extend_from_slice(&44100u32.to_le_bytes());
-        bytes.extend_from_slice(&88200u32.to_le_bytes());
-        bytes.extend_from_slice(&2u16.to_le_bytes());
-        bytes.extend_from_slice(&16u16.to_le_bytes());
-        bytes.extend_from_slice(b"data");
-        bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&data);
-        bytes
-    };
-    std::fs::write(music.join("01.wav"), &bytes).unwrap();
-
-    // No token: matching fails before any network call, after the import.
-    let output = Command::new(env!("CARGO_BIN_EXE_radish"))
-        .arg("--db")
-        .arg(&db)
-        .arg("import")
-        .arg(&music)
-        .arg("--match")
-        .env_remove("RADISH_DISCOGS_TOKEN")
-        .stdin(Stdio::null())
-        .output()
-        .expect("run radish");
+    // Explicit Discogs mode needs a token: matching fails before any request,
+    // after the import is durable.
+    let output = run(
+        &db,
+        &server,
+        &[
+            "import",
+            &music.to_string_lossy(),
+            "--match",
+            "--provider",
+            "discogs",
+        ],
+        None,
+    );
 
     assert!(!output.status.success(), "matching failure must be nonzero");
     let text = stdout(&output);
     assert!(text.contains("Imported 1 tracks"), "{text}");
 
-    let list = Command::new(env!("CARGO_BIN_EXE_radish"))
-        .arg("--db")
-        .arg(&db)
-        .arg("list")
-        .stdin(Stdio::null())
-        .output()
-        .expect("run radish list");
+    let list = run(&db, &server, &["list"], None);
     assert!(list.status.success());
     assert!(stdout(&list).contains("1 track(s)"), "{}", stdout(&list));
+}
+
+#[tokio::test]
+async fn default_import_requires_no_discogs_token() {
+    let db = db_path("import-no-token");
+    let music = temp_dir("import-no-token-music");
+    write_wav(&music.join("01.wav"));
+    let server = MockServer::start(handler);
+
+    let output = run(
+        &db,
+        &server,
+        &["import", &music.to_string_lossy(), "--match"],
+        None,
+    );
+
+    assert!(output.status.success(), "{:?}", output);
+    let text = stdout(&output);
+    assert!(text.contains("Imported 1 tracks"), "{text}");
+    assert_eq!(server.requests_matching("/database/search"), 0);
+}
+
+#[tokio::test]
+async fn releases_reports_provider_qualified_status() {
+    let db = db_path("releases");
+    seed_library(&db).await;
+    let server = MockServer::start(handler);
+
+    let output = run(&db, &server, &["releases"], None);
+    assert!(output.status.success(), "{:?}", output);
+    let text = stdout(&output);
+    assert!(text.contains("local release(s)"), "{text}");
+    assert!(text.contains("unmatched"), "{text}");
 }
