@@ -4138,4 +4138,51 @@ mod tests {
             "c:/music/blue".to_string()
         );
     }
+
+    #[tokio::test]
+    async fn overlay_rows_of_foreign_matches_are_ignored_and_replaced_on_accept() {
+        let pool = test_pool().await;
+        let mut blue = scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1);
+        blue.title = Some("Blue One".into());
+        let mut red = scanned("/music/b/01.flac", Some("Red"), Some("Artist"), 1);
+        red.title = Some("Red One".into());
+        insert(&pool, "/music/a", &[blue]).await;
+        insert(&pool, "/music/b", &[red]).await;
+        let blue_id = accept_manually(&pool, "Blue", &["Blue Remote"]).await;
+
+        // A leftover overlay row: Red's file is tied to Blue's match.
+        sqlx::query(
+            "INSERT INTO release_track_matches (match_id, track_id, remote_ordinal, remote_title)
+             SELECT m.id, t.id, 9, 'Orphan'
+             FROM release_matches m, tracks t
+             WHERE m.local_release_id = ?1 AND t.path = '/music/b/01.flac'",
+        )
+        .bind(blue_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let listed = list_tracks(&pool).await.unwrap();
+        let red_row = listed
+            .iter()
+            .find(|r| r.path.ends_with("b/01.flac"))
+            .unwrap();
+        assert_eq!(red_row.title.as_deref(), Some("Red One"));
+        let found = search_tracks(&pool, "Orphan").await.unwrap();
+        assert!(
+            found.is_empty(),
+            "the orphan overlay must not be searchable"
+        );
+        let found = search_tracks(&pool, "Red One").await.unwrap();
+        assert_eq!(found.len(), 1);
+
+        // Accepting the track's own release replaces the leftover row.
+        accept_manually(&pool, "Red", &["Red Remote"]).await;
+        let listed = list_tracks(&pool).await.unwrap();
+        let red_row = listed
+            .iter()
+            .find(|r| r.path.ends_with("b/01.flac"))
+            .unwrap();
+        assert_eq!(red_row.title.as_deref(), Some("Red Remote"));
+    }
 }
