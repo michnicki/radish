@@ -328,3 +328,37 @@ async fn releases_reports_provider_qualified_status() {
     assert!(text.contains("local release(s)"), "{text}");
     assert!(text.contains("unmatched"), "{text}");
 }
+
+#[tokio::test]
+async fn fallback_queue_explains_its_blockers_after_a_musicbrainz_outage() {
+    let db = db_path("fallback-queue-explanation");
+    seed_library(&db).await;
+    let server = MockServer::start(|target| {
+        if target.contains("/ws/2/") {
+            return (503, "{}".into());
+        }
+        if target.contains("/releases/42") {
+            let mut release: serde_json::Value =
+                serde_json::from_str(&discogs_release_json()).unwrap();
+            for track in release["tracklist"].as_array_mut().unwrap() {
+                track.as_object_mut().unwrap().remove("duration");
+            }
+            return (200, release.to_string());
+        }
+        handler(target)
+    });
+    let output = run(&db, &server, &["match"], Some("test-token"));
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    let explanation = text
+        .lines()
+        .find(|line| line.contains("queued for review:"))
+        .unwrap();
+    assert!(explanation.contains("discogs:"), "{explanation}");
+    assert!(explanation.contains("duration"), "{explanation}");
+    assert!(explanation.contains("HTTP 503"), "{explanation}");
+    assert!(text.contains("Queued for review: 1"), "{text}");
+    assert_eq!(server.requests_matching("/ws/2/"), 3);
+    assert_eq!(row_count(&db, "release_matches").await, 0);
+    assert_eq!(row_count(&db, "match_reviews").await, 1);
+}

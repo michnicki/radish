@@ -5,6 +5,7 @@
 //! unsatisfactory MusicBrainz stage and only when a token is available. An
 //! explicit provider or direct selector uses one service and no fallback.
 
+use crate::clef::{Advice, AdviceChoice, ClefClient, ReviewCandidate};
 use crate::discogs::{AdapterError, DiscogsAdapter};
 use crate::discovery::{self, DiscoveryResult};
 use crate::matcher::{
@@ -19,6 +20,8 @@ use sqlx::SqlitePool;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
+const REVIEW_CANDIDATE_LIMIT: usize = 5;
+
 #[derive(Debug, Clone, Default)]
 pub struct MatchOptions {
     pub scope: Option<PathBuf>,
@@ -26,6 +29,7 @@ pub struct MatchOptions {
     pub direct_release: Option<ReleaseId>,
     pub review: bool,
     pub dry_run: bool,
+    pub ai_review: bool,
     pub policy: ProviderPolicy,
 }
 
@@ -106,6 +110,8 @@ pub struct ProviderAttempt {
     pub notes: Vec<String>,
     pub error: Option<ProviderError>,
     pub embedded_release_resolved: bool,
+    /// Shared model assessment, subject to separate conservative album gates.
+    pub ai_advice: Option<Advice>,
 }
 
 impl ProviderAttempt {
@@ -117,6 +123,7 @@ impl ProviderAttempt {
             notes: Vec::new(),
             error: Some(error),
             embedded_release_resolved: false,
+            ai_advice: None,
         }
     }
 
@@ -194,6 +201,7 @@ impl ProviderAttempt {
             notes: result.notes,
             error,
             embedded_release_resolved,
+            ai_advice: None,
         }
     }
 
@@ -385,7 +393,6 @@ where
             release,
             options,
             release_policy,
-            interactive,
             &mut musicbrainz_client,
             &mut discogs_client,
             &mut discogs_disabled,
@@ -435,7 +442,6 @@ async fn process_release<M, D>(
     release: &LocalRelease,
     options: &MatchOptions,
     policy: ProviderPolicy,
-    interactive: bool,
     musicbrainz_client: &mut Option<M>,
     discogs_client: &mut Option<D>,
     discogs_disabled: &mut Option<String>,
@@ -567,6 +573,7 @@ where
             AcceptanceMethod::Automatic,
             options.dry_run,
             guard,
+            None,
         )
         .await;
     }
@@ -599,12 +606,14 @@ where
                 AcceptanceMethod::Automatic,
                 options.dry_run,
                 guard,
+                None,
             )
             .await;
         }
         for conflict in &conflicts {
             outln!("  fallback conflict: {conflict}");
         }
+        attempts[1].notes.extend(conflicts);
     }
 
     let has_candidates = attempts
@@ -615,13 +624,51 @@ where
         .is_some_and(|attempt| attempt.error.is_some());
 
     if has_candidates {
+        if options.ai_review {
+            add_ai_advice(release, &mut attempts).await;
+        }
+        if !options.review
+            && direct.is_none()
+            && attempts.iter().any(|attempt| attempt.ai_advice.is_some())
+        {
+            match choose_ai_match(release, &attempts) {
+                Ok((candidate, evaluation, advice)) => {
+                    return accept(
+                        pool,
+                        release,
+                        candidate.release.provider(),
+                        &candidate,
+                        &evaluation,
+                        AcceptanceMethod::Automatic,
+                        options.dry_run,
+                        guard,
+                        Some(&advice),
+                    )
+                    .await;
+                }
+                Err(reason) => {
+                    let note = format!("AI match not applied: {reason}");
+                    outln!("  {note}");
+                    for attempt in &mut attempts {
+                        if !attempt.candidates.is_empty() {
+                            attempt.notes.push(note.clone());
+                        }
+                    }
+                }
+            }
+        }
         if options.dry_run {
             for attempt in &attempts {
                 print_decision(attempt);
             }
             return Ok(Outcome::Queued);
         }
-        if interactive {
+        if options.review {
+            // Keep paid advisory evidence even when the user skips or quits.
+            // Accepting a candidate clears these queued snapshots atomically.
+            if attempts.iter().any(|attempt| attempt.ai_advice.is_some()) {
+                queue_attempts(pool, release, &attempts, guard).await?;
+            }
             return review_attempts(
                 pool,
                 release,
@@ -657,6 +704,155 @@ where
     Ok(Outcome::Unmatched)
 }
 
+async fn add_ai_advice(release: &LocalRelease, attempts: &mut [ProviderAttempt]) {
+    let candidates: Vec<ReviewCandidate<'_>> = attempts
+        .iter()
+        .flat_map(|attempt| {
+            attempt
+                .candidates
+                .iter()
+                .zip(&attempt.evaluations)
+                .take(REVIEW_CANDIDATE_LIMIT)
+                .map(|(candidate, evaluation)| ReviewCandidate {
+                    candidate,
+                    evaluation,
+                })
+        })
+        .collect();
+
+    let result = match ClefClient::from_env() {
+        Ok(client) => client.advise(release, &candidates).await,
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(advice) => {
+            print_ai_advice(&advice);
+            let assessed = candidates
+                .iter()
+                .filter(|item| advice_assessed(&advice, item.candidate))
+                .count();
+            if assessed < candidates.len() {
+                outln!(
+                    "  AI assessed {assessed} of {} candidates with complete tracklists",
+                    candidates.len()
+                );
+            }
+            for attempt in attempts {
+                if !attempt.candidates.is_empty() {
+                    attempt.ai_advice = Some(advice.clone());
+                }
+            }
+        }
+        Err(error) => outln!("  AI review unavailable: {error}; continuing without AI matching"),
+    }
+}
+
+fn print_ai_advice(advice: &Advice) {
+    outln!("  AI advice: {}", advice.summary());
+}
+
+fn advice_assessed(advice: &Advice, candidate: &Candidate) -> bool {
+    advice.probabilities.contains_key(&format!(
+        "{}:{}",
+        candidate.release.provider(),
+        candidate.release.id.storage_id()
+    ))
+}
+
+fn choose_ai_match(
+    release: &LocalRelease,
+    attempts: &[ProviderAttempt],
+) -> Result<(Candidate, Evaluation, Advice), String> {
+    let advice = attempts
+        .iter()
+        .find_map(|attempt| attempt.ai_advice.as_ref())
+        .ok_or_else(|| "no model assessment is available".to_string())?;
+    if matches!(advice.choice, AdviceChoice::NoMatch) {
+        return Err("the model found no supported match".into());
+    }
+    if !advice.can_automate() {
+        return Err("model confidence or selected probability does not meet the automatic acceptance policy".into());
+    }
+    // The client may narrow its request to complete candidates that fit. Only
+    // actual returned option keys establish which evidence the model assessed.
+    let offered: Vec<&Candidate> = attempts
+        .iter()
+        .flat_map(|attempt| attempt.candidates.iter())
+        .filter(|candidate| advice_assessed(advice, candidate))
+        .collect();
+    let candidate = match &advice.choice {
+        AdviceChoice::Candidate { release: id } => *offered
+            .iter()
+            .find(|candidate| candidate.release.id == *id)
+            .ok_or_else(|| "the selected release was not assessed".to_string())?,
+        AdviceChoice::EquivalentEditions => {
+            let candidate = *offered
+                .first()
+                .ok_or_else(|| "no candidates were assessed".to_string())?;
+            if offered.len() < 2 {
+                return Err("equivalent editions requires at least two assessed candidates".into());
+            }
+            if !offered
+                .iter()
+                .all(|other| matcher::compatible_album_audio(candidate, other))
+            {
+                return Err("the assessed editions do not establish equivalent audio".into());
+            }
+            candidate
+        }
+        AdviceChoice::NoMatch => unreachable!(),
+    };
+    // Include candidates outside the model budget when checking ambiguity.
+    let alternatives: Vec<Candidate> = attempts
+        .iter()
+        .flat_map(|attempt| attempt.candidates.iter().cloned())
+        .collect();
+    let evaluation = matcher::evaluate_ai_album(release, candidate, &alternatives);
+    if !evaluation.auto_accept {
+        return Err(evaluation.blockers.join("; "));
+    }
+    // The model cannot supply semantic agreement for evidence it never saw.
+    if let Some(other) = alternatives.iter().find(|other| {
+        !advice_assessed(advice, other)
+            && candidate.score.album_score() - other.score.album_score()
+                <= matcher::RUNNER_UP_GAP + 1e-9
+            && !matcher::equivalent_unassessed_audio(candidate, other)
+    }) {
+        return Err(format!(
+            "unassessed close alternative {} does not establish the same album and recordings",
+            other.release.id
+        ));
+    }
+    if matches!(advice.choice, AdviceChoice::EquivalentEditions) {
+        for other in &offered {
+            let other_evaluation = matcher::evaluate_ai_album(release, other, &alternatives);
+            if !other_evaluation.auto_accept {
+                return Err(format!(
+                    "equivalent edition {}: {}",
+                    other.release.id,
+                    other_evaluation.blockers.join("; ")
+                ));
+            }
+        }
+    }
+    if candidate.release.provider() == ProviderKind::Discogs
+        && let Some(primary) = attempts
+            .iter()
+            .find(|attempt| attempt.provider == ProviderKind::MusicBrainz)
+    {
+        let conflicts = matcher::fallback_conflicts(
+            release,
+            &primary.candidates,
+            candidate,
+            primary.embedded_release_resolved,
+        );
+        if !conflicts.is_empty() {
+            return Err(conflicts.join("; "));
+        }
+    }
+    Ok((candidate.clone(), evaluation, advice.clone()))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn accept(
     pool: &SqlitePool,
@@ -667,6 +863,7 @@ async fn accept(
     method: AcceptanceMethod,
     dry_run: bool,
     guard: &MatchGuard,
+    ai_advice: Option<&Advice>,
 ) -> Result<Outcome> {
     if !evaluation.can_apply(candidate) {
         outln!(
@@ -688,16 +885,20 @@ async fn accept(
         return Ok(Outcome::Accepted);
     }
 
-    match store::accept_match(
-        pool,
-        release.id,
-        candidate,
-        method,
-        evaluation.match_scope,
-        guard,
-    )
-    .await
-    {
+    let result = if let Some(advice) = ai_advice {
+        store::accept_ai_match(pool, release.id, candidate, guard, advice).await
+    } else {
+        store::accept_match(
+            pool,
+            release.id,
+            candidate,
+            method,
+            evaluation.match_scope,
+            guard,
+        )
+        .await
+    };
+    match result {
         Ok(()) => {
             outln!(
                 "  accepted {provider} release {} (score {:.3}, {})",
@@ -707,6 +908,9 @@ async fn accept(
             );
             outln!("    {} {}", provider, candidate.release.id.storage_id());
             outln!("    {}", candidate.release.url);
+            if ai_advice.is_some() {
+                outln!("    AI-supported album match; decision evidence saved");
+            }
             if evaluation.match_scope == MatchScope::Album {
                 outln!("    album and tracks matched; exact edition unconfirmed");
             }
@@ -724,8 +928,9 @@ fn stored_candidates(attempt: &ProviderAttempt) -> Vec<StoredCandidate> {
         .candidates
         .iter()
         .zip(attempt.evaluations.iter())
-        .take(5)
-        .map(|(candidate, evaluation)| StoredCandidate {
+        .take(REVIEW_CANDIDATE_LIMIT)
+        .enumerate()
+        .map(|(index, (candidate, evaluation))| StoredCandidate {
             release: candidate.release.clone(),
             mapping: candidate.mapping.clone(),
             score: candidate.score,
@@ -734,8 +939,34 @@ fn stored_candidates(attempt: &ProviderAttempt) -> Vec<StoredCandidate> {
             blockers: evaluation.blockers.clone(),
             warnings: evaluation.warnings.clone(),
             evidence: evaluation.evidence.clone(),
+            ai_advice: (index == 0).then(|| attempt.ai_advice.clone()).flatten(),
         })
         .collect()
+}
+
+fn review_reason_summary(attempts: &[ProviderAttempt]) -> String {
+    let mut reasons = Vec::new();
+    for attempt in attempts {
+        let blockers = attempt
+            .evaluations
+            .first()
+            .into_iter()
+            .flat_map(|evaluation| &evaluation.blockers);
+        for reason in blockers.chain(&attempt.notes) {
+            let reason = format!("{}: {reason}", attempt.provider);
+            if !reasons.contains(&reason) {
+                reasons.push(reason);
+            }
+        }
+        if let Some(error) = &attempt.error {
+            reasons.push(error.to_string());
+        }
+    }
+    if reasons.is_empty() {
+        "candidate selection requires review".into()
+    } else {
+        reasons.join("; ")
+    }
 }
 
 async fn queue_attempts(
@@ -768,11 +999,7 @@ async fn queue_attempts(
         .await?;
     }
 
-    let reason = attempts
-        .first()
-        .and_then(|attempt| attempt.evaluations.first())
-        .map(|evaluation| evaluation.blockers.join("; "))
-        .unwrap_or_default();
+    let reason = review_reason_summary(attempts);
     outln!("  queued for review: {reason}");
     Ok(())
 }
@@ -812,6 +1039,13 @@ async fn review_saved_release(
         .collect();
 
     print_release_header(release);
+    if let Some(advice) = saved
+        .iter()
+        .flat_map(|review| &review.candidates)
+        .find_map(|candidate| candidate.ai_advice.as_ref())
+    {
+        print_ai_advice(advice);
+    }
     for (provider, candidates, evaluations) in &groups {
         for (index, (candidate, evaluation)) in
             candidates.iter().zip(evaluations.iter()).enumerate()
@@ -845,6 +1079,7 @@ async fn review_saved_release(
                 AcceptanceMethod::Manual,
                 false,
                 guard,
+                None,
             )
             .await
         }
@@ -914,6 +1149,7 @@ where
                 AcceptanceMethod::Manual,
                 false,
                 guard,
+                None,
             )
             .await
         }
@@ -1247,6 +1483,7 @@ fn print_decision_for(provider: ProviderKind, candidate: &Candidate, evaluation:
         notes: Vec::new(),
         error: None,
         embedded_release_resolved: false,
+        ai_advice: None,
     });
 }
 
@@ -1283,5 +1520,198 @@ mod tests {
             ProviderPolicy::Only(ProviderKind::Discogs)
         );
         assert!(resolve_policy(Some(ProviderKind::Discogs), Some(&id)).is_err());
+    }
+
+    fn ai_album_fixture() -> (LocalRelease, RemoteRelease) {
+        use crate::matcher::{
+            ArtistKind, EmbeddedReleaseEvidence, LocalTrack, RemoteTrack, TrackEntryType,
+        };
+        let local = LocalRelease {
+            id: 1,
+            directory: "/music/album".into(),
+            album_title: Some("Album".into()),
+            album_artist: Some("Artist".into()),
+            artist_kind: ArtistKind::AlbumArtist,
+            year: Some(2001),
+            barcode: None,
+            catalog_number: None,
+            embedded_discogs_id: None,
+            embedded_evidence: EmbeddedReleaseEvidence::default(),
+            is_compilation: false,
+            has_album_tag: true,
+            revision: "rev".into(),
+            tracks: (1..=12)
+                .map(|number| LocalTrack {
+                    id: number,
+                    path: format!("/music/album/{number}.flac"),
+                    title: Some(if number == 1 {
+                        "Track One".into()
+                    } else {
+                        format!("Track {number}")
+                    }),
+                    disc: None,
+                    track_number: Some(number),
+                    duration_secs: Some(180.0 + number as f64),
+                    release_track_id: None,
+                    recording_id: None,
+                    identifier_problems: vec![],
+                })
+                .collect(),
+        };
+        let remote = RemoteRelease {
+            id: ReleaseId::Discogs(42),
+            group_id: None,
+            title: "Album".into(),
+            artists: vec!["Artist".into()],
+            year: Some(2001),
+            country: None,
+            labels: vec![],
+            catalog_numbers: vec![],
+            formats: vec!["CD".into()],
+            barcodes: vec![],
+            url: "https://example.invalid/release/42".into(),
+            lookup_aliases: vec![],
+            artist_credit: None,
+            structure_issues: vec![],
+            edition_notes: vec![],
+            provider_metadata: serde_json::Value::Null,
+            tracklist: (1..=12)
+                .map(|number| RemoteTrack {
+                    position: Some(number.to_string()),
+                    title: format!("Track {number}"),
+                    artists: vec![],
+                    duration_secs: Some(180.0 + number as f64),
+                    entry_type: TrackEntryType::Track,
+                    medium_position: None,
+                    track_position: None,
+                    release_track_id: None,
+                    recording_id: None,
+                    artist_credit: None,
+                })
+                .collect(),
+        };
+        (local, remote)
+    }
+
+    #[test]
+    fn review_summary_uses_fallback_reasons_when_the_primary_failed() {
+        let (local, remote) = ai_album_fixture();
+        let primary = ProviderAttempt::failed(
+            ProviderKind::MusicBrainz,
+            ProviderError::Network {
+                provider: ProviderKind::MusicBrainz,
+                message: "HTTP 503 Service Unavailable after 3 attempts".into(),
+            },
+        );
+        let fallback = ProviderAttempt::from_discovery(
+            ProviderKind::Discogs,
+            &local,
+            DiscoveryResult {
+                releases: vec![remote],
+                ..Default::default()
+            },
+            None,
+            false,
+        );
+        let expected = fallback.evaluations[0].blockers[0].clone();
+        let reason = review_reason_summary(&[primary, fallback]);
+        assert!(reason.contains(&format!("discogs: {expected}")), "{reason}");
+        assert!(
+            reason.contains("musicbrainz request failed: HTTP 503"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn review_summary_explains_unresolved_selection_without_inventing_conflicts() {
+        let (local, mut remote) = ai_album_fixture();
+        remote.tracklist[0].title = "Track One".into();
+        let attempt = ProviderAttempt::from_discovery(
+            ProviderKind::Discogs,
+            &local,
+            DiscoveryResult {
+                releases: vec![remote],
+                ..Default::default()
+            },
+            None,
+            false,
+        );
+        assert!(attempt.evaluations[0].blockers.is_empty());
+        assert_eq!(
+            review_reason_summary(&[attempt]),
+            "candidate selection requires review"
+        );
+    }
+
+    #[test]
+    fn unoffered_close_candidates_cannot_inherit_semantic_agreement() {
+        let (local, remote) = ai_album_fixture();
+        for change_credit in [false, true] {
+            let releases = (42..=47)
+                .map(|id| {
+                    let mut release = remote.clone();
+                    release.id = ReleaseId::Discogs(id);
+                    if id == 47 {
+                        if change_credit {
+                            release.tracklist[11].artists =
+                                vec!["Entirely Different Artist".into()];
+                        } else {
+                            release.tracklist[11].title = "Entirely Different Recording".into();
+                        }
+                    }
+                    release
+                })
+                .collect();
+            let mut attempt = ProviderAttempt::from_discovery(
+                ProviderKind::Discogs,
+                &local,
+                DiscoveryResult {
+                    releases,
+                    ..Default::default()
+                },
+                None,
+                false,
+            );
+            assert_eq!(attempt.candidates[5].release.id, ReleaseId::Discogs(47));
+            attempt.ai_advice = Some(Advice {
+                model: "clef-flash".into(),
+                prompt_version: "radish-clef-album-v3".into(),
+                choice: AdviceChoice::Candidate {
+                    release: ReleaseId::Discogs(42),
+                },
+                probabilities: (42..=46)
+                    .map(|id| (format!("discogs:{id}"), if id == 42 { 1.0 } else { 0.0 }))
+                    .chain([("none".into(), 0.0), ("equivalent_editions".into(), 0.0)])
+                    .collect(),
+                confidence: 1.0,
+            });
+            assert!(
+                choose_ai_match(&local, std::slice::from_ref(&attempt)).is_err(),
+                "unassessed text/credit conflict accepted"
+            );
+            attempt.candidates.pop();
+            attempt.evaluations.pop();
+            assert!(
+                choose_ai_match(&local, std::slice::from_ref(&attempt)).is_ok(),
+                "compatible assessed editions must still be eligible"
+            );
+            // A reduced request may assess fewer than the usual five candidates.
+            // Candidates omitted to fit the request must retain the stricter
+            // unassessed-evidence check, even when they are in the first five.
+            attempt
+                .ai_advice
+                .as_mut()
+                .unwrap()
+                .probabilities
+                .retain(|key, _| {
+                    !key.starts_with("discogs:") || key == "discogs:42" || key == "discogs:43"
+                });
+            attempt.candidates[3].release.tracklist[11].artists =
+                vec!["Entirely Different Artist".into()];
+            assert!(
+                choose_ai_match(&local, &[attempt]).is_err(),
+                "budget-omitted candidates cannot inherit semantic agreement"
+            );
+        }
     }
 }

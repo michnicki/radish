@@ -11,6 +11,7 @@
 //! - [`store`]: grouping, revisions, review queue, and transactional overlay.
 //! - [`runner`]: CLI orchestration and the interactive review screen.
 
+pub mod clef;
 pub mod db;
 pub mod discogs;
 pub mod discovery;

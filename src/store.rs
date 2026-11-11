@@ -994,6 +994,9 @@ pub struct StoredCandidate {
     pub blockers: Vec<String>,
     pub warnings: Vec<String>,
     pub evidence: Vec<String>,
+    /// Optional advisory evidence, independent of deterministic acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_advice: Option<crate::clef::Advice>,
 }
 
 /// Immutable inputs an acceptance decision was based on. Reloading them inside
@@ -1177,6 +1180,7 @@ pub fn decode_stored_candidates(
                     blockers: candidate.blockers,
                     warnings: candidate.warnings,
                     evidence: candidate.evidence,
+                    ai_advice: None,
                 })
                 .collect())
         }
@@ -1205,6 +1209,48 @@ pub async fn accept_match(
     method: AcceptanceMethod,
     match_scope: MatchScope,
     guard: &MatchGuard,
+) -> Result<()> {
+    accept_recorded_match(
+        pool,
+        local_release_id,
+        candidate,
+        method,
+        match_scope,
+        guard,
+        None,
+    )
+    .await
+}
+
+/// Applies an AI-supported album overlay while retaining the decision evidence.
+pub async fn accept_ai_match(
+    pool: &SqlitePool,
+    local_release_id: i64,
+    candidate: &Candidate,
+    guard: &MatchGuard,
+    advice: &crate::clef::Advice,
+) -> Result<()> {
+    accept_recorded_match(
+        pool,
+        local_release_id,
+        candidate,
+        AcceptanceMethod::Automatic,
+        MatchScope::Album,
+        guard,
+        Some(advice),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn accept_recorded_match(
+    pool: &SqlitePool,
+    local_release_id: i64,
+    candidate: &Candidate,
+    method: AcceptanceMethod,
+    match_scope: MatchScope,
+    guard: &MatchGuard,
+    ai_advice: Option<&crate::clef::Advice>,
 ) -> Result<()> {
     if !candidate.mapping.complete {
         bail!("refusing to accept an incomplete track mapping");
@@ -1252,7 +1298,16 @@ pub async fn accept_match(
     let remote = &candidate.release;
     let edition = (match_scope == MatchScope::Edition).then_some(remote);
     let provider = remote.provider();
-    let metadata_json = serde_json::to_string(remote)?;
+    let mut metadata = serde_json::to_value(remote)?;
+    let algorithm_version = if let Some(advice) = ai_advice {
+        metadata["radish_ai_decision"] = serde_json::json!({
+            "policy_version": "clef-album-v1", "advice": advice,
+        });
+        format!("{provider}-clef-album-v1")
+    } else {
+        matcher::algorithm_version(provider).to_string()
+    };
+    let metadata_json = serde_json::to_string(&metadata)?;
 
     sqlx::query("DELETE FROM release_matches WHERE local_release_id = ?1")
         .bind(local_release_id)
@@ -1287,7 +1342,7 @@ pub async fn accept_match(
     .bind(edition.and_then(RemoteRelease::format_display))
     .bind(edition.and_then(|release| release.barcodes.first()))
     .bind(match_scope.score(&candidate.score))
-    .bind(matcher::algorithm_version(provider))
+    .bind(&algorithm_version)
     .bind(method.as_str())
     .bind(&guard.source_revision)
     .bind(SNAPSHOT_VERSION)
@@ -2245,6 +2300,7 @@ mod tests {
             blockers: vec!["review".to_string()],
             warnings: Vec::new(),
             evidence: Vec::new(),
+            ai_advice: None,
         };
 
         queue_review(

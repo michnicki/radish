@@ -32,6 +32,13 @@ enum Command {
         /// Restrict matching to one service and disable fallback
         #[arg(long, value_name = "PROVIDER", requires = "match_releases")]
         provider: Option<ProviderKind>,
+        /// Automatically resolve strongly supported album matches with Clef
+        #[arg(
+            long = "ai-match",
+            visible_alias = "ai-review",
+            requires = "match_releases"
+        )]
+        ai_review: bool,
     },
     /// Watch a music directory and keep the library in sync in real time
     Watch { path: PathBuf },
@@ -77,6 +84,9 @@ enum Command {
         /// Search and show decisions without storing matches
         #[arg(long = "dry-run")]
         dry_run: bool,
+        /// Automatically resolve strongly supported album matches with Clef
+        #[arg(long = "ai-match", visible_alias = "ai-review")]
+        ai_review: bool,
         /// Remove the accepted match for a local release
         #[arg(
             long,
@@ -88,7 +98,8 @@ enum Command {
                 "musicbrainz_release",
                 "discogs_release",
                 "review",
-                "dry_run"
+                "dry_run",
+                "ai_review"
             ]
         )]
         clear: Option<i64>,
@@ -109,8 +120,17 @@ fn parse_direct(musicbrainz: Option<&str>, discogs: Option<u64>) -> Result<Optio
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Set process configuration before Tokio starts any worker threads. Existing
+    // environment variables take precedence; missing or invalid files stay quiet.
+    let _ = dotenvy::dotenv();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // CLI validation happens before the database is opened or any client is
@@ -141,6 +161,7 @@ async fn main() -> Result<()> {
             path,
             match_releases,
             provider: _,
+            ai_review,
         } => {
             let canonical = run_import(&pool, &path).await?;
             if match_releases {
@@ -149,6 +170,7 @@ async fn main() -> Result<()> {
                     runner::MatchOptions {
                         scope: Some(canonical),
                         policy: policy.unwrap_or_default(),
+                        ai_review,
                         ..runner::MatchOptions::default()
                     },
                 )
@@ -177,6 +199,7 @@ async fn main() -> Result<()> {
             discogs_release: _,
             review,
             dry_run,
+            ai_review,
             clear,
         } => {
             if let Some(id) = clear {
@@ -195,6 +218,7 @@ async fn main() -> Result<()> {
                         direct_release: direct,
                         review,
                         dry_run,
+                        ai_review,
                         policy: policy.unwrap_or_default(),
                     },
                 )
@@ -353,6 +377,17 @@ mod tests {
     fn import_provider_requires_match() {
         assert!(parse(&["import", "/music", "--provider", "discogs"]).is_err());
         assert!(parse(&["import", "/music", "--match", "--provider", "discogs"]).is_ok());
+    }
+
+    #[test]
+    fn ai_review_is_explicit_and_requires_matching() {
+        assert!(parse(&["match", "--ai-match"]).is_ok());
+        assert!(parse(&["match", "--ai-review"]).is_ok());
+        assert!(parse(&["match", "--clear", "3", "--ai-match"]).is_err());
+        assert!(parse(&["match", "--clear", "3", "--ai-review"]).is_err());
+        assert!(parse(&["import", "/music", "--ai-review"]).is_err());
+        assert!(parse(&["import", "/music", "--match", "--ai-review"]).is_ok());
+        assert!(parse(&["import", "/music", "--match", "--ai-match"]).is_ok());
     }
 
     #[test]

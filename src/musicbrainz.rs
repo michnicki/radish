@@ -36,6 +36,8 @@ pub const RELEASE_URL_PREFIX: &str = "https://musicbrainz.org/release/";
 
 /// A suggested wait longer than this is reported instead of slept.
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(120);
+/// Stop restarting retry budgets for other releases while the service is down.
+const OUTAGE_COOLDOWN: Duration = Duration::from_secs(60);
 const BACKOFF_START_SECS: u64 = 2;
 const INCLUDES: &str = "recordings+artist-credits+release-groups+labels";
 
@@ -63,6 +65,8 @@ pub struct MusicBrainzAdapter {
     config: MusicBrainzConfig,
     /// Monotonic next-slot bookkeeping shared by every actual attempt.
     scheduler: Mutex<Option<Instant>>,
+    /// Shared by searches and lookups; successful cache reads bypass this gate.
+    cooldown_until: Mutex<Option<tokio::time::Instant>>,
     release_cache: Mutex<HashMap<Mbid, RemoteRelease>>,
     search_cache: Mutex<HashMap<String, SearchPage>>,
 }
@@ -93,6 +97,7 @@ impl MusicBrainzAdapter {
             client,
             config,
             scheduler: Mutex::new(None),
+            cooldown_until: Mutex::new(None),
             release_cache: Mutex::new(HashMap::new()),
             search_cache: Mutex::new(HashMap::new()),
         })
@@ -128,6 +133,35 @@ impl MusicBrainzAdapter {
         }
     }
 
+    fn start_cooldown(&self, retry_after: Option<Duration>) {
+        let delay = retry_after
+            .unwrap_or_default()
+            .max(OUTAGE_COOLDOWN)
+            .min(MAX_RETRY_WAIT);
+        let deadline = tokio::time::Instant::now() + delay;
+        let mut until = lock(&self.cooldown_until);
+        *until = Some(until.map_or(deadline, |previous| previous.max(deadline)));
+    }
+
+    fn check_cooldown(&self) -> Result<(), ProviderError> {
+        let mut until = lock(&self.cooldown_until);
+        let Some(deadline) = *until else {
+            return Ok(());
+        };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            *until = None;
+            return Ok(());
+        }
+        let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0);
+        Err(ProviderError::Network {
+            provider: ProviderKind::MusicBrainz,
+            message: format!(
+                "temporarily unavailable after transient failures; retry in {seconds}s"
+            ),
+        })
+    }
+
     fn is_allowed_redirect(&self, url: &Url) -> bool {
         url.scheme() == self.config.base_url.scheme()
             && url.host_str() == self.config.base_url.host_str()
@@ -140,8 +174,11 @@ impl MusicBrainzAdapter {
         let mut backoff_index = 0u32;
 
         loop {
+            self.check_cooldown()?;
             attempt += 1;
             self.schedule().await;
+            // Another request can exhaust its retries while this one waits.
+            self.check_cooldown()?;
 
             let response = self
                 .client
@@ -155,6 +192,9 @@ impl MusicBrainzAdapter {
                 Ok(response) => response,
                 Err(error) => {
                     if attempt >= self.config.max_attempts {
+                        if !error.is_builder() {
+                            self.start_cooldown(None);
+                        }
                         return Err(ProviderError::Network {
                             provider: ProviderKind::MusicBrainz,
                             message: if error.is_timeout() {
@@ -216,6 +256,7 @@ impl MusicBrainzAdapter {
                 let retry_after = parse_retry_after(response.headers());
                 let delay = retry_after.unwrap_or_default().max(backoff(backoff_index));
                 if delay > MAX_RETRY_WAIT {
+                    self.start_cooldown(retry_after);
                     return Err(ProviderError::RateLimited {
                         provider: ProviderKind::MusicBrainz,
                         message: "the service asked for a longer wait than Radish allows"
@@ -224,6 +265,7 @@ impl MusicBrainzAdapter {
                     });
                 }
                 if attempt >= self.config.max_attempts {
+                    self.start_cooldown(retry_after);
                     return Err(ProviderError::Network {
                         provider: ProviderKind::MusicBrainz,
                         message: format!(
@@ -1025,6 +1067,34 @@ mod tests {
         ReleaseId::MusicBrainz("76df3287-6cda-33eb-8e9a-044b5e15ffdd".parse().unwrap())
     }
 
+    fn search_request(title: &str) -> SearchRequest {
+        SearchRequest {
+            strategy: SearchStrategy::TitleArtist {
+                title: title.to_string(),
+                artist: None,
+                release_group: None,
+            },
+            offset: 0,
+            limit: 50,
+        }
+    }
+
+    async fn expect_cooldown<T: std::fmt::Debug>(
+        request: impl std::future::Future<Output = Result<T, ProviderError>>,
+    ) {
+        let before = tokio::time::Instant::now();
+        let error = tokio::time::timeout(Duration::from_millis(1), request)
+            .await
+            .expect("cooldown must return immediately")
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::Network { .. }), "{error}");
+        assert!(
+            error.to_string().contains("temporarily unavailable"),
+            "{error}"
+        );
+        assert_eq!(tokio::time::Instant::now(), before);
+    }
+
     #[test]
     fn literal_queries_do_not_treat_titles_as_query_operators() {
         assert_eq!(literal_field("release", "Blue"), "release:\"Blue\"");
@@ -1282,6 +1352,230 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exhausted_outage_skips_uncached_requests_until_cooldown_expires() {
+        let attempts = Arc::new(Mutex::new(0usize));
+        let counter = attempts.clone();
+        let body = fixture().to_string();
+        let server = MockServer::start(move |_| {
+            let mut attempts = counter.lock().unwrap();
+            *attempts += 1;
+            if *attempts <= 3 {
+                (503, Vec::new(), "{}".to_string())
+            } else {
+                (200, Vec::new(), body.clone())
+            }
+        });
+        let adapter = MusicBrainzAdapter::with_config(config(&server)).unwrap();
+
+        let error = adapter.fetch_release(release_id()).await.unwrap_err();
+        assert!(error.to_string().contains("after 3 attempts"), "{error}");
+        assert_eq!(server.request_count(), 3);
+
+        tokio::time::pause();
+        expect_cooldown(adapter.search(search_request("Another album"))).await;
+        let other = ReleaseId::MusicBrainz("99999999-9999-4999-8999-999999999999".parse().unwrap());
+        expect_cooldown(adapter.fetch_release(other)).await;
+        tokio::time::advance(Duration::from_secs(59)).await;
+        expect_cooldown(adapter.fetch_release(release_id())).await;
+        assert_eq!(server.request_count(), 3);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::resume();
+        assert_eq!(
+            adapter.fetch_release(release_id()).await.unwrap().title,
+            "Blue"
+        );
+        assert_eq!(server.request_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn exhausted_rate_limits_and_server_errors_honor_retry_after_during_cooldown() {
+        for status in [429, 500] {
+            let failed = Arc::new(AtomicBool::new(false));
+            let flag = failed.clone();
+            let body = fixture().to_string();
+            let server = MockServer::start(move |_| {
+                if !flag.swap(true, Ordering::SeqCst) {
+                    (
+                        status,
+                        vec![("Retry-After".to_string(), "90".to_string())],
+                        "{}".to_string(),
+                    )
+                } else {
+                    (200, Vec::new(), body.clone())
+                }
+            });
+            let adapter = MusicBrainzAdapter::with_config(MusicBrainzConfig {
+                max_attempts: 1,
+                ..config(&server)
+            })
+            .unwrap();
+
+            let error = adapter.fetch_release(release_id()).await.unwrap_err();
+            assert!(matches!(error, ProviderError::Network { .. }), "{error}");
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(89)).await;
+            expect_cooldown(adapter.fetch_release(release_id())).await;
+            assert_eq!(server.request_count(), 1);
+
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::time::resume();
+            adapter.fetch_release(release_id()).await.unwrap();
+            assert_eq!(server.request_count(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_retry_after_starts_capped_cooldown_without_sleeping() {
+        let future_date =
+            httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(600));
+        for (status, retry_after, minimum_delay) in [
+            (429, "121".to_string(), Duration::from_secs(121)),
+            (503, "600".to_string(), Duration::from_secs(600)),
+            (503, future_date, Duration::from_secs(598)),
+        ] {
+            let failed = Arc::new(AtomicBool::new(false));
+            let flag = failed.clone();
+            let body = fixture().to_string();
+            let server = MockServer::start(move |_| {
+                if !flag.swap(true, Ordering::SeqCst) {
+                    (
+                        status,
+                        vec![("Retry-After".to_string(), retry_after.clone())],
+                        "{}".to_string(),
+                    )
+                } else {
+                    (200, Vec::new(), body.clone())
+                }
+            });
+            let adapter = MusicBrainzAdapter::with_config(config(&server)).unwrap();
+
+            let error =
+                tokio::time::timeout(Duration::from_secs(1), adapter.fetch_release(release_id()))
+                    .await
+                    .expect("oversized Retry-After must be reported without sleeping")
+                    .unwrap_err();
+            match error {
+                ProviderError::RateLimited {
+                    retry_after: Some(delay),
+                    ..
+                } => assert!(delay >= minimum_delay),
+                other => panic!("expected the original rate-limit error, got {other}"),
+            }
+            assert_eq!(server.request_count(), 1);
+
+            tokio::time::pause();
+            expect_cooldown(adapter.search(search_request("Another album"))).await;
+            tokio::time::advance(Duration::from_secs(119)).await;
+            expect_cooldown(adapter.fetch_release(release_id())).await;
+            assert_eq!(server.request_count(), 1);
+
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::time::resume();
+            adapter.fetch_release(release_id()).await.unwrap();
+            assert_eq!(server.request_count(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_searches_and_documents_remain_cached_during_outages() {
+        let unavailable = Arc::new(AtomicBool::new(false));
+        let flag = unavailable.clone();
+        let body = fixture().to_string();
+        let server = MockServer::start(move |target| {
+            if flag.load(Ordering::SeqCst) {
+                (503, Vec::new(), "{}".to_string())
+            } else if target.starts_with("/ws/2/release?") {
+                (
+                    200,
+                    Vec::new(),
+                    json!({"count": 1, "releases": [fixture()]}).to_string(),
+                )
+            } else {
+                (200, Vec::new(), body.clone())
+            }
+        });
+        let adapter = MusicBrainzAdapter::with_config(MusicBrainzConfig {
+            max_attempts: 1,
+            ..config(&server)
+        })
+        .unwrap();
+        adapter.fetch_release(release_id()).await.unwrap();
+        adapter.search(search_request("Blue")).await.unwrap();
+        unavailable.store(true, Ordering::SeqCst);
+        assert!(adapter.search(search_request("Uncached")).await.is_err());
+        assert_eq!(server.request_count(), 3);
+
+        tokio::time::pause();
+        expect_cooldown(adapter.search(search_request("Uncached"))).await;
+        assert_eq!(
+            adapter.fetch_release(release_id()).await.unwrap().title,
+            "Blue"
+        );
+        let page = adapter.search(search_request("Blue")).await.unwrap();
+        assert_eq!(page.hits.len(), 1);
+        assert_eq!(page.hits[0].id, release_id());
+        assert_eq!(server.request_count(), 3);
+
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::resume();
+        unavailable.store(false, Ordering::SeqCst);
+        assert_eq!(
+            adapter
+                .search(search_request("Uncached"))
+                .await
+                .unwrap()
+                .hits
+                .len(),
+            1
+        );
+        assert_eq!(server.request_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn missing_permanent_malformed_and_redirect_errors_do_not_start_outage_cooldown() {
+        for (status, body, headers) in [
+            (404, "{}", Vec::new()),
+            (400, "{}", Vec::new()),
+            (401, "{}", Vec::new()),
+            (403, "{}", Vec::new()),
+            (200, "not json", Vec::new()),
+            (200, "{}", Vec::new()),
+            (
+                302,
+                "",
+                vec![(
+                    "Location".to_string(),
+                    format!("/ws/2/release/{}", release_id().storage_id()),
+                )],
+            ),
+        ] {
+            let failed = Arc::new(AtomicBool::new(false));
+            let flag = failed.clone();
+            let success = fixture().to_string();
+            let server = MockServer::start(move |_| {
+                if !flag.swap(true, Ordering::SeqCst) {
+                    (status, headers.clone(), body.to_string())
+                } else {
+                    (200, Vec::new(), success.clone())
+                }
+            });
+            let adapter = MusicBrainzAdapter::with_config(MusicBrainzConfig {
+                max_attempts: 1,
+                ..config(&server)
+            })
+            .unwrap();
+
+            assert!(adapter.fetch_release(release_id()).await.is_err());
+            assert_eq!(
+                adapter.fetch_release(release_id()).await.unwrap().title,
+                "Blue"
+            );
+            assert_eq!(server.request_count(), 2);
+        }
+    }
+
+    #[tokio::test]
     async fn follows_same_service_redirects_and_retains_aliases() {
         let requested = "76df3287-6cda-33eb-8e9a-044b5e15ffdd";
         let canonical = "12121212-1212-4212-8212-121212121212";
@@ -1369,6 +1663,9 @@ mod tests {
 
         let error = adapter.fetch_release(release_id()).await.unwrap_err();
         assert!(matches!(error, ProviderError::Network { .. }), "{error}");
+        assert_eq!(server.request_count(), 1);
+        tokio::time::pause();
+        expect_cooldown(adapter.search(search_request("Another album"))).await;
         assert_eq!(server.request_count(), 1);
     }
 

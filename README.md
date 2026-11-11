@@ -12,7 +12,7 @@ A compiled CLI for music library management. Radish reads the tags in your audio
 - **Reads tags in parallel** — uses Tokio's blocking thread pool to parse files with [Lofty](https://github.com/Serial-ATA/lofty-rs).
 - **Searches locally** — queries stored titles, artists, and albums without rescanning your files.
 - **Watches for changes** — uses filesystem events to refresh tags and remove deleted file entries while running.
-- **Matches MusicBrainz first (opt-in)** — compares complete tracklists and automatically matches strongly supported albums and tracks, even when the exact pressing is unknown. Conflicting results get interactive review. Discogs runs once as a fallback only when MusicBrainz cannot settle the match and a token is available.
+- **Matches MusicBrainz first (opt-in)** — compares complete tracklists and automatically matches strongly supported albums and tracks, even when the exact pressing is unknown. Uncertain results are queued; `--review` opens interactive review. Discogs runs once as a fallback only when MusicBrainz cannot settle the match and a token is available.
 - **Stores everything in SQLite** — runs as a compiled executable without a separate database server or Python environment.
 
 Supported file extensions: `mp3`, `flac`, `m4a`, `ogg`, `opus`, `wav`, `aac`, and `wma`. Extension checks ignore case, so `.FLAC` is accepted too. Files must also be readable by Lofty.
@@ -195,9 +195,57 @@ Everything else is queued or reviewed. In review you may override score or ident
 
 ### Review
 
-Reviews are queued per provider, MusicBrainz first. Without a terminal, unresolved groups are stored and summary output explains why. With `--review`, the screen shows the policy, each provider's stage notes and errors, release ID and URL, exact credit, edition date/country/labels/catalog numbers, media/format/status/disambiguation, score breakdown, evidence, contradictions, mapping, and the current source when replacing an overlay.
+Normal matching never prompts, including in an interactive terminal. Unresolved groups are queued per provider, MusicBrainz first, and summary output explains why. With `--review`, the screen shows the policy, each provider's stage notes and errors, release ID and URL, exact credit, edition date/country/labels/catalog numbers, media/format/status/disambiguation, score breakdown, evidence, contradictions, mapping, and the current source when replacing an overlay.
 
 Actions are: accept a candidate, choose another provider group, enter a release ID (with a provider choice in default mode), skip, or quit. Saved queues are reviewed offline without fetching missing provider groups; an entered ID may use an existing lazily-created client. A saved proposal whose revision or accepted-match guard changed can no longer be applied. Acceptance, replacement, and clearing each update the overlay, mappings, status, and reviews in one transaction.
+
+### Optional automatic AI matching with Clef
+
+Use Cloudflare's [Clef](https://developers.cloudflare.com/workers-ai/models/clef/) or [Clef Flash](https://developers.cloudflare.com/workers-ai/models/clef-flash/) to resolve strongly supported album matches that ordinary text comparison leaves uncertain. Configure your Cloudflare account ID and an API token with Workers AI access. Radish loads `.env` from the current directory or its nearest parent; exported environment variables take precedence. For example, put these keys in `target/release/.env` when running the binary from that directory, or export them:
+
+```bash
+export RADISH_CLOUDFLARE_ACCOUNT_ID="your-account-id"
+export RADISH_CLOUDFLARE_API_TOKEN="your-api-token"
+export RADISH_CLOUDFLARE_MODEL="clef" # Optional: clef or clef-flash (default)
+
+radish match --ai-match
+radish match --local-release 12 --ai-match --dry-run
+radish import ~/Music --match --ai-match
+
+# Explicit human review remains available, including saved reviews offline
+radish match --review
+```
+
+`--ai-review` remains an alias for `--ai-match`. **Behavior changed:** AI recommendations can now accept a strongly supported album automatically. Ordinary matching never asks for confirmation; uncertain cases stay queued until you explicitly run `--review`. Combining `--review` with `--ai-match` keeps decisions manual. Direct release selectors also remain review-only.
+
+Clef considers up to five candidates from each attempted provider. Requests share repeated metadata and use compact track tables. If the full set is still too large, it selects fewer complete candidates, prioritizing supported mappings and stronger album scores while retaining provider coverage where possible. Output reports when fewer candidates were assessed. It may recommend a provider-qualified release, no match, or equivalent editions. An automatic AI match requires all of these checks:
+
+- At least `0.98` probability for the selected option and `0.95` reported model confidence, using the current album-matching prompt.
+- An album score of at least `0.85`, with album title, artist, and every mapped track title each at least `0.50` similar. These lower text floors allow semantic agreement to resolve spelling, numeric-word, and credit-formatting differences; unrelated metadata stays blocked.
+- A nonempty local album title and artist, a title and finite positive duration for every track on both sides, complete unambiguous one-to-one mapping, and durations within three seconds.
+- No unsupported structures or observed identifier, barcode, catalog-number, recording, release-group, or edition-qualifier conflicts. Every close or higher-scoring alternative must have compatible known audio, including alternatives outside the model's request budget. Existing cross-provider fallback checks still apply.
+
+For close alternatives outside the AI request, matching durations alone are insufficient: every mapped track needs matching normalized titles and credits or a shared recording ID. Track-version qualifiers must agree even when recording IDs match.
+
+Equivalent editions can match automatically when every offered candidate passes the album checks and describes compatible audio. AI establishes an **album match**, never an exact pressing. Edition-specific fields stay absent from the overlay. For example:
+
+```text
+  AI advice: clef-flash: recommend musicbrainz 76df3287-6cda-33eb-8e9a-044b5e15ffdd (99% model confidence)
+  accepted musicbrainz release 76df3287-6cda-33eb-8e9a-044b5e15ffdd (score 0.877, automatic)
+    AI-supported album match; decision evidence saved
+    album and tracks matched; exact edition unconfirmed
+
+Accepted: 1
+Queued for review: 0
+```
+
+When an AI recommendation cannot be applied, output and the saved queue explain the failed acceptance checks. Model confidence is an uncalibrated signal, not a measured success rate; the thresholds above are conservative heuristics rather than an accuracy guarantee. Scores retain their original text/duration values. Accepted AI matches store a distinct algorithm version (`musicbrainz-clef-album-v1` or `discogs-clef-album-v1`) and the model, prompt version, choice, probabilities, and confidence in the accepted snapshot. Scanned tags and audio remain unchanged. Use `radish match --clear ID` to remove an accepted overlay.
+
+Unresolved recommendations are saved with the queue. `radish match --review` displays them offline without Cloudflare credentials; saved reviews stay offline even with `--ai-match`. Run normal matching with `--ai-match` to refresh an unresolved assessment. Old advisory prompt results are never reused for automatic acceptance.
+
+AI matching sends album and artist tags, track titles and durations, observed identifiers, candidate metadata and tracklists, and mapping/check diagnostics to Cloudflare. Audio and local file paths are excluded. Each request stays within a conservative 16,000-byte application budget. Complete tracklists and mapping evidence are retained for every assessed candidate; omitted candidates remain subject to ambiguity checks. If even one complete candidate cannot fit, output reports its measured size and AI matching is skipped. Cloudflare usage is billed to your account; see its current model pricing.
+
+Cloudflare is contacted only with `--ai-match` (or its alias), after normal matching cannot settle a release and candidates exist. Settled matches make no AI request. Missing credentials, oversized evidence, timeouts, service errors, invalid responses, and low-confidence answers preserve the normal review queue without opening a prompt. A dry run may incur Cloudflare usage but saves no recommendation or match. Plain import, watch, list, search, releases, and clear remain unchanged.
 
 ### Overlay, staleness, and clearing
 
@@ -215,7 +263,7 @@ Actions are: accept a candidate, choose another provider group, enter a release 
 - **Edition twins:** equivalent editions may be accepted as an album match, but their exact pressing stays unconfirmed. Conflicting recordings or tracklists still require review.
 - **Incomplete editions:** a single disc from a larger set, pregaps, data/video tracks, and unsupported media produce suggestions only.
 - **MusicBrainz MBIDs:** only hyphenated non-nil UUIDs are accepted. Nil IDs and compact 32-character forms are rejected everywhere, including stored snapshots.
-- **Rate limits and retries:** MusicBrainz attempts share a scheduler with at least 1.1 seconds between starts, including redirect hops. Every attempt has a 30-second timeout and a logical request gets at most three actual attempts. Transport failures, 429, and 5xx retry with 2s/4s backoff and honor both `Retry-After` forms; a suggested wait above 120 seconds is reported instead of slept. Discogs keeps its own existing spacing and retries.
+- **Rate limits and retries:** MusicBrainz attempts share a scheduler with at least 1.1 seconds between starts, including redirect hops. Every attempt has a 30-second timeout and a logical request gets at most three actual attempts. Transport failures, 429, and 5xx retry with 2s/4s backoff and honor both `Retry-After` forms; a suggested wait above 120 seconds is reported instead of slept. Exhausted transient failures and excessive `Retry-After` suggestions pause uncached MusicBrainz requests for 60 seconds (up to 120 seconds with `Retry-After`), allowing Discogs fallback to proceed without repeated retry loops. Cached successful results remain available, and requests resume after the cooldown. Discogs keeps its own existing spacing and retries.
 - **Network scope:** successful search and release results are cached per run only. Between runs Radish persists accepted metadata and review candidates, never a general HTTP cache.
 
 ### Example output
