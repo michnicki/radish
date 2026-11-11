@@ -23,7 +23,8 @@ use std::collections::{HashMap, HashSet};
 /// an exact artist match alone reaches 0.3. Discogs titles carry the artist
 /// (`Artist - Title`), which lowers their title similarity, so the floor stays
 /// well under a typical true hit. Hits from a barcode or catalog number search
-/// are always looked up, and so is everything when no hit reaches the floor.
+/// are always looked up, and so is everything when no hit reaches the floor
+/// or the local release lacks an album title or artist.
 const MIN_DETAIL_RANK: f64 = 0.25;
 
 /// Per-provider search and lookup limits. Weak title hits are skipped before
@@ -391,7 +392,13 @@ pub async fn discover<P: MetadataProvider>(
         .sort_by(|(a_rank, a), (b_rank, b)| b_rank.total_cmp(a_rank).then_with(|| a.id.cmp(&b.id)));
     // When nothing clears the floor, the ranking carries no signal (for
     // example, sparse local tags), so every summary stays eligible.
-    let skip_weak = ranked.iter().any(|(rank, _)| *rank >= MIN_DETAIL_RANK);
+    // The rank only measures what the local tags provide, so the floor needs
+    // both a title and an artist to be meaningful.
+    let has_nonempty =
+        |value: &Option<String>| value.as_deref().is_some_and(|v| !v.trim().is_empty());
+    let skip_weak = has_nonempty(&local.album_title)
+        && has_nonempty(&local.album_artist)
+        && ranked.iter().any(|(rank, _)| *rank >= MIN_DETAIL_RANK);
     let mut skipped_weak = 0usize;
 
     for (rank, summary) in ranked {
@@ -909,6 +916,44 @@ mod tests {
         );
         let result = discover(&provider, &local(), None).await.unwrap();
         assert_eq!(result.releases.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_rank_floor_needs_both_a_local_title_and_artist() {
+        let strong = "11111111-1111-1111-1111-111111111111";
+        let weak = "22222222-2222-2222-2222-222222222222";
+        // Discogs-style titles carry the artist, so a correct hit can rank low
+        // when the local artist is unknown and cannot be used to rank it.
+        let mut weak_hit = summary(weak);
+        weak_hit.title = "Test Artist - Blue".to_string();
+        weak_hit.artists.clear();
+        weak_hit.barcodes.clear();
+        let mut strong_hit = summary(strong);
+        strong_hit.barcodes.clear();
+        let mut local = local();
+        local.album_artist = None;
+        assert!(matcher::rank_search_summary(&local, &weak_hit) < MIN_DETAIL_RANK);
+        let empty = || {
+            Ok(SearchPage {
+                hits: Vec::new(),
+                total: Some(0),
+                next_offset: None,
+            })
+        };
+        let provider = FakeProvider::new(
+            ProviderKind::MusicBrainz,
+            vec![
+                empty(),
+                Ok(SearchPage {
+                    hits: vec![strong_hit, weak_hit],
+                    total: Some(2),
+                    next_offset: None,
+                }),
+            ],
+            vec![Ok(remote(strong)), Ok(remote(weak))],
+        );
+        let result = discover(&provider, &local, None).await.unwrap();
+        assert_eq!(result.releases.len(), 2, "{:?}", result.notes);
     }
 
     #[tokio::test]
