@@ -14,6 +14,20 @@ use crate::providers::{
 };
 use std::collections::{HashMap, HashSet};
 
+/// Lowest [`matcher::rank_search_summary`] score that earns a detailed lookup
+/// for a title or artist search hit.
+///
+/// The rank adds up to 0.5 for the title, 0.3 for the artist, 0.1 for the year
+/// and 0.4 for each matching identifier. Unrelated results land near 0.1
+/// because only a lucky year match and a little character overlap score, while
+/// an exact artist match alone reaches 0.3. Discogs titles carry the artist
+/// (`Artist - Title`), which lowers their title similarity, so the floor stays
+/// well under a typical true hit. Hits from a barcode or catalog number search
+/// are always looked up, and so is everything when no hit reaches the floor.
+const MIN_DETAIL_RANK: f64 = 0.25;
+
+/// Per-provider search and lookup limits. Weak title hits are skipped before
+/// they can use up `detail_attempts`; see [`MIN_DETAIL_RANK`].
 #[derive(Debug, Clone, Copy)]
 pub struct DiscoveryBudget {
     pub max_strategies: usize,
@@ -369,15 +383,23 @@ pub async fn discover<P: MetadataProvider>(
         identifier_complete = false;
     }
 
-    let mut ranked: Vec<SearchSummary> = summaries.into_values().collect();
-    ranked.sort_by(|a, b| {
-        matcher::rank_search_summary(local, b)
-            .total_cmp(&matcher::rank_search_summary(local, a))
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    let mut ranked: Vec<(f64, SearchSummary)> = summaries
+        .into_values()
+        .map(|summary| (matcher::rank_search_summary(local, &summary), summary))
+        .collect();
+    ranked
+        .sort_by(|(a_rank, a), (b_rank, b)| b_rank.total_cmp(a_rank).then_with(|| a.id.cmp(&b.id)));
+    // When nothing clears the floor, the ranking carries no signal (for
+    // example, sparse local tags), so every summary stays eligible.
+    let skip_weak = ranked.iter().any(|(rank, _)| *rank >= MIN_DETAIL_RANK);
+    let mut skipped_weak = 0usize;
 
-    for summary in ranked {
+    for (rank, summary) in ranked {
         if releases.contains_key(&summary.id) {
+            continue;
+        }
+        if skip_weak && rank < MIN_DETAIL_RANK && !identifier_ids.contains(&summary.id) {
+            skipped_weak += 1;
             continue;
         }
         if lookup_slots >= budget.detail_attempts {
@@ -397,6 +419,12 @@ pub async fn discover<P: MetadataProvider>(
                 failed_ids.insert(summary.id.clone());
             }
         }
+    }
+
+    if skipped_weak > 0 {
+        notes.push(format!(
+            "skipped detailed lookups for {skipped_weak} weakly matching search result(s)"
+        ));
     }
 
     if unhydrated_ids.is_empty() && lookup_slots >= budget.detail_attempts {
@@ -796,6 +824,91 @@ mod tests {
         assert_eq!(result.releases.len(), 1);
         assert!(!result.evidence[&release_id].blockers.is_empty());
         assert_eq!(provider.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn weak_title_results_do_not_use_detail_lookups_but_identifier_hits_do() {
+        let uuid = |n: u32| format!("{n:08x}-0000-0000-0000-000000000000");
+        let weak = |n: u32| {
+            let mut hit = summary(&uuid(n));
+            hit.title = "Zzzz Qqqq".to_string();
+            hit.artists = vec!["Nobody Else".to_string()];
+            hit.year = Some(1975);
+            hit.barcodes.clear();
+            hit
+        };
+        let good = |n: u32| {
+            let mut hit = summary(&uuid(n));
+            hit.barcodes.clear();
+            hit
+        };
+
+        // The barcode search returns one weak summary; it is still an
+        // identifier hit and must be hydrated.
+        let barcode_page = SearchPage {
+            hits: vec![weak(100)],
+            total: Some(1),
+            next_offset: None,
+        };
+        let mut title_hits = vec![good(1), good(2)];
+        title_hits.extend((10..20).map(weak));
+        let title_page = SearchPage {
+            hits: title_hits,
+            total: Some(12),
+            next_offset: None,
+        };
+        let provider = FakeProvider::new(
+            ProviderKind::MusicBrainz,
+            vec![Ok(barcode_page), Ok(title_page)],
+            vec![
+                Ok(remote(&uuid(1))),
+                Ok(remote(&uuid(2))),
+                Ok(remote(&uuid(100))),
+            ],
+        );
+
+        let result = discover(&provider, &local(), None).await.unwrap();
+        let fetched: Vec<String> = provider
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.starts_with("fetch:"))
+            .cloned()
+            .collect();
+        assert_eq!(fetched.len(), 3, "{fetched:?}");
+        assert!(fetched.iter().any(|call| call.ends_with(&uuid(100))));
+        assert!(fetched.iter().any(|call| call.ends_with(&uuid(1))));
+        assert!(fetched.iter().any(|call| call.ends_with(&uuid(2))));
+        assert_eq!(result.releases.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn weak_results_are_still_fetched_when_nothing_clears_the_rank_floor() {
+        let weak_id = "11111111-1111-1111-1111-111111111111";
+        let mut hit = summary(weak_id);
+        hit.title = "Zzzz Qqqq".to_string();
+        hit.artists = vec!["Nobody Else".to_string()];
+        hit.year = Some(1975);
+        hit.barcodes.clear();
+        let provider = FakeProvider::new(
+            ProviderKind::MusicBrainz,
+            vec![
+                Ok(SearchPage {
+                    hits: Vec::new(),
+                    total: Some(0),
+                    next_offset: None,
+                }),
+                Ok(SearchPage {
+                    hits: vec![hit],
+                    total: Some(1),
+                    next_offset: None,
+                }),
+            ],
+            vec![Ok(remote(weak_id))],
+        );
+        let result = discover(&provider, &local(), None).await.unwrap();
+        assert_eq!(result.releases.len(), 1);
     }
 
     #[tokio::test]
