@@ -59,10 +59,14 @@ pub(crate) async fn sync_files(
     if !tokio::fs::metadata(dir).await?.is_dir() {
         bail!("{} is not a directory", dir.display());
     }
-    let known = store::known_modified_times(pool, dir).await?;
+    let known = store::known_tracks(pool, dir).await?;
     let ScanResult { tracks, unchanged } = scanner::scan_directory_incremental(
         dir,
-        |path, modified_at| known.get(&store::path_key(path)) == Some(&modified_at),
+        |path, modified_at| {
+            known
+                .get(&store::path_key(path))
+                .is_some_and(|known| known.modified_at == modified_at)
+        },
         |event| match progress {
             Some(progress) => progress.scan_event(event),
             None => match event {
@@ -99,11 +103,12 @@ pub(crate) async fn sync_files(
         .chain(unchanged.iter().map(PathBuf::as_path))
         .map(store::path_key)
         .collect();
-    let mut removed = 0;
-    for key in known.keys().filter(|key| !seen.contains(*key)) {
-        // Keys are lowercased, which removal matches case-insensitively.
-        removed += store::remove_tracks_under(pool, Path::new(key)).await?;
-    }
+    let gone: Vec<String> = known
+        .iter()
+        .filter(|(key, _)| !seen.contains(*key))
+        .map(|(_, known)| known.path.clone())
+        .collect();
+    let removed = store::remove_tracks_by_paths(pool, &gone).await?;
 
     Ok(ImportSummary {
         scanned: tracks.len(),

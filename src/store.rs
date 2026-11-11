@@ -189,7 +189,7 @@ async fn write_track(
 
 /// The comparison key for a file path: forward slashes and ASCII lowercase,
 /// matching how the path columns compare. Use it to look paths up in the
-/// result of [`known_modified_times`].
+/// result of [`known_tracks`].
 pub fn path_key(path: &Path) -> String {
     path.to_string_lossy()
         .replace('\\', "/")
@@ -232,10 +232,17 @@ pub async fn remove_tracks_under(pool: &SqlitePool, path: &Path) -> Result<u64> 
     Ok(result.rows_affected())
 }
 
-/// Modification times of every stored file under `root`, keyed by
-/// [`path_key`] of the stored path. The watcher compares them with the files on
-/// disk to find what changed.
-pub async fn known_modified_times(pool: &SqlitePool, root: &Path) -> Result<HashMap<String, i64>> {
+/// What the database remembers about one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownTrack {
+    /// The path exactly as stored, with its original casing.
+    pub path: String,
+    pub modified_at: i64,
+}
+
+/// Every stored file under `root`, keyed by [`path_key`] of the stored path.
+/// An import compares them with the files on disk to find what changed.
+pub async fn known_tracks(pool: &SqlitePool, root: &Path) -> Result<HashMap<String, KnownTrack>> {
     let root = scope_param(root);
     let rows = sqlx::query_as::<_, (String, i64)>(
         "SELECT path, modified_at FROM tracks
@@ -247,8 +254,30 @@ pub async fn known_modified_times(pool: &SqlitePool, root: &Path) -> Result<Hash
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(path, modified_at)| (path_key(Path::new(&path)), modified_at))
+        .map(|(path, modified_at)| (path_key(Path::new(&path)), KnownTrack { path, modified_at }))
         .collect())
+}
+
+/// Deletes the rows with exactly these stored paths and returns how many went.
+///
+/// Each delete is an index lookup on the unique, case-insensitive `path`
+/// column, and every [`UPSERT_BATCH_SIZE`] deletes share one write
+/// transaction. Use it when the stored paths are known; [`remove_tracks_under`]
+/// scans the table and is meant for one path at a time.
+pub async fn remove_tracks_by_paths(pool: &SqlitePool, paths: &[String]) -> Result<u64> {
+    let mut removed = 0;
+    for chunk in paths.chunks(UPSERT_BATCH_SIZE) {
+        let mut tx = begin_write(pool).await?;
+        for path in chunk {
+            removed += sqlx::query("DELETE FROM tracks WHERE path = ?1")
+                .bind(path)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        }
+        tx.commit().await?;
+    }
+    Ok(removed)
 }
 
 // ---------------------------------------------------------------------------
@@ -4172,7 +4201,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn known_modified_times_lists_files_under_a_root() {
+    async fn known_tracks_lists_files_under_a_root() {
         let pool = test_pool().await;
         let directory_id = upsert_directory(&pool, Path::new("/music")).await.unwrap();
         let mut first = scanned("/music/Blue/01.flac", Some("Album"), Some("Artist"), 1);
@@ -4184,16 +4213,39 @@ mod tests {
             .await
             .unwrap();
 
-        let known = known_modified_times(&pool, Path::new("/MUSIC/blue"))
-            .await
-            .unwrap();
+        let known = known_tracks(&pool, Path::new("/MUSIC/blue")).await.unwrap();
         assert_eq!(known.len(), 2);
-        assert_eq!(known["/music/blue/01.flac"], 11);
-        assert_eq!(known["/music/blue/sub/02.flac"], 22);
+        assert_eq!(known["/music/blue/01.flac"].modified_at, 11);
+        assert_eq!(known["/music/blue/01.flac"].path, "/music/Blue/01.flac");
+        assert_eq!(known["/music/blue/sub/02.flac"].modified_at, 22);
+        assert_eq!(
+            known["/music/blue/sub/02.flac"].path,
+            "/music/blue/Sub/02.flac"
+        );
         assert_eq!(
             path_key(Path::new(r"C:\Music\Blue")),
             "c:/music/blue".to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn remove_tracks_by_paths_deletes_stored_paths_in_bulk() {
+        let pool = test_pool().await;
+        let directory_id = upsert_directory(&pool, Path::new("/music")).await.unwrap();
+        let tracks: Vec<_> = (0..1200)
+            .map(|n| scanned(&format!("/music/A/{n:04}.flac"), Some("Album"), None, 1))
+            .collect();
+        let keeper = scanned("/music/B/keep.flac", Some("Other"), None, 1);
+        upsert_tracks(&pool, &tracks, directory_id).await.unwrap();
+        upsert_tracks(&pool, &[keeper], directory_id).await.unwrap();
+
+        // Stored casing is not required: the path column compares NOCASE.
+        let doomed: Vec<String> = (0..1200).map(|n| format!("/MUSIC/a/{n:04}.FLAC")).collect();
+        let removed = remove_tracks_by_paths(&pool, &doomed).await.unwrap();
+
+        assert_eq!(removed, 1200);
+        assert_eq!(count(&pool, "tracks").await, 1);
+        assert_eq!(remove_tracks_by_paths(&pool, &[]).await.unwrap(), 0);
     }
 
     #[tokio::test]
