@@ -1863,4 +1863,57 @@ mod tests {
                 .is_none()
         );
     }
+
+    #[tokio::test]
+    async fn accept_turns_a_changed_snapshot_into_a_skip() {
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let directory_id = store::upsert_directory(&pool, std::path::Path::new("/music"))
+            .await
+            .unwrap();
+        let file = scanned_track("/music/a/01.flac", "Alpha", 1);
+        store::upsert_tracks(&pool, std::slice::from_ref(&file), directory_id)
+            .await
+            .unwrap();
+        store::rebuild_local_releases(&pool, None).await.unwrap();
+        let release = store::load_local_releases(&pool, None)
+            .await
+            .unwrap()
+            .remove(0);
+        let guard = store::load_match_guard(&pool, release.id).await.unwrap();
+
+        let (_, mut remote) = ai_album_fixture();
+        remote.tracklist.truncate(1);
+        let candidate = Candidate::new(&release, remote);
+        let evaluation = matcher::evaluate(
+            &release,
+            &candidate,
+            None,
+            &matcher::DiscoveryEvidence::default(),
+        );
+        assert!(evaluation.can_apply(&candidate));
+
+        // The files change after the release was loaded and the guard taken.
+        let mut retagged = file;
+        retagged.title = Some("Retitled".into());
+        retagged.modified_at = 2;
+        store::upsert_tracks(&pool, &[retagged], directory_id)
+            .await
+            .unwrap();
+        store::rebuild_local_releases(&pool, None).await.unwrap();
+
+        let outcome = accept(
+            &pool,
+            &release,
+            ProviderKind::Discogs,
+            &candidate,
+            &evaluation,
+            AcceptanceMethod::Manual,
+            false,
+            &guard,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, Outcome::Skipped), "{outcome:?}");
+    }
 }
