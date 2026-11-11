@@ -986,15 +986,6 @@ fn decode_search_page(value: &Value, offset: u16) -> Result<SearchPage, Provider
                 formats.push(format);
             }
         }
-        let media_tracks: Vec<u64> = media
-            .iter()
-            .filter_map(|medium| medium.get("track-count").and_then(Value::as_u64))
-            .collect();
-        let track_count = release
-            .get("track-count")
-            .and_then(Value::as_u64)
-            .or_else(|| (!media_tracks.is_empty()).then(|| media_tracks.iter().sum()))
-            .and_then(|count| u32::try_from(count).ok());
 
         hits.push(SearchSummary {
             id: ReleaseId::MusicBrainz(id),
@@ -1008,7 +999,6 @@ fn decode_search_page(value: &Value, offset: u16) -> Result<SearchPage, Provider
             formats,
             barcodes: text(release, "barcode").into_iter().collect(),
             result_type: "release".to_string(),
-            track_count,
         });
     }
 
@@ -1902,7 +1892,7 @@ mod tests {
     const ONE_HIT_SEARCH: &str = r#"{"count":1,"offset":0,"releases":[{"id":"76df3287-6cda-33eb-8e9a-044b5e15ffdd","title":"Abbey Road","artist-credit":[{"name":"The Beatles","joinphrase":""}]}]}"#;
 
     #[test]
-    fn search_summaries_carry_formats_and_track_counts() {
+    fn search_summaries_carry_formats() {
         let page = decode_search_page(
             &json!({
                 "count": 2,
@@ -1928,10 +1918,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(page.hits[0].formats, vec!["CD", "DVD-Video"]);
-        assert_eq!(page.hits[0].track_count, Some(12));
-        // Without a release-level count, the media counts are summed.
         assert!(page.hits[1].formats.is_empty());
-        assert_eq!(page.hits[1].track_count, Some(9));
     }
 
     #[test]
