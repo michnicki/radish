@@ -726,6 +726,13 @@ async fn observed_tracks(
     .fetch_all(conn)
     .await?;
 
+    // The SQL prefix is a coarse filter on slash-normalized paths. A file name
+    // that contains a backslash can pass it while its directory is outside the
+    // scope, so apply the same directory test the release rows use.
+    if let Some(scope) = scope {
+        rows.retain(|track| path_within(&directory_of(&track.path), Path::new(scope)));
+    }
+
     // Decode the identifier JSON once per file, not once per use.
     for row in &mut rows {
         row.musicbrainz_ids = serde_json::from_str(&row.musicbrainz_ids_json).unwrap_or_default();
@@ -4226,5 +4233,29 @@ mod tests {
         assert_eq!(status, STATUS_STALE);
         let rows = list_tracks(&pool).await.unwrap();
         assert!(rows.iter().all(|row| row.stale));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scoped_rebuild_agrees_with_directories_when_file_names_contain_backslashes() {
+        let pool = test_pool().await;
+        // On Unix the backslash is part of the file name, so this file lives in
+        // `/m`, not in `/m/x`, even though a slash-normalized path would say so.
+        insert(
+            &pool,
+            "/m",
+            &[
+                scanned("/m/01.flac", Some("Blue"), Some("Artist"), 1),
+                scanned("/m/x\\y.flac", Some("Blue"), Some("Artist"), 2),
+            ],
+        )
+        .await;
+
+        let summary = rebuild_local_releases(&pool, Some(Path::new("/m/x")))
+            .await
+            .unwrap();
+        assert_eq!(summary.groups, 0);
+        assert!(!summary.changed());
+        assert_eq!(release_ids(&pool).await.len(), 1);
     }
 }
