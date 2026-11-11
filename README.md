@@ -70,7 +70,7 @@ MusicBrainz release search and lookup need no account. Discogs fallback and expl
 export RADISH_DISCOGS_TOKEN="your-token"
 ```
 
-Radish reads the token only when a Discogs stage actually runs. A missing or empty token in default mode is an optional-unavailable condition, not an error: MusicBrainz results are kept and fallback is skipped with a note. Explicit Discogs mode treats it as a credential failure. Invalid configured credentials disable fallback for the rest of the run while MusicBrainz continues. Tokens are redacted from output and errors, and never committed.
+Radish reads the token only when a Discogs stage actually runs. A missing or empty token in default mode is an optional-unavailable condition, not an error: MusicBrainz results are kept and fallback is skipped with a note. Explicit Discogs mode treats it as a credential failure. Invalid configured credentials, or a token Discogs rejects, disable Discogs for the rest of the run while MusicBrainz continues. In explicit Discogs mode every remaining release then fails with the original error instead of contacting Discogs again. Tokens are redacted from output and errors, and never committed.
 
 ### Commands
 
@@ -118,7 +118,7 @@ For each selected release Radish evaluates MusicBrainz first. If its best candid
 
 Each provider keeps its own requests, budgets, caches, scores, and runner-up gaps; they are never merged. A fallback candidate must pass its own gates and must not contradict the local edition or a complete, plausible primary candidate on edition qualifiers, mapped titles (below `0.90`), or known durations (more than three seconds apart). An observed but unresolved MusicBrainz release ID blocks automatic fallback. Both groups are kept for review when identity cannot be established.
 
-Intermediate failures are counted once, from the final release outcome. A Discogs fallback after a permanent MusicBrainz failure can be accepted as recovered, but after a transient MusicBrainz failure (network error, rate limit, cooldown, or unusable response) the fallback candidate is queued for review instead; an attempted stage that failed with no usable result is a failure, not an unmatched release.
+Intermediate failures are counted once, from the final release outcome. A Discogs fallback after a permanent MusicBrainz failure can be accepted as recovered, but after a transient MusicBrainz failure (network error, rate limit, or cooldown) the fallback candidate is queued for review instead, with a note saying why, even when `--ai-match` is on; an attempted stage that failed with no usable result is a failure, not an unmatched release.
 
 ### Identity
 
@@ -241,11 +241,11 @@ Queued for review: 0
 
 When an AI recommendation cannot be applied, output and the saved queue explain the failed acceptance checks. Model confidence is an uncalibrated signal, not a measured success rate; the thresholds above are conservative heuristics rather than an accuracy guarantee. Scores retain their original text/duration values. Accepted AI matches store a distinct algorithm version (`musicbrainz-clef-album-v2` or `discogs-clef-album-v2`) and the model, prompt version, choice, probabilities, and confidence in the accepted snapshot. Scanned tags and audio remain unchanged. Use `radish match --clear ID` to remove an accepted overlay.
 
-Unresolved recommendations are saved with the queue. `radish match --review` displays them offline without Cloudflare credentials; saved reviews stay offline even with `--ai-match`. Run normal matching with `--ai-match` to refresh an unresolved assessment. Old advisory prompt results are never reused for automatic acceptance.
+Unresolved recommendations are saved with the queue. `radish match --review` displays them offline without Cloudflare credentials; saved reviews stay offline even with `--ai-match`. Running normal matching with `--ai-match` again reuses the saved assessment and makes no Cloudflare request while the request is byte-for-byte the same. A new request is made when the request content changed (local files, a candidate's metadata or tracklist, or the set of candidates), when the model or prompt version changed, or when the saved advice predates request digests or cannot be read. Old advisory prompt results are never reused for automatic acceptance.
 
 AI matching sends album and artist tags, track titles and durations, observed identifiers, candidate metadata and tracklists, and mapping/check diagnostics to Cloudflare. Audio and local file paths are excluded. Each request stays within a conservative 16,000-byte application budget. Complete tracklists and mapping evidence are retained for every assessed candidate; omitted candidates remain subject to ambiguity checks. If even one complete candidate cannot fit, output reports its measured size and AI matching is skipped. Cloudflare usage is billed to your account; see its current model pricing.
 
-Cloudflare is contacted only with `--ai-match` (or its alias), after normal matching cannot settle a release and candidates exist. Settled matches make no AI request. Missing credentials, oversized evidence, timeouts, service errors, invalid responses, and low-confidence answers preserve the normal review queue without opening a prompt. A dry run may incur Cloudflare usage but saves no recommendation or match. Plain import, watch, list, search, releases, and clear remain unchanged.
+Cloudflare is contacted only with `--ai-match` (or its alias), after normal matching cannot settle a release and candidates exist. Settled matches make no AI request. Missing credentials, oversized evidence, timeouts, service errors, invalid responses, and low-confidence answers preserve the normal review queue without opening a prompt. An HTTP 401, 403, 404 or 429 answer, or a transport failure, disables AI review for the rest of the run: it is reported once, not per release, and repeated in the final summary. Missing credentials are likewise reported once. A transient MusicBrainz failure never lets an AI recommendation accept a fallback candidate; it is queued for review. A dry run may incur Cloudflare usage but saves no recommendation or match. Plain import, watch, list, search, releases, and clear remain unchanged.
 
 ### Overlay, staleness, and clearing
 
@@ -254,7 +254,7 @@ Cloudflare is contacted only with `--ai-match` (or its alias), after normal matc
 - Each local release has at most one accepted overlay across all providers. Accepting a different provider replaces the previous overlay atomically.
 - Import and watcher updates refresh observed metadata without overwriting accepted metadata.
 - A deterministic `release-input-v2:` revision covers membership, year, barcode, catalog number, and all four identifier lists. The first rebuild after upgrade changes older revisions once and marks existing matches stale while keeping their overlays visible.
-- Reimporting unchanged tags keeps a match valid. Changed observations mark it stale with a `[stale match]` marker until it is reviewed or cleared. A stale match is refreshed from its accepted provider; preferring a different source requires review.
+- Reimporting unchanged tags keeps a match valid. Changed observations mark it stale with a `[stale match]` marker until it is reviewed or cleared. A stale match is refreshed from its accepted provider; preferring a different source requires review. Refreshing a stale Discogs match needs `RADISH_DISCOGS_TOKEN`; without one the release is skipped (not failed) with a note.
 - Ordinary runs skip current accepted matches. Clearing restores scanned values and contacts no provider.
 
 ### Known limits
