@@ -1,5 +1,6 @@
 //! Terminal-only progress shared by import and the initial watcher sync.
 
+use crate::output::Clean;
 use crate::scanner::ScanEvent;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::io::{self, IsTerminal};
@@ -40,7 +41,8 @@ impl ImportProgress {
 
     fn warn(&self, message: &str) {
         // Unlike ProgressBar::println, this also prints when hidden.
-        self.bar.suspend(|| eprintln!("{message}"));
+        // Warnings can carry file names, which are untrusted.
+        self.bar.suspend(|| eprintln!("{}", Clean(message)));
     }
 
     pub fn saving(&self, total: usize) {

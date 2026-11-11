@@ -127,6 +127,16 @@ impl std::fmt::Display for ClefError {
 
 impl std::error::Error for ClefError {}
 
+/// The configured origin, or the Cloudflare default when unset or blank.
+fn origin_setting(raw: Option<&str>) -> &str {
+    raw.map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .unwrap_or("https://api.cloudflare.com")
+}
+
+/// Test-server override for the Cloudflare origin.
+const BASE_URL_ENV: &str = "RADISH_CLOUDFLARE_BASE_URL";
+
 /// Optional Cloudflare service. The runner applies separate acceptance checks.
 pub struct ClefClient {
     http: Client,
@@ -141,17 +151,17 @@ impl ClefClient {
             .map_err(|_| anyhow!("RADISH_CLOUDFLARE_ACCOUNT_ID is required for AI review"))?;
         let token = std::env::var("RADISH_CLOUDFLARE_API_TOKEN")
             .map_err(|_| anyhow!("RADISH_CLOUDFLARE_API_TOKEN is required for AI review"))?;
-        let origin = match std::env::var("RADISH_CLOUDFLARE_BASE_URL") {
+        let origin = match std::env::var(BASE_URL_ENV) {
             Ok(origin) => origin,
-            Err(std::env::VarError::NotPresent) => "https://api.cloudflare.com".to_string(),
-            Err(_) => bail!("AI review API origin is invalid"),
+            Err(std::env::VarError::NotPresent) => String::new(),
+            Err(_) => bail!("{BASE_URL_ENV} is invalid"),
         };
         let model = match std::env::var("RADISH_CLOUDFLARE_MODEL") {
             Ok(model) => model,
             Err(std::env::VarError::NotPresent) => DEFAULT_MODEL.to_string(),
             Err(_) => bail!("AI review model is invalid"),
         };
-        Self::configured(&account, &token, &origin, &model)
+        Self::configured(&account, &token, origin_setting(Some(&origin)), &model)
     }
 
     fn configured(account: &str, token: &str, origin: &str, model: &str) -> Result<Self> {
@@ -174,23 +184,23 @@ impl ClefClient {
             .map_err(|_| anyhow!("AI review API token is invalid"))?;
         authorization.set_sensitive(true);
         let mut endpoint =
-            Url::parse(origin).map_err(|_| anyhow!("AI review API origin is invalid"))?;
-        let loopback = endpoint.host_str().is_some_and(|host| {
-            host == "localhost"
-                || host
-                    .trim_matches(['[', ']'])
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        });
-        if !(endpoint.scheme() == "https" || endpoint.scheme() == "http" && loopback)
-            || endpoint.host_str().is_none()
+            Url::parse(origin).map_err(|_| anyhow!("{BASE_URL_ENV} is not a valid URL"))?;
+        // The origin receives the API token, so only Cloudflare itself or a
+        // local test server is acceptable.
+        let cloudflare = endpoint.scheme() == "https"
+            && endpoint.host_str() == Some("api.cloudflare.com")
+            && endpoint.port().is_none();
+        let trusted = cloudflare || crate::providers::is_loopback_url(&endpoint);
+        if !trusted
             || !endpoint.username().is_empty()
             || endpoint.password().is_some()
             || endpoint.path() != "/"
             || endpoint.query().is_some()
             || endpoint.fragment().is_some()
         {
-            bail!("AI review API origin must be an HTTPS origin (HTTP is allowed for loopback)");
+            bail!(
+                "{BASE_URL_ENV} must be https://api.cloudflare.com (or a loopback http(s) origin for tests)"
+            );
         }
         endpoint.set_path(&format!(
             "/client/v4/accounts/{account}/ai/run/@cf/cloudflare/{model}"
@@ -1756,6 +1766,69 @@ mod tests {
                 DEFAULT_MODEL
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn accepts_only_the_cloudflare_origin_or_a_loopback_origin() {
+        let error = ClefClient::configured(
+            "test-account",
+            "fake-api-token",
+            "https://evil.example",
+            DEFAULT_MODEL,
+        )
+        .err()
+        .expect("an arbitrary HTTPS host would receive the real token")
+        .to_string();
+        assert!(!error.contains("evil.example"), "{error}");
+        for origin in [
+            "http://0.0.0.0",
+            "http://127.0.0.1@evil.example",
+            "https://api.cloudflare.com.",
+            "http://api.cloudflare.com",
+            "https://api.cloudflare.com:8443",
+        ] {
+            assert!(
+                ClefClient::configured("test-account", "fake-api-token", origin, DEFAULT_MODEL)
+                    .is_err(),
+                "{origin}"
+            );
+        }
+        for origin in [
+            "https://api.cloudflare.com",
+            "http://127.0.0.1:8787",
+            "http://[::1]:8787",
+        ] {
+            assert!(
+                ClefClient::configured("test-account", "fake-api-token", origin, DEFAULT_MODEL)
+                    .is_ok(),
+                "{origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn origin_errors_name_the_variable_without_echoing_the_value() {
+        for origin in ["https://evil.example/secret-path", "not a url secret-path"] {
+            let error =
+                ClefClient::configured("test-account", "fake-api-token", origin, DEFAULT_MODEL)
+                    .err()
+                    .expect("rejected")
+                    .to_string();
+            assert!(error.contains("RADISH_CLOUDFLARE_BASE_URL"), "{error}");
+            assert!(!error.contains("secret-path"), "{error}");
+            assert!(!error.contains("evil"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_blank_origin_setting_means_the_default_origin() {
+        for raw in [None, Some(""), Some("  ")] {
+            assert_eq!(origin_setting(raw), "https://api.cloudflare.com");
+        }
+        assert_eq!(
+            origin_setting(Some("http://127.0.0.1:1")),
+            "http://127.0.0.1:1"
         );
     }
 

@@ -148,6 +148,8 @@ pub struct ProviderAttempt {
     pub evaluations: Vec<Evaluation>,
     pub notes: Vec<String>,
     pub error: Option<ProviderError>,
+    /// Failures discovery worked around because other results arrived.
+    pub partial_failures: Vec<ProviderError>,
     pub embedded_release_resolved: bool,
     /// Shared model assessment, subject to separate conservative album gates.
     pub ai_advice: Option<Advice>,
@@ -161,6 +163,7 @@ impl ProviderAttempt {
             evaluations: Vec::new(),
             notes: Vec::new(),
             error: Some(error),
+            partial_failures: Vec::new(),
             embedded_release_resolved: false,
             ai_advice: None,
         }
@@ -239,6 +242,7 @@ impl ProviderAttempt {
             evaluations,
             notes: result.notes,
             error,
+            partial_failures: result.failures,
             embedded_release_resolved,
             ai_advice: None,
         }
@@ -504,20 +508,28 @@ where
 /// A primary stage that failed for a reason that says nothing about the
 /// release means a fallback candidate was never compared against what the
 /// primary would have found, so it must be reviewed rather than accepted.
+///
+/// Failed lookups that discovery worked around count too: the release that
+/// failed to load may have been the right one.
 fn primary_failed_transiently(attempts: &[ProviderAttempt]) -> bool {
-    attempts
-        .first()
-        .and_then(|attempt| attempt.error.as_ref())
-        .is_some_and(|error| {
-            // A malformed response is deterministic for that release and starts
-            // no cooldown, so it is not an outage.
-            matches!(
-                error,
-                ProviderError::Network { .. }
-                    | ProviderError::RateLimited { .. }
-                    | ProviderError::Unavailable { .. }
-            )
-        })
+    attempts.first().is_some_and(|attempt| {
+        attempt
+            .error
+            .iter()
+            .chain(&attempt.partial_failures)
+            .any(is_transient_failure)
+    })
+}
+
+/// An outage-like failure. A malformed response is deterministic for that
+/// release and starts no cooldown, so it is not an outage.
+fn is_transient_failure(error: &ProviderError) -> bool {
+    matches!(
+        error,
+        ProviderError::Network { .. }
+            | ProviderError::RateLimited { .. }
+            | ProviderError::Unavailable { .. }
+    )
 }
 
 const TRANSIENT_PRIMARY_NOTE: &str =
@@ -1726,6 +1738,7 @@ fn print_decision_for(provider: ProviderKind, candidate: &Candidate, evaluation:
         evaluations: vec![evaluation.clone()],
         notes: Vec::new(),
         error: None,
+        partial_failures: Vec::new(),
         embedded_release_resolved: false,
         ai_advice: None,
     });
@@ -2173,6 +2186,30 @@ mod tests {
             }
         )));
         assert!(!primary_failed_transiently(&[]));
+    }
+
+    #[test]
+    fn worked_around_transient_lookup_failures_count_as_a_transient_primary_failure() {
+        let provider = ProviderKind::MusicBrainz;
+        let mut attempt = ProviderAttempt::failed(
+            provider,
+            ProviderError::Network {
+                provider,
+                message: "unused".into(),
+            },
+        );
+        attempt.error = None;
+        assert!(!primary_failed_transiently(std::slice::from_ref(&attempt)));
+        attempt.partial_failures = vec![ProviderError::Malformed {
+            provider,
+            message: "bad json".into(),
+        }];
+        assert!(!primary_failed_transiently(std::slice::from_ref(&attempt)));
+        attempt.partial_failures.push(ProviderError::Unavailable {
+            provider,
+            retry_after: std::time::Duration::from_secs(5),
+        });
+        assert!(primary_failed_transiently(std::slice::from_ref(&attempt)));
     }
 
     #[test]

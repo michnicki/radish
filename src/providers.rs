@@ -21,6 +21,54 @@ pub const RELEASE_CACHE_CAPACITY: usize = 256;
 /// Most search pages an adapter keeps for one run (same reasoning).
 pub const SEARCH_CACHE_CAPACITY: usize = 256;
 
+/// Reads a test-server endpoint override that may only name this machine.
+///
+/// Returns `None` when the variable is unset or blank. The overrides exist so
+/// tests can point a provider at a local mock; accepting any host would let a
+/// poisoned environment send real credentials elsewhere.
+///
+/// # Errors
+///
+/// Fails when the value is not an `http` or `https` URL whose host is
+/// `localhost` or a loopback address. The error names the variable but never
+/// its value.
+pub fn loopback_override(var: &str) -> anyhow::Result<Option<reqwest::Url>> {
+    match std::env::var(var) {
+        Ok(raw) => loopback_override_value(var, Some(&raw)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("{var} must be a loopback http(s) URL")
+        }
+    }
+}
+
+/// Validation behind [`loopback_override`], separated from the environment.
+pub(crate) fn loopback_override_value(
+    var: &str,
+    raw: Option<&str>,
+) -> anyhow::Result<Option<reqwest::Url>> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(None);
+    };
+    let url = reqwest::Url::parse(raw)
+        .ok()
+        .filter(is_loopback_url)
+        .ok_or_else(|| anyhow::anyhow!("{var} must be a loopback http(s) URL"))?;
+    Ok(Some(url))
+}
+
+/// True for an `http` or `https` URL whose host is `localhost` or a loopback IP.
+pub fn is_loopback_url(url: &reqwest::Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+}
+
 /// Locks a mutex, recovering the data if a panicking holder poisoned it.
 ///
 /// Every guarded value here is plain bookkeeping that stays consistent after a
@@ -492,6 +540,47 @@ pub trait MetadataProvider: Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn loopback_override_treats_unset_and_blank_values_as_absent() {
+        for raw in [None, Some(""), Some("   ")] {
+            assert!(loopback_override_value("TEST_VAR", raw).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn loopback_override_accepts_loopback_http_and_https_origins() {
+        for raw in [
+            "http://127.0.0.1:8080",
+            "http://127.1.2.3:9",
+            "http://localhost:1234",
+            "http://[::1]:5555",
+            "https://localhost",
+        ] {
+            let url = loopback_override_value("TEST_VAR", Some(raw))
+                .unwrap_or_else(|error| panic!("{raw} rejected: {error}"))
+                .expect("a URL");
+            assert_eq!(url.scheme(), raw.split(':').next().unwrap());
+        }
+    }
+
+    #[test]
+    fn loopback_override_rejects_other_hosts_without_echoing_the_value() {
+        for raw in [
+            "https://evil.example/secret-path",
+            "http://127.0.0.1.evil.example",
+            "http://10.0.0.1",
+            "http://localhost.evil.example",
+            "ftp://127.0.0.1",
+            "not a url secret-path",
+        ] {
+            let error = loopback_override_value("TEST_VAR", Some(raw))
+                .expect_err(raw)
+                .to_string();
+            assert!(error.contains("TEST_VAR"), "{error}");
+            assert!(!error.contains("secret-path"), "{error}");
+            assert!(!error.contains("evil"), "{error}");
+        }
+    }
 
     #[test]
     fn an_unavailable_provider_is_a_transient_failure_that_names_its_service() {

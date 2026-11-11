@@ -12,7 +12,7 @@ use crate::matcher::{RemoteRelease, RemoteTrack, SearchSummary, TrackEntryType};
 use crate::providers::{
     BoundedCache, GroupId, Mbid, MetadataProvider, ProviderError, ProviderKind,
     RELEASE_CACHE_CAPACITY, ReleaseId, SEARCH_CACHE_CAPACITY, SearchPage, SearchRequest,
-    SearchStrategy, lock,
+    SearchStrategy, lock, loopback_override,
 };
 use reqwest::StatusCode;
 use reqwest::Url;
@@ -80,11 +80,8 @@ impl MusicBrainzAdapter {
     /// request is made until a search or lookup runs.
     pub fn new() -> anyhow::Result<Self> {
         let mut config = MusicBrainzConfig::default();
-        if let Ok(base) = std::env::var(BASE_URL_ENV)
-            && !base.trim().is_empty()
-        {
-            config.base_url = Url::parse(base.trim())
-                .map_err(|error| anyhow::anyhow!("invalid {BASE_URL_ENV}: {error}"))?;
+        if let Some(base_url) = loopback_override(BASE_URL_ENV)? {
+            config.base_url = base_url;
         }
         Self::with_config(config)
     }

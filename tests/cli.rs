@@ -642,3 +642,106 @@ async fn a_permanent_musicbrainz_error_still_recovers_through_the_fallback() {
     assert!(text.contains("Accepted: 1"), "{text}");
     assert_eq!(row_count(&db, "release_matches").await, 1);
 }
+
+#[tokio::test]
+async fn non_loopback_service_overrides_are_rejected_without_any_request() {
+    for (provider, variable) in [
+        ("musicbrainz", "RADISH_MUSICBRAINZ_BASE_URL"),
+        ("discogs", "RADISH_DISCOGS_BASE_URL"),
+    ] {
+        let db = db_path(&format!("evil-override-{provider}"));
+        seed_library(&db).await;
+        let server = MockServer::start(handler);
+        // If the override were honored, traffic would flow through this local
+        // proxy and be recorded; nothing may reach the network either way.
+        let output = Command::new(env!("CARGO_BIN_EXE_radish"))
+            .arg("--db")
+            .arg(&db)
+            .args(["match", "--provider", provider])
+            .env("RADISH_MUSICBRAINZ_BASE_URL", &server.url)
+            .env("RADISH_DISCOGS_BASE_URL", &server.url)
+            .env(variable, "https://evil.example/secret-path")
+            .env("RADISH_DISCOGS_TOKEN", "test-token")
+            .env("HTTPS_PROXY", &server.url)
+            .env("https_proxy", &server.url)
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .stdin(Stdio::null())
+            .output()
+            .expect("run radish");
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(all.contains(variable), "{provider}: {all}");
+        assert!(!all.contains("evil.example"), "{provider}: {all}");
+        assert!(!all.contains("secret-path"), "{provider}: {all}");
+        assert_eq!(server.request_count(), 0, "{provider}: {all}");
+    }
+}
+
+#[tokio::test]
+async fn partial_musicbrainz_lookup_failures_queue_a_discogs_fallback() {
+    let db = db_path("partial-outage-fallback-queued");
+    seed_library(&db).await;
+    // The weak release sorts first, so it is fetched before the failing one
+    // (a failed fetch starts a service-wide cooldown).
+    let readable = "11111111-1111-1111-1111-111111111111";
+    let failing = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+    let server = MockServer::start(move |target| {
+        if target.contains(&format!("/ws/2/release/{failing}")) {
+            return (503, "{}".into());
+        }
+        if target.contains(&format!("/ws/2/release/{readable}")) {
+            // A real but different album: it cannot be accepted.
+            return (
+                200,
+                musicbrainz_release_json(readable, &["Other 1", "Other 2"], &[300.0, 301.0]),
+            );
+        }
+        if target.contains("/ws/2/release") {
+            let releases: Vec<_> = [readable, failing]
+                .into_iter()
+                .map(|id| {
+                    serde_json::json!({
+                        "id": id, "title": "Blue", "date": "2001-05-01",
+                        "artist-credit": [{"name": "Test Artist", "joinphrase": ""}]
+                    })
+                })
+                .collect();
+            return (
+                200,
+                serde_json::json!({"count": 2, "offset": 0, "releases": releases}).to_string(),
+            );
+        }
+        handler(target)
+    });
+
+    let output = run(&db, &server, &["match"], Some("test-token"));
+
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(
+        server.requests_matching(&format!("/ws/2/release/{failing}")) > 0,
+        "the failing lookup must have been attempted: {:?}",
+        server.targets()
+    );
+    assert!(text.contains("Queued for review: 1"), "{text}");
+    assert!(text.contains("Accepted: 0"), "{text}");
+    assert!(!text.contains("recovered the release"), "{text}");
+    assert!(
+        text.contains("MusicBrainz stage failed transiently; fallback candidates need review"),
+        "{text}"
+    );
+    assert_eq!(row_count(&db, "release_matches").await, 0);
+    // Each provider's best candidate is queued for the reviewer.
+    let pool = radish::db::connect(&db).await.unwrap();
+    let providers: Vec<String> =
+        sqlx::query_scalar("SELECT provider FROM match_reviews ORDER BY provider")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    pool.close().await;
+    assert_eq!(providers, ["discogs", "musicbrainz"]);
+}

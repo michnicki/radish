@@ -62,6 +62,10 @@ pub struct DiscoveryResult {
     /// Candidate-specific evidence. Absent candidates were never hydrated.
     pub evidence: HashMap<ReleaseId, DiscoveryEvidence>,
     pub notes: Vec<String>,
+    /// Search and detail-lookup failures that did not stop discovery because
+    /// other results arrived. The right release may be among what failed to
+    /// load, so a caller must not treat the candidates as the complete answer.
+    pub failures: Vec<ProviderError>,
 }
 
 impl DiscoveryResult {
@@ -268,6 +272,7 @@ pub async fn discover<P: MetadataProvider>(
             releases: vec![release.clone()],
             evidence: HashMap::new(),
             notes,
+            failures: Vec::new(),
         };
         result.evidence.insert(release.id.clone(), evidence);
         return Ok(result);
@@ -449,6 +454,7 @@ pub async fn discover<P: MetadataProvider>(
             releases: Vec::new(),
             evidence: HashMap::new(),
             notes,
+            failures: Vec::new(),
         });
     }
 
@@ -505,6 +511,7 @@ pub async fn discover<P: MetadataProvider>(
         releases,
         evidence,
         notes,
+        failures,
     })
 }
 

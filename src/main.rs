@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use radish::output::Clean;
+use radish::output::{Clean, clean_path};
 use radish::progress::ImportProgress;
 use radish::providers::{ProviderKind, ReleaseId};
 use radish::{db, importer, outln, runner, store, watcher};
@@ -121,14 +121,78 @@ fn parse_direct(musicbrainz: Option<&str>, discogs: Option<u64>) -> Result<Optio
     }
 }
 
-fn main() -> Result<()> {
-    // Set process configuration before Tokio starts any worker threads. Existing
-    // environment variables take precedence; missing or invalid files stay quiet.
-    let _ = dotenvy::dotenv();
-    tokio::runtime::Builder::new_multi_thread()
+/// The only keys read from `.env`. Endpoint overrides are deliberately excluded
+/// so a stray `.env` can never redirect real credentials to another host.
+const DOTENV_KEYS: [&str; 4] = [
+    "RADISH_CLOUDFLARE_ACCOUNT_ID",
+    "RADISH_CLOUDFLARE_API_TOKEN",
+    "RADISH_CLOUDFLARE_MODEL",
+    "RADISH_DISCOGS_TOKEN",
+];
+
+/// Loads allowed keys from `./.env` in the current directory only, never from a
+/// parent. Existing environment variables win. Anything but a readable regular
+/// file (absent, a directory such as a virtualenv, a FIFO) is ignored quietly,
+/// and so are malformed lines.
+fn load_dotenv() {
+    // Opening a directory succeeds but every read fails, which would make the
+    // line iterator yield errors forever.
+    if !std::fs::metadata(".env").is_ok_and(|metadata| metadata.is_file()) {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(".env") else {
+        return;
+    };
+    // Some editors and PowerShell 5 write a UTF-8 byte order mark, which
+    // would otherwise become part of the first key.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    for entry in dotenvy::from_read_iter(text.as_bytes()) {
+        match entry {
+            Ok((key, value)) => {
+                if DOTENV_KEYS.contains(&key.as_str()) && std::env::var_os(&key).is_none() {
+                    // SAFETY: still single-threaded; Tokio has not started.
+                    unsafe { std::env::set_var(key, value) }
+                }
+            }
+            // A malformed line is skipped; a read error would repeat forever.
+            Err(dotenvy::Error::Io(_)) => break,
+            Err(_) => {}
+        }
+    }
+}
+
+fn main() -> std::process::ExitCode {
+    // Set process configuration before Tokio starts any worker threads.
+    load_dotenv();
+    let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(run())
+        .build()
+        .map_err(anyhow::Error::from)
+        .and_then(|runtime| runtime.block_on(run()));
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            report_error(&error);
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Prints an error and its causes like `anyhow` does, but with every line
+/// escaped: error contexts can carry file names, which are untrusted.
+fn report_error(error: &anyhow::Error) {
+    eprintln!("Error: {}", Clean(&error.to_string()));
+    let causes: Vec<String> = error.chain().skip(1).map(ToString::to_string).collect();
+    if !causes.is_empty() {
+        eprintln!("\nCaused by:");
+        for (index, cause) in causes.iter().enumerate() {
+            if causes.len() == 1 {
+                eprintln!("    {}", Clean(cause));
+            } else {
+                eprintln!("    {index}: {}", Clean(cause));
+            }
+        }
+    }
 }
 
 async fn run() -> Result<()> {
@@ -242,7 +306,7 @@ fn canonical_scope(path: Option<&Path>) -> Result<Option<PathBuf>> {
     match path {
         Some(path) => {
             Ok(Some(path.canonicalize().with_context(|| {
-                format!("cannot resolve {}", path.display())
+                format!("cannot resolve {}", clean_path(path))
             })?))
         }
         None => Ok(None),
@@ -340,16 +404,22 @@ fn format_duration(secs: Option<f64>) -> String {
 
 async fn run_import(pool: &sqlx::SqlitePool, path: &std::path::Path) -> Result<PathBuf> {
     let path = path.canonicalize()?;
-    outln!("Scanning {}...", path.display());
+    outln!("Scanning {}...", clean_path(&path));
 
     let progress = ImportProgress::new();
     let summary = importer::sync_directory(pool, &path, &progress).await?;
     drop(progress);
 
-    let kept = match summary.kept {
-        0 => String::new(),
-        kept => format!(", {kept} kept (unreadable)"),
-    };
+    let mut kept = String::new();
+    if summary.kept > 0 {
+        kept.push_str(&format!(", {} kept (unreadable)", summary.kept));
+    }
+    if summary.kept_no_audio > 0 {
+        kept.push_str(&format!(
+            ", {} kept (no audio files found)",
+            summary.kept_no_audio
+        ));
+    }
     outln!(
         "Imported {} new or changed tracks ({} unchanged, {} removed{kept}) into {} local release(s).",
         summary.saved,

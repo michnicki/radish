@@ -72,6 +72,17 @@ export RADISH_DISCOGS_TOKEN="your-token"
 
 Radish reads the token only when a Discogs stage actually runs. A missing or empty token in default mode is an optional-unavailable condition, not an error: MusicBrainz results are kept and fallback is skipped with a note. Explicit Discogs mode treats it as a credential failure. Invalid configured credentials, or a token Discogs rejects, disable Discogs for the rest of the run while MusicBrainz continues. In explicit Discogs mode every remaining release then fails with the original error instead of contacting Discogs again. Tokens are redacted from output and errors, and never committed.
 
+#### `.env` files
+
+Radish also reads settings from a file named `.env` in the **current directory only**. Parent directories are never searched, so a `.env` dropped into a downloaded album folder or `/tmp` cannot affect a run elsewhere. Only these keys are read from it; every other key in the file is ignored:
+
+- `RADISH_CLOUDFLARE_ACCOUNT_ID`
+- `RADISH_CLOUDFLARE_API_TOKEN`
+- `RADISH_CLOUDFLARE_MODEL`
+- `RADISH_DISCOGS_TOKEN`
+
+Variables already set in the environment always win over the file. Only a regular file named `.env` is read: a missing file, a directory of that name (as in a Python virtualenv), or an unreadable file is ignored without a message. Malformed lines are skipped, and valid keys after them still load. A leading UTF-8 byte order mark is ignored. Service endpoints cannot be set from `.env` (see [Test-server overrides](#test-server-overrides)).
+
 ### Commands
 
 ```bash
@@ -118,7 +129,7 @@ For each selected release Radish evaluates MusicBrainz first. If its best candid
 
 Each provider keeps its own requests, budgets, caches, scores, and runner-up gaps; they are never merged. A fallback candidate must pass its own gates and must not contradict the local edition or a complete, plausible primary candidate on edition qualifiers, mapped titles (below `0.90`), or known durations (more than three seconds apart). An observed but unresolved MusicBrainz release ID blocks automatic fallback. Both groups are kept for review when identity cannot be established.
 
-Intermediate failures are counted once, from the final release outcome. A Discogs fallback after a permanent MusicBrainz failure can be accepted as recovered, but after a transient MusicBrainz failure (network error, rate limit, or cooldown) the fallback candidate is queued for review instead, with a note saying why, even when `--ai-match` is on; an attempted stage that failed with no usable result is a failure, not an unmatched release.
+Intermediate failures are counted once, from the final release outcome. A Discogs fallback after a permanent MusicBrainz failure can be accepted as recovered, but after a transient MusicBrainz failure (network error, rate limit, or cooldown) the fallback candidate is queued for review instead, with a note saying why. This also applies when MusicBrainz returned some candidates but a search or release lookup failed transiently along the way, since the release that failed to load may have been the right one. This holds even when `--ai-match` is on; an attempted stage that failed with no usable result is a failure, not an unmatched release.
 
 ### Identity
 
@@ -191,7 +202,7 @@ Radish prefers an **exact-edition match** when all of these hold:
 - Edition identity comes from a consistent embedded release ID or a fully resolved barcode/catalog search that uniquely identifies the release. A release group, a recording, or an explicitly entered ID never counts as edition evidence on its own.
 - Identifier discovery was not truncated or left unhydrated.
 
-Everything else is queued or reviewed. In review you may override score or identity uncertainty after seeing the warnings, but never an invalid, incomplete, or unsupported mapping. New decisions store `musicbrainz-match-v2` or `discogs-match-v3`; historical algorithm versions and accepted matches are preserved.
+Everything else is queued or reviewed. In review you may override score or identity uncertainty after seeing the warnings, but never an invalid, incomplete, or unsupported mapping. New decisions store `musicbrainz-match-v3` or `discogs-match-v4`; historical algorithm versions and accepted matches are preserved.
 
 ### Review
 
@@ -201,7 +212,7 @@ Actions are: accept a candidate, choose another provider group, enter a release 
 
 ### Optional automatic AI matching with Clef
 
-Use Cloudflare's [Clef](https://developers.cloudflare.com/workers-ai/models/clef/) or [Clef Flash](https://developers.cloudflare.com/workers-ai/models/clef-flash/) to resolve strongly supported album matches that ordinary text comparison leaves uncertain. Configure your Cloudflare account ID and an API token with Workers AI access. Radish loads `.env` from the current directory or its nearest parent; exported environment variables take precedence. For example, put these keys in `target/release/.env` when running the binary from that directory, or export them:
+Use Cloudflare's [Clef](https://developers.cloudflare.com/workers-ai/models/clef/) or [Clef Flash](https://developers.cloudflare.com/workers-ai/models/clef-flash/) to resolve strongly supported album matches that ordinary text comparison leaves uncertain. Configure your Cloudflare account ID and an API token with Workers AI access. Set them in the environment or in a `.env` file in the directory you run Radish from (see [`.env` files](#env-files); exported variables take precedence, and no parent directory is searched):
 
 ```bash
 export RADISH_CLOUDFLARE_ACCOUNT_ID="your-account-id"
@@ -254,11 +265,13 @@ Cloudflare is contacted only with `--ai-match` (or its alias), after normal matc
 - Each local release has at most one accepted overlay across all providers. Accepting a different provider replaces the previous overlay atomically.
 - Import and watcher updates refresh observed metadata without overwriting accepted metadata.
 - A deterministic `release-input-v2:` revision covers membership, year, barcode, catalog number, and all four identifier lists. The first rebuild after upgrade changes older revisions once and marks existing matches stale while keeping their overlays visible.
-- Reimporting unchanged tags keeps a match valid. Changed observations mark it stale with a `[stale match]` marker until it is reviewed or cleared. A stale match is refreshed from its accepted provider; preferring a different source requires review. Refreshing a stale Discogs match needs `RADISH_DISCOGS_TOKEN`; without one the release is skipped (not failed) with a note.
+- Reimporting unchanged tags keeps a match valid. Changed observations mark it stale with a `[stale match]` marker until it is reviewed or cleared. A stale match is refreshed from its accepted provider; preferring a different source requires review. Refreshing a stale Discogs match needs `RADISH_DISCOGS_TOKEN`; without one the release is skipped (not failed) with a note. The same applies after Discogs rejected the token earlier in the run: the remaining stale Discogs matches are skipped rather than failed.
 - Ordinary runs skip current accepted matches. Clearing restores scanned values and contacts no provider.
 
 ### Known limits
 
+- **Splits, moves and folder renames drop accepted matches.** A local release is identified by its containing folder plus its album title. Splitting a release across new album titles, renaming or moving its folder, or moving its files to another folder therefore creates different releases, so the accepted match is dropped (the import output reports it) and the release must be matched again. Renaming files within the same folder keeps the release; its membership changed, so the match is marked stale.
+- **Retagging an album title keeps the match.** Changing the album title of a whole release keeps its accepted match and marks it stale, because the files are the same; review or refresh it.
 - **No fingerprinting or AcoustID.** Matching relies on tags, embedded IDs, barcode, catalog number, titles, artists, years, and durations.
 - **Edition twins:** equivalent editions may be accepted as an album match, but their exact pressing stays unconfirmed. Conflicting recordings or tracklists still require review.
 - **Incomplete editions:** a single disc from a larger set, pregaps, data/video tracks, and unsupported media produce suggestions only.
@@ -284,14 +297,15 @@ This is illustrative synthetic output; the UUID does not describe a real release
 
 ### Test-server overrides
 
-Automated tests point both providers at loopback servers:
+Automated tests point the providers at loopback servers:
 
 ```bash
 RADISH_MUSICBRAINZ_BASE_URL=http://127.0.0.1:PORT
 RADISH_DISCOGS_BASE_URL=http://127.0.0.1:PORT
+RADISH_CLOUDFLARE_BASE_URL=http://127.0.0.1:PORT
 ```
 
-Neither variable is set by Radish, and neither is required for normal use.
+These overrides exist for tests only. An unset or empty variable means the normal public service. Otherwise each accepts only an `http` or `https` URL on `localhost`, `127.0.0.0/8` or `::1`; any other value is rejected with an error that names the variable but not its value, so a stray setting cannot send your credentials to another host. `RADISH_CLOUDFLARE_BASE_URL` additionally accepts exactly `https://api.cloudflare.com`. None of them is read from `.env`, set by Radish, or required for normal use.
 
 ## Local data model
 
@@ -337,11 +351,19 @@ Tag parsing runs in parallel; database updates happen afterward. A file that fai
 
 When stderr is an interactive terminal, import shows a spinner during file discovery, completed/total counters while reading tags and saving tracks, and a spinner while rebuilding local-release groups. Failed tag reads count toward scan progress and still produce warnings. Live progress is hidden when stderr is redirected; stdout messages and the final import summary are unchanged. Progress clears before optional matching starts.
 
-Import adds and refreshes entries, removes the rows of files that have disappeared from the imported directory, and refreshes local-release grouping. Rows are only removed when the walk positively found their files missing: anything at or below a path the walk could not read (a failed read, a permission error, a dangling link) is kept and counted as `kept (unreadable)`. If the walk finds no audio files at all while the library still has rows under the directory, nothing is removed and a warning asks whether the volume is mounted; this protects against an unmounted share, but it also means the last remaining files of a directory cannot be cleared by `import`, and a share mounted *below* the imported directory can still look like deleted files if it is empty. It prints how many tracks were new or changed, unchanged, and removed, and warns when an accepted match was dropped or became stale.
+Import adds and refreshes entries, removes the rows of files that have disappeared from the imported directory, and refreshes local-release grouping. Rows are only removed when the walk positively found their files missing: anything at or below a path the walk could not read (a failed read, a permission error, a dangling link) is kept and counted as `kept (unreadable)`. A dangling link to a folder that still has stored rows beneath it also produces one warning, `kept N stored tracks under <path>: the folder is unreachable (broken link?)`; a broken link to a non-audio file (a cover image, say) is ignored silently. If the walk finds no audio files at all while the library still has rows under the directory, nothing is removed, the summary counts them as `kept (no audio files found)`, and a warning asks whether the volume is mounted; this protects against an unmounted share, but it also means the last remaining files of a directory cannot be cleared by `import`, and a share mounted *below* the imported directory can still look like deleted files if it is empty. It prints how many tracks were new or changed, unchanged, and removed, and warns when an accepted match was dropped or became stale.
+
+Symbolic links are followed during the walk, which has consequences:
+
+- A link to a sibling folder inside the library makes the same files reachable at two paths, and they are imported twice (one track row per path).
+- A link that points outside the library pulls that whole tree in.
+- Link loops are reported as skipped paths rather than followed forever.
+
+File and folder names are untrusted text. Everything Radish prints that contains a path, tag value, or provider response, including warnings and errors, shows control characters and bidirectional overrides as `\u{..}` escapes instead of sending them to your terminal.
 
 ### Watch
 
-`watch` performs the same incremental import as `import`, then subscribes to recursive filesystem events using [Notify](https://github.com/notify-rs/notify), and starts listening before the initial import so changes made during it are not missed. After the first event it collects events for 500 ms and handles them as one batch. What is on disk decides what happens to each affected path, whatever the event kind: a directory is scanned, an audio file has its tags read, and a missing path has its stored tracks removed (every track under it, for a directory). Renames, folders moved in or out, and the generic event kinds some platforms report are handled the same way. Reads, metadata-only changes, and the database's own `-wal`, `-shm` and `-journal` files are ignored, so a database inside the watched directory is safe. Local-release grouping is recomputed once per batch, and only when rows changed, so accepted matches become stale when matching inputs change. A path that fails is reported as a warning and the rest of the batch still applies. If the backend reports that it lost events, or a database write failed, the watcher runs a full sync (the same incremental import as at startup) with the next batch. Dropped and newly stale accepted matches are reported after every rebuild. If the watched directory itself is removed, the watcher says so and exits. Stop watching with `Ctrl+C`.
+`watch` performs the same incremental import as `import`, then subscribes to recursive filesystem events using [Notify](https://github.com/notify-rs/notify), and starts listening before the initial import so changes made during it are not missed. After the first event it collects events for 500 ms and handles them as one batch. What is on disk decides what happens to each affected path, whatever the event kind: a directory is scanned, an audio file has its tags read, and a missing path has its stored tracks removed (every track under it, for a directory). Renames, folders moved in or out, and the generic event kinds some platforms report are handled the same way. Reads, metadata-only changes, and the database's own `-wal`, `-shm` and `-journal` files are ignored, so a database inside the watched directory is safe. Local-release grouping is recomputed once per batch, and only when rows changed, so accepted matches become stale when matching inputs change. A path that fails is reported as a warning and the rest of the batch still applies. If the backend reports that it lost events, or a database write failed, the watcher runs a full sync (the same incremental import as at startup) with the next batch. Dropped and newly stale accepted matches are reported after every rebuild. If the watched directory itself is removed, the watcher says so and exits, including when it was about to run a full sync. Stop watching with `Ctrl+C`.
 
 The initial import uses the same terminal progress display as `import`. Ongoing watch events print `synced:` and `removed:` lines for real changes only.
 
@@ -350,6 +372,7 @@ Current synchronization limits:
 - Like `import`, a full sync keeps rows it cannot positively show to be gone: unreadable files and folders, and a walk that finds no audio files at all, remove nothing.
 - Changes made while the watcher is stopped are replayed by the initial import, which also removes rows for files that disappeared.
 - A change that only touches a file's modification time is not picked up until the next import, because metadata-only events are ignored.
+- If the database lives inside the watched tree, removing the whole tree with `rm -rf` may not raise a root-deleted event, because SQLite's open files pin the directory. Keep the database outside the watched directory if you need the watcher to notice that.
 
 ## Storage and output
 
@@ -368,6 +391,13 @@ The base schema is embedded in the binary and initialized on connection; additiv
 `list` and `search` read the database without checking the audio files. Output includes artist, title, available album, disc and track number, rounded duration in `minutes:seconds`, a `[stale match]` marker when accepted metadata no longer matches the group, and a final track count. A missing title displays the filename; a missing artist displays `(unknown artist)`. An empty result prints `No tracks found.`
 
 `radish releases` prints each local release's ID, artist, title, track count, status (`unmatched`, `matched`, `stale`, plus queued providers), folder, and the accepted provider, release ID, and title when present.
+
+File databases use SQLite's WAL journal mode, so `<db>-wal` and `<db>-shm` files appear next to the database while it is open. They are part of the database: keep them with it when you move or back it up, and do not delete them while Radish is running.
+
+### Upgrade notes
+
+- A migration marks previously accepted multi-track matches stale when their file order differs from their track order. Older versions could apply remote track metadata to the wrong files in that case. The overlay stays visible; the next `radish match` run re-evaluates those releases.
+- The year used to be stored on an album row shared by every folder with the same title and artist, and now lives on each track. Releases that were affected by that shared year may go stale once on their first rescan after upgrading. Review or refresh them as usual.
 
 ## Development
 

@@ -83,6 +83,9 @@ fn command(cwd: &Path, db: &Path, server: &MockServer) -> Command {
         .env_remove("RADISH_CLOUDFLARE_BASE_URL")
         .env_remove("RADISH_CLOUDFLARE_MODEL")
         .env_remove("RADISH_DISCOGS_TOKEN")
+        // A developer's proxy exemptions must not let a test reach a real host.
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
         // Pin provider services even before .env support exists: failing tests
         // must also remain completely local.
         .env("RADISH_MUSICBRAINZ_BASE_URL", &server.url)
@@ -112,9 +115,11 @@ async fn loads_fake_ai_credentials_from_working_directory_dotenv() {
     seed(&db).await;
     let server = server();
     std::fs::write(cwd.join(".env"), format!(
-        "RADISH_CLOUDFLARE_ACCOUNT_ID={FILE_ACCOUNT}\nRADISH_CLOUDFLARE_API_TOKEN={FILE_TOKEN}\nRADISH_CLOUDFLARE_BASE_URL={}\nRADISH_CLOUDFLARE_MODEL=clef\n", server.url
+        "RADISH_CLOUDFLARE_ACCOUNT_ID={FILE_ACCOUNT}\nRADISH_CLOUDFLARE_API_TOKEN={FILE_TOKEN}\nRADISH_CLOUDFLARE_MODEL=clef\n"
     )).unwrap();
+    // The base URL is not an allowed .env key, so the mock comes from the real environment.
     let output = command(&cwd, &db, &server)
+        .env("RADISH_CLOUDFLARE_BASE_URL", &server.url)
         .args(["match", "--provider", "musicbrainz", "--ai-review"])
         .output()
         .unwrap();
@@ -128,7 +133,7 @@ async fn loads_fake_ai_credentials_from_working_directory_dotenv() {
 }
 
 #[tokio::test]
-async fn finds_dotenv_in_parent_of_working_directory() {
+async fn ignores_dotenv_in_parent_of_working_directory() {
     let parent = temp_dir("dotenv-parent");
     let cwd = parent.join("nested");
     std::fs::create_dir(&cwd).unwrap();
@@ -136,9 +141,163 @@ async fn finds_dotenv_in_parent_of_working_directory() {
     seed(&db).await;
     let server = server();
     std::fs::write(parent.join(".env"), format!(
+        "RADISH_CLOUDFLARE_ACCOUNT_ID={FILE_ACCOUNT}\nRADISH_CLOUDFLARE_API_TOKEN={FILE_TOKEN}\n"
+    )).unwrap();
+    let output = command(&cwd, &db, &server)
+        .env("RADISH_CLOUDFLARE_BASE_URL", &server.url)
+        .args(["match", "--provider", "musicbrainz", "--ai-review"])
+        .output()
+        .unwrap();
+    // Without credentials the AI review cannot start, so no AI request is made.
+    let text = String::from_utf8_lossy(&output.stdout);
+    let errors = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(server.requests_matching("/ai/run/"), 0, "{text}\n{errors}");
+    assert!(!text.contains("AI advice"), "{text}");
+}
+
+#[tokio::test]
+async fn dotenv_loads_only_allowed_keys_and_ignores_endpoint_overrides() {
+    let cwd = temp_dir("dotenv-allowlist");
+    let db = cwd.join("library.db");
+    seed(&db).await;
+    let server = server();
+    // Route HTTPS through the mock: if the file's base URL were ignored, the
+    // default Cloudflare origin is contacted via this proxy and recorded here
+    // instead of reaching the network.
+    std::fs::write(cwd.join(".env"), format!(
         "RADISH_CLOUDFLARE_ACCOUNT_ID={FILE_ACCOUNT}\nRADISH_CLOUDFLARE_API_TOKEN={FILE_TOKEN}\nRADISH_CLOUDFLARE_BASE_URL={}\n", server.url
     )).unwrap();
     let output = command(&cwd, &db, &server)
+        .env("HTTPS_PROXY", &server.url)
+        .env("https_proxy", &server.url)
+        .args(["match", "--provider", "musicbrainz", "--ai-review"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    let errors = String::from_utf8_lossy(&output.stderr);
+    // The file's endpoint override was not applied: no AI request reached the
+    // mock as an origin-form path, only a proxy tunnel to the default origin.
+    assert_eq!(server.requests_matching("/ai/run/"), 0, "{text}\n{errors}");
+    assert!(
+        server
+            .targets()
+            .iter()
+            .any(|target| target.starts_with("api.cloudflare.com")),
+        "the credential from .env was not used for the default origin: {:?}",
+        server.targets()
+    );
+    assert!(!text.contains(FILE_TOKEN));
+    assert!(!errors.contains(FILE_TOKEN));
+}
+
+#[tokio::test]
+async fn dotenv_cannot_redirect_the_musicbrainz_or_discogs_endpoints() {
+    for (provider, variable, default_host, origin_path) in [
+        (
+            "musicbrainz",
+            "RADISH_MUSICBRAINZ_BASE_URL",
+            "musicbrainz.org",
+            "/ws/2/",
+        ),
+        (
+            "discogs",
+            "RADISH_DISCOGS_BASE_URL",
+            "api.discogs.com",
+            "/database/",
+        ),
+    ] {
+        let cwd = temp_dir(&format!("dotenv-endpoint-{provider}"));
+        let db = cwd.join("library.db");
+        seed(&db).await;
+        let server = server();
+        // The file points at a loopback mock, which is a valid override value:
+        // only the allowlist keeps it out. Without it, the provider falls back
+        // to its public host, reached here only through the local proxy.
+        std::fs::write(cwd.join(".env"), format!("{variable}={}\n", server.url)).unwrap();
+        let output = command(&cwd, &db, &server)
+            .env_remove("RADISH_MUSICBRAINZ_BASE_URL")
+            .env_remove("RADISH_DISCOGS_BASE_URL")
+            .env("RADISH_DISCOGS_TOKEN", "synthetic-env-token")
+            .env("HTTPS_PROXY", &server.url)
+            .env("https_proxy", &server.url)
+            .args(["match", "--provider", provider])
+            .output()
+            .unwrap();
+        let targets = server.targets();
+        assert!(
+            !targets.iter().any(|target| target.contains(origin_path)),
+            "{provider}: the file's endpoint override was applied: {targets:?}"
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.starts_with(default_host)),
+            "{provider}: expected a proxied request to {default_host}: {targets:?} {output:?}"
+        );
+    }
+}
+
+/// Runs `radish list` in `cwd`, failing instead of hanging when it never exits.
+fn list_with_timeout(cwd: &Path, db: &Path, server: &MockServer) -> Option<Output> {
+    let mut child = command(cwd, db, server)
+        .arg("list")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if child.try_wait().unwrap().is_some() {
+            return Some(child.wait_with_output().unwrap());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+#[test]
+fn a_dotenv_directory_is_ignored_instead_of_hanging() {
+    let cwd = temp_dir("dotenv-directory");
+    std::fs::create_dir(cwd.join(".env")).unwrap();
+    let server = server();
+
+    let output = list_with_timeout(&cwd, &cwd.join("library.db"), &server)
+        .expect("radish did not exit with a .env directory present");
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No tracks found."));
+}
+
+#[tokio::test]
+async fn a_byte_order_mark_does_not_hide_the_first_dotenv_key() {
+    let cwd = temp_dir("dotenv-bom");
+    let db = cwd.join("library.db");
+    seed(&db).await;
+    let server = server();
+    // PowerShell 5 writes a UTF-8 BOM; the account ID is the first line.
+    std::fs::write(cwd.join(".env"), format!(
+        "\u{feff}RADISH_CLOUDFLARE_ACCOUNT_ID={FILE_ACCOUNT}\nRADISH_CLOUDFLARE_API_TOKEN={FILE_TOKEN}\n"
+    )).unwrap();
+    let output = command(&cwd, &db, &server)
+        .env("RADISH_CLOUDFLARE_BASE_URL", &server.url)
+        .args(["match", "--provider", "musicbrainz", "--ai-review"])
+        .output()
+        .unwrap();
+    assert_reviewed(&output, &server, FILE_ACCOUNT);
+}
+
+#[tokio::test]
+async fn a_malformed_dotenv_line_does_not_stop_later_keys_loading() {
+    let cwd = temp_dir("dotenv-bad-line");
+    let db = cwd.join("library.db");
+    seed(&db).await;
+    let server = server();
+    std::fs::write(cwd.join(".env"), format!(
+        "RADISH_CLOUDFLARE_ACCOUNT_ID={FILE_ACCOUNT}\nthis line is not an assignment\nRADISH_CLOUDFLARE_API_TOKEN={FILE_TOKEN}\n"
+    )).unwrap();
+    let output = command(&cwd, &db, &server)
+        .env("RADISH_CLOUDFLARE_BASE_URL", &server.url)
         .args(["match", "--provider", "musicbrainz", "--ai-review"])
         .output()
         .unwrap();

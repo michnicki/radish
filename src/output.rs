@@ -57,6 +57,11 @@ impl fmt::Display for Clean<'_> {
     }
 }
 
+/// Escapes a path for display; see [`Clean`]. Non-UTF-8 bytes show as U+FFFD.
+pub fn clean_path(path: &std::path::Path) -> String {
+    Clean(&path.to_string_lossy()).to_string()
+}
+
 /// Writes formatted text to stdout without a trailing newline.
 ///
 /// Exits the process with status 0 on a broken pipe, and with status 1 after

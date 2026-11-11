@@ -1,3 +1,4 @@
+use crate::output::{Clean, clean_path};
 use crate::progress::ImportProgress;
 use crate::{importer, outln, scanner, store};
 use anyhow::Result;
@@ -37,7 +38,7 @@ pub async fn watch_directory(pool: SqlitePool, root: &Path, db_path: &Path) -> R
     })?;
     watcher.watch(&root, RecursiveMode::Recursive)?;
 
-    outln!("Doing initial scan of {}...", root.display());
+    outln!("Doing initial scan of {}...", clean_path(&root));
     let progress = ImportProgress::new();
     let summary = importer::sync_directory(&pool, &root, &progress).await?;
     drop(progress);
@@ -53,7 +54,7 @@ pub async fn watch_directory(pool: SqlitePool, root: &Path, db_path: &Path) -> R
     let mut state = WatchState::default();
     while let Some(batch) = collect_batch(&mut rx, DEBOUNCE).await {
         if process_batch(&pool, &scope, directory_id, batch, &mut state).await == Flow::RootGone {
-            outln!("{} was removed; no longer watching.", root.display());
+            outln!("{} was removed; no longer watching.", clean_path(&root));
             break;
         }
     }
@@ -186,7 +187,7 @@ async fn process_batch(
         match res {
             Ok(event) => events.push(event),
             Err(err) => {
-                eprintln!("watch error: {err}");
+                eprintln!("watch error: {}", Clean(&err.to_string()));
                 lost_events = true;
             }
         }
@@ -200,7 +201,10 @@ async fn process_batch(
             }
         }
         Err(err) => {
-            eprintln!("warning: failed to process filesystem events: {err:#}");
+            eprintln!(
+                "warning: failed to process filesystem events: {}",
+                Clean(&format!("{err:#}"))
+            );
             state.rescan_pending = true;
         }
     }
@@ -237,8 +241,24 @@ async fn handle_events(
     if force_rescan || plan.rescan {
         // Events were lost or not applied, so a full sync is the only way to be sure.
         let progress = ImportProgress::new();
-        let summary = importer::sync_directory(pool, &scope.root, &progress).await?;
+        let synced = importer::sync_directory(pool, &scope.root, &progress).await;
         drop(progress);
+        let summary = match synced {
+            Ok(summary) => summary,
+            Err(err) => {
+                // The per-path handling that normally notices a deleted root is
+                // skipped during a full sync, so check for it here. The rows
+                // stay, as in the per-path case.
+                if matches!(
+                    tokio::fs::metadata(&scope.root).await,
+                    Err(error) if error.kind() == ErrorKind::NotFound
+                ) {
+                    outcome.root_gone = true;
+                    return Ok(outcome);
+                }
+                return Err(err);
+            }
+        };
         outcome.synced = summary.saved;
         outcome.removed = summary.removed;
         importer::report_rebuild(&summary.rebuild);
@@ -246,7 +266,7 @@ async fn handle_events(
         if summary.saved + summary.removed > 0 {
             outln!(
                 "synced: {} ({} changed, {} removed)",
-                scope.root.display(),
+                clean_path(&scope.root),
                 summary.saved,
                 summary.removed
             );
@@ -257,7 +277,11 @@ async fn handle_events(
     for (key, path) in &plan.paths {
         // One path failing must not cost the rest of the batch.
         if let Err(err) = apply_path(pool, scope, directory_id, key, path, &mut outcome).await {
-            eprintln!("warning: failed to sync {}: {err:#}", path.display());
+            eprintln!(
+                "warning: failed to sync {}: {}",
+                clean_path(path),
+                Clean(&format!("{err:#}"))
+            );
             outcome.failed |= err.downcast_ref::<sqlx::Error>().is_some();
         }
         if outcome.root_gone {
@@ -274,7 +298,10 @@ async fn handle_events(
                 outcome.rebuild = Some(rebuild);
             }
             Err(err) => {
-                eprintln!("warning: failed to refresh local releases: {err:#}");
+                eprintln!(
+                    "warning: failed to refresh local releases: {}",
+                    Clean(&format!("{err:#}"))
+                );
                 outcome.failed = true;
             }
         }
@@ -297,10 +324,10 @@ async fn apply_path(
             outcome.synced += summary.saved;
             outcome.removed += summary.removed;
             if summary.saved > 0 {
-                outln!("synced: {} ({} tracks)", path.display(), summary.saved);
+                outln!("synced: {} ({} tracks)", clean_path(path), summary.saved);
             }
             if summary.removed > 0 {
-                outln!("removed: {} ({} tracks)", path.display(), summary.removed);
+                outln!("removed: {} ({} tracks)", clean_path(path), summary.removed);
             }
         }
         Ok(metadata) if metadata.is_file() && scanner::is_audio_file(path) => {
@@ -316,10 +343,14 @@ async fn apply_path(
                             .await?;
                     outcome.synced += changed;
                     if changed > 0 {
-                        outln!("synced: {}", path.display());
+                        outln!("synced: {}", clean_path(path));
                     }
                 }
-                Err(err) => eprintln!("warning: failed to tag {}: {err}", path.display()),
+                Err(err) => eprintln!(
+                    "warning: failed to tag {}: {}",
+                    clean_path(path),
+                    Clean(&format!("{err:#}"))
+                ),
             }
         }
         Ok(_) => {}
@@ -332,10 +363,14 @@ async fn apply_path(
             let removed = store::remove_tracks_under(pool, path).await?;
             outcome.removed += removed;
             if removed > 0 {
-                outln!("removed: {}", path.display());
+                outln!("removed: {}", clean_path(path));
             }
         }
-        Err(err) => eprintln!("warning: failed to inspect {}: {err}", path.display()),
+        Err(err) => eprintln!(
+            "warning: failed to inspect {}: {}",
+            clean_path(path),
+            Clean(&err.to_string())
+        ),
     }
     Ok(())
 }
@@ -861,6 +896,32 @@ mod tests {
             fixture.directory_id,
             batch,
             &mut WatchState::default(),
+        )
+        .await;
+
+        assert_eq!(flow, Flow::RootGone);
+    }
+
+    #[tokio::test]
+    async fn a_pending_full_sync_notices_that_the_root_is_gone() {
+        let fixture = Fixture::new("watcher-root-gone-while-pending").await;
+        write_wav(&fixture.path("a.wav"));
+        let mut state = WatchState {
+            rescan_pending: true,
+        };
+        std::fs::remove_dir_all(fixture.music.path()).unwrap();
+        // An unrelated event: only the pending full sync looks at the root.
+        let batch = vec![Ok(event(
+            EventKind::Access(AccessKind::Read),
+            &[&fixture.path("a.wav")],
+        ))];
+
+        let flow = process_batch(
+            &fixture.pool,
+            &fixture.scope,
+            fixture.directory_id,
+            batch,
+            &mut state,
         )
         .await;
 
