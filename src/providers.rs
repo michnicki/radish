@@ -7,9 +7,92 @@
 //! `(provider, TEXT id)` pairs in SQLite.
 
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::hash::Hash;
 use std::str::FromStr;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
+
+/// Most release documents an adapter keeps for one run. A library import
+/// touches far more releases than it revisits, so an unbounded map would only
+/// grow; this covers the repeats that occur close together.
+pub const RELEASE_CACHE_CAPACITY: usize = 256;
+/// Most search pages an adapter keeps for one run (same reasoning).
+pub const SEARCH_CACHE_CAPACITY: usize = 256;
+
+/// Locks a mutex, recovering the data if a panicking holder poisoned it.
+///
+/// Every guarded value here is plain bookkeeping that stays consistent after a
+/// panic, so continuing is safe.
+pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A small least-recently-used cache: a map plus a recency queue.
+///
+/// Lookups and inserts are O(capacity) because the queue is scanned to refresh
+/// an entry. That is deliberate; the capacities here are a few hundred and each
+/// hit saves a rate-limited network request.
+#[derive(Debug)]
+pub struct BoundedCache<K, V> {
+    capacity: usize,
+    /// Least recently used first.
+    order: VecDeque<K>,
+    entries: HashMap<K, V>,
+}
+
+impl<K: Eq + Hash + Clone, V: Clone> BoundedCache<K, V> {
+    /// A cache holding at most `capacity` entries (at least one).
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            order: VecDeque::new(),
+            entries: HashMap::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Returns a copy of the entry and marks it most recently used.
+    pub fn get(&mut self, key: &K) -> Option<V> {
+        let value = self.entries.get(key)?.clone();
+        self.touch(key);
+        Some(value)
+    }
+
+    /// Stores the entry as most recently used, evicting the least recently
+    /// used one when the cache is full.
+    pub fn insert(&mut self, key: K, value: V) {
+        if self.entries.insert(key.clone(), value).is_some() {
+            self.touch(&key);
+            return;
+        }
+        self.order.push_back(key);
+        while self.entries.len() > self.capacity {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn touch(&mut self, key: &K) {
+        if let Some(position) = self.order.iter().position(|existing| existing == key)
+            && let Some(key) = self.order.remove(position)
+        {
+            self.order.push_back(key);
+        }
+    }
+}
 
 /// A metadata service Radish can match against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -454,5 +537,34 @@ mod tests {
         let mbid: Mbid = "4642ee19-7790-3c8d-ab5e-d133de942db6".parse().unwrap();
         let json = serde_json::to_string(&GroupId::MusicBrainzReleaseGroup(mbid)).unwrap();
         assert!(json.contains("musicbrainz_release_group"), "{json}");
+    }
+
+    #[test]
+    fn bounded_cache_evicts_the_oldest_entry_at_capacity() {
+        let mut cache = BoundedCache::new(2);
+        cache.insert("a", 1);
+        cache.insert("b", 2);
+        cache.insert("c", 3);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get(&"a"), None);
+        assert_eq!(cache.get(&"b"), Some(2));
+        assert_eq!(cache.get(&"c"), Some(3));
+    }
+
+    #[test]
+    fn bounded_cache_reads_and_overwrites_refresh_recency() {
+        let mut cache = BoundedCache::new(2);
+        cache.insert("a", 1);
+        cache.insert("b", 2);
+        // Reading "a" makes "b" the oldest entry.
+        assert_eq!(cache.get(&"a"), Some(1));
+        cache.insert("c", 3);
+        assert_eq!(cache.get(&"b"), None);
+        // Overwriting "a" keeps one entry and refreshes it.
+        cache.insert("a", 10);
+        cache.insert("d", 4);
+        assert_eq!(cache.get(&"c"), None);
+        assert_eq!(cache.get(&"a"), Some(10));
+        assert_eq!(cache.len(), 2);
     }
 }

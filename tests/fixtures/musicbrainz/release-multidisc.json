@@ -49,6 +49,7 @@
         {
           "id": "11111111-aaaa-4aaa-8aaa-111111111111",
           "number": "1",
+          "position": 1,
           "title": "Shared Recording",
           "length": 200000,
           "recording": {
@@ -67,6 +68,7 @@
         {
           "id": "22222222-aaaa-4aaa-8aaa-222222222222",
           "number": "1",
+          "position": 1,
           "title": "Shared Recording",
           "length": 201000,
           "recording": {
@@ -78,6 +80,7 @@
         {
           "id": "33333333-aaaa-4aaa-8aaa-333333333333",
           "number": "2",
+          "position": 2,
           "title": "Second Disc Track",
           "length": 150000,
           "recording": {

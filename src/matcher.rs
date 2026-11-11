@@ -301,6 +301,9 @@ pub struct SearchSummary {
     pub formats: Vec<String>,
     pub barcodes: Vec<String>,
     pub result_type: String,
+    /// Total tracks across all media, when the service reports it.
+    #[serde(default)]
+    pub track_count: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2764,6 +2767,7 @@ mod tests {
             formats: vec!["CD".to_string()],
             barcodes: vec!["0123456789012".to_string()],
             result_type: "release".to_string(),
+            track_count: None,
         };
         let other = SearchSummary {
             title: "Someone Else - Another Album".to_string(),

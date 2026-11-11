@@ -655,6 +655,7 @@ mod tests {
             formats: Vec::new(),
             barcodes: vec!["0123456789012".to_string()],
             result_type: "release".to_string(),
+            track_count: None,
         }
     }
 
