@@ -3083,7 +3083,7 @@ mod tests {
             result
                 .blockers
                 .iter()
-                .any(|reason| reason.contains("qualifier")),
+                .any(|reason| reason.contains("track version qualifiers")),
             "{:?}",
             result.blockers
         );
@@ -3091,18 +3091,11 @@ mod tests {
 
     #[test]
     fn album_scope_ignores_remastered_in_track_titles() {
-        let local = local_release(&["Song - Remastered 2009", "Other"]);
-        let remote = remote_release(&["Song", "Other"]);
+        let local = local_release(&["Here Comes the Sun", "Something"]);
+        let remote = remote_release(&["Here Comes the Sun (Remastered)", "Something"]);
         let candidate = Candidate::new(&local, remote);
         let result = evaluate_ai_album(&local, &candidate, &[]);
-        assert!(
-            !result
-                .blockers
-                .iter()
-                .any(|reason| reason.contains("qualifier")),
-            "{:?}",
-            result.blockers
-        );
+        assert!(result.auto_accept, "{:?}", result.blockers);
     }
 
     #[test]
