@@ -385,6 +385,29 @@ async fn an_edited_remote_tracklist_invalidates_saved_advice_under_the_same_ids(
 }
 
 #[tokio::test]
+async fn an_unreadable_saved_review_is_a_cache_miss_not_a_failure() {
+    let db = db_path("clef-reuse-corrupt-review");
+    seed(&db, false).await;
+    let server = server(200, &format!("musicbrainz:{MBID}"));
+    let args = ["match", "--provider", "musicbrainz", "--ai-review"];
+    assert!(run(&db, &server, &args, true).status.success());
+    let pool = radish::db::connect(&db).await.unwrap();
+    sqlx::query("UPDATE match_reviews SET candidates_json = 'not json'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let output = run(&db, &server, &args, true);
+
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("Failed: 0"), "{text}");
+    assert!(text.contains("Queued for review: 1"), "{text}");
+    assert_eq!(server.requests_matching("/ai/run/"), 2, "{text}");
+}
+
+#[tokio::test]
 async fn changed_files_invalidate_saved_advice() {
     let db = db_path("clef-reuse-changed");
     seed(&db, false).await;

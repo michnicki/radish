@@ -739,7 +739,7 @@ where
 
     if has_candidates {
         if options.ai_review {
-            add_ai_advice(pool, release, guard, &mut attempts, ai).await?;
+            add_ai_advice(pool, release, guard, &mut attempts, ai).await;
         }
         if !options.review
             && direct.is_none()
@@ -823,9 +823,9 @@ async fn add_ai_advice(
     guard: &MatchGuard,
     attempts: &mut [ProviderAttempt],
     ai: &mut AiState,
-) -> Result<()> {
+) {
     let Some(client) = ai.client() else {
-        return Ok(());
+        return;
     };
     let candidates: Vec<ReviewCandidate<'_>> = attempts
         .iter()
@@ -843,7 +843,15 @@ async fn add_ai_advice(
         .collect();
 
     // Paid advice is reused while everything it was based on is unchanged.
-    let result = match saved_advice(pool, release, guard, attempts, client, &candidates).await? {
+    let saved = match saved_advice(pool, release, guard, attempts, client, &candidates).await {
+        Ok(saved) => saved,
+        Err(_) => {
+            // A damaged saved review only costs a new request.
+            outln!("  saved AI advice could not be read; asking again");
+            None
+        }
+    };
+    let result = match saved {
         Some(advice) => {
             outln!("  reusing saved AI advice; no new request was made");
             Ok(advice)
@@ -875,7 +883,6 @@ async fn add_ai_advice(
         }
         Err(error) => outln!("  AI review unavailable: {error}; continuing without AI matching"),
     }
-    Ok(())
 }
 
 /// Advice stored with a queued review, if it still answers the question that
