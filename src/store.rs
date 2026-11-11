@@ -197,6 +197,16 @@ pub fn path_key(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+/// True when `key` is `prefix_key` or lives beneath it. Both are [`path_key`]
+/// values, and `prefix_key` has no trailing slash. Whole components only, so
+/// `/music/blue` does not contain `/music/bluegrass`.
+pub(crate) fn key_within(key: &str, prefix_key: &str) -> bool {
+    key == prefix_key
+        || key
+            .strip_prefix(prefix_key)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// True for a normalized scope that covers a whole volume: a bare drive such as
 /// `C:`, or a UNC server or share root such as `//server/share`. Pure string
 /// logic, so it behaves the same on every platform.
@@ -522,7 +532,9 @@ fn consistent_value<'a>(values: impl Iterator<Item = &'a str>) -> Option<String>
     }
 }
 
-fn fnv1a64(bytes: &[u8]) -> u64 {
+/// FNV-1a over the bytes. Stable across builds and platforms, which a
+/// `Hasher` from the standard library does not promise.
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in bytes {
         hash ^= u64::from(*byte);
@@ -792,7 +804,7 @@ pub fn path_within(candidate: &str, root: &Path) -> bool {
     if root.is_empty() {
         return true;
     }
-    candidate == root || candidate.starts_with(&format!("{root}/"))
+    key_within(&candidate, &root)
 }
 
 /// What one `rebuild_local_releases` call did.
@@ -2350,6 +2362,23 @@ mod tests {
     use crate::matcher::{RemoteTrack, ScoreBreakdown, TrackEntryType};
     use crate::scanner;
     use std::path::PathBuf;
+
+    #[test]
+    fn key_within_matches_the_prefix_and_whole_components_beneath_it() {
+        assert!(key_within("/music/blue", "/music/blue"));
+        assert!(key_within("/music/blue/01.flac", "/music/blue"));
+        assert!(!key_within("/music/bluegrass/01.flac", "/music/blue"));
+        assert!(!key_within("/music", "/music/blue"));
+        // A filesystem root has an empty key once its trailing slash is trimmed.
+        assert!(key_within("/music/blue", ""));
+    }
+
+    #[test]
+    fn fnv1a64_matches_the_published_test_vectors() {
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
+    }
 
     fn scanned(path: &str, album: Option<&str>, artist: Option<&str>, track: i64) -> ScannedTrack {
         ScannedTrack {

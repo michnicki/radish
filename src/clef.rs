@@ -280,13 +280,9 @@ impl ClefClient {
     }
 }
 
-/// FNV-1a over the bytes, as fixed-width hex. Stable across builds and
-/// platforms, which a `Hasher` from the standard library does not promise.
+/// FNV-1a over the bytes, as fixed-width hex.
 fn digest(bytes: &[u8]) -> String {
-    let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
-    });
-    format!("fnv1a64:{hash:016x}")
+    format!("fnv1a64:{:016x}", crate::store::fnv1a64(bytes))
 }
 
 struct PreparedRequest {

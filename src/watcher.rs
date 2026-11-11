@@ -89,10 +89,7 @@ impl Scope {
     /// True for the root and everything beneath it, compared like the path
     /// columns: forward slashes, ASCII case folded, whole components only.
     fn contains(&self, key: &str) -> bool {
-        key == self.root_key
-            || key
-                .strip_prefix(&self.root_key)
-                .is_some_and(|rest| rest.starts_with('/'))
+        store::key_within(key, &self.root_key)
     }
 
     fn is_ignored(&self, key: &str) -> bool {

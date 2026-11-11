@@ -219,12 +219,9 @@ pub(crate) async fn sync_files(
         .collect();
     // A file or folder the scan could not read says nothing about its rows.
     let is_unreadable = |key: &str| {
-        unreadable_keys.iter().any(|blocked| {
-            key == blocked
-                || key
-                    .strip_prefix(blocked.as_str())
-                    .is_some_and(|rest| rest.starts_with('/'))
-        })
+        unreadable_keys
+            .iter()
+            .any(|blocked| store::key_within(key, blocked))
     };
     let mut gone = Vec::new();
     let mut kept = 0;
@@ -246,12 +243,7 @@ pub(crate) async fn sync_files(
         let protected = known
             .keys()
             .filter(|key| !seen.contains(*key))
-            .filter(|key| {
-                key.as_str() == blocked
-                    || key
-                        .strip_prefix(blocked.as_str())
-                        .is_some_and(|rest| rest.starts_with('/'))
-            })
+            .filter(|key| store::key_within(key, &blocked))
             .count();
         if protected > 0 {
             let message = format!(
