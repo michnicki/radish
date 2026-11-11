@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use radish::providers::{ProviderKind, ReleaseId};
 use radish::{db, runner, scanner, store, watcher};
 use std::path::{Path, PathBuf};
 
@@ -23,9 +24,13 @@ enum Command {
     /// Multi-threaded scan and import of a music directory
     Import {
         path: PathBuf,
-        /// Match the imported directory against Discogs after importing
+        /// Match the imported directory after importing (MusicBrainz first,
+        /// then Discogs when a token is available)
         #[arg(long = "match")]
         match_releases: bool,
+        /// Restrict matching to one service and disable fallback
+        #[arg(long, value_name = "PROVIDER", requires = "match_releases")]
+        provider: Option<ProviderKind>,
     },
     /// Watch a music directory and keep the library in sync in real time
     Watch { path: PathBuf },
@@ -39,25 +44,34 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         path: Option<PathBuf>,
     },
-    /// Match local releases against Discogs releases
+    /// Match local releases against MusicBrainz, with optional Discogs fallback
     Match {
         /// Restrict matching to this directory tree
         path: Option<PathBuf>,
         /// Only process this local release
         #[arg(long = "local-release", value_name = "ID", conflicts_with = "path")]
         local_release: Option<i64>,
+        /// Restrict matching to one service and disable fallback
+        #[arg(long, value_name = "PROVIDER")]
+        provider: Option<ProviderKind>,
+        /// Fetch this MusicBrainz release directly, bypassing search
+        #[arg(
+            long = "musicbrainz-release",
+            value_name = "MBID",
+            requires = "local_release",
+            conflicts_with = "discogs_release"
+        )]
+        musicbrainz_release: Option<String>,
         /// Fetch this Discogs release directly, bypassing search
         #[arg(
             long = "discogs-release",
             value_name = "ID",
-            requires = "local_release"
+            requires = "local_release",
+            conflicts_with = "musicbrainz_release"
         )]
         discogs_release: Option<u64>,
         /// Review candidates interactively instead of accepting automatically
-        #[arg(
-            long,
-            conflicts_with_all = ["clear", "local_release", "discogs_release"]
-        )]
+        #[arg(long, conflicts_with = "clear")]
         review: bool,
         /// Search and show decisions without storing matches
         #[arg(long = "dry-run")]
@@ -66,21 +80,66 @@ enum Command {
         #[arg(
             long,
             value_name = "ID",
-            conflicts_with_all = ["path", "local_release", "discogs_release", "review", "dry_run"]
+            conflicts_with_all = [
+                "path",
+                "local_release",
+                "provider",
+                "musicbrainz_release",
+                "discogs_release",
+                "review",
+                "dry_run"
+            ]
         )]
         clear: Option<i64>,
     },
 }
 
+fn parse_direct(musicbrainz: Option<&str>, discogs: Option<u64>) -> Result<Option<ReleaseId>> {
+    match (musicbrainz, discogs) {
+        (Some(raw), None) => {
+            let id = raw
+                .parse()
+                .with_context(|| format!("'{raw}' is not a hyphenated MusicBrainz MBID"))?;
+            Ok(Some(ReleaseId::MusicBrainz(id)))
+        }
+        (None, Some(id)) => Ok(Some(ReleaseId::Discogs(id))),
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => bail!("choose either a MusicBrainz or a Discogs release selector"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // CLI validation happens before the database is opened or any client is
+    // constructed, so invalid combinations never touch storage or the network.
+    let selection: Option<(Option<ProviderKind>, Option<ReleaseId>)> = match &cli.command {
+        Command::Match {
+            provider,
+            musicbrainz_release,
+            discogs_release,
+            ..
+        } => Some((
+            *provider,
+            parse_direct(musicbrainz_release.as_deref(), *discogs_release)?,
+        )),
+        Command::Import { provider, .. } => Some((*provider, None)),
+        _ => None,
+    };
+    let policy = match &selection {
+        Some((provider, direct)) => Some(runner::resolve_policy(*provider, direct.as_ref())?),
+        None => None,
+    };
+    let direct = selection.and_then(|(_, direct)| direct);
+
     let pool = db::connect(&cli.db).await?;
 
     match cli.command {
         Command::Import {
             path,
             match_releases,
+            provider: _,
         } => {
             let canonical = run_import(&pool, &path).await?;
             if match_releases {
@@ -88,6 +147,7 @@ async fn main() -> Result<()> {
                     &pool,
                     runner::MatchOptions {
                         scope: Some(canonical),
+                        policy: policy.unwrap_or_default(),
                         ..runner::MatchOptions::default()
                     },
                 )
@@ -95,7 +155,7 @@ async fn main() -> Result<()> {
                 summary.print_report();
                 if summary.has_failures() {
                     bail!(
-                        "Discogs matching finished with {} failure(s); the import was kept",
+                        "matching finished with {} failure(s); the import was kept",
                         summary.failed
                     );
                 }
@@ -111,7 +171,9 @@ async fn main() -> Result<()> {
         Command::Match {
             path,
             local_release,
-            discogs_release,
+            provider: _,
+            musicbrainz_release: _,
+            discogs_release: _,
             review,
             dry_run,
             clear,
@@ -129,16 +191,17 @@ async fn main() -> Result<()> {
                     runner::MatchOptions {
                         scope,
                         local_release,
-                        discogs_release,
+                        direct_release: direct,
                         review,
                         dry_run,
+                        policy: policy.unwrap_or_default(),
                     },
                 )
                 .await?;
                 summary.print_report();
                 if summary.has_failures() {
                     bail!(
-                        "Discogs matching finished with {} failure(s); completed matches were kept",
+                        "matching finished with {} failure(s); completed matches were kept",
                         summary.failed
                     );
                 }
@@ -170,21 +233,29 @@ fn print_releases(rows: &[store::LocalReleaseStatus]) {
         let artist = row.album_artist.as_deref().unwrap_or("(unknown artist)");
         let title = row.album_title.as_deref().unwrap_or("(no album tag)");
         let mut status = row.status.clone();
-        if row.queued && row.status != store::STATUS_MATCHED {
-            status.push_str(", queued");
+        if row.stale && row.status != store::STATUS_STALE {
+            status.push_str(", stale");
         }
-        let discogs = match row.discogs_release_id {
-            Some(id) => format!(
-                " -> discogs {id}{}",
-                row.discogs_title
+        if row.queued() && row.status != store::STATUS_MATCHED {
+            let providers: Vec<&str> = row
+                .queued_providers
+                .iter()
+                .map(|provider| provider.as_str())
+                .collect();
+            status.push_str(&format!(", queued ({})", providers.join(", ")));
+        }
+        let remote = match (&row.provider, &row.remote_release_id) {
+            (Some(provider), Some(id)) => format!(
+                " -> {provider} {id}{}",
+                row.remote_title
                     .as_deref()
                     .map(|title| format!(" ({title})"))
                     .unwrap_or_default()
             ),
-            None => String::new(),
+            _ => String::new(),
         };
         println!(
-            "#{} {} — {}  [{} track(s)]  {status}{discogs}\n     {}",
+            "#{} {} — {}  [{} track(s)]  {status}{remote}\n     {}",
             row.id, artist, title, row.track_count, row.directory
         );
     }
@@ -206,13 +277,15 @@ fn print_tracks(rows: &[store::TrackRow]) {
         let artist = row.artist.as_deref().unwrap_or("(unknown artist)");
         let duration = format_duration(row.duration_secs);
         let stale = if row.stale { "  [stale match]" } else { "" };
-        match (&row.album, row.track_number) {
-            (Some(album), Some(n)) => {
-                println!("{artist} - {title}  [{album} #{n}]  {duration}{stale}")
+        let location = match (&row.album, row.disc_number, row.track_number) {
+            (Some(album), Some(disc), Some(number)) if disc > 1 => {
+                format!("  [{album} disc {disc} #{number}]")
             }
-            (Some(album), None) => println!("{artist} - {title}  [{album}]  {duration}{stale}"),
-            (None, _) => println!("{artist} - {title}  {duration}{stale}"),
-        }
+            (Some(album), _, Some(number)) => format!("  [{album} #{number}]"),
+            (Some(album), _, None) => format!("  [{album}]"),
+            _ => String::new(),
+        };
+        println!("{artist} - {title}{location}  {duration}{stale}");
     }
     println!("\n{} track(s).", rows.len());
 }
@@ -263,21 +336,68 @@ mod tests {
     }
 
     #[test]
+    fn import_provider_requires_match() {
+        assert!(parse(&["import", "/music", "--provider", "discogs"]).is_err());
+        assert!(parse(&["import", "/music", "--match", "--provider", "discogs"]).is_ok());
+    }
+
+    #[test]
     fn discogs_release_requires_local_release() {
         assert!(parse(&["match", "--discogs-release", "42"]).is_err());
         assert!(parse(&["match", "--local-release", "3", "--discogs-release", "42"]).is_ok());
     }
 
     #[test]
+    fn musicbrainz_release_requires_local_release_and_conflicts_with_discogs() {
+        let mbid = "76df3287-6cda-33eb-8e9a-044b5e15ffdd";
+        assert!(parse(&["match", "--musicbrainz-release", mbid]).is_err());
+        assert!(
+            parse(&[
+                "match",
+                "--local-release",
+                "3",
+                "--musicbrainz-release",
+                mbid
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse(&[
+                "match",
+                "--local-release",
+                "3",
+                "--musicbrainz-release",
+                mbid,
+                "--discogs-release",
+                "42"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn provider_parsing_rejects_unknown_services() {
+        assert!(parse(&["match", "--provider", "spotify"]).is_err());
+        assert!(parse(&["match", "--provider", "musicbrainz"]).is_ok());
+        assert!(parse(&["match", "--provider", "discogs"]).is_ok());
+    }
+
+    #[test]
     fn clear_conflicts_with_matching_options() {
         assert!(parse(&["match", "--clear", "3", "--review"]).is_err());
         assert!(parse(&["match", "--clear", "3", "/music"]).is_err());
+        assert!(parse(&["match", "--clear", "3", "--provider", "discogs"]).is_err());
         assert!(parse(&["match", "--clear", "3"]).is_ok());
     }
 
     #[test]
     fn local_release_conflicts_with_a_path() {
         assert!(parse(&["match", "--local-release", "3", "/music"]).is_err());
+    }
+
+    #[test]
+    fn review_can_revisit_an_explicit_local_release() {
+        assert!(parse(&["match", "--review", "--local-release", "3"]).is_ok());
     }
 
     #[test]
@@ -298,5 +418,33 @@ mod tests {
             }
             _ => panic!("expected match"),
         }
+    }
+
+    #[test]
+    fn direct_id_validation_happens_before_the_database_opens() {
+        let cli = parse(&[
+            "match",
+            "--local-release",
+            "3",
+            "--musicbrainz-release",
+            "not-an-mbid",
+        ])
+        .unwrap();
+        let selection = match cli.command {
+            Command::Match {
+                musicbrainz_release,
+                discogs_release,
+                ..
+            } => parse_direct(musicbrainz_release.as_deref(), discogs_release),
+            _ => panic!("expected match"),
+        };
+        assert!(selection.is_err());
+    }
+
+    #[test]
+    fn contradictory_provider_and_direct_id_is_rejected() {
+        let id: ReleaseId =
+            ReleaseId::MusicBrainz("76df3287-6cda-33eb-8e9a-044b5e15ffdd".parse().unwrap());
+        assert!(runner::resolve_policy(Some(ProviderKind::Discogs), Some(&id)).is_err());
     }
 }

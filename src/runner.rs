@@ -1,31 +1,29 @@
-//! CLI orchestration: select local releases, discover Discogs candidates,
-//! decide, review, and persist.
+//! CLI orchestration: select local releases, run the provider policy, decide,
+//! review, and persist.
+//!
+//! MusicBrainz is attempted first. Discogs is created lazily, only after an
+//! unsatisfactory MusicBrainz stage and only when a token is available. An
+//! explicit provider or direct selector uses one service and no fallback.
 
-use crate::discogs::{AdapterError, DiscogsAdapter, release_search_params};
-use crate::matcher::{
-    self, Candidate, DiscoveryEvidence, Evaluation, LocalRelease, RemoteRelease, SearchSummary,
-};
-use crate::store::{self, AcceptanceMethod, StoredCandidate};
-use anyhow::{Context, Result, anyhow, bail};
-use discogger::SearchParams;
+use crate::discogs::{AdapterError, DiscogsAdapter};
+use crate::discovery::{self, DiscoveryResult};
+use crate::matcher::{self, Candidate, DiscoveryEvidence, Evaluation, LocalRelease, RemoteRelease};
+use crate::musicbrainz::MusicBrainzAdapter;
+use crate::providers::{MetadataProvider, ProviderError, ProviderKind, ProviderPolicy, ReleaseId};
+use crate::store::{self, AcceptanceMethod, MatchGuard, StoredCandidate};
+use anyhow::{Context, Result, bail};
 use sqlx::SqlitePool;
-use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
-
-/// Strategies, pages, and detailed fetches are bounded so one release cannot
-/// exhaust the Discogs rate limit.
-const MAX_STRATEGIES: usize = 3;
-const MAX_PAGES: u32 = 2;
-const MAX_DETAIL_FETCHES: usize = 10;
 
 #[derive(Debug, Clone, Default)]
 pub struct MatchOptions {
     pub scope: Option<PathBuf>,
     pub local_release: Option<i64>,
-    pub discogs_release: Option<u64>,
+    pub direct_release: Option<ReleaseId>,
     pub review: bool,
     pub dry_run: bool,
+    pub policy: ProviderPolicy,
 }
 
 #[derive(Debug, Default)]
@@ -66,24 +64,176 @@ enum Outcome {
 
 #[derive(Debug)]
 enum ReviewOutcome {
-    Accept(Box<Candidate>),
+    Accept(ProviderKind, Box<Candidate>, Box<Evaluation>),
     Skip,
     Quit,
 }
 
-struct Discovery {
-    candidates: Vec<Candidate>,
-    evaluations: Vec<Evaluation>,
-    notes: Vec<String>,
+/// Resolves the CLI selection into a provider policy. A direct release selector
+/// implies its provider; a contradictory explicit provider is rejected before
+/// any database or network work.
+pub fn resolve_policy(
+    explicit: Option<ProviderKind>,
+    direct: Option<&ReleaseId>,
+) -> Result<ProviderPolicy> {
+    match (explicit, direct) {
+        (None, None) => Ok(ProviderPolicy::MusicBrainzThenDiscogs),
+        (None, Some(id)) => Ok(ProviderPolicy::Only(id.provider())),
+        (Some(provider), None) => Ok(ProviderPolicy::Only(provider)),
+        (Some(provider), Some(id)) if provider == id.provider() => {
+            Ok(ProviderPolicy::Only(provider))
+        }
+        (Some(provider), Some(id)) => bail!(
+            "--provider {provider} conflicts with a {} release selector",
+            id.provider()
+        ),
+    }
+}
+
+/// One provider's discovery and evaluation, with its own evidence and errors.
+#[derive(Debug)]
+pub struct ProviderAttempt {
+    pub provider: ProviderKind,
+    pub candidates: Vec<Candidate>,
+    pub evaluations: Vec<Evaluation>,
+    pub notes: Vec<String>,
+    pub error: Option<ProviderError>,
+    pub embedded_release_resolved: bool,
+}
+
+impl ProviderAttempt {
+    fn failed(provider: ProviderKind, error: ProviderError) -> Self {
+        Self {
+            provider,
+            candidates: Vec::new(),
+            evaluations: Vec::new(),
+            notes: Vec::new(),
+            error: Some(error),
+            embedded_release_resolved: false,
+        }
+    }
+
+    fn from_discovery(
+        provider: ProviderKind,
+        local: &LocalRelease,
+        result: DiscoveryResult,
+        error: Option<ProviderError>,
+    ) -> Self {
+        let embedded_release_resolved = result
+            .evidence
+            .values()
+            .next()
+            .map(|evidence| evidence.embedded_release_resolved)
+            .unwrap_or(false);
+
+        let mut candidates: Vec<Candidate> = result
+            .releases
+            .into_iter()
+            .map(|release| Candidate::new(local, release))
+            .collect();
+        candidates.sort_by(|a, b| {
+            b.score
+                .total
+                .total_cmp(&a.score.total)
+                .then_with(|| a.release.id.cmp(&b.release.id))
+        });
+
+        let evaluations = candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                let evidence = result
+                    .evidence
+                    .get(&candidate.release.id)
+                    .cloned()
+                    .unwrap_or_default();
+                let runner_up = if index == 0 { candidates.get(1) } else { None };
+                matcher::evaluate(local, candidate, runner_up, &evidence)
+            })
+            .collect();
+
+        Self {
+            provider,
+            candidates,
+            evaluations,
+            notes: result.notes,
+            error,
+            embedded_release_resolved,
+        }
+    }
+
+    fn settled(&self, has_direct: bool) -> bool {
+        !has_direct
+            && self
+                .evaluations
+                .first()
+                .is_some_and(|evaluation| evaluation.auto_accept)
+    }
+}
+
+pub async fn attempt_provider<P: MetadataProvider>(
+    provider: &P,
+    local: &LocalRelease,
+    direct: Option<ReleaseId>,
+) -> ProviderAttempt {
+    let kind = provider.kind();
+    match discovery::discover(provider, local, direct).await {
+        Ok(result) => ProviderAttempt::from_discovery(kind, local, result, None),
+        Err(error) => ProviderAttempt::failed(kind, error),
+    }
+}
+
+fn provider_error_from(provider: ProviderKind, error: anyhow::Error) -> ProviderError {
+    if let Some(error) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ProviderError>())
+    {
+        return error.clone();
+    }
+    if let Some(error) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<AdapterError>())
+    {
+        return ProviderError::from(error.clone());
+    }
+    ProviderError::Configuration {
+        provider,
+        message: format!("{error:#}"),
+    }
+}
+
+fn is_missing_discogs_token(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<AdapterError>(),
+            Some(AdapterError::MissingToken)
+        )
+    })
 }
 
 pub async fn run_match(pool: &SqlitePool, options: MatchOptions) -> Result<MatchSummary> {
+    run_with_policy(pool, &options, MusicBrainzAdapter::new, || {
+        DiscogsAdapter::from_env().map_err(anyhow::Error::new)
+    })
+    .await
+}
+
+pub async fn run_with_policy<M, D>(
+    pool: &SqlitePool,
+    options: &MatchOptions,
+    make_musicbrainz: impl Fn() -> Result<M>,
+    make_discogs: impl Fn() -> Result<D>,
+) -> Result<MatchSummary>
+where
+    M: MetadataProvider,
+    D: MetadataProvider,
+{
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     if options.review && !interactive {
         bail!("--review requires an interactive terminal");
     }
-    if options.discogs_release.is_some() && options.local_release.is_none() {
-        bail!("--discogs-release requires --local-release");
+    if options.direct_release.is_some() && options.local_release.is_none() {
+        bail!("a direct release selector requires --local-release");
     }
 
     // Grouping is derived identity, not a matching result, so it is refreshed
@@ -91,6 +241,7 @@ pub async fn run_match(pool: &SqlitePool, options: MatchOptions) -> Result<Match
     store::rebuild_local_releases(pool, options.scope.as_deref()).await?;
 
     let statuses = store::status_by_id(pool).await?;
+    let existing_matches = store::accepted_matches_by_release(pool).await?;
     let mut releases = store::load_local_releases(pool, options.scope.as_deref()).await?;
 
     if let Some(id) = options.local_release {
@@ -100,34 +251,56 @@ pub async fn run_match(pool: &SqlitePool, options: MatchOptions) -> Result<Match
         }
     }
 
-    if !options.review {
-        // Ordinary matching only processes unmatched and stale releases.
-        releases.retain(|release| {
-            matches!(
-                statuses
-                    .get(&release.id)
-                    .map(String::as_str)
-                    .unwrap_or(store::STATUS_UNMATCHED),
-                store::STATUS_UNMATCHED | store::STATUS_STALE
-            )
-        });
-    }
-
     let mut summary = MatchSummary {
         dry_run: options.dry_run,
         ..MatchSummary::default()
     };
 
-    if releases.is_empty() {
+    let mut selected: Vec<LocalRelease> = Vec::new();
+    for release in releases {
+        let status = statuses
+            .get(&release.id)
+            .map(String::as_str)
+            .unwrap_or(store::STATUS_UNMATCHED);
+        let accepted = existing_matches.get(&release.id).and_then(|p| *p);
+
+        if !options.review {
+            match status {
+                store::STATUS_UNMATCHED => {}
+                store::STATUS_STALE => {
+                    if let ProviderPolicy::Only(provider) = options.policy
+                        && accepted.is_some_and(|accepted| accepted != provider)
+                    {
+                        println!(
+                            "\nSkipping local release {}: its stale match belongs to {}, not the explicitly selected {}",
+                            release.id,
+                            accepted.unwrap(),
+                            provider
+                        );
+                        summary.skipped += 1;
+                        continue;
+                    }
+                }
+                _ => {
+                    summary.skipped += 1;
+                    continue;
+                }
+            }
+        }
+
+        selected.push(release);
+    }
+
+    if selected.is_empty() {
         println!("Nothing to match.");
         return Ok(summary);
     }
 
-    let adapter = DiscogsAdapter::from_env()
-        .map_err(|error| anyhow!("{error}"))
-        .context("Discogs matching needs a personal access token")?;
+    let mut musicbrainz_client: Option<M> = None;
+    let mut discogs_client: Option<D> = None;
+    let mut discogs_disabled: Option<String> = None;
 
-    for release in &releases {
+    for release in &selected {
         let label = format!(
             "{} — {}",
             release
@@ -138,7 +311,58 @@ pub async fn run_match(pool: &SqlitePool, options: MatchOptions) -> Result<Match
         );
         println!("\nMatching local release {} ({label})", release.id);
 
-        let outcome = process_release(pool, &adapter, release, &options, interactive).await;
+        // A stale match is refreshed from the provider that accepted it; a
+        // different source requires deliberate review.
+        let mut release_policy = options.policy;
+        if !options.review
+            && statuses.get(&release.id).map(String::as_str) == Some(store::STATUS_STALE)
+            && let Some(provider) = existing_matches.get(&release.id).and_then(|p| *p)
+            && release_policy == ProviderPolicy::MusicBrainzThenDiscogs
+        {
+            println!("  refreshing the stale {provider} match from its original source");
+            release_policy = ProviderPolicy::Only(provider);
+        }
+
+        let guard = store::load_match_guard(pool, release.id).await?;
+
+        // Unchanged saved queues are reviewed without contacting a provider.
+        if let Some(saved) = load_saved_reviews(pool, release, &guard, release_policy).await? {
+            if !options.review {
+                println!(
+                    "  queued for review from saved candidates ({} provider group(s))",
+                    saved.len()
+                );
+                summary.queued += 1;
+                continue;
+            }
+            match review_saved_release(pool, release, saved, options.dry_run, &guard).await {
+                Ok(Outcome::Accepted) => summary.accepted += 1,
+                Ok(Outcome::Queued) => summary.queued += 1,
+                Ok(Outcome::Skipped) => summary.skipped += 1,
+                Ok(Outcome::Quit) => return Ok(summary),
+                Ok(_) => summary.failed += 1,
+                Err(error) => {
+                    eprintln!("failed to review local release {}: {error:#}", release.id);
+                    summary.failed += 1;
+                }
+            }
+            continue;
+        }
+
+        let outcome = process_release(
+            pool,
+            release,
+            options,
+            release_policy,
+            interactive,
+            &mut musicbrainz_client,
+            &mut discogs_client,
+            &mut discogs_disabled,
+            &make_musicbrainz,
+            &make_discogs,
+            &guard,
+        )
+        .await;
 
         match outcome {
             Ok(Outcome::Accepted) => summary.accepted += 1,
@@ -148,9 +372,6 @@ pub async fn run_match(pool: &SqlitePool, options: MatchOptions) -> Result<Match
             Ok(Outcome::Failed) => summary.failed += 1,
             Ok(Outcome::Quit) => return Ok(summary),
             Err(error) => {
-                if is_auth_error(&error) {
-                    return Err(error.context("Discogs authentication failed; stopping matching"));
-                }
                 summary.failed += 1;
                 eprintln!("failed to match local release {}: {error:#}", release.id);
             }
@@ -160,101 +381,265 @@ pub async fn run_match(pool: &SqlitePool, options: MatchOptions) -> Result<Match
     Ok(summary)
 }
 
-fn is_auth_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<AdapterError>()
-            .map(AdapterError::is_auth)
-            .unwrap_or(false)
-    })
+async fn load_saved_reviews(
+    pool: &SqlitePool,
+    release: &LocalRelease,
+    guard: &MatchGuard,
+    policy: ProviderPolicy,
+) -> Result<Option<Vec<store::StoredReview>>> {
+    let mut saved = Vec::new();
+    for provider in policy.order() {
+        if let Some(review) = store::load_review(pool, release.id, provider).await?
+            && review.guard == *guard
+        {
+            saved.push(review);
+        }
+    }
+    Ok((!saved.is_empty()).then_some(saved))
 }
 
-async fn process_release(
+#[allow(clippy::too_many_arguments)]
+async fn process_release<M, D>(
     pool: &SqlitePool,
-    adapter: &DiscogsAdapter,
     release: &LocalRelease,
     options: &MatchOptions,
+    policy: ProviderPolicy,
     interactive: bool,
-) -> Result<Outcome> {
-    let discovery = discover(adapter, release, options.discogs_release).await?;
+    musicbrainz_client: &mut Option<M>,
+    discogs_client: &mut Option<D>,
+    discogs_disabled: &mut Option<String>,
+    make_musicbrainz: impl Fn() -> Result<M>,
+    make_discogs: impl Fn() -> Result<D>,
+    guard: &MatchGuard,
+) -> Result<Outcome>
+where
+    M: MetadataProvider,
+    D: MetadataProvider,
+{
+    let direct = options
+        .direct_release
+        .clone()
+        .filter(|id| policy.allows(id.provider()));
+    let mut attempts: Vec<ProviderAttempt> = Vec::new();
+    let mut fallback_skip: Option<String> = None;
 
-    for note in &discovery.notes {
-        eprintln!("  note: {note}");
+    let order = policy.order();
+    for (index, provider) in order.iter().copied().enumerate() {
+        if index > 0 {
+            let primary = &attempts[0];
+            if primary.settled(direct.is_some()) {
+                break;
+            }
+            let reason = if let Some(error) = &primary.error {
+                format!("primary stage failed: {error}")
+            } else if primary.candidates.is_empty() {
+                "primary stage found no candidates".to_string()
+            } else {
+                "primary candidates did not settle the edition".to_string()
+            };
+            println!("  Discogs fallback: {reason}");
+        }
+
+        match provider {
+            ProviderKind::MusicBrainz => {
+                if musicbrainz_client.is_none() {
+                    match make_musicbrainz() {
+                        Ok(client) => *musicbrainz_client = Some(client),
+                        Err(error) => {
+                            attempts.push(ProviderAttempt::failed(
+                                ProviderKind::MusicBrainz,
+                                provider_error_from(ProviderKind::MusicBrainz, error),
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                let client = musicbrainz_client.as_ref().expect("client initialized");
+                attempts.push(attempt_provider(client, release, direct.clone()).await);
+            }
+            ProviderKind::Discogs => {
+                if let Some(reason) = discogs_disabled.as_ref() {
+                    fallback_skip = Some(reason.clone());
+                    break;
+                }
+                if discogs_client.is_none() {
+                    match make_discogs() {
+                        Ok(client) => *discogs_client = Some(client),
+                        Err(error) => {
+                            let missing = is_missing_discogs_token(&error);
+                            if policy.is_explicit() {
+                                attempts.push(ProviderAttempt::failed(
+                                    ProviderKind::Discogs,
+                                    provider_error_from(ProviderKind::Discogs, error),
+                                ));
+                            } else if missing {
+                                fallback_skip = Some(
+                                    "Discogs token is not set; optional fallback was skipped"
+                                        .to_string(),
+                                );
+                            } else {
+                                let reason = format!(
+                                    "configured Discogs credentials are unusable: {error:#}"
+                                );
+                                *discogs_disabled = Some(reason.clone());
+                                fallback_skip = Some(reason);
+                                eprintln!("  Disabling Discogs fallback for the rest of this run");
+                            }
+                            break;
+                        }
+                    }
+                }
+                let client = discogs_client.as_ref().expect("client initialized");
+                attempts.push(attempt_provider(client, release, direct.clone()).await);
+            }
+        }
     }
 
-    if discovery.candidates.is_empty() {
-        println!("  no Discogs candidates found");
-        return Ok(Outcome::Unmatched);
+    for attempt in &attempts {
+        for note in &attempt.notes {
+            eprintln!("  note ({}): {note}", attempt.provider);
+        }
+        if let Some(error) = &attempt.error {
+            eprintln!("  {} stage error: {error}", attempt.provider);
+        }
+    }
+    if let Some(reason) = &fallback_skip {
+        println!("  {reason}");
     }
 
-    let best = &discovery.candidates[0];
-    let best_evaluation = &discovery.evaluations[0];
+    // A settled primary result stops discovery and never touches Discogs.
+    if let Some(primary) = attempts.first()
+        && primary.settled(direct.is_some())
+    {
+        let candidate = &primary.candidates[0];
+        let evaluation = &primary.evaluations[0];
 
-    if !options.review && options.discogs_release.is_none() && best_evaluation.auto_accept {
+        if options.review {
+            return review_attempts(
+                pool,
+                release,
+                &attempts,
+                guard,
+                options.dry_run,
+                musicbrainz_client.as_ref(),
+                discogs_client.as_ref(),
+            )
+            .await;
+        }
+
         return accept(
             pool,
             release,
-            best,
-            best_evaluation,
+            primary.provider,
+            candidate,
+            evaluation,
             AcceptanceMethod::Automatic,
             options.dry_run,
+            guard,
         )
         .await;
     }
 
-    if options.dry_run {
-        print_decision(release, &discovery);
-        return Ok(if best_evaluation.auto_accept {
-            Outcome::Accepted
-        } else {
-            Outcome::Queued
-        });
+    // A fallback candidate is accepted only when it settles its own gates and
+    // does not contradict the local edition or a plausible primary candidate.
+    if attempts.len() > 1
+        && let Some(fallback) = attempts.get(1)
+        && let (Some(candidate), Some(evaluation)) =
+            (fallback.candidates.first(), fallback.evaluations.first())
+        && evaluation.auto_accept
+    {
+        let primary = &attempts[0];
+        let conflicts = matcher::fallback_conflicts(
+            release,
+            &primary.candidates,
+            candidate,
+            primary.embedded_release_resolved,
+        );
+        if conflicts.is_empty() && direct.is_none() && !options.review && !options.dry_run {
+            if let Some(error) = &primary.error {
+                println!("  recovered the release from a failed MusicBrainz stage: {error}");
+            }
+            return accept(
+                pool,
+                release,
+                fallback.provider,
+                candidate,
+                evaluation,
+                AcceptanceMethod::Automatic,
+                false,
+                guard,
+            )
+            .await;
+        }
+        for conflict in &conflicts {
+            println!("  fallback conflict: {conflict}");
+        }
     }
 
-    // `--discogs-release` and `--review` never auto-accept; both go through the
-    // same review path when a terminal is available.
-    if interactive {
-        match review_release(adapter, release, &discovery)? {
-            ReviewOutcome::Accept(candidate) => {
-                let candidate = *candidate;
-                let evaluation = discovery
-                    .candidates
-                    .iter()
-                    .position(|candidate_entry| candidate_entry.release.id == candidate.release.id)
-                    .map(|index| discovery.evaluations[index].clone())
-                    .unwrap_or_else(|| {
-                        matcher::evaluate(release, &candidate, None, &DiscoveryEvidence::default())
-                    });
-                accept(
-                    pool,
-                    release,
-                    &candidate,
-                    &evaluation,
-                    AcceptanceMethod::Manual,
-                    false,
-                )
-                .await
+    let has_candidates = attempts
+        .iter()
+        .any(|attempt| !attempt.candidates.is_empty());
+    let fallback_failed = attempts
+        .get(1)
+        .is_some_and(|attempt| attempt.error.is_some());
+
+    if has_candidates {
+        if options.dry_run {
+            for attempt in &attempts {
+                print_decision(attempt);
             }
-            ReviewOutcome::Skip => Ok(Outcome::Skipped),
-            ReviewOutcome::Quit => Ok(Outcome::Quit),
+            return Ok(Outcome::Queued);
         }
-    } else {
-        queue_for_review(pool, release, &discovery).await?;
-        Ok(Outcome::Queued)
+        if interactive {
+            return review_attempts(
+                pool,
+                release,
+                &attempts,
+                guard,
+                options.dry_run,
+                musicbrainz_client.as_ref(),
+                discogs_client.as_ref(),
+            )
+            .await;
+        }
+        queue_attempts(pool, release, &attempts, guard).await?;
+        return Ok(Outcome::Queued);
     }
+
+    // No usable candidates. A completed-empty stage means no match; an
+    // unrecovered attempted-stage failure must not be disguised as one.
+    if let Some(error) = attempts.iter().find_map(|attempt| attempt.error.clone()) {
+        eprintln!("  {error}");
+        if fallback_failed {
+            eprintln!("  the fallback stage also failed; the release outcome is a failure");
+        }
+        return Ok(Outcome::Failed);
+    }
+
+    println!(
+        "  no {} candidates found",
+        attempts
+            .first()
+            .map(|a| a.provider)
+            .unwrap_or(ProviderKind::MusicBrainz)
+    );
+    Ok(Outcome::Unmatched)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn accept(
     pool: &SqlitePool,
     release: &LocalRelease,
+    provider: ProviderKind,
     candidate: &Candidate,
     evaluation: &Evaluation,
     method: AcceptanceMethod,
     dry_run: bool,
+    guard: &MatchGuard,
 ) -> Result<Outcome> {
     if !evaluation.can_apply(candidate) {
         println!(
-            "  cannot accept Discogs release {}: track mapping is invalid or incomplete ({})",
+            "  cannot accept {provider} release {}: the track mapping is invalid or incomplete ({})",
             candidate.release.id,
             candidate.mapping.notes.join("; ")
         );
@@ -262,8 +647,9 @@ async fn accept(
     }
 
     if dry_run {
+        print_decision_for(provider, candidate, evaluation);
         println!(
-            "  would accept Discogs release {} (score {:.3}) as {}",
+            "  would accept {provider} release {} (score {:.3}) as {}",
             candidate.release.id,
             candidate.score.total,
             method.as_str()
@@ -271,14 +657,16 @@ async fn accept(
         return Ok(Outcome::Accepted);
     }
 
-    match store::accept_match(pool, release.id, candidate, method, &release.revision).await {
+    match store::accept_match(pool, release.id, candidate, method, guard).await {
         Ok(()) => {
             println!(
-                "  accepted Discogs release {} (score {:.3}, {})",
+                "  accepted {provider} release {} (score {:.3}, {})",
                 candidate.release.id,
                 candidate.score.total,
                 method.as_str()
             );
+            println!("    {} {}", provider, candidate.release.id.storage_id());
+            println!("    {}", candidate.release.url);
             Ok(Outcome::Accepted)
         }
         Err(error) => {
@@ -288,15 +676,11 @@ async fn accept(
     }
 }
 
-async fn queue_for_review(
-    pool: &SqlitePool,
-    release: &LocalRelease,
-    discovery: &Discovery,
-) -> Result<Outcome> {
-    let stored: Vec<StoredCandidate> = discovery
+fn stored_candidates(attempt: &ProviderAttempt) -> Vec<StoredCandidate> {
+    attempt
         .candidates
         .iter()
-        .zip(discovery.evaluations.iter())
+        .zip(attempt.evaluations.iter())
         .take(5)
         .map(|(candidate, evaluation)| StoredCandidate {
             release: candidate.release.clone(),
@@ -307,318 +691,234 @@ async fn queue_for_review(
             warnings: evaluation.warnings.clone(),
             evidence: evaluation.evidence.clone(),
         })
-        .collect();
-
-    let reasons = discovery.evaluations[0].blockers.clone();
-    store::queue_review(
-        pool,
-        release.id,
-        &release.revision,
-        &stored,
-        &discovery.candidates[0].mapping,
-        &reasons,
-    )
-    .await?;
-
-    println!("  queued for review: {}", reasons.join("; "));
-    Ok(Outcome::Queued)
+        .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Discovery
-// ---------------------------------------------------------------------------
-
-async fn discover(
-    adapter: &DiscogsAdapter,
-    local: &LocalRelease,
-    direct: Option<u64>,
-) -> Result<Discovery> {
-    let mut notes = Vec::new();
-    let mut fetched: HashMap<u64, RemoteRelease> = HashMap::new();
-
-    if let Some(id) = direct {
-        let release = adapter
-            .fetch_release(id)
-            .await
-            .map_err(anyhow::Error::new)?;
-        fetched.insert(release.id, release);
-        return Ok(finish(local, fetched, DiscoveryEvidence::default(), notes));
-    }
-
-    if let Some(id) = local.embedded_discogs_id {
-        match adapter.fetch_release(id).await {
-            Ok(release) => {
-                fetched.insert(release.id, release);
-            }
-            Err(error) if error.is_auth() => return Err(anyhow::Error::new(error)),
-            Err(error) => notes.push(format!(
-                "embedded Discogs release {id} could not be fetched: {error}"
-            )),
-        }
-    }
-
-    let mut ranked: Vec<(f64, SearchSummary)> = Vec::new();
-    let mut identifier_truncated = false;
-    let mut identifier_searched = false;
-
-    for (strategy_index, (name, params)) in discover_strategies(local).into_iter().enumerate() {
-        if strategy_index >= MAX_STRATEGIES {
-            break;
-        }
-
-        let mut page = 1;
-        let mut strategy_truncated = false;
-        loop {
-            let result = match adapter.search(params.clone(), page).await {
-                Ok(result) => result,
-                Err(error) if error.is_auth() => return Err(anyhow::Error::new(error)),
-                Err(error) => {
-                    notes.push(format!("{name} search failed: {error}"));
-                    break;
-                }
-            };
-
-            if result.truncated() {
-                strategy_truncated = true;
-            }
-
-            if name == "identifier" {
-                identifier_searched = true;
-                if result.truncated() {
-                    identifier_truncated = true;
-                }
-            }
-
-            for hit in &result.hits {
-                ranked.push((matcher::rank_search_summary(local, hit), hit.clone()));
-            }
-
-            if page >= MAX_PAGES || page >= result.pages || result.hits.is_empty() {
-                break;
-            }
-            page += 1;
-        }
-
-        if strategy_truncated {
-            notes.push(format!(
-                "{name} search returned more results than the {MAX_PAGES} pages fetched"
-            ));
-        }
-    }
-
-    ranked
-        .sort_by(|(rank_a, a), (rank_b, b)| rank_b.total_cmp(rank_a).then_with(|| a.id.cmp(&b.id)));
-
-    let mut seen: Vec<u64> = Vec::new();
-    for (_, summary) in ranked {
-        if fetched.contains_key(&summary.id) || seen.contains(&summary.id) {
+async fn queue_attempts(
+    pool: &SqlitePool,
+    release: &LocalRelease,
+    attempts: &[ProviderAttempt],
+    guard: &MatchGuard,
+) -> Result<()> {
+    for attempt in attempts {
+        if attempt.candidates.is_empty() {
             continue;
         }
-        seen.push(summary.id);
-        if fetched.len() >= MAX_DETAIL_FETCHES {
-            notes.push(format!(
-                "stopped after {MAX_DETAIL_FETCHES} detailed release fetches"
-            ));
-            break;
+        let stored = stored_candidates(attempt);
+        let mut reasons = attempt.evaluations[0].blockers.clone();
+        reasons.extend(attempt.notes.iter().cloned());
+        if let Some(error) = &attempt.error {
+            reasons.push(format!("provider stage error: {error}"));
         }
 
-        match adapter.fetch_release(summary.id).await {
-            Ok(release) => {
-                fetched.insert(release.id, release);
-            }
-            Err(error) if error.is_auth() => return Err(anyhow::Error::new(error)),
-            Err(error) => notes.push(format!(
-                "could not fetch Discogs release {}: {error}",
-                summary.id
-            )),
-        }
+        store::queue_review(
+            pool,
+            release.id,
+            attempt.provider,
+            &release.revision,
+            guard.accepted_match_id,
+            &stored,
+            &attempt.candidates[0].mapping,
+            &reasons,
+        )
+        .await?;
     }
 
-    let identifier_matches = fetched
-        .values()
-        .filter(|release| identifier_matches(local, release))
-        .count();
-    let has_identifier = local.barcode.is_some() || local.catalog_number.is_some();
-    let identifier_unique =
-        has_identifier && identifier_searched && !identifier_truncated && identifier_matches == 1;
-
-    let evidence = DiscoveryEvidence {
-        identifier_search_truncated: identifier_truncated,
-        identifier_unique,
-    };
-
-    Ok(finish(local, fetched, evidence, notes))
+    let reason = attempts
+        .first()
+        .and_then(|attempt| attempt.evaluations.first())
+        .map(|evaluation| evaluation.blockers.join("; "))
+        .unwrap_or_default();
+    println!("  queued for review: {reason}");
+    Ok(())
 }
 
-fn discover_strategies(local: &LocalRelease) -> Vec<(&'static str, SearchParams)> {
-    let mut strategies = Vec::new();
-
-    if local.barcode.is_some() || local.catalog_number.is_some() {
-        let mut params = SearchParams::new();
-        if let Some(barcode) = &local.barcode {
-            params = params.barcode(barcode.clone());
-        }
-        if let Some(catalog) = &local.catalog_number {
-            params = params.catno(catalog.clone());
-        }
-        strategies.push(("identifier", params));
-    }
-
-    if let Some(title) = local
-        .album_title
-        .as_deref()
-        .filter(|title| !title.trim().is_empty())
-    {
-        strategies.push((
-            "title",
-            release_search_params(title, local.album_artist.as_deref()),
-        ));
-
-        // Compilations and releases with ambiguous artists relax the artist
-        // constraint, because a compilation's artist is not a Discogs artist.
-        if local.is_compilation && local.album_artist.is_some() {
-            strategies.push(("relaxed", release_search_params(title, None)));
-        }
-    }
-
-    strategies
-}
-
-fn identifier_matches(local: &LocalRelease, release: &RemoteRelease) -> bool {
-    let barcode_match = local.barcode.as_ref().is_some_and(|barcode| {
-        let normalized = matcher::normalize_barcode(barcode);
-        !normalized.is_empty()
-            && release
-                .barcodes
-                .iter()
-                .any(|candidate| matcher::normalize_barcode(candidate) == normalized)
-    });
-
-    let catalog_match = local.catalog_number.as_ref().is_some_and(|catalog| {
-        let normalized = matcher::normalize_identifier(catalog);
-        !normalized.is_empty()
-            && release
-                .catalog_numbers
-                .iter()
-                .any(|candidate| matcher::normalize_identifier(candidate) == normalized)
-    });
-
-    barcode_match || catalog_match
-}
-
-fn finish(
-    local: &LocalRelease,
-    fetched: HashMap<u64, RemoteRelease>,
-    evidence: DiscoveryEvidence,
-    notes: Vec<String>,
-) -> Discovery {
-    let mut candidates: Vec<Candidate> = fetched
-        .into_values()
-        .map(|release| Candidate::new(local, release))
-        .collect();
-
-    candidates.sort_by(|a, b| {
-        b.score
-            .total
-            .total_cmp(&a.score.total)
-            .then_with(|| a.release.id.cmp(&b.release.id))
-    });
-
-    let evaluations = candidates
+async fn review_saved_release(
+    pool: &SqlitePool,
+    release: &LocalRelease,
+    saved: Vec<store::StoredReview>,
+    dry_run: bool,
+    guard: &MatchGuard,
+) -> Result<Outcome> {
+    let mut groups: Vec<(ProviderKind, Vec<Candidate>, Vec<Evaluation>)> = saved
         .iter()
-        .enumerate()
-        .map(|(index, candidate)| {
-            let runner_up = if index == 0 { candidates.get(1) } else { None };
-            matcher::evaluate(local, candidate, runner_up, &evidence)
+        .map(|review| {
+            let candidates: Vec<Candidate> = review
+                .candidates
+                .iter()
+                .map(|stored| Candidate {
+                    release: stored.release.clone(),
+                    mapping: stored.mapping.clone(),
+                    score: stored.score,
+                })
+                .collect();
+            let evaluations: Vec<Evaluation> = review
+                .candidates
+                .iter()
+                .map(|stored| Evaluation {
+                    auto_accept: stored.auto_accept,
+                    blockers: stored.blockers.clone(),
+                    warnings: stored.warnings.clone(),
+                    evidence: stored.evidence.clone(),
+                })
+                .collect();
+            (review.provider, candidates, evaluations)
         })
         .collect();
 
-    let _ = evidence;
+    print_release_header(release);
+    for (provider, candidates, evaluations) in &groups {
+        for (index, (candidate, evaluation)) in
+            candidates.iter().zip(evaluations.iter()).enumerate()
+        {
+            print_candidate(release, *provider, index, candidate, evaluation, None);
+        }
+    }
 
-    Discovery {
-        candidates,
-        evaluations,
-        notes,
+    match review_prompt(
+        release,
+        &mut groups,
+        Option::<&MusicBrainzAdapter>::None,
+        Option::<&DiscogsAdapter>::None,
+    )
+    .await?
+    {
+        ReviewOutcome::Accept(provider, candidate, evaluation) => {
+            if dry_run {
+                println!(
+                    "  would accept {provider} release {} after review",
+                    candidate.release.id
+                );
+                return Ok(Outcome::Accepted);
+            }
+            accept(
+                pool,
+                release,
+                provider,
+                &candidate,
+                &evaluation,
+                AcceptanceMethod::Manual,
+                false,
+                guard,
+            )
+            .await
+        }
+        ReviewOutcome::Skip => Ok(Outcome::Skipped),
+        ReviewOutcome::Quit => Ok(Outcome::Quit),
     }
 }
 
-// ---------------------------------------------------------------------------
-// Reporting and review
-// ---------------------------------------------------------------------------
-
-fn print_decision(local: &LocalRelease, discovery: &Discovery) {
-    for (index, (candidate, evaluation)) in discovery
-        .candidates
+#[allow(clippy::too_many_arguments)]
+async fn review_attempts<M, D>(
+    pool: &SqlitePool,
+    release: &LocalRelease,
+    attempts: &[ProviderAttempt],
+    guard: &MatchGuard,
+    dry_run: bool,
+    musicbrainz: Option<&M>,
+    discogs: Option<&D>,
+) -> Result<Outcome>
+where
+    M: MetadataProvider,
+    D: MetadataProvider,
+{
+    let mut groups: Vec<(ProviderKind, Vec<Candidate>, Vec<Evaluation>)> = attempts
         .iter()
-        .zip(discovery.evaluations.iter())
-        .enumerate()
-        .take(3)
-    {
-        println!(
-            "  {}. Discogs release {} — {} (score {:.3}){}",
-            index + 1,
-            candidate.release.id,
-            candidate.release.title,
-            candidate.score.total,
-            if evaluation.auto_accept {
-                " [auto-acceptable]"
-            } else {
-                " [review]"
-            }
-        );
-        for blocker in &evaluation.blockers {
-            println!("       blocked: {blocker}");
-        }
-        for note in &candidate.mapping.notes {
-            println!("       mapping: {note}");
+        .filter(|attempt| !attempt.candidates.is_empty())
+        .map(|attempt| {
+            (
+                attempt.provider,
+                attempt.candidates.clone(),
+                attempt.evaluations.clone(),
+            )
+        })
+        .collect();
+
+    if groups.is_empty() {
+        return Ok(Outcome::Unmatched);
+    }
+
+    print_release_header(release);
+    for (provider, candidates, evaluations) in &groups {
+        for (index, (candidate, evaluation)) in
+            candidates.iter().zip(evaluations.iter()).enumerate()
+        {
+            let current = attempts
+                .iter()
+                .find(|attempt| attempt.provider == *provider)
+                .and_then(|attempt| attempt.error.as_ref());
+            print_candidate(release, *provider, index, candidate, evaluation, current);
         }
     }
 
-    if let Some((_, first)) = discovery
-        .candidates
-        .first()
-        .zip(discovery.evaluations.first())
-    {
-        if first.auto_accept {
-            println!(
-                "  would accept Discogs release {} (score {:.3})",
-                discovery.candidates[0].release.id, discovery.candidates[0].score.total
-            );
-        } else {
-            println!("  would queue for review");
+    match review_prompt(release, &mut groups, musicbrainz, discogs).await? {
+        ReviewOutcome::Accept(provider, candidate, evaluation) => {
+            if dry_run {
+                println!(
+                    "  would accept {provider} release {} after review",
+                    candidate.release.id
+                );
+                return Ok(Outcome::Accepted);
+            }
+            accept(
+                pool,
+                release,
+                provider,
+                &candidate,
+                &evaluation,
+                AcceptanceMethod::Manual,
+                false,
+                guard,
+            )
+            .await
         }
+        ReviewOutcome::Skip => Ok(Outcome::Skipped),
+        ReviewOutcome::Quit => Ok(Outcome::Quit),
     }
-    let _ = local;
 }
 
 fn print_release_header(release: &LocalRelease) {
     println!(
-        "\nLocal release {} — {}",
+        "  local release {} — {} ({} file(s))",
         release.id,
-        release.album_title.as_deref().unwrap_or("(no album tag)")
-    );
-    println!(
-        "  artist: {}   files: {}",
-        release.album_artist.as_deref().unwrap_or("(unknown)"),
+        release.album_title.as_deref().unwrap_or("(no album tag)"),
         release.tracks.len()
     );
-    println!("  folder: {}", release.directory);
+    println!(
+        "  artist: {}   folder: {}",
+        release.album_artist.as_deref().unwrap_or("(unknown)"),
+        release.directory
+    );
+    if !release.embedded_evidence.problems.is_empty() {
+        for problem in &release.embedded_evidence.problems {
+            println!("  identifier problem: {problem}");
+        }
+    }
 }
 
 fn print_candidate(
-    local: &LocalRelease,
+    _local: &LocalRelease,
+    provider: ProviderKind,
     index: usize,
     candidate: &Candidate,
     evaluation: &Evaluation,
+    stage_error: Option<&ProviderError>,
 ) {
     let release = &candidate.release;
     println!(
-        "\n  [{}] Discogs release {} — score {:.3}",
+        "\n  [{}] {} release {} — score {:.3}{}",
         index + 1,
-        release.id,
-        candidate.score.total
+        provider,
+        release.id.storage_id(),
+        candidate.score.total,
+        if evaluation.auto_accept {
+            " [auto-acceptable]"
+        } else {
+            " [review]"
+        }
     );
-    println!("      {} — {}", release.artist_display(), release.title);
+    println!("      {}", release.artist_display());
+    println!("      {}", release.url);
     let mut details = Vec::new();
     if let Some(year) = release.year {
         details.push(format!("year {year}"));
@@ -629,16 +929,34 @@ fn print_candidate(
     if let Some(label) = release.label_display() {
         details.push(label);
     }
-    if let Some(catalog) = release.catalog_number() {
+    for catalog in &release.catalog_numbers {
         details.push(format!("catno {catalog}"));
     }
     if let Some(format) = release.format_display() {
         details.push(format);
     }
+    if !release.edition_notes.is_empty() {
+        details.push(format!("edition: {}", release.edition_notes.join(", ")));
+    }
     if !details.is_empty() {
         println!("      {}", details.join(" · "));
     }
-    println!("      {}", release.url);
+    if !release.structure_issues.is_empty() {
+        for issue in &release.structure_issues {
+            println!("      structure: {issue}");
+        }
+    }
+    if !release.lookup_aliases.is_empty() {
+        println!(
+            "      aliases: {}",
+            release
+                .lookup_aliases
+                .iter()
+                .map(ReleaseId::storage_id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     let components: Vec<String> = candidate
         .score
@@ -647,37 +965,11 @@ fn print_candidate(
         .map(|(name, value, weight)| format!("{name} {value:.2}×{weight:.2}"))
         .collect();
     println!("      score: {}", components.join("  "));
-
     println!(
         "      mapping: {}/{} files mapped",
         candidate.mapping.assigned_count(),
-        local.tracks.len()
+        _local.tracks.len()
     );
-    for (local_index, remote_index) in candidate.mapping.assigned_pairs() {
-        let local_title = local.tracks[local_index]
-            .title
-            .as_deref()
-            .unwrap_or(&local.tracks[local_index].path);
-        let remote_track = &release.tracklist[remote_index];
-        println!(
-            "        {local_title}  ->  {}{}",
-            remote_track
-                .position
-                .as_deref()
-                .map(|position| format!("{position} "))
-                .unwrap_or_default(),
-            remote_track.title
-        );
-    }
-    for (index, pair) in candidate.mapping.pairs.iter().enumerate() {
-        if pair.is_none() {
-            let title = local.tracks[index]
-                .title
-                .as_deref()
-                .unwrap_or(&local.tracks[index].path);
-            println!("        missing: {title}");
-        }
-    }
 
     for note in &evaluation.evidence {
         println!("      evidence: {note}");
@@ -689,7 +981,10 @@ fn print_candidate(
         println!("      warning: {warning}");
     }
     for note in &candidate.mapping.notes {
-        println!("      mapping note: {note}");
+        println!("      mapping: {note}");
+    }
+    if let Some(error) = stage_error {
+        println!("      stage error: {error}");
     }
 }
 
@@ -701,38 +996,84 @@ fn prompt(message: &str) -> Result<String> {
     Ok(line.trim().to_string())
 }
 
-fn review_release(
-    adapter: &DiscogsAdapter,
-    local: &LocalRelease,
-    discovery: &Discovery,
-) -> Result<ReviewOutcome> {
-    let mut candidates: Vec<(Candidate, Evaluation)> = discovery
-        .candidates
-        .iter()
-        .cloned()
-        .zip(discovery.evaluations.iter().cloned())
-        .collect();
-
-    print_release_header(local);
-    for (index, (candidate, evaluation)) in candidates.iter().enumerate() {
-        print_candidate(local, index, candidate, evaluation);
+fn parse_entered_id(provider: ProviderKind, raw: &str) -> Result<ReleaseId> {
+    match provider {
+        ProviderKind::MusicBrainz => {
+            let id = raw
+                .parse()
+                .with_context(|| format!("'{raw}' is not a MusicBrainz MBID"))?;
+            Ok(ReleaseId::MusicBrainz(id))
+        }
+        ProviderKind::Discogs => {
+            let id = raw
+                .parse::<u64>()
+                .with_context(|| format!("'{raw}' is not a Discogs release ID"))?;
+            Ok(ReleaseId::Discogs(id))
+        }
     }
+}
 
+async fn fetch_entered<M, D>(
+    provider: ProviderKind,
+    id: ReleaseId,
+    musicbrainz: Option<&M>,
+    discogs: Option<&D>,
+) -> Result<RemoteRelease, ProviderError>
+where
+    M: MetadataProvider,
+    D: MetadataProvider,
+{
+    match provider {
+        ProviderKind::MusicBrainz => match musicbrainz {
+            Some(client) => client.fetch_release(id).await,
+            None => Err(ProviderError::Configuration {
+                provider,
+                message: "no MusicBrainz session is available in this run".to_string(),
+            }),
+        },
+        ProviderKind::Discogs => match discogs {
+            Some(client) => client.fetch_release(id).await,
+            None => Err(ProviderError::Configuration {
+                provider,
+                message: "no Discogs session is available in this run".to_string(),
+            }),
+        },
+    }
+}
+
+async fn review_prompt<M, D>(
+    local: &LocalRelease,
+    groups: &mut Vec<(ProviderKind, Vec<Candidate>, Vec<Evaluation>)>,
+    musicbrainz: Option<&M>,
+    discogs: Option<&D>,
+) -> Result<ReviewOutcome>
+where
+    M: MetadataProvider,
+    D: MetadataProvider,
+{
     loop {
         let action = prompt("\n[a]ccept  [i]d  [s]kip  [q]uit > ")?;
         match action.as_str() {
             "a" | "" => {
+                let group_index = if groups.len() > 1 {
+                    let choice = prompt("provider [1]=first [2]=second > ")?;
+                    choice.parse::<usize>().unwrap_or(1).clamp(1, groups.len()) - 1
+                } else {
+                    0
+                };
+                let (provider, candidates, evaluations) = &groups[group_index];
                 let selection = prompt("candidate number [1] > ")?;
                 let index = selection
                     .parse::<usize>()
                     .unwrap_or(1)
                     .clamp(1, candidates.len().max(1))
                     - 1;
-                let (candidate, evaluation) = &candidates[index];
+                let candidate = &candidates[index];
+                let evaluation = &evaluations[index];
 
                 if !evaluation.can_apply(candidate) {
                     println!(
-                        "cannot accept: the track mapping is invalid or incomplete ({})",
+                        "cannot accept: the track mapping is invalid, incomplete, or structurally unsupported ({})",
                         candidate.mapping.notes.join("; ")
                     );
                     continue;
@@ -750,16 +1091,32 @@ fn review_release(
 
                 let confirm = prompt("accept this release? [y/N] > ")?;
                 if matches!(confirm.as_str(), "y" | "yes") {
-                    return Ok(ReviewOutcome::Accept(Box::new(candidate.clone())));
+                    return Ok(ReviewOutcome::Accept(
+                        *provider,
+                        Box::new(candidate.clone()),
+                        Box::new(evaluation.clone()),
+                    ));
                 }
             }
             "i" => {
-                let raw = prompt("Discogs release ID > ")?;
-                let Ok(id) = raw.parse::<u64>() else {
-                    println!("invalid release ID");
-                    continue;
+                let provider = if groups.len() > 1 {
+                    let choice = prompt("provider [1]=musicbrainz [2]=discogs > ")?;
+                    match choice.as_str() {
+                        "2" | "discogs" => ProviderKind::Discogs,
+                        _ => ProviderKind::MusicBrainz,
+                    }
+                } else {
+                    groups[0].0
                 };
-                match futures_block_on(adapter, id) {
+                let raw = prompt("release ID > ")?;
+                let id = match parse_entered_id(provider, &raw) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        println!("invalid release ID: {error}");
+                        continue;
+                    }
+                };
+                match fetch_entered(provider, id, musicbrainz, discogs).await {
                     Ok(release) => {
                         let candidate = Candidate::new(local, release);
                         let evaluation = matcher::evaluate(
@@ -768,11 +1125,12 @@ fn review_release(
                             None,
                             &DiscoveryEvidence::default(),
                         );
-                        println!("\nFetched release {id}:");
-                        print_candidate(local, candidates.len(), &candidate, &evaluation);
-                        candidates.push((candidate, evaluation));
+                        println!("\nFetched {provider} release:");
+                        print_candidate(local, provider, 0, &candidate, &evaluation, None);
+                        groups.push((provider, vec![candidate], vec![evaluation]));
+                        println!("  candidate added to this review");
                     }
-                    Err(error) => println!("could not fetch release {id}: {error}"),
+                    Err(error) => println!("could not fetch release: {error}"),
                 }
             }
             "s" => return Ok(ReviewOutcome::Skip),
@@ -782,105 +1140,90 @@ fn review_release(
     }
 }
 
-/// The review screen is synchronous; this keeps the async fetch local.
-fn futures_block_on(adapter: &DiscogsAdapter, id: u64) -> Result<RemoteRelease> {
-    tokio::runtime::Handle::current()
-        .block_on(adapter.fetch_release(id))
-        .map_err(anyhow::Error::new)
+fn print_decision(attempt: &ProviderAttempt) {
+    for (index, (candidate, evaluation)) in attempt
+        .candidates
+        .iter()
+        .zip(attempt.evaluations.iter())
+        .enumerate()
+        .take(3)
+    {
+        println!(
+            "  {}. {} release {} — {} (score {:.3}){}",
+            index + 1,
+            attempt.provider,
+            candidate.release.id.storage_id(),
+            candidate.release.title,
+            candidate.score.total,
+            if evaluation.auto_accept {
+                " [auto-acceptable]"
+            } else {
+                " [review]"
+            }
+        );
+        for blocker in &evaluation.blockers {
+            println!("       blocked: {blocker}");
+        }
+    }
+    if let (Some(candidate), Some(evaluation)) =
+        (attempt.candidates.first(), attempt.evaluations.first())
+    {
+        if evaluation.auto_accept {
+            println!(
+                "  would accept {} release {} (score {:.3})",
+                attempt.provider,
+                candidate.release.id.storage_id(),
+                candidate.score.total
+            );
+        } else {
+            println!("  would queue for review");
+        }
+    }
+}
+
+fn print_decision_for(provider: ProviderKind, candidate: &Candidate, evaluation: &Evaluation) {
+    print_decision(&ProviderAttempt {
+        provider,
+        candidates: vec![candidate.clone()],
+        evaluations: vec![evaluation.clone()],
+        notes: Vec::new(),
+        error: None,
+        embedded_release_resolved: false,
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matcher::{ALGORITHM_VERSION, ArtistKind, LocalTrack};
+    use crate::providers::Mbid;
 
-    fn local_release() -> LocalRelease {
-        LocalRelease {
-            id: 1,
-            directory: "/music/blue".to_string(),
-            album_title: Some("Blue".to_string()),
-            album_artist: Some("Test Artist".to_string()),
-            artist_kind: ArtistKind::AlbumArtist,
-            year: Some(2001),
-            barcode: None,
-            catalog_number: None,
-            embedded_discogs_id: None,
-            is_compilation: false,
-            has_album_tag: true,
-            revision: "rev".to_string(),
-            tracks: vec![LocalTrack {
-                id: 1,
-                path: "/music/blue/01.flac".to_string(),
-                title: Some("One".to_string()),
-                disc: None,
-                track_number: Some(1),
-                duration_secs: Some(180.0),
-            }],
-        }
+    fn mbid(value: &str) -> Mbid {
+        value.parse().unwrap()
     }
 
     #[test]
-    fn strategy_order_starts_with_identifiers_then_title() {
-        let mut local = local_release();
-        local.barcode = Some("0123456789012".to_string());
-        let strategies = discover_strategies(&local);
-        assert_eq!(strategies[0].0, "identifier");
-        assert_eq!(strategies[1].0, "title");
-        assert!(strategies.len() <= MAX_STRATEGIES);
-    }
-
-    #[test]
-    fn compilations_add_a_relaxed_artist_strategy() {
-        let mut local = local_release();
-        local.is_compilation = true;
-        local.artist_kind = ArtistKind::VariousArtists;
-        local.album_artist = Some("Various Artists".to_string());
-        let names: Vec<&str> = discover_strategies(&local)
-            .iter()
-            .map(|(name, _)| *name)
-            .collect();
-        assert_eq!(names, vec!["title", "relaxed"]);
-    }
-
-    #[test]
-    fn sparse_tags_only_use_the_title_strategy() {
-        let mut local = local_release();
-        local.album_artist = None;
-        local.artist_kind = ArtistKind::Unknown;
-        let strategies = discover_strategies(&local);
-        assert_eq!(strategies.len(), 1);
-        assert_eq!(strategies[0].0, "title");
-    }
-
-    #[test]
-    fn identifiers_match_only_when_normalized_values_agree() {
-        let mut local = local_release();
-        local.barcode = Some("0123 4567 89012".to_string());
-        let release = RemoteRelease {
-            id: 1,
-            master_id: None,
-            title: "Blue".to_string(),
-            artists: vec!["Test Artist".to_string()],
-            year: Some(2001),
-            country: None,
-            labels: Vec::new(),
-            catalog_numbers: Vec::new(),
-            formats: Vec::new(),
-            barcodes: vec!["0123456789012".to_string()],
-            tracklist: Vec::new(),
-            url: String::new(),
-        };
-        assert!(identifier_matches(&local, &release));
-
-        let other = RemoteRelease {
-            barcodes: vec!["9999999999999".to_string()],
-            ..release
-        };
-        assert!(!identifier_matches(&local, &other));
-    }
-
-    #[test]
-    fn algorithm_version_is_recorded_for_explainability() {
-        assert_eq!(ALGORITHM_VERSION, "discogs-match-v1");
+    fn defaults_to_musicbrainz_then_discogs_and_explicit_selectors_disable_fallback() {
+        let id = ReleaseId::MusicBrainz(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"));
+        assert_eq!(
+            resolve_policy(None, None).unwrap(),
+            ProviderPolicy::MusicBrainzThenDiscogs
+        );
+        assert_eq!(
+            resolve_policy(None, Some(&id)).unwrap(),
+            ProviderPolicy::Only(ProviderKind::MusicBrainz)
+        );
+        assert_eq!(
+            resolve_policy(Some(ProviderKind::Discogs), None).unwrap(),
+            ProviderPolicy::Only(ProviderKind::Discogs)
+        );
+        assert_eq!(
+            resolve_policy(Some(ProviderKind::MusicBrainz), None).unwrap(),
+            ProviderPolicy::Only(ProviderKind::MusicBrainz)
+        );
+        assert_eq!(
+            resolve_policy(None, Some(&ReleaseId::Discogs(42))).unwrap(),
+            ProviderPolicy::Only(ProviderKind::Discogs)
+        );
+        assert!(resolve_policy(Some(ProviderKind::Discogs), Some(&id)).is_err());
     }
 }
