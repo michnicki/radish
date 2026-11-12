@@ -2,27 +2,48 @@
 
 ## Project Structure & Module Organization
 
-Radish is a Rust 2024 CLI for music library management. `src/main.rs` defines the Clap commands and output formatting. `src/scanner.rs` reads audio tags using Lofty; `src/watcher.rs` handles filesystem events using Notify. `src/store.rs` contains SQL queries, while `src/db.rs` opens SQLite connections and applies the embedded `src/schema.sql`. Keep changes in the corresponding module. `.github/workflows/` contains CI and platform release workflows. There are currently no dedicated test or asset directories.
+Radish is a Rust 2024 CLI for music library management. It indexes audio tags into SQLite and, when asked, matches local releases against MusicBrainz, with an optional Discogs fallback. All logic lives in the library crate (`src/lib.rs`); `src/main.rs` holds the Clap commands, `.env` loading, and output formatting. Keep changes in the module that owns the behavior:
+
+- `scanner.rs` reads tags with Lofty. `importer.rs` is the one import pipeline, used by both `import` and the watcher. `watcher.rs` handles Notify events.
+- `store.rs` contains all SQL queries. `db.rs` opens connections and applies the baseline `src/schema.sql` and then the SQLx migrations in `migrations/`.
+- `providers.rs` defines the `MetadataProvider` trait and typed IDs. `musicbrainz.rs` and `discogs.rs` are the provider adapters. `discovery.rs` runs bounded candidate searches. `matcher.rs` holds pure mapping, scoring, and acceptance logic. `clef.rs` asks Cloudflare AI for optional advice. `runner.rs` orchestrates matching and the interactive review.
+- `output.rs` handles stdout writes and text escaping; `progress.rs` shows terminal progress.
+
+Integration tests are in `tests/`, with shared helpers in `tests/support/` and provider JSON in `tests/fixtures/`. Design specs and implementation plans are in `docs/superpowers/`. `.github/workflows/` contains CI and the platform release workflow.
 
 ## Build, Test, and Development Commands
 
-Use stable Rust and run commands from the repository root:
+Use stable Rust and run commands from the repository root. CI runs these four checks, and all must pass:
 
-- `cargo build` — compile the development binary; CI uses `cargo build --verbose`.
-- `cargo build --release` — build the optimized binary at `target/release/radish`.
-- `cargo run -- --db /tmp/radish-dev.db import /path/to/music` — import a local music directory into a development database.
-- `cargo run -- --db /tmp/radish-dev.db list` — inspect imported tracks. Other commands include `search "artist"` and `watch /path/to/music`.
-- `cargo test --verbose` — run Rust tests, matching CI.
-- `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings` — recommended local formatting and lint checks; CI currently runs only build and tests.
+- `cargo build --verbose --locked`
+- `cargo test --verbose --locked` (about 40 seconds)
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets --locked -- -D warnings`
+
+Other useful commands:
+
+- `cargo test --lib <name>` or `cargo test --test <file> <name>` runs a subset of unit or integration tests.
+- `cargo build --release` builds the optimized binary at `target/release/radish`.
+- `cargo run -- --db /tmp/radish-dev.db import /path/to/music` imports into a development database. Then run `list`, `search "artist"`, `releases`, `match`, or `watch /path/to/music` with the same `--db`.
 
 ## Coding Style & Naming Conventions
 
-Use standard rustfmt formatting with four-space indentation. Name modules, functions, and variables in `snake_case`, types in `PascalCase`, and constants in `SCREAMING_SNAKE_CASE`. Follow existing `anyhow::Result` and `?` error propagation patterns. Bind SQL parameters through SQLx. Preserve case-insensitive path matching in schema and query changes.
+Use standard rustfmt formatting with four-space indentation. Name modules, functions, and variables in `snake_case`, types in `PascalCase`, and constants in `SCREAMING_SNAKE_CASE`. Follow existing `anyhow::Result` and `?` error propagation patterns. Bind SQL parameters through SQLx. Preserve case-insensitive path matching (`COLLATE NOCASE`, `store::path_key`) in schema and query changes.
+
+- Put schema changes in a new timestamped file in `migrations/`. Never edit an applied migration or `src/schema.sql`.
+- Write stdout through the `outln!` and `out!` macros, not `println!`. Escape paths, tag values, and provider text with `output::Clean` or `output::clean_path`.
+- Start write transactions with `store::begin_write`. Helpers called inside a transaction take `&mut SqliteConnection`, not the pool.
+- Matching must not modify audio files or scanned metadata, and every command except matching must work offline.
 
 ## Testing Guidelines
 
-No automated tests or coverage threshold are currently defined. Add focused Rust unit tests in module-local `#[cfg(test)] mod tests` blocks, using `#[test]` or `#[tokio::test]` for asynchronous cases. Name tests after behavior, such as `accepts_uppercase_audio_extensions`. Use temporary SQLite databases and small, redistributable audio fixtures. Cover scanner filtering, database upserts, search, and watcher behavior when changing those areas.
+Unit tests go in module-local `#[cfg(test)] mod tests` blocks; CLI integration tests in `tests/*.rs` run the built binary. Use `#[tokio::test]` for asynchronous cases, and name tests after behavior, such as `accepts_uppercase_audio_extensions`.
+
+- Unit tests use `db::connect_in_memory()` and the helpers in `src/test_support.rs`, which provide scratch directories and synthetic WAV files.
+- Integration tests use `tests/support/mod.rs`: a loopback mock HTTP server, WAV writers, and canned provider responses. Point the `RADISH_*_BASE_URL` variables at the mock and remove credential variables from the child process.
+
+Tests must not contact real services or need credentials. The only exception is the `#[ignore]`d live Discogs smoke test. When changing scanner filtering, database upserts, release grouping, matching rules, search, or watcher behavior, add tests for the change.
 
 ## Commit & Pull Request Guidelines
 
-History currently contains one commit, `Initial implementation of Radish`; no broader message convention is established. Use concise, descriptive subjects. Keep pull requests focused, describe behavior changes, link relevant issues, and report validation commands and results. Include sample CLI output when output changes. Update `README.md` for command or usage changes. Keep generated databases, `target/`, and downloaded music out of commits.
+Commit subjects use `type(scope): summary`, for example `fix(watcher): keep the stored spelling of case-colliding files`, `refactor: …`, `docs: …`, or `build: …`. Keep pull requests focused, describe behavior changes, link relevant issues, and report validation commands and results. Include sample CLI output when output changes. `README.md` is the detailed behavior spec; update it for command, usage, or behavior changes. Keep generated databases (including `-wal` and `-shm` files), `.env` files, `target/`, and downloaded music out of commits.
