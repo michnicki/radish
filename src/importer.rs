@@ -89,6 +89,15 @@ fn emit(progress: Option<&ImportProgress>, event: ScanEvent) {
     }
 }
 
+/// The warning for a file skipped because another file differs from it only in
+/// letter case. Shared by the import and the watcher.
+pub(crate) fn case_collision_warning(path: &Path) -> String {
+    format!(
+        "warning: skipping {}: another file differs only in letter case",
+        clean_path(path)
+    )
+}
+
 /// Drops all but one of the scanned files that share a [`store::path_key`] and
 /// returns the dropped paths in sorted order.
 ///
@@ -170,10 +179,7 @@ pub(crate) async fn sync_files(
     // `tracks.path` ignores letter case, so files that differ only in case would
     // overwrite each other's row on every import.
     for path in skip_case_collisions(&mut tracks, &mut unchanged, &known) {
-        let message = format!(
-            "warning: skipping {}: another file differs only in letter case",
-            clean_path(&path)
-        );
+        let message = case_collision_warning(&path);
         emit(progress, ScanEvent::Warning { message });
     }
 

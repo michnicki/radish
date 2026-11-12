@@ -350,6 +350,15 @@ async fn apply_path(
             }
         }
         Ok(metadata) if metadata.is_file() && scanner::is_audio_file(path) => {
+            // The stored spelling wins over a file that differs only in case, as
+            // in an import, so the row does not move between the two.
+            if let Some(stored) = store::stored_path(pool, path).await?
+                && Path::new(&stored) != path
+                && tokio::fs::try_exists(&stored).await?
+            {
+                eprintln!("{}", importer::case_collision_warning(path));
+                return Ok(());
+            }
             let read = tokio::task::spawn_blocking({
                 let path = path.to_path_buf();
                 move || scanner::read_tags(&path)
@@ -649,6 +658,37 @@ mod tests {
             .await;
 
         assert_eq!(track_paths(&fixture).await, [new.display().to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_case_colliding_file_does_not_displace_the_stored_spelling() {
+        let fixture = Fixture::new("watcher-case-collision").await;
+        write_wav(&fixture.path("X.wav"));
+        if fixture.path("x.wav").exists() {
+            return; // case-insensitive filesystem: the two names cannot coexist
+        }
+        import(&fixture, &["X.wav"]).await;
+        let revisions = || async {
+            sqlx::query_scalar::<_, String>("SELECT source_revision FROM local_releases")
+                .fetch_all(&fixture.pool)
+                .await
+                .unwrap()
+        };
+        let before = revisions().await;
+        let stored = track_paths(&fixture).await;
+        write_wav(&fixture.path("x.wav"));
+
+        let outcome = fixture
+            .handle(&[event(
+                EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+                &[&fixture.path("x.wav")],
+            )])
+            .await;
+
+        assert_eq!(outcome.synced, 0, "{outcome:?}");
+        assert_eq!(track_paths(&fixture).await, stored);
+        assert_eq!(revisions().await, before);
     }
 
     #[tokio::test]

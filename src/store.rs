@@ -251,6 +251,17 @@ pub struct KnownTrack {
     pub modified_at: i64,
 }
 
+/// The path as stored for this file, with its original casing, when a row
+/// exists. The lookup ignores letter case, like the `path` column.
+pub async fn stored_path(pool: &SqlitePool, path: &Path) -> Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT path FROM tracks WHERE path = ?1")
+            .bind(path.to_string_lossy())
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
 /// Every stored file under `root`, keyed by [`path_key`] of the stored path.
 /// An import compares them with the files on disk to find what changed.
 pub async fn known_tracks(pool: &SqlitePool, root: &Path) -> Result<HashMap<String, KnownTrack>> {
