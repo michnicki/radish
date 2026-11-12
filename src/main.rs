@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use radish::output::{Clean, clean_path};
 use radish::progress::ImportProgress;
 use radish::providers::{ProviderKind, ReleaseId};
-use radish::{db, importer, outln, runner, store, watcher};
+use radish::{db, importer, index, outln, runner, store, watcher};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -43,6 +43,14 @@ enum Command {
         /// Read every file again, even when its modification time is unchanged
         #[arg(long)]
         rescan: bool,
+        /// Match against locally built dump indexes instead of the network
+        #[arg(long, requires = "match_releases")]
+        offline: bool,
+    },
+    /// Build and inspect the local provider indexes used by --offline
+    Index {
+        #[command(subcommand)]
+        action: IndexAction,
     },
     /// Watch a music directory and keep the library in sync in real time
     Watch { path: PathBuf },
@@ -91,6 +99,9 @@ enum Command {
         /// Automatically resolve strongly supported album matches with Clef
         #[arg(long = "ai-match", visible_alias = "ai-review")]
         ai_review: bool,
+        /// Match against locally built dump indexes instead of the network
+        #[arg(long, conflicts_with = "clear")]
+        offline: bool,
         /// Remove the accepted match for a local release
         #[arg(
             long,
@@ -110,6 +121,21 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum IndexAction {
+    /// Build an index from an official data dump (at least one flag)
+    Build {
+        /// MusicBrainz core dump (mbdump.tar.bz2)
+        #[arg(long, value_name = "PATH")]
+        musicbrainz: Option<PathBuf>,
+        /// Discogs releases dump (releases.xml.gz, or the tar holding it)
+        #[arg(long, value_name = "PATH")]
+        discogs: Option<PathBuf>,
+    },
+    /// Show each index's dump date, size, and release count
+    Status,
+}
+
 fn parse_direct(musicbrainz: Option<&str>, discogs: Option<u64>) -> Result<Option<ReleaseId>> {
     match (musicbrainz, discogs) {
         (Some(raw), None) => {
@@ -126,11 +152,12 @@ fn parse_direct(musicbrainz: Option<&str>, discogs: Option<u64>) -> Result<Optio
 
 /// The only keys read from `.env`. Endpoint overrides are deliberately excluded
 /// so a stray `.env` can never redirect real credentials to another host.
-const DOTENV_KEYS: [&str; 4] = [
+const DOTENV_KEYS: [&str; 5] = [
     "RADISH_CLOUDFLARE_ACCOUNT_ID",
     "RADISH_CLOUDFLARE_API_TOKEN",
     "RADISH_CLOUDFLARE_MODEL",
     "RADISH_DISCOGS_TOKEN",
+    "RADISH_INDEX_DIR",
 ];
 
 /// Loads allowed keys from `./.env` in the current directory only, never from a
@@ -201,6 +228,10 @@ fn report_error(error: &anyhow::Error) {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
 
+    // `index build` and `--offline` resolve the directory the same way.
+    let index_dir_value = std::env::var(index::INDEX_DIR_ENV).ok();
+    let index_dir = index::index_dir_value(index_dir_value.as_deref());
+
     // CLI validation happens before the database is opened or any client is
     // constructed, so invalid combinations never touch storage or the network.
     let selection: Option<(Option<ProviderKind>, Option<ReleaseId>)> = match &cli.command {
@@ -231,19 +262,21 @@ async fn run() -> Result<()> {
             provider: _,
             ai_review,
             rescan,
+            offline,
         } => {
             let canonical = run_import(&pool, &path, rescan).await?;
             if match_releases {
-                let summary = runner::run_match(
-                    &pool,
-                    runner::MatchOptions {
-                        scope: Some(canonical),
-                        policy: policy.unwrap_or_default(),
-                        ai_review,
-                        ..runner::MatchOptions::default()
-                    },
-                )
-                .await?;
+                let options = runner::MatchOptions {
+                    scope: Some(canonical),
+                    policy: policy.unwrap_or_default(),
+                    ai_review,
+                    ..runner::MatchOptions::default()
+                };
+                let summary = if offline {
+                    runner::run_match_offline(&pool, options, &index_dir).await?
+                } else {
+                    runner::run_match(&pool, options).await?
+                };
                 summary.print_report();
                 if summary.has_failures() {
                     bail!(
@@ -254,6 +287,13 @@ async fn run() -> Result<()> {
             }
         }
         Command::Watch { path } => watcher::watch_directory(pool, &path, &cli.db).await?,
+        Command::Index { action } => match action {
+            IndexAction::Build {
+                musicbrainz,
+                discogs,
+            } => index::cli::build(musicbrainz, discogs, &index_dir).await?,
+            IndexAction::Status => index::cli::status(&index_dir).await?,
+        },
         Command::List => print_tracks(&store::list_tracks(&pool).await?),
         Command::Search { query } => print_tracks(&store::search_tracks(&pool, &query).await?),
         Command::Releases { path } => {
@@ -269,6 +309,7 @@ async fn run() -> Result<()> {
             review,
             dry_run,
             ai_review,
+            offline,
             clear,
         } => {
             if let Some(id) = clear {
@@ -279,19 +320,20 @@ async fn run() -> Result<()> {
                 }
             } else {
                 let scope = canonical_scope(path.as_deref())?;
-                let summary = runner::run_match(
-                    &pool,
-                    runner::MatchOptions {
-                        scope,
-                        local_release,
-                        direct_release: direct,
-                        review,
-                        dry_run,
-                        ai_review,
-                        policy: policy.unwrap_or_default(),
-                    },
-                )
-                .await?;
+                let options = runner::MatchOptions {
+                    scope,
+                    local_release,
+                    direct_release: direct,
+                    review,
+                    dry_run,
+                    ai_review,
+                    policy: policy.unwrap_or_default(),
+                };
+                let summary = if offline {
+                    runner::run_match_offline(&pool, options, &index_dir).await?
+                } else {
+                    runner::run_match(&pool, options).await?
+                };
                 summary.print_report();
                 if summary.has_failures() {
                     bail!(
@@ -508,6 +550,20 @@ mod tests {
     }
 
     #[test]
+    fn offline_matching_selects_the_provider_policy_before_any_work() {
+        let cli = parse(&["match", "--offline", "--provider", "musicbrainz"]).unwrap();
+        match cli.command {
+            Command::Match {
+                provider, offline, ..
+            } => {
+                assert!(offline);
+                assert_eq!(provider, Some(ProviderKind::MusicBrainz));
+            }
+            _ => panic!("expected match"),
+        }
+    }
+
+    #[test]
     fn provider_parsing_rejects_unknown_services() {
         assert!(parse(&["match", "--provider", "spotify"]).is_err());
         assert!(parse(&["match", "--provider", "musicbrainz"]).is_ok());
@@ -536,6 +592,42 @@ mod tests {
     fn releases_accepts_an_optional_path() {
         assert!(parse(&["releases"]).is_ok());
         assert!(parse(&["releases", "--path", "/music"]).is_ok());
+    }
+
+    #[test]
+    fn offline_requires_matching_and_conflicts_with_clearing() {
+        assert!(parse(&["match", "--offline"]).is_ok());
+        assert!(parse(&["import", "/music", "--offline"]).is_err());
+        assert!(parse(&["import", "/music", "--match", "--offline"]).is_ok());
+        assert!(parse(&["match", "--clear", "3", "--offline"]).is_err());
+    }
+
+    #[test]
+    fn index_commands_parse() {
+        let cli = parse(&[
+            "index",
+            "build",
+            "--musicbrainz",
+            "/dumps/mbdump.tar.bz2",
+            "--discogs",
+            "/dumps/releases.xml.gz",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Index {
+                action:
+                    IndexAction::Build {
+                        musicbrainz,
+                        discogs,
+                    },
+            } => {
+                assert_eq!(musicbrainz, Some(PathBuf::from("/dumps/mbdump.tar.bz2")));
+                assert_eq!(discogs, Some(PathBuf::from("/dumps/releases.xml.gz")));
+            }
+            _ => panic!("expected index build"),
+        }
+        assert!(parse(&["index", "status"]).is_ok());
+        assert!(parse(&["index", "build"]).is_ok());
     }
 
     #[test]

@@ -41,6 +41,8 @@ All logic lives in the library crate (`src/lib.rs`). `src/main.rs` holds the Cla
 
 MusicBrainz runs first. Discogs is a fallback, constructed only when MusicBrainz does not settle the release.
 
+**Offline matching (`index build`, `match --offline`).** `index/` builds one SQLite index per provider from the official MusicBrainz and Discogs dumps, then serves it through `MetadataProvider`: `runner::run_match_offline` opens an index for each provider the active policy may attempt and passes those adapters into the same `run_with_policy` path, so discovery, scoring, and acceptance are unchanged. The MusicBrainz builder synthesizes the `/ws/2/release` document and runs the existing `musicbrainz::decode_release_document`, which keeps offline results identical to the network adapter by construction.
+
 Layering rules:
 - Adapters (`musicbrainz.rs`, `discogs.rs`) convert service payloads into `matcher::RemoteRelease`; provider types never reach `matcher` or `store`. Typed identities (`ReleaseId`, `Mbid`, `ProviderKind`) live in `providers.rs` and are stored as `(provider, TEXT id)`.
 - Matching never overwrites scanned metadata or writes audio files. Accepted metadata is a separate overlay (`release_matches` and `release_track_matches`, at most one per local release across providers). `list` and `search` show the effective value: the overlay where present, scanned tags otherwise. Each local release's `release-input-v2:` source revision decides when a match goes stale.
@@ -64,5 +66,5 @@ Layering rules:
 ## Tests
 
 - Unit tests live in module-local `#[cfg(test)] mod tests` blocks and use `src/test_support.rs` (`ScratchDir`, `write_wav`, `write_tagged_wav`) and `db::connect_in_memory()`.
-- Integration tests in `tests/*.rs` run the built binary (`env!("CARGO_BIN_EXE_radish")`). `tests/support/mod.rs` provides a loopback `MockServer`, synthetic WAV writers, and canned provider JSON; more fixtures are in `tests/fixtures/musicbrainz/`. Tests point `RADISH_*_BASE_URL` at the mock and `env_remove` credentials, so no test contacts a real service.
+- Integration tests in `tests/*.rs` run the built binary (`env!("CARGO_BIN_EXE_radish")`). `tests/support/mod.rs` provides a loopback `MockServer`, synthetic WAV writers, a MusicBrainz dump archive writer, and canned provider JSON; more fixtures are in `tests/fixtures/musicbrainz/`. Tests point `RADISH_*_BASE_URL` at the mock and `env_remove` credentials, so no test contacts a real service.
 - Commit subjects use `type(scope): summary`, e.g. `fix(watcher): …`, `refactor: …`, `docs: …`.

@@ -191,6 +191,58 @@ pub fn musicbrainz_release_json(mbid: &str, titles: &[&str], durations: &[f64]) 
     )
 }
 
+/// Writes a WAV file carrying the tags the grouper and matcher read.
+pub fn write_tagged_wav(
+    path: &Path,
+    album: &str,
+    album_artist: &str,
+    title: &str,
+    track: u16,
+    year: u16,
+) {
+    use lofty::config::WriteOptions;
+    use lofty::file::{AudioFile, TaggedFileExt};
+    use lofty::tag::items::Timestamp;
+    use lofty::tag::{Accessor, ItemKey, Tag};
+
+    // One second of 16-bit 44.1 kHz mono, so a real duration is measurable.
+    write_wav_with_data(path, 88_200);
+    let mut file = lofty::probe::Probe::open(path).unwrap().read().unwrap();
+    let mut tag = Tag::new(file.primary_tag_type());
+    tag.set_album(album.to_string());
+    tag.set_artist(album_artist.to_string());
+    tag.insert_text(ItemKey::AlbumArtist, album_artist.to_string());
+    tag.set_title(title.to_string());
+    tag.set_track(u32::from(track));
+    tag.set_date(Timestamp {
+        year,
+        ..Timestamp::default()
+    });
+    file.insert_tag(tag);
+    file.save_to_path(path, WriteOptions::default()).unwrap();
+}
+
+/// Writes a `mbdump.tar.bz2` for fixtures, laid out like the real dump.
+pub fn write_mb_archive(dir: &Path, files: &[(&str, &str)]) -> PathBuf {
+    let path = dir.join("mbdump.tar.bz2");
+    let file = std::fs::File::create(&path).unwrap();
+    let encoder = bzip2::write::BzEncoder::new(file, bzip2::Compression::best());
+    let mut builder = tar::Builder::new(encoder);
+
+    for (name, contents) in files {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, format!("mbdump/{name}"), contents.as_bytes())
+            .unwrap();
+    }
+
+    builder.into_inner().unwrap().finish().unwrap();
+    path
+}
+
 pub fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("radish-it-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

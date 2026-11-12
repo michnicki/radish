@@ -8,6 +8,7 @@
 use crate::clef::{Advice, AdviceChoice, ClefClient, ReviewCandidate, choice_key};
 use crate::discogs::{AdapterError, DiscogsAdapter};
 use crate::discovery::{self, DiscoveryResult};
+use crate::index::{IndexKind, IndexPaths, local::LocalIndex};
 use crate::matcher::{
     self, Candidate, DiscoveryEvidence, Evaluation, LocalRelease, MatchScope, RemoteRelease,
 };
@@ -303,6 +304,56 @@ pub async fn run_match(pool: &SqlitePool, options: MatchOptions) -> Result<Match
     run_with_policy(pool, &options, MusicBrainzAdapter::new, || {
         DiscogsAdapter::from_env().map_err(anyhow::Error::new)
     })
+    .await
+}
+
+/// Matches against locally built dump indexes instead of the network.
+///
+/// Every provider the active policy may attempt must have an index. That is
+/// checked once, before any release is processed, so a half-built setup fails
+/// up front instead of silently losing its fallback stage. No credential is
+/// read and no request is made on this path.
+pub async fn run_match_offline(
+    pool: &SqlitePool,
+    options: MatchOptions,
+    index_dir: &std::path::Path,
+) -> Result<MatchSummary> {
+    let paths = IndexPaths::from_dir(index_dir);
+    let mut musicbrainz_index: Option<LocalIndex> = None;
+    let mut discogs_index: Option<LocalIndex> = None;
+
+    for provider in options.policy.order() {
+        let kind = IndexKind::for_provider(provider);
+        let index = LocalIndex::open(&paths, kind)
+            .await
+            .with_context(|| format!("offline matching needs the {kind} index"))?;
+        match provider {
+            ProviderKind::MusicBrainz => musicbrainz_index = Some(index),
+            ProviderKind::Discogs => discogs_index = Some(index),
+        }
+    }
+
+    // The policy layer builds each adapter at most once per run, so each cell
+    // is handed out exactly once; a second request is a programming error.
+    let musicbrainz = std::cell::RefCell::new(musicbrainz_index);
+    let discogs = std::cell::RefCell::new(discogs_index);
+
+    run_with_policy(
+        pool,
+        &options,
+        || {
+            musicbrainz
+                .borrow_mut()
+                .take()
+                .context("the MusicBrainz index was already opened")
+        },
+        || {
+            discogs
+                .borrow_mut()
+                .take()
+                .context("the Discogs index is not part of the selected policy")
+        },
+    )
     .await
 }
 

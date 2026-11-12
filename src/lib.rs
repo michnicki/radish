@@ -7,6 +7,7 @@
 //! - [`musicbrainz`]: MusicBrainz transport, query escaping, and conversion.
 //! - [`discogs`]: Discogs provider access, credentials, retries, conversion.
 //! - [`discovery`]: bounded provider-neutral candidate discovery.
+//! - [`index`]: local provider indexes built from the official data dumps.
 //! - [`matcher`]: pure normalization, mapping, scoring, and acceptance rules.
 //! - [`store`]: grouping, revisions, review queue, and transactional overlay.
 //! - [`runner`]: CLI orchestration and the interactive review screen.
@@ -16,6 +17,7 @@ pub mod db;
 pub mod discogs;
 pub mod discovery;
 pub mod importer;
+pub mod index;
 pub mod matcher;
 pub mod musicbrainz;
 pub mod output;

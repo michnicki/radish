@@ -1,5 +1,6 @@
 //! Helpers shared by unit tests: scratch directories and audio fixtures.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// A scratch directory removed when dropped, including when a test panics.
@@ -49,6 +50,29 @@ pub(crate) fn write_wav(path: &Path) {
     bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&data);
     std::fs::write(path, bytes).unwrap();
+}
+
+/// Writes a `mbdump.tar.bz2` containing the given table files, as the real
+/// MusicBrainz core dump is laid out: one tar entry per table in COPY format.
+pub(crate) fn write_mb_archive(dir: &Path, files: &[(&str, &str)]) -> PathBuf {
+    let path = dir.join("mbdump.tar.bz2");
+    let file = std::fs::File::create(&path).unwrap();
+    let encoder = bzip2::write::BzEncoder::new(file, bzip2::Compression::best());
+    let mut builder = tar::Builder::new(encoder);
+
+    for (name, contents) in files {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, format!("mbdump/{name}"), contents.as_bytes())
+            .unwrap();
+    }
+
+    let encoder = builder.into_inner().unwrap();
+    encoder.finish().unwrap().flush().unwrap();
+    path
 }
 
 /// Writes a WAV file whose tag holds `album` and the release `year`.

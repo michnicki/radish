@@ -83,6 +83,7 @@ Radish also reads settings from a file named `.env` in the **current directory o
 - `RADISH_CLOUDFLARE_API_TOKEN`
 - `RADISH_CLOUDFLARE_MODEL`
 - `RADISH_DISCOGS_TOKEN`
+- `RADISH_INDEX_DIR`
 
 Variables already set in the environment always win over the file. Only a regular file named `.env` is read: a missing file, a directory of that name (as in a Python virtualenv), or an unreadable file is ignored without a message. Malformed lines are skipped, and valid keys after them still load. A leading UTF-8 byte order mark is ignored. Service endpoints cannot be set from `.env` (see [Test-server overrides](#test-server-overrides)).
 
@@ -116,11 +117,51 @@ radish match --clear 12
 # Import first, then run the same policy for that scope
 radish import ~/Music --match
 radish import ~/Music --match --provider musicbrainz
+
+# Build local indexes from downloaded dumps, then match with no network
+radish index build --musicbrainz ~/dumps/mbdump.tar.bz2 --discogs ~/dumps/discogs_20260101_releases.xml.gz
+radish index status
+radish match --offline
+radish import ~/Music --match --offline --provider musicbrainz
 ```
 
 An explicit `--provider` or a direct release selector restricts matching to that service and disables fallback. A direct selector requires `--local-release`, and the two direct flags conflict. `--provider` on `import` requires `--match`. `--review` requires an interactive terminal. `--clear` conflicts with every matching selector. Invalid combinations and malformed MBIDs are rejected before the database is opened or a client is created. Matching failures never roll back a successful import, and `--match` exits nonzero after the import is kept.
 
 Already imported your library? Run `radish --db /path/to/radish.db match`. Strong album/track matches no longer need a barcode, catalog number, or embedded release ID. Ordinary runs search previously queued releases again; `--review` still loads unchanged saved candidates offline.
+
+### Local dump indexes (offline matching)
+
+Live matching is paced by the providers, not by Radish: MusicBrainz allows about one request per second and discovery can spend more than ten per release. `--offline` answers the same searches and lookups from indexes built once from the official dumps, which are CC0 and need no account:
+
+| Source | File | Approximate size |
+| --- | --- | --- |
+| [MusicBrainz core dump](https://musicbrainz.org/doc/MusicBrainz_Database/Download) | `mbdump.tar.bz2` | 7 GB |
+| [Discogs releases dump](https://data.discogs.com/) | `discogs_*_releases.xml.gz`, or the tar holding it | 11 GB |
+
+Credits, labels, catalog numbers, barcodes, and tracklists are inline in those two files; the separate artist, label, and master dumps are not needed. Radish never downloads or refreshes a dump.
+
+```bash
+# The default directory is ./radish-index; RADISH_INDEX_DIR overrides it
+radish index build --musicbrainz ~/dumps/mbdump.tar.bz2
+radish index build --discogs ~/dumps/discogs_20260101_releases.xml.gz
+radish index status
+
+radish match --offline
+radish match --offline --provider musicbrainz
+radish import ~/Music --match --offline
+```
+
+A build streams the archive into a temporary database, writes `<name>.db.tmp`, and renames it into place only after the search index is complete, so an interrupted build never damages a working index. When the MusicBrainz `MD5SUMS` file sits next to the dump, the compressed bytes are verified while they are read. `index status` reports each index's size, release count, and checksum state, plus the MusicBrainz export date taken from the archive's own `TIMESTAMP` entry (the file's modification time says when it was downloaded, so it is not used; an archive without one shows no date).
+
+The MusicBrainz archive is a PostgreSQL COPY export with no DDL of its own: it names a table layout with `SCHEMA_SEQUENCE` (currently 31) and expects the server's `CreateTables.sql`. Radish carries that layout for the tables it reads and refuses a dump from a different schema instead of misreading every row, so a schema bump needs a Radish update rather than a silently wrong index.
+
+`--offline` needs an index for every provider the active policy may attempt: the default MusicBrainz-then-Discogs policy needs both, while `--offline --provider musicbrainz` needs only the MusicBrainz index. A missing index fails once, before any release is processed, naming the expected file and the rebuild command. Offline matching reads no credential and makes no HTTP request; `--ai-match` still contacts Cloudflare, because it is a separate explicit opt-in.
+
+Local title searches mirror the network adapters' two steps: every word must match first, and only if that finds nothing does the search accept any word. The any-word step ignores single-character words (`s`, `1`, a stray initial), which match millions of releases and carry no evidence; the every-word step keeps them. Candidates are ranked by relevance inside the search index and only the returned page is read from the table, which keeps even a common-word search under a second on the full dumps. A title with no searchable characters (`-`, `???`) is a miss, as it is on the network, not a failure.
+
+Measured on one machine with the 2026-11 dumps (release build, local NVMe): the MusicBrainz index holds 5.9 million releases, takes about 2 hours to build (with the Discogs build running at the same time), needs about 1.5 GB of memory, and is 15.8 GiB; the Discogs index holds 19.6 million releases, takes about 1 hour, needs under 0.2 GB of memory, and is 24 GiB. Building also needs scratch space: the MusicBrainz staging database was 19 GB while it was being built. Matching a library of 5,516 local releases with `match --offline` took 11 minutes with no network (accepted 763, queued for review 4,555, unmatched 198, failed 0) and about 0.14 GB of memory; the network adapters are limited to about one MusicBrainz request per second and spend more than ten per release on discovery. Your times depend on disk speed, since searching is I/O-bound.
+
+Dumps are snapshots: MusicBrainz publishes weekly and Discogs monthly. A release newer than the dump is not found and stays unmatched; match those without `--offline`.
 
 ### Provider order and fallback
 
@@ -281,6 +322,7 @@ Cloudflare is contacted only with `--ai-match` (or its alias), after normal matc
 - **MusicBrainz MBIDs:** only hyphenated non-nil UUIDs are accepted. Nil IDs and compact 32-character forms are rejected everywhere, including stored snapshots.
 - **Rate limits and retries:** MusicBrainz attempts share a scheduler with at least 1.1 seconds between starts, including redirect hops. Every attempt has a 30-second timeout and a logical request gets at most three actual attempts. Transport failures, 429, and 5xx retry with 2s/4s backoff and honor both `Retry-After` forms; a suggested wait above 120 seconds is reported instead of slept. Exhausted transient failures and excessive `Retry-After` suggestions pause uncached MusicBrainz requests for 60 seconds (up to 120 seconds with `Retry-After`), allowing Discogs fallback to proceed without repeated retry loops. Cached successful results remain available, and requests resume after the cooldown. Discogs keeps its own existing spacing and retries.
 - **Network scope:** successful search and release results are cached per run only. Between runs Radish persists accepted metadata and review candidates, never a general HTTP cache.
+- **Offline indexes are snapshots.** `--offline` can only find what the dump contains: releases newer than the dump, and Discogs IDs merged or removed since it, are not found. Rebuild from a newer dump, or match without `--offline` when a release is missing.
 
 ### Example output
 
@@ -399,6 +441,7 @@ File databases use SQLite's WAL journal mode, so `<db>-wal` and `<db>-shm` files
 
 ### Upgrade notes
 
+- Index files carry a schema version. Version 2 stores each release document zlib-compressed, so an index built by an earlier version is refused with a rebuild hint; run `radish index build` again.
 - A migration marks previously accepted multi-track matches stale when their file order differs from their track order. Older versions could apply remote track metadata to the wrong files in that case. The overlay stays visible; the next `radish match` run re-evaluates those releases.
 - The year used to be stored on an album row shared by every folder with the same title and artist, and now lives on each track. The upgrade copies each track's old (possibly wrong) year, then forces the next `import` or `watch` to read every file once, which replaces it with the file's own tag. Releases affected by the shared year may go stale at that first re-read. Review or refresh them as usual.
 
