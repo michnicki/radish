@@ -106,6 +106,9 @@ fn server_with_probability(
 fn run(db: &Path, server: &MockServer, args: &[&str], credentials: bool) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_radish"));
     command
+        // Radish reads `.env` from the working directory; a developer's real
+        // credentials must never reach a test, so run where none exists.
+        .current_dir(db.parent().unwrap())
         .arg("--db")
         .arg(db)
         .args(args)
@@ -493,6 +496,9 @@ fn outage_server(ai_choice: &'static str) -> MockServer {
 fn run_with_discogs(db: &Path, server: &MockServer, args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_radish"));
     command
+        // Radish reads `.env` from the working directory; a developer's real
+        // credentials must never reach a test, so run where none exists.
+        .current_dir(db.parent().unwrap())
         .arg("--db")
         .arg(db)
         .args(args)

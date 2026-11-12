@@ -72,6 +72,9 @@ async fn seed_album(db: &Path, directory: &str, album: &str, year: i64) -> i64 {
 fn run(db: &Path, server: &MockServer, args: &[&str], token: Option<&str>) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_radish"));
     command
+        // Radish reads `.env` from the working directory; a developer's real
+        // credentials must never reach a test, so run where none exists.
+        .current_dir(db.parent().unwrap())
         .arg("--db")
         .arg(db)
         .args(args)
