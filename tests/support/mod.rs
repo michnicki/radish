@@ -209,7 +209,12 @@ pub fn db_path(name: &str) -> PathBuf {
 
 /// Minimal valid PCM WAV bytes for scanner tests.
 pub fn write_wav(path: &Path) {
-    let data = [0u8; 32];
+    write_wav_with_data(path, 32);
+}
+
+/// Like [`write_wav`], with `data_len` bytes of audio so the duration differs.
+pub fn write_wav_with_data(path: &Path, data_len: usize) {
+    let data = vec![0u8; data_len];
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"RIFF");
     bytes.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());

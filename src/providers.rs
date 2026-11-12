@@ -457,14 +457,13 @@ impl ProviderError {
         matches!(self, Self::NotFound { .. })
     }
 
-    /// True for failures that say nothing about whether a match exists.
+    /// True for outage-like failures that say nothing about whether a match
+    /// exists. A malformed response is deterministic for that release and
+    /// starts no cooldown, so it is not an outage.
     pub fn is_transient(&self) -> bool {
         matches!(
             self,
-            Self::RateLimited { .. }
-                | Self::Network { .. }
-                | Self::Unavailable { .. }
-                | Self::Malformed { .. }
+            Self::RateLimited { .. } | Self::Network { .. } | Self::Unavailable { .. }
         )
     }
 }
@@ -592,6 +591,55 @@ mod tests {
         assert!(!error.is_auth());
         assert_eq!(error.provider(), ProviderKind::MusicBrainz);
         assert!(error.to_string().contains("retry in 7s"), "{error}");
+    }
+
+    #[test]
+    fn only_outage_like_failures_are_transient() {
+        let provider = ProviderKind::MusicBrainz;
+        let message = || "x".to_string();
+        for error in [
+            ProviderError::Network {
+                provider,
+                message: message(),
+            },
+            ProviderError::RateLimited {
+                provider,
+                message: message(),
+                retry_after: None,
+            },
+            ProviderError::Unavailable {
+                provider,
+                retry_after: Duration::from_secs(1),
+            },
+        ] {
+            assert!(error.is_transient(), "{error}");
+        }
+        // A malformed response is deterministic for that release.
+        for error in [
+            ProviderError::Malformed {
+                provider,
+                message: message(),
+            },
+            ProviderError::Permanent {
+                provider,
+                status: Some(400),
+                message: message(),
+            },
+            ProviderError::NotFound {
+                provider,
+                id: message(),
+            },
+            ProviderError::Configuration {
+                provider,
+                message: message(),
+            },
+            ProviderError::Authentication {
+                provider,
+                message: message(),
+            },
+        ] {
+            assert!(!error.is_transient(), "{error}");
+        }
     }
 
     #[test]

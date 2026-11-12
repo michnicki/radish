@@ -37,6 +37,9 @@ The binary is at `target/release/radish` (`radish.exe` on Windows). Add it to yo
 # Import a music directory and its subdirectories
 radish import ~/Music
 
+# Read every file again, even when its modification time is unchanged
+radish import --rescan ~/Music
+
 # List stored tracks
 radish list
 
@@ -347,7 +350,7 @@ Albums are also grouped by the pair `(album title, artist)` for scanned-metadata
 
 `import` walks the selected directory, filters files by extension, and reads each file's primary tag, falling back to its first available tag. It stores title, artist, album, album-artist, year, track number, disc number, barcode, catalog number, all four MusicBrainz identifier values, duration, and modification time. Missing tag fields are stored as SQL `NULL`. Format inference from the audio codec is not performed.
 
-Tag parsing runs in parallel; database updates happen afterward. A file that fails tag reading produces a warning and is skipped while other files continue importing; if it was imported before, its stored row is kept rather than deleted. Files whose modification time matches the stored one are not read again, so a repeat import of an unchanged library reads no tags.
+Tag parsing runs in parallel; database updates happen afterward. A file that fails tag reading produces a warning and is skipped while other files continue importing; if it was imported before, its stored row is kept rather than deleted. Files whose modification time matches the stored one are not read again, so a repeat import of an unchanged library reads no tags. `radish import --rescan PATH` skips that check and reads every file, which picks up edits made within the same second or by tools that preserve the modification time.
 
 When stderr is an interactive terminal, import shows a spinner during file discovery, completed/total counters while reading tags and saving tracks, and a spinner while rebuilding local-release groups. Failed tag reads count toward scan progress and still produce warnings. Live progress is hidden when stderr is redirected; stdout messages and the final import summary are unchanged. Progress clears before optional matching starts.
 
@@ -386,7 +389,7 @@ The SQLite database contains these tables:
 - `release_track_matches` — one-to-one file-to-track mapping with remote ordinals, medium/track positions, and MusicBrainz track/recording IDs.
 - `match_reviews` — candidate summaries, proposed mappings, and reasons keyed by `(local_release_id, provider)`.
 
-The base schema is embedded in the binary and initialized on connection; additive changes are applied through versioned SQLx migrations in [`migrations/`](migrations). The MusicBrainz migration copies existing Discogs accepted rows, track mappings, timestamps, scores, revisions, and review reasons into the provider-qualified tables before retiring the old ones. Historical snapshots stay version 1 and decode through the legacy Discogs codec. Existing databases keep their rows and IDs, and new observed fields stay absent until the next rescan. See [the schema](src/schema.sql) and [storage queries](src/store.rs) for exact matching rules.
+The base schema is embedded in the binary and initialized on connection; additive changes are applied through versioned SQLx migrations in [`migrations/`](migrations). The MusicBrainz migration copies existing Discogs accepted rows, track mappings, timestamps, scores, revisions, and review reasons into the provider-qualified tables before retiring the old ones. Historical snapshots stay version 1 and decode through the legacy Discogs codec. Existing databases keep their rows and IDs. The upgrade itself never reads files, so new observed fields start empty; it resets each track's stored modification time, which makes the next `import` or `watch` read every file once and fill them from the real tags. See [the schema](src/schema.sql) and [storage queries](src/store.rs) for exact matching rules.
 
 `list` and `search` read the database without checking the audio files. Output includes artist, title, available album, disc and track number, rounded duration in `minutes:seconds`, a `[stale match]` marker when accepted metadata no longer matches the group, and a final track count. A missing title displays the filename; a missing artist displays `(unknown artist)`. An empty result prints `No tracks found.`
 
@@ -397,7 +400,7 @@ File databases use SQLite's WAL journal mode, so `<db>-wal` and `<db>-shm` files
 ### Upgrade notes
 
 - A migration marks previously accepted multi-track matches stale when their file order differs from their track order. Older versions could apply remote track metadata to the wrong files in that case. The overlay stays visible; the next `radish match` run re-evaluates those releases.
-- The year used to be stored on an album row shared by every folder with the same title and artist, and now lives on each track. Releases that were affected by that shared year may go stale once on their first rescan after upgrading. Review or refresh them as usual.
+- The year used to be stored on an album row shared by every folder with the same title and artist, and now lives on each track. The upgrade copies each track's old (possibly wrong) year, then forces the next `import` or `watch` to read every file once, which replaces it with the file's own tag. Releases affected by the shared year may go stale at that first re-read. Review or refresh them as usual.
 
 ## Development
 

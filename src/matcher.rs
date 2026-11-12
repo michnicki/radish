@@ -303,9 +303,6 @@ pub struct SearchSummary {
     pub formats: Vec<String>,
     pub barcodes: Vec<String>,
     pub result_type: String,
-    /// Total tracks across all media, when the service reports it.
-    #[serde(default)]
-    pub track_count: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1769,7 +1766,7 @@ fn evaluate_at_scope(
 
     if let Some(runner_up) = runner_up {
         let gap = candidate.score.total - runner_up.score.total;
-        if gap + 1e-9 < RUNNER_UP_GAP && !embedded_consistent {
+        if within_gap(gap) && !embedded_consistent {
             blockers.push(format!(
                 "runner-up release {} is only {:.3} behind",
                 runner_up.release.id, gap
@@ -2733,6 +2730,35 @@ mod tests {
     }
 
     #[test]
+    fn a_runner_up_exactly_at_the_gap_blocks_acceptance() {
+        let mut local = local_release(&["One", "Two"]);
+        local.barcode = Some("0123456789012".to_string());
+        let first = Candidate::new(&local, remote_release(&["One", "Two"]));
+        let discovery = DiscoveryEvidence {
+            identifier_unique: true,
+            ..DiscoveryEvidence::default()
+        };
+        let mut second = first.clone();
+        second.release.id = ReleaseId::Discogs(43);
+
+        second.score.total = first.score.total - (RUNNER_UP_GAP + 0.001);
+        let clear = evaluate(&local, &first, Some(&second), &discovery);
+        assert!(clear.auto_accept, "{:?}", clear.blockers);
+
+        second.score.total = first.score.total - RUNNER_UP_GAP;
+        let boundary = evaluate(&local, &first, Some(&second), &discovery);
+        assert!(!boundary.auto_accept);
+        assert!(
+            boundary
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("runner-up")),
+            "{:?}",
+            boundary.blockers
+        );
+    }
+
+    #[test]
     fn edition_qualifier_mismatch_blocks_acceptance() {
         let mut local = local_release(&["One", "Two"]);
         local.album_title = Some("Test Album (Live)".to_string());
@@ -2769,7 +2795,6 @@ mod tests {
             formats: vec!["CD".to_string()],
             barcodes: vec!["0123456789012".to_string()],
             result_type: "release".to_string(),
-            track_count: None,
         };
         let other = SearchSummary {
             title: "Someone Else - Another Album".to_string(),

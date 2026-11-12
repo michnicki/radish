@@ -3,7 +3,7 @@
 mod support;
 
 use std::process::Command;
-use support::{db_path, temp_dir, write_wav};
+use support::{db_path, temp_dir, write_wav, write_wav_with_data};
 
 fn radish(db: &std::path::Path, args: &[&std::path::Path]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_radish"))
@@ -214,4 +214,46 @@ fn watching_paths_with_escape_bytes_prints_no_raw_escape() {
             String::from_utf8_lossy(&bytes)
         );
     }
+}
+
+/// Pins a file's modification time, so a rewrite can keep the stored value.
+fn set_mtime(path: &std::path::Path, secs: u64) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+        .unwrap();
+}
+
+#[test]
+fn rescan_rereads_files_whose_modification_time_did_not_change() {
+    let db = db_path("import-rescan");
+    let music = temp_dir("import-rescan-music");
+    let file = music.join("a.wav");
+    write_wav_with_data(&file, 32);
+    set_mtime(&file, 1_700_000_000);
+    let first = radish(&db, &["import".as_ref(), music.as_ref()]);
+    assert!(first.status.success(), "{first:?}");
+
+    // A tool rewrote the file and restored its modification time.
+    write_wav_with_data(&file, 8192);
+    set_mtime(&file, 1_700_000_000);
+    let plain = radish(&db, &["import".as_ref(), music.as_ref()]);
+    let plain_out = String::from_utf8_lossy(&plain.stdout);
+    assert!(
+        plain_out.contains("Imported 0 new or changed tracks (1 unchanged"),
+        "{plain_out}"
+    );
+
+    let rescan = radish(
+        &db,
+        &["import".as_ref(), "--rescan".as_ref(), music.as_ref()],
+    );
+    assert!(rescan.status.success(), "{rescan:?}");
+    let rescan_out = String::from_utf8_lossy(&rescan.stdout);
+    assert!(
+        rescan_out.contains("Imported 1 new or changed tracks (0 unchanged"),
+        "{rescan_out}"
+    );
 }
