@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v9";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v8";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v10";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v9";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -387,12 +387,12 @@ pub fn similarity(a: &str, b: &str) -> f64 {
 /// [`similarity`] over titles whose apostrophe-joined text the caller already
 /// has: the better of that and the apostrophe-as-space reading.
 ///
-/// A tag may write `Dont`, `Don t`, or `Don't` for the same word, so neither
-/// reading alone is right; taking the better of the two never scores a pair
+/// A tag may write `Dont`, `Don t`, or `Don't` (or `A&B` for `A B`) for the
+/// same thing, so neither reading alone is right; taking the better of the two never scores a pair
 /// lower than either one would.
 fn comparison_similarity(a: &str, a_chars: &[char], b: &str, b_chars: &[char]) -> f64 {
     let joined = similarity_of_normalized(a, a_chars, b, b_chars);
-    if joined >= 1.0 || !(has_apostrophe(a) || has_apostrophe(b)) {
+    if joined >= 1.0 || !(needs_plain_reading(a) || needs_plain_reading(b)) {
         return joined;
     }
     let spaced = similarity_of_normalized(
@@ -404,19 +404,23 @@ fn comparison_similarity(a: &str, a_chars: &[char], b: &str, b_chars: &[char]) -
     joined.max(spaced)
 }
 
-fn has_apostrophe(text: &str) -> bool {
-    text.chars().any(is_apostrophe)
+/// Whether [`normalized_chars`] reads `text` differently from [`normalize_text`].
+fn needs_plain_reading(text: &str) -> bool {
+    text.chars().any(|ch| ch == '&' || is_apostrophe(ch))
 }
 
 /// Text for comparison: [`normalize_text`] with apostrophes joined, not split.
 ///
 /// `Don't`, `Don’t` and a tag's `Dont` all compare as `dont`. Only comparison
 /// does this: [`normalize_text`] also feeds the search indexes and the stored
-/// album key, so changing it would desynchronize both. [`comparison_similarity`]
-/// also tries the apostrophe-as-space form.
+/// album key, so changing it would desynchronize both. `&` reads as `and`.
+/// [`comparison_similarity`] also tries the plain [`normalize_text`] reading, in
+/// which an apostrophe or `&` is a space.
 fn normalized_chars(text: &str) -> Vec<char> {
     let joined: String = text.chars().filter(|ch| !is_apostrophe(*ch)).collect();
-    normalize_text(&joined).chars().collect()
+    // `Seek & Destroy` and `Seek And Destroy` are the same words.
+    let spelled = joined.replace('&', " and ");
+    normalize_text(&spelled).chars().collect()
 }
 
 fn is_apostrophe(ch: char) -> bool {
@@ -2578,6 +2582,20 @@ mod tests {
     }
 
     #[test]
+    fn an_ampersand_reads_as_and_in_comparison_but_not_in_normalization() {
+        assert_eq!(similarity("Seek & Destroy", "Seek And Destroy"), 1.0);
+        assert_eq!(similarity("Rock & Roll Girl", "Rock and Roll Girl"), 1.0);
+        assert_eq!(similarity("Hits&Misses", "Hits and Misses"), 1.0);
+        // A tag that wrote the break as a space still matches the `&`.
+        assert_eq!(similarity("Black White", "Black & White"), 1.0);
+        assert_eq!(similarity("A&B", "A B"), 1.0);
+        // Different words stay different.
+        assert!(similarity("Black & Blue", "Black & White") < 0.8);
+        // Search indexes and album keys still treat `&` as a break.
+        assert_eq!(normalize_text("Seek & Destroy"), "seek destroy");
+    }
+
+    #[test]
     fn a_full_width_local_value_may_be_a_cut_off_copy() {
         let remote = "The Mouth Licking What You\u{2019}ve Bled";
         let cut = "the mouth licking what you've ";
@@ -3539,10 +3557,13 @@ mod tests {
 
     #[test]
     fn algorithm_versions_are_provider_specific() {
-        assert_eq!(algorithm_version(ProviderKind::Discogs), "discogs-match-v9");
+        assert_eq!(
+            algorithm_version(ProviderKind::Discogs),
+            "discogs-match-v10"
+        );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v8"
+            "musicbrainz-match-v9"
         );
     }
 
