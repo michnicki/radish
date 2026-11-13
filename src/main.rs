@@ -42,6 +42,14 @@ enum Command {
         /// Match against locally built dump indexes instead of the network
         #[arg(long, requires = "match_releases")]
         offline: bool,
+        /// Offline releases matched at once (default: one per core, up to 8)
+        #[arg(
+            long,
+            value_name = "N",
+            requires = "offline",
+            value_parser = clap::value_parser!(u16).range(1..=i64::from(runner::MAX_JOBS))
+        )]
+        jobs: Option<u16>,
     },
     /// Build and inspect the local provider indexes used by --offline
     Index {
@@ -102,6 +110,15 @@ enum Command {
         /// Match against locally built dump indexes instead of the network
         #[arg(long, conflicts_with = "clear")]
         offline: bool,
+        /// Offline releases matched at once (default: one per core, up to 8)
+        #[arg(
+            long,
+            value_name = "N",
+            requires = "offline",
+            conflicts_with = "review",
+            value_parser = clap::value_parser!(u16).range(1..=i64::from(runner::MAX_JOBS))
+        )]
+        jobs: Option<u16>,
         /// Remove the accepted match for a local release
         #[arg(
             long,
@@ -147,6 +164,33 @@ fn parse_direct(musicbrainz: Option<&str>, discogs: Option<u64>) -> Result<Optio
         (None, None) => Ok(None),
         (Some(_), Some(_)) => bail!("choose either a MusicBrainz or a Discogs release selector"),
     }
+}
+
+/// The most releases `--offline` matches at once when `--jobs` is not given.
+///
+/// Offline matching spends nearly all of its time in SQLite queries, which run
+/// on their own threads, so it speeds up with the cores it gets. On an 8-core,
+/// 16-thread laptop a 6,819-release library took 112 s with 8 jobs and 92 s
+/// with 16: this default keeps most of the gain and leaves half the threads to
+/// the rest of the machine. Machines with fewer cores get one job per core.
+const DEFAULT_OFFLINE_JOBS: usize = 8;
+
+/// How many releases a match run handles at once.
+///
+/// Network matching is paced by the services' rate limits, so it always takes
+/// one release at a time.
+fn match_jobs(offline: bool, jobs: Option<u16>) -> usize {
+    if !offline {
+        return 1;
+    }
+    jobs.map_or_else(
+        || {
+            std::thread::available_parallelism()
+                .map_or(1, std::num::NonZeroUsize::get)
+                .min(DEFAULT_OFFLINE_JOBS)
+        },
+        usize::from,
+    )
 }
 
 /// The only keys read from `.env`. Endpoint overrides are deliberately excluded
@@ -255,12 +299,14 @@ async fn run() -> Result<()> {
             provider: _,
             rescan,
             offline,
+            jobs,
         } => {
             let canonical = run_import(&pool, &path, rescan).await?;
             if match_releases {
                 let options = runner::MatchOptions {
                     scope: Some(canonical),
                     policy: policy.unwrap_or_default(),
+                    jobs: match_jobs(offline, jobs),
                     ..runner::MatchOptions::default()
                 };
                 let summary = if offline {
@@ -301,6 +347,7 @@ async fn run() -> Result<()> {
             review,
             dry_run,
             offline,
+            jobs,
             clear,
         } => {
             if let Some(id) = clear {
@@ -318,6 +365,7 @@ async fn run() -> Result<()> {
                     review,
                     dry_run,
                     policy: policy.unwrap_or_default(),
+                    jobs: match_jobs(offline, jobs),
                 };
                 let summary = if offline {
                     runner::run_match_offline(&pool, options, &index_dir).await?
@@ -590,6 +638,33 @@ mod tests {
     fn releases_accepts_an_optional_path() {
         assert!(parse(&["releases"]).is_ok());
         assert!(parse(&["releases", "--path", "/music"]).is_ok());
+    }
+
+    #[test]
+    fn jobs_need_offline_matching_and_stay_in_range() {
+        match parse(&["match", "--offline", "--jobs", "4"])
+            .unwrap()
+            .command
+        {
+            Command::Match { jobs, .. } => assert_eq!(jobs, Some(4)),
+            _ => panic!("expected match"),
+        }
+        assert!(parse(&["import", "/music", "--match", "--offline", "--jobs", "4"]).is_ok());
+        // Network matching is paced by the services' rate limits.
+        assert!(parse(&["match", "--jobs", "4"]).is_err());
+        assert!(parse(&["import", "/music", "--match", "--jobs", "4"]).is_err());
+        // Interactive review asks about one release at a time.
+        assert!(parse(&["match", "--offline", "--review", "--jobs", "2"]).is_err());
+        assert!(parse(&["match", "--offline", "--jobs", "0"]).is_err());
+        assert!(parse(&["match", "--offline", "--jobs", "17"]).is_err());
+    }
+
+    #[test]
+    fn offline_matching_runs_several_releases_unless_told_otherwise() {
+        assert_eq!(match_jobs(false, None), 1);
+        assert_eq!(match_jobs(true, Some(3)), 3);
+        let default = match_jobs(true, None);
+        assert!((1..=DEFAULT_OFFLINE_JOBS).contains(&default), "{default}");
     }
 
     #[test]

@@ -308,6 +308,66 @@ fn the_default_policy_falls_back_to_the_discogs_index_when_musicbrainz_misses() 
 }
 
 #[test]
+fn releases_matched_at_once_print_one_block_each() {
+    let db = db_path("offline-jobs");
+    let index_dir = temp_dir("offline-jobs-index");
+    let dumps = temp_dir("offline-jobs-dumps");
+    let albums = [(41, "Blue"), (42, "Green"), (43, "Red"), (44, "Yellow")];
+    let discogs = discogs_dump(&dumps, &albums);
+    let music = temp_dir("offline-jobs-music");
+    for (_, album) in albums {
+        write_album(&music, album, 2001);
+    }
+
+    let build = radish(
+        &db,
+        &index_dir,
+        &["index", "build", "--discogs", discogs.to_str().unwrap()],
+    );
+    assert!(build.status.success(), "{build:?}");
+    let import = radish(&db, &index_dir, &["import", music.to_str().unwrap()]);
+    assert!(import.status.success(), "{import:?}");
+
+    let matched = radish(
+        &db,
+        &index_dir,
+        &["match", "--offline", "--provider", "discogs", "--jobs", "4"],
+    );
+    let (stdout, stderr) = (stdout_of(&matched), stderr_of(&matched));
+    assert!(matched.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("Accepted: 4"), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+
+    // Every release's lines stay together: each block names one album and
+    // accepts that album's own release.
+    let blocks: Vec<&str> = stdout.split("\nMatching local release ").skip(1).collect();
+    assert_eq!(blocks.len(), albums.len(), "{stdout}");
+    for (id, album) in albums {
+        let block = blocks
+            .iter()
+            .find(|block| {
+                block
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .contains(&format!("— {album})"))
+            })
+            .unwrap_or_else(|| panic!("no block for {album}: {stdout}"));
+        let accepted: Vec<&str> = block
+            .lines()
+            .filter(|line| line.contains("accepted discogs release"))
+            .collect();
+        assert_eq!(
+            accepted,
+            [format!(
+                "  accepted discogs release discogs {id} (score 1.000, automatic)"
+            )],
+            "{block}"
+        );
+    }
+}
+
+#[test]
 fn a_stale_match_is_refreshed_from_the_local_index() {
     let db = db_path("offline-refresh");
     let index_dir = temp_dir("offline-refresh-index");

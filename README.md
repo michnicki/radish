@@ -148,6 +148,7 @@ radish index status
 
 radish match --offline
 radish match --offline --provider musicbrainz
+radish match --offline --jobs 16
 radish import ~/Music --match --offline
 ```
 
@@ -159,7 +160,9 @@ The MusicBrainz archive is a PostgreSQL COPY export with no DDL of its own: it n
 
 Local title searches mirror the network adapters' two steps: every word must match first, and only if that finds nothing does the search accept any word. The any-word step ignores single-character words (`s`, `1`, a stray initial), which match millions of releases and carry no evidence; the every-word step keeps them. Candidates are ranked by relevance inside the search index and only the returned page is read from the table, which keeps even a common-word search under a second on the full dumps. A title with no searchable characters (`-`, `???`) is a miss, as it is on the network, not a failure. Within one run each index remembers its last 256 searches, so a search repeated by the volumes of a series or by two copies of one album is answered from memory.
 
-Measured on one machine with the 2026-11 dumps (release build, local NVMe): the MusicBrainz index holds 5.9 million releases, takes about 2 hours to build (with the Discogs build running at the same time), needs about 1.5 GB of memory, and is 15.8 GiB; the Discogs index holds 19.6 million releases, takes about 1 hour, needs under 0.2 GB of memory, and is 24 GiB. Building also needs scratch space: the MusicBrainz staging database was 19 GB while it was being built. Matching a library of 5,516 local releases with `match --offline` took 10 to 15 minutes with no network (accepted 2,084, queued for review 3,234, unmatched 198, failed 0) and about 0.13 GB of memory; the network adapters are limited to about one MusicBrainz request per second and spend more than ten per release on discovery. Your times depend on disk speed, since searching is I/O-bound.
+Offline matching handles several releases at once: one per core, up to 8, unless `--jobs N` (1 to 16) says otherwise. `--jobs` requires `--offline` and cannot be combined with `--review`; matching against the network is paced by the services and always takes one release at a time. Each release's lines are printed together when it finishes, so releases appear in the order they finish rather than in library order. The number of jobs never changes a decision: every release is matched exactly as it would be on its own.
+
+Measured on one machine with the 2026-11 dumps (release build, local NVMe): the MusicBrainz index holds 5.9 million releases, takes about 2 hours to build (with the Discogs build running at the same time), needs about 1.5 GB of memory, and is 15.8 GiB; the Discogs index holds 19.6 million releases, takes about 1 hour, needs under 0.2 GB of memory, and is 24 GiB. Building also needs scratch space: the MusicBrainz staging database was 19 GB while it was being built. Matching a library of 6,819 local releases with `match --offline` (accepted 2,802, queued for review 3,767, unmatched 250, failed 0) took about 2 minutes with the default 8 jobs, 1.5 minutes with `--jobs 16` and 9.5 minutes one release at a time, on an 8-core, 16-thread laptop with no network and under 0.2 GB of memory; the network adapters are limited to about one MusicBrainz request per second and spend more than ten per release on discovery. With the indexes mostly in the page cache, searching was CPU-bound; a cold cache or a slower disk adds to those times.
 
 Dumps are snapshots: MusicBrainz publishes weekly and Discogs monthly. A release newer than the dump is not found and stays unmatched; match those without `--offline`.
 

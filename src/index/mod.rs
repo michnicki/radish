@@ -259,10 +259,17 @@ pub async fn open_read_only(
     Ok((pool, meta))
 }
 
+/// Read connections per open index.
+///
+/// Matching runs up to [`crate::runner::MAX_JOBS`] releases at once, and each
+/// keeps at most one query open per index. Connections open only when a query
+/// needs one, so a sequential run still uses a single connection.
+const READERS: u16 = crate::runner::MAX_JOBS;
+
 async fn open_pool(path: &Path, kind: IndexKind) -> Result<SqlitePool> {
     let options = SqliteConnectOptions::new().filename(path).read_only(true);
     SqlitePoolOptions::new()
-        .max_connections(4)
+        .max_connections(u32::from(READERS))
         .connect_with(options)
         .await
         .with_context(|| format!("cannot open the {kind} index at {}", clean_path(path)))

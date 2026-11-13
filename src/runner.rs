@@ -17,14 +17,36 @@ use crate::providers::{MetadataProvider, ProviderError, ProviderKind, ProviderPo
 use crate::store::{self, AcceptanceMethod, MatchGuard, StoredCandidate};
 use crate::{out, outln};
 use anyhow::{Context, Result, bail};
+use futures_util::stream::{self, StreamExt};
 use sqlx::SqlitePool;
+use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
+/// [`outln!`] into a [`Transcript`].
+macro_rules! outln_to {
+    ($transcript:expr, $($arg:tt)*) => {
+        $transcript.out(format_args!($($arg)*))
+    };
+}
+
+/// [`eprintln!`] into a [`Transcript`].
+macro_rules! eprintln_to {
+    ($transcript:expr, $($arg:tt)*) => {
+        $transcript.err(format_args!($($arg)*))
+    };
+}
+
 /// How many candidates per provider a queued review snapshot keeps.
 const REVIEW_CANDIDATE_LIMIT: usize = 5;
+
+/// The most releases one run matches at once.
+///
+/// Each release in flight keeps at most one query open per provider, so the
+/// read pools of the offline indexes are sized for this many readers.
+pub const MAX_JOBS: u16 = 16;
 
 #[derive(Debug, Clone, Default)]
 pub struct MatchOptions {
@@ -34,6 +56,105 @@ pub struct MatchOptions {
     pub review: bool,
     pub dry_run: bool,
     pub policy: ProviderPolicy,
+    /// How many releases to match at once; 0 and 1 both mean one at a time.
+    /// Interactive review always takes one release at a time.
+    pub jobs: usize,
+}
+
+/// Where one release's progress lines go.
+///
+/// A release matched on its own prints as it goes. Releases matched at once
+/// hold their lines until they finish, so the output of two releases never
+/// interleaves.
+#[derive(Debug)]
+struct Transcript {
+    /// `None` prints each line at once; otherwise the lines so far, in order.
+    held: Option<Vec<Line>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Line {
+    Out(String),
+    Err(String),
+}
+
+impl Transcript {
+    /// Prints every line as it is written.
+    fn direct() -> Self {
+        Self { held: None }
+    }
+
+    /// Holds every line until [`Transcript::flush`].
+    fn held() -> Self {
+        Self {
+            held: Some(Vec::new()),
+        }
+    }
+
+    /// Writes one line to stdout, now or when flushed.
+    fn out(&mut self, args: fmt::Arguments<'_>) {
+        match &mut self.held {
+            None => crate::output::write_line(args),
+            Some(lines) => lines.push(Line::Out(args.to_string())),
+        }
+    }
+
+    /// Writes one line to stderr, now or when flushed.
+    fn err(&mut self, args: fmt::Arguments<'_>) {
+        match &mut self.held {
+            None => eprintln!("{args}"),
+            Some(lines) => lines.push(Line::Err(args.to_string())),
+        }
+    }
+
+    /// Prints the held lines in the order they were written.
+    fn flush(self) {
+        for line in self.held.into_iter().flatten() {
+            match line {
+                Line::Out(text) => crate::output::write_line(format_args!("{text}")),
+                Line::Err(text) => eprintln!("{text}"),
+            }
+        }
+    }
+}
+
+/// The provider clients of one run, each built when a release first needs it
+/// and shared by every release after that.
+struct Clients<'a, M, D> {
+    musicbrainz: OnceCell<M>,
+    discogs: OnceCell<D>,
+    /// Why Discogs is off for the rest of the run, once it is.
+    discogs_disabled: RefCell<Option<ProviderError>>,
+    make_musicbrainz: &'a dyn Fn() -> Result<M>,
+    make_discogs: &'a dyn Fn() -> Result<D>,
+}
+
+impl<M, D> Clients<'_, M, D> {
+    /// The MusicBrainz client, built now if no release has needed it yet.
+    fn musicbrainz(&self) -> Result<&M> {
+        if let Some(client) = self.musicbrainz.get() {
+            return Ok(client);
+        }
+        let client = (self.make_musicbrainz)()?;
+        Ok(self.musicbrainz.get_or_init(|| client))
+    }
+
+    /// The Discogs client, built now if no release has needed it yet.
+    fn discogs(&self) -> Result<&D> {
+        if let Some(client) = self.discogs.get() {
+            return Ok(client);
+        }
+        let client = (self.make_discogs)()?;
+        Ok(self.discogs.get_or_init(|| client))
+    }
+
+    fn discogs_disabled(&self) -> Option<ProviderError> {
+        self.discogs_disabled.borrow().clone()
+    }
+
+    fn disable_discogs(&self, error: ProviderError) {
+        *self.discogs_disabled.borrow_mut() = Some(error);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -394,7 +515,13 @@ where
         return Ok(summary);
     }
 
-    let mut musicbrainz_client: Option<M> = None;
+    let clients = Clients {
+        musicbrainz: OnceCell::new(),
+        discogs: OnceCell::new(),
+        discogs_disabled: RefCell::new(None),
+        make_musicbrainz: &make_musicbrainz,
+        make_discogs: &make_discogs,
+    };
     // A MusicBrainz adapter that cannot be built is a configuration error, not
     // an outage: every release would hit it again, and a Discogs fallback would
     // look like a recovery from a stage that never ran. Fail once, up front.
@@ -405,119 +532,173 @@ where
                 .map_or(options.policy, ProviderPolicy::Only)
                 .allows(ProviderKind::MusicBrainz)
         });
-    if needs_musicbrainz {
-        match make_musicbrainz() {
-            Ok(client) => musicbrainz_client = Some(client),
-            Err(error) => bail!("MusicBrainz is unusable: {}", Clean(&format!("{error:#}"))),
-        }
+    if needs_musicbrainz && let Err(error) = clients.musicbrainz() {
+        bail!("MusicBrainz is unusable: {}", Clean(&format!("{error:#}")));
     }
-    let mut discogs_client: Option<D> = None;
-    let mut discogs_disabled: Option<ProviderError> = None;
 
-    for release in &selected {
-        let label = format!(
-            "{} — {}",
-            release
-                .album_artist
-                .as_deref()
-                .unwrap_or("(unknown artist)"),
-            release.album_title.as_deref().unwrap_or("(no album tag)")
-        );
-        outln!(
-            "\nMatching local release {} ({})",
-            release.id,
-            Clean(&label)
-        );
-
-        let mut release_policy = options.policy;
-        let mut refreshing = false;
-        if let Some(provider) = refresh_source(options, &statuses, &existing_matches, release.id) {
-            outln!("  refreshing the stale {provider} match from its original source");
-            release_policy = ProviderPolicy::Only(provider);
-            refreshing = true;
-        }
-
-        let guard = match store::load_match_guard(pool, release.id).await {
-            Ok(guard) => guard,
-            Err(error) if error.downcast_ref::<store::SnapshotChanged>().is_some() => {
-                outln!(
-                    "  skipping local release {}: it no longer exists; run match again",
-                    release.id
-                );
-                summary.skipped += 1;
-                continue;
+    // Each release waits on SQLite or a provider almost all of the time, so
+    // several in flight on this one task keep that many queries running.
+    let jobs = if options.review {
+        1
+    } else {
+        options.jobs.max(1)
+    };
+    let mut outcomes = stream::iter(&selected)
+        .map(|release| {
+            let (statuses, existing_matches, clients) = (&statuses, &existing_matches, &clients);
+            async move {
+                let mut transcript = if jobs > 1 {
+                    Transcript::held()
+                } else {
+                    Transcript::direct()
+                };
+                let outcome = match_release(
+                    pool,
+                    release,
+                    options,
+                    statuses,
+                    existing_matches,
+                    clients,
+                    &mut transcript,
+                )
+                .await;
+                (outcome, transcript)
             }
-            Err(error) => return Err(error),
-        };
-        // The release was loaded before provider calls began. If its files
-        // changed since, any candidate evaluated against the old snapshot
-        // would map onto the wrong files, so do not contact a provider.
-        if guard.source_revision != release.revision {
-            outln!(
-                "  skipping local release {}: its files changed since matching started; run match again",
-                release.id
-            );
-            summary.skipped += 1;
-            continue;
-        }
+        })
+        .buffer_unordered(jobs);
 
-        // Explicit review stays offline. Normal matching rediscovers candidates
-        // so an old edition-only review does not permanently block automation.
-        if options.review
-            && let Some(saved) = load_saved_reviews(pool, release, &guard, release_policy).await?
-        {
-            match review_saved_release(pool, release, saved, options.dry_run, &guard).await {
-                Ok(Outcome::Accepted) => summary.accepted += 1,
-                Ok(Outcome::Queued) => summary.queued += 1,
-                Ok(Outcome::Skipped) => summary.skipped += 1,
-                Ok(Outcome::Quit) => return Ok(summary),
-                Ok(_) => summary.failed += 1,
-                Err(error) => {
-                    eprintln!(
-                        "failed to review local release {}: {}",
-                        release.id,
-                        Clean(&format!("{error:#}"))
-                    );
-                    summary.failed += 1;
-                }
-            }
-            continue;
-        }
-
-        let outcome = process_release(
-            pool,
-            release,
-            options,
-            release_policy,
-            &mut musicbrainz_client,
-            &mut discogs_client,
-            &mut discogs_disabled,
-            refreshing,
-            &make_musicbrainz,
-            &make_discogs,
-            &guard,
-        )
-        .await;
-
-        match outcome {
-            Ok(Outcome::Accepted) => summary.accepted += 1,
-            Ok(Outcome::Queued) => summary.queued += 1,
-            Ok(Outcome::Unmatched) => summary.unmatched += 1,
-            Ok(Outcome::Skipped) => summary.skipped += 1,
-            Ok(Outcome::Failed) => summary.failed += 1,
-            Ok(Outcome::Quit) => return Ok(summary),
-            Err(error) => {
-                summary.failed += 1;
-                eprintln!(
-                    "failed to match local release {}: {}",
-                    release.id,
-                    Clean(&format!("{error:#}"))
-                );
-            }
+    while let Some((outcome, transcript)) = outcomes.next().await {
+        transcript.flush();
+        match outcome? {
+            Outcome::Accepted => summary.accepted += 1,
+            Outcome::Queued => summary.queued += 1,
+            Outcome::Unmatched => summary.unmatched += 1,
+            Outcome::Skipped => summary.skipped += 1,
+            Outcome::Failed => summary.failed += 1,
+            Outcome::Quit => return Ok(summary),
         }
     }
 
     Ok(summary)
+}
+
+/// Matches or reviews one selected release, writing its progress to
+/// `transcript`.
+///
+/// # Errors
+///
+/// Only when the release's stored state cannot be read; every other failure
+/// is reported in the transcript and returned as [`Outcome::Failed`].
+async fn match_release<M, D>(
+    pool: &SqlitePool,
+    release: &LocalRelease,
+    options: &MatchOptions,
+    statuses: &HashMap<i64, String>,
+    existing_matches: &HashMap<i64, Option<ProviderKind>>,
+    clients: &Clients<'_, M, D>,
+    transcript: &mut Transcript,
+) -> Result<Outcome>
+where
+    M: MetadataProvider,
+    D: MetadataProvider,
+{
+    let label = format!(
+        "{} — {}",
+        release
+            .album_artist
+            .as_deref()
+            .unwrap_or("(unknown artist)"),
+        release.album_title.as_deref().unwrap_or("(no album tag)")
+    );
+    outln_to!(
+        transcript,
+        "\nMatching local release {} ({})",
+        release.id,
+        Clean(&label)
+    );
+
+    let mut release_policy = options.policy;
+    let mut refreshing = false;
+    if let Some(provider) = refresh_source(options, statuses, existing_matches, release.id) {
+        outln_to!(
+            transcript,
+            "  refreshing the stale {provider} match from its original source"
+        );
+        release_policy = ProviderPolicy::Only(provider);
+        refreshing = true;
+    }
+
+    let guard = match store::load_match_guard(pool, release.id).await {
+        Ok(guard) => guard,
+        Err(error) if error.downcast_ref::<store::SnapshotChanged>().is_some() => {
+            outln_to!(
+                transcript,
+                "  skipping local release {}: it no longer exists; run match again",
+                release.id
+            );
+            return Ok(Outcome::Skipped);
+        }
+        Err(error) => return Err(error),
+    };
+    // The release was loaded before provider calls began. If its files
+    // changed since, any candidate evaluated against the old snapshot
+    // would map onto the wrong files, so do not contact a provider.
+    if guard.source_revision != release.revision {
+        outln_to!(
+            transcript,
+            "  skipping local release {}: its files changed since matching started; run match again",
+            release.id
+        );
+        return Ok(Outcome::Skipped);
+    }
+
+    // Explicit review stays offline. Normal matching rediscovers candidates
+    // so an old edition-only review does not permanently block automation.
+    if options.review
+        && let Some(saved) = load_saved_reviews(pool, release, &guard, release_policy).await?
+    {
+        return Ok(
+            match review_saved_release(pool, release, saved, options.dry_run, &guard).await {
+                Ok(
+                    outcome @ (Outcome::Accepted
+                    | Outcome::Queued
+                    | Outcome::Skipped
+                    | Outcome::Quit),
+                ) => outcome,
+                Ok(_) => Outcome::Failed,
+                Err(error) => {
+                    eprintln_to!(
+                        transcript,
+                        "failed to review local release {}: {}",
+                        release.id,
+                        Clean(&format!("{error:#}"))
+                    );
+                    Outcome::Failed
+                }
+            },
+        );
+    }
+
+    let outcome = process_release(
+        pool,
+        release,
+        options,
+        release_policy,
+        clients,
+        refreshing,
+        &guard,
+        transcript,
+    )
+    .await;
+    Ok(outcome.unwrap_or_else(|error| {
+        eprintln_to!(
+            transcript,
+            "failed to match local release {}: {}",
+            release.id,
+            Clean(&format!("{error:#}"))
+        );
+        Outcome::Failed
+    }))
 }
 
 /// The provider a stale match is refreshed from, when this run refreshes it.
@@ -577,19 +758,19 @@ async fn load_saved_reviews(
     Ok((!saved.is_empty()).then_some(saved))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one release's whole decision; the arguments have no natural grouping"
+)]
 async fn process_release<M, D>(
     pool: &SqlitePool,
     release: &LocalRelease,
     options: &MatchOptions,
     policy: ProviderPolicy,
-    musicbrainz_client: &mut Option<M>,
-    discogs_client: &mut Option<D>,
-    discogs_disabled: &mut Option<ProviderError>,
+    clients: &Clients<'_, M, D>,
     refreshing: bool,
-    make_musicbrainz: impl Fn() -> Result<M>,
-    make_discogs: impl Fn() -> Result<D>,
     guard: &MatchGuard,
+    transcript: &mut Transcript,
 ) -> Result<Outcome>
 where
     M: MetadataProvider,
@@ -616,35 +797,29 @@ where
             } else {
                 "primary candidates did not settle the edition".to_string()
             };
-            outln!("  Discogs fallback: {}", Clean(&reason));
+            outln_to!(transcript, "  Discogs fallback: {}", Clean(&reason));
         }
 
         match provider {
             ProviderKind::MusicBrainz => {
-                if musicbrainz_client.is_none() {
-                    match make_musicbrainz() {
-                        Ok(client) => *musicbrainz_client = Some(client),
-                        Err(error) => {
-                            attempts.push(ProviderAttempt::failed(
-                                ProviderKind::MusicBrainz,
-                                provider_error_from(ProviderKind::MusicBrainz, error),
-                            ));
-                            continue;
-                        }
+                let client = match clients.musicbrainz() {
+                    Ok(client) => client,
+                    Err(error) => {
+                        attempts.push(ProviderAttempt::failed(
+                            ProviderKind::MusicBrainz,
+                            provider_error_from(ProviderKind::MusicBrainz, error),
+                        ));
+                        continue;
                     }
-                }
-                let client = musicbrainz_client.as_ref().expect("client initialized");
+                };
                 attempts.push(attempt_provider(client, release, direct.clone()).await);
             }
             ProviderKind::Discogs => {
-                if let Some(error) = discogs_disabled.as_ref() {
+                if let Some(error) = clients.discogs_disabled() {
                     if policy.is_explicit() && !refreshing {
                         // The user asked for Discogs, so a release it cannot
                         // serve is a failure, whichever release met the error.
-                        attempts.push(ProviderAttempt::failed(
-                            ProviderKind::Discogs,
-                            error.clone(),
-                        ));
+                        attempts.push(ProviderAttempt::failed(ProviderKind::Discogs, error));
                     } else {
                         fallback_skip = Some(format!(
                             "Discogs is disabled for the rest of this run: {error}"
@@ -652,46 +827,46 @@ where
                     }
                     break;
                 }
-                if discogs_client.is_none() {
-                    match make_discogs() {
-                        Ok(client) => *discogs_client = Some(client),
-                        Err(error) => {
-                            let missing = is_missing_discogs_token(&error);
-                            if refreshing && missing {
-                                // The release is not at fault and nothing was
-                                // tried, so this is neither a failure nor a miss.
-                                outln!(
-                                    "  stale Discogs match needs RADISH_DISCOGS_TOKEN to refresh"
-                                );
-                                return Ok(Outcome::Skipped);
-                            }
-                            if policy.is_explicit() {
-                                attempts.push(ProviderAttempt::failed(
-                                    ProviderKind::Discogs,
-                                    provider_error_from(ProviderKind::Discogs, error),
-                                ));
-                            } else if missing {
-                                fallback_skip = Some(
-                                    "Discogs token is not set; optional fallback was skipped"
-                                        .to_string(),
-                                );
-                            } else {
-                                let error = provider_error_from(ProviderKind::Discogs, error);
-                                fallback_skip =
-                                    Some(format!("Discogs fallback was skipped: {error}"));
-                                *discogs_disabled = Some(error);
-                                eprintln!("  Disabling Discogs fallback for the rest of this run");
-                            }
-                            break;
+                let client = match clients.discogs() {
+                    Ok(client) => client,
+                    Err(error) => {
+                        let missing = is_missing_discogs_token(&error);
+                        if refreshing && missing {
+                            // The release is not at fault and nothing was
+                            // tried, so this is neither a failure nor a miss.
+                            outln_to!(
+                                transcript,
+                                "  stale Discogs match needs RADISH_DISCOGS_TOKEN to refresh"
+                            );
+                            return Ok(Outcome::Skipped);
                         }
+                        if policy.is_explicit() {
+                            attempts.push(ProviderAttempt::failed(
+                                ProviderKind::Discogs,
+                                provider_error_from(ProviderKind::Discogs, error),
+                            ));
+                        } else if missing {
+                            fallback_skip = Some(
+                                "Discogs token is not set; optional fallback was skipped"
+                                    .to_string(),
+                            );
+                        } else {
+                            let error = provider_error_from(ProviderKind::Discogs, error);
+                            fallback_skip = Some(format!("Discogs fallback was skipped: {error}"));
+                            clients.disable_discogs(error);
+                            eprintln_to!(
+                                transcript,
+                                "  Disabling Discogs fallback for the rest of this run"
+                            );
+                        }
+                        break;
                     }
-                }
-                let client = discogs_client.as_ref().expect("client initialized");
+                };
                 let attempt = attempt_provider(client, release, direct.clone()).await;
                 // A rejected credential rejects every later release too.
-                if attempt.error.as_ref().is_some_and(ProviderError::is_auth) {
-                    *discogs_disabled = attempt.error.clone();
-                    eprintln!("  Disabling Discogs for the rest of this run");
+                if let Some(error) = attempt.error.as_ref().filter(|error| error.is_auth()) {
+                    clients.disable_discogs(error.clone());
+                    eprintln_to!(transcript, "  Disabling Discogs for the rest of this run");
                 }
                 attempts.push(attempt);
             }
@@ -700,10 +875,11 @@ where
 
     for attempt in &attempts {
         for note in &attempt.notes {
-            eprintln!("  note ({}): {}", attempt.provider, Clean(note));
+            eprintln_to!(transcript, "  note ({}): {}", attempt.provider, Clean(note));
         }
         if let Some(error) = &attempt.error {
-            eprintln!(
+            eprintln_to!(
+                transcript,
                 "  {} stage error: {}",
                 attempt.provider,
                 Clean(&error.to_string())
@@ -711,7 +887,7 @@ where
         }
     }
     if let Some(reason) = &fallback_skip {
-        outln!("  {}", Clean(reason));
+        outln_to!(transcript, "  {}", Clean(reason));
     }
 
     // A settled primary result stops discovery and never touches Discogs.
@@ -728,8 +904,8 @@ where
                 &attempts,
                 guard,
                 options.dry_run,
-                musicbrainz_client.as_ref(),
-                discogs_client.as_ref(),
+                clients.musicbrainz.get(),
+                clients.discogs.get(),
             )
             .await;
         }
@@ -743,6 +919,7 @@ where
             AcceptanceMethod::Automatic,
             options.dry_run,
             guard,
+            transcript,
         )
         .await;
     }
@@ -755,7 +932,7 @@ where
             .is_some_and(|evaluation| evaluation.auto_accept)
         && primary_failed_transiently(&attempts)
     {
-        outln!("  {TRANSIENT_PRIMARY_NOTE}");
+        outln_to!(transcript, "  {TRANSIENT_PRIMARY_NOTE}");
         attempts[1].notes.push(TRANSIENT_PRIMARY_NOTE.to_string());
     }
 
@@ -777,7 +954,8 @@ where
         );
         if conflicts.is_empty() && direct.is_none() && !options.review {
             if let Some(error) = &primary.error {
-                outln!(
+                outln_to!(
+                    transcript,
                     "  recovered the release from a failed MusicBrainz stage: {}",
                     Clean(&error.to_string())
                 );
@@ -791,11 +969,12 @@ where
                 AcceptanceMethod::Automatic,
                 options.dry_run,
                 guard,
+                transcript,
             )
             .await;
         }
         for conflict in &conflicts {
-            outln!("  fallback conflict: {}", Clean(conflict));
+            outln_to!(transcript, "  fallback conflict: {}", Clean(conflict));
         }
         attempts[1].notes.extend(conflicts);
     }
@@ -810,7 +989,7 @@ where
     if has_candidates {
         if options.dry_run {
             for attempt in &attempts {
-                print_decision(attempt);
+                print_decision(attempt, transcript);
             }
             return Ok(Outcome::Queued);
         }
@@ -821,21 +1000,24 @@ where
                 &attempts,
                 guard,
                 options.dry_run,
-                musicbrainz_client.as_ref(),
-                discogs_client.as_ref(),
+                clients.musicbrainz.get(),
+                clients.discogs.get(),
             )
             .await;
         }
-        queue_attempts(pool, release, &attempts, guard).await?;
+        queue_attempts(pool, release, &attempts, guard, transcript).await?;
         return Ok(Outcome::Queued);
     }
 
     // No usable candidates. A completed-empty stage means no match; an
     // unrecovered attempted-stage failure must not be disguised as one.
     if let Some(error) = attempts.iter().find_map(|attempt| attempt.error.clone()) {
-        eprintln!("  {}", Clean(&error.to_string()));
+        eprintln_to!(transcript, "  {}", Clean(&error.to_string()));
         if fallback_failed {
-            eprintln!("  the fallback stage also failed; the release outcome is a failure");
+            eprintln_to!(
+                transcript,
+                "  the fallback stage also failed; the release outcome is a failure"
+            );
         }
         return Ok(Outcome::Failed);
     }
@@ -845,11 +1027,14 @@ where
     let Some(first) = attempts.first() else {
         return Ok(Outcome::Skipped);
     };
-    outln!("  no {} candidates found", first.provider);
+    outln_to!(transcript, "  no {} candidates found", first.provider);
     Ok(Outcome::Unmatched)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the decision, its provenance and where to report it travel together"
+)]
 async fn accept(
     pool: &SqlitePool,
     release: &LocalRelease,
@@ -859,9 +1044,11 @@ async fn accept(
     method: AcceptanceMethod,
     dry_run: bool,
     guard: &MatchGuard,
+    transcript: &mut Transcript,
 ) -> Result<Outcome> {
     if !evaluation.can_apply(candidate) {
-        outln!(
+        outln_to!(
+            transcript,
             "  cannot accept {provider} release {}: the track mapping is invalid or incomplete ({})",
             candidate.release.id,
             Clean(&candidate.mapping.notes.join("; "))
@@ -870,8 +1057,9 @@ async fn accept(
     }
 
     if dry_run {
-        print_decision_for(provider, candidate, evaluation);
-        outln!(
+        print_decision_for(provider, candidate, evaluation, transcript);
+        outln_to!(
+            transcript,
             "  would accept {provider} release {} (score {:.3}) as {}",
             candidate.release.id,
             evaluation.match_scope.score(&candidate.score),
@@ -891,25 +1079,35 @@ async fn accept(
     .await;
     match result {
         Ok(()) => {
-            outln!(
+            outln_to!(
+                transcript,
                 "  accepted {provider} release {} (score {:.3}, {})",
                 candidate.release.id,
                 evaluation.match_scope.score(&candidate.score),
                 method.as_str()
             );
-            outln!("    {} {}", provider, candidate.release.id.storage_id());
-            outln!("    {}", Clean(&candidate.release.url));
+            outln_to!(
+                transcript,
+                "    {} {}",
+                provider,
+                candidate.release.id.storage_id()
+            );
+            outln_to!(transcript, "    {}", Clean(&candidate.release.url));
             if evaluation.match_scope == MatchScope::Album {
-                outln!("    album and tracks matched; exact edition unconfirmed");
+                outln_to!(
+                    transcript,
+                    "    album and tracks matched; exact edition unconfirmed"
+                );
             }
             Ok(Outcome::Accepted)
         }
         Err(error) if error.downcast_ref::<store::SnapshotChanged>().is_some() => {
-            outln!("  skipping: {error}; run match again");
+            outln_to!(transcript, "  skipping: {error}; run match again");
             Ok(Outcome::Skipped)
         }
         Err(error) => {
-            eprintln!(
+            eprintln_to!(
+                transcript,
                 "  could not apply the match: {}",
                 Clean(&format!("{error:#}"))
             );
@@ -967,6 +1165,7 @@ async fn queue_attempts(
     release: &LocalRelease,
     attempts: &[ProviderAttempt],
     guard: &MatchGuard,
+    transcript: &mut Transcript,
 ) -> Result<()> {
     for attempt in attempts {
         if attempt.candidates.is_empty() {
@@ -993,7 +1192,7 @@ async fn queue_attempts(
     }
 
     let reason = review_reason_summary(attempts);
-    outln!("  queued for review: {}", Clean(&reason));
+    outln_to!(transcript, "  queued for review: {}", Clean(&reason));
     Ok(())
 }
 
@@ -1065,6 +1264,8 @@ async fn review_saved_release(
                 AcceptanceMethod::Manual,
                 false,
                 guard,
+                // Interactive review handles one release at a time.
+                &mut Transcript::direct(),
             )
             .await
         }
@@ -1134,6 +1335,8 @@ where
                 AcceptanceMethod::Manual,
                 false,
                 guard,
+                // Interactive review handles one release at a time.
+                &mut Transcript::direct(),
             )
             .await
         }
@@ -1442,7 +1645,7 @@ where
     }
 }
 
-fn print_decision(attempt: &ProviderAttempt) {
+fn print_decision(attempt: &ProviderAttempt, transcript: &mut Transcript) {
     for (index, (candidate, evaluation)) in attempt
         .candidates
         .iter()
@@ -1450,7 +1653,8 @@ fn print_decision(attempt: &ProviderAttempt) {
         .enumerate()
         .take(3)
     {
-        outln!(
+        outln_to!(
+            transcript,
             "  {}. {} release {} — {} (score {:.3}){}",
             index + 1,
             attempt.provider,
@@ -1464,38 +1668,47 @@ fn print_decision(attempt: &ProviderAttempt) {
             }
         );
         for blocker in &evaluation.blockers {
-            outln!("       blocked: {}", Clean(blocker));
+            outln_to!(transcript, "       blocked: {}", Clean(blocker));
         }
         for warning in &evaluation.warnings {
-            outln!("       note: {}", Clean(warning));
+            outln_to!(transcript, "       note: {}", Clean(warning));
         }
     }
     if let (Some(candidate), Some(evaluation)) =
         (attempt.candidates.first(), attempt.evaluations.first())
     {
         if evaluation.auto_accept {
-            outln!(
+            outln_to!(
+                transcript,
                 "  would accept {} release {} (score {:.3})",
                 attempt.provider,
                 candidate.release.id.storage_id(),
                 evaluation.match_scope.score(&candidate.score)
             );
         } else {
-            outln!("  would queue for review");
+            outln_to!(transcript, "  would queue for review");
         }
     }
 }
 
-fn print_decision_for(provider: ProviderKind, candidate: &Candidate, evaluation: &Evaluation) {
-    print_decision(&ProviderAttempt {
-        provider,
-        candidates: vec![candidate.clone()],
-        evaluations: vec![evaluation.clone()],
-        notes: Vec::new(),
-        error: None,
-        partial_failures: Vec::new(),
-        embedded_release_resolved: false,
-    });
+fn print_decision_for(
+    provider: ProviderKind,
+    candidate: &Candidate,
+    evaluation: &Evaluation,
+    transcript: &mut Transcript,
+) {
+    print_decision(
+        &ProviderAttempt {
+            provider,
+            candidates: vec![candidate.clone()],
+            evaluations: vec![evaluation.clone()],
+            notes: Vec::new(),
+            error: None,
+            partial_failures: Vec::new(),
+            embedded_release_resolved: false,
+        },
+        transcript,
+    );
 }
 
 #[cfg(test)]
@@ -1718,6 +1931,88 @@ mod tests {
         }
     }
 
+    /// Holds the first `gate` searches until all of them are waiting at once,
+    /// then answers every search with no results.
+    struct GatedProvider {
+        barrier: std::sync::Arc<tokio::sync::Barrier>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        gate: usize,
+    }
+
+    impl MetadataProvider for GatedProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::MusicBrainz
+        }
+
+        async fn search(&self, _request: SearchRequest) -> Result<SearchPage, ProviderError> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < self.gate {
+                self.barrier.wait().await;
+            }
+            Ok(SearchPage {
+                hits: Vec::new(),
+                total: Some(0),
+                next_offset: None,
+            })
+        }
+
+        async fn fetch_release(&self, id: ReleaseId) -> Result<RemoteRelease, ProviderError> {
+            Err(ProviderError::Permanent {
+                provider: id.provider(),
+                status: None,
+                message: "not available in this test".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn jobs_match_that_many_releases_at_once() {
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let directory_id = store::upsert_directory(&pool, std::path::Path::new("/music"))
+            .await
+            .unwrap();
+        let albums = ["Alpha", "Beta", "Gamma", "Delta"];
+        let tracks: Vec<_> = albums
+            .iter()
+            .map(|album| scanned_track(&format!("/music/{album}/01.flac"), album, 1))
+            .collect();
+        store::upsert_tracks(&pool, &tracks, directory_id)
+            .await
+            .unwrap();
+        store::rebuild_local_releases(&pool, None).await.unwrap();
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(albums.len()));
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let make_provider = || -> Result<GatedProvider> {
+            Ok(GatedProvider {
+                barrier: barrier.clone(),
+                calls: calls.clone(),
+                gate: albums.len(),
+            })
+        };
+        let options = MatchOptions {
+            policy: ProviderPolicy::Only(ProviderKind::MusicBrainz),
+            jobs: albums.len(),
+            ..MatchOptions::default()
+        };
+
+        // One release at a time would wait at the barrier forever.
+        let summary = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_with_policy(
+                &pool,
+                &options,
+                make_provider,
+                || -> Result<GatedProvider> { bail!("Discogs is not used in this test") },
+            ),
+        )
+        .await
+        .expect("the releases were not matched at the same time")
+        .unwrap();
+
+        assert_eq!(summary.unmatched, albums.len(), "{summary:?}");
+        assert_eq!(summary.failed, 0, "{summary:?}");
+    }
+
     #[tokio::test]
     async fn release_changed_after_loading_is_skipped_without_contacting_providers() {
         let pool = crate::db::connect_in_memory().await.unwrap();
@@ -1824,6 +2119,7 @@ mod tests {
             AcceptanceMethod::Manual,
             false,
             &guard,
+            &mut Transcript::direct(),
         )
         .await
         .unwrap();

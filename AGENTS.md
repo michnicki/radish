@@ -33,6 +33,7 @@ Use standard rustfmt formatting with four-space indentation. Name modules, funct
 
 - Put schema changes in a new timestamped file in `migrations/`. Never edit an applied migration or `src/schema.sql`.
 - Write stdout through the `outln!` and `out!` macros, not `println!`. Escape paths, tag values, and provider text with `output::Clean` or `output::clean_path`.
+- In `runner.rs`, write a release's progress through its `Transcript` (`outln_to!` / `eprintln_to!`), since offline matching runs several releases at once and prints each one's lines together.
 - `.cargo/config.toml` builds the bundled SQLite without `SQLITE_ENABLE_MEMORY_MANAGEMENT`; keep it, or parallel offline matching stops scaling.
 - Start write transactions with `store::begin_write`. Helpers called inside a transaction take `&mut SqliteConnection`, not the pool.
 - Matching must not modify audio files or scanned metadata, and every command except matching must work offline.

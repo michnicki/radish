@@ -13,6 +13,7 @@ dependencies = [
  "discogger",
  "dotenvy",
  "flate2",
+ "futures-util",
  "httpdate",
  "indicatif",
  "lofty",
