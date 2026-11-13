@@ -159,7 +159,7 @@ The MusicBrainz archive is a PostgreSQL COPY export with no DDL of its own: it n
 
 Local title searches mirror the network adapters' two steps: every word must match first, and only if that finds nothing does the search accept any word. The any-word step ignores single-character words (`s`, `1`, a stray initial), which match millions of releases and carry no evidence; the every-word step keeps them. Candidates are ranked by relevance inside the search index and only the returned page is read from the table, which keeps even a common-word search under a second on the full dumps. A title with no searchable characters (`-`, `???`) is a miss, as it is on the network, not a failure.
 
-Measured on one machine with the 2026-11 dumps (release build, local NVMe): the MusicBrainz index holds 5.9 million releases, takes about 2 hours to build (with the Discogs build running at the same time), needs about 1.5 GB of memory, and is 15.8 GiB; the Discogs index holds 19.6 million releases, takes about 1 hour, needs under 0.2 GB of memory, and is 24 GiB. Building also needs scratch space: the MusicBrainz staging database was 19 GB while it was being built. Matching a library of 5,516 local releases with `match --offline` took 10 to 15 minutes with no network (accepted 1,396, queued for review 3,922, unmatched 198, failed 0) and about 0.13 GB of memory; the network adapters are limited to about one MusicBrainz request per second and spend more than ten per release on discovery. Your times depend on disk speed, since searching is I/O-bound.
+Measured on one machine with the 2026-11 dumps (release build, local NVMe): the MusicBrainz index holds 5.9 million releases, takes about 2 hours to build (with the Discogs build running at the same time), needs about 1.5 GB of memory, and is 15.8 GiB; the Discogs index holds 19.6 million releases, takes about 1 hour, needs under 0.2 GB of memory, and is 24 GiB. Building also needs scratch space: the MusicBrainz staging database was 19 GB while it was being built. Matching a library of 5,516 local releases with `match --offline` took 10 to 15 minutes with no network (accepted 1,654, queued for review 3,664, unmatched 198, failed 0) and about 0.13 GB of memory; the network adapters are limited to about one MusicBrainz request per second and spend more than ten per release on discovery. Your times depend on disk speed, since searching is I/O-bound.
 
 Dumps are snapshots: MusicBrainz publishes weekly and Discogs monthly. A release newer than the dump is not found and stays unmatched; match those without `--offline`.
 
@@ -230,7 +230,7 @@ A candidate can be accepted automatically as an **album match** when:
 
 - Its album score is at least `0.95`, with album title and artist similarity each at least `0.90`.
 - Every local file maps uniquely, track counts agree, and no unsupported structures exist.
-- Every track has a local title and a positive, known duration on both sides. Each title scores at least `0.90`, and durations differ by at most three seconds.
+- Every track has a local title and a positive, known duration on both sides. Each title scores at least `0.90`, and durations differ by at most three seconds. One title may score as low as `0.75` if it is the only one under `0.90` and its duration agrees (`Seek & Destroy` against `Seek And Destroy`): with every other track agreeing, a spelling variant on the one remaining track is the same recording.
 - Observed identifiers and edition qualifiers do not contradict the candidate.
 - Every alternative within `0.05` of its album score is either another edition of the same album (the same MusicBrainz release group or Discogs master, however many bonus tracks it adds) or describes equivalent audio: matching normalized album/artist and mapped track titles/credits (a credit may differ when the track's MusicBrainz recording is the same), compatible durations, no conflicting known recording IDs or release groups, and a complete supported mapping.
 
@@ -246,7 +246,7 @@ Radish prefers an **exact-edition match** when all of these hold:
 - Edition identity comes from a consistent embedded release ID or a fully resolved barcode/catalog search that uniquely identifies the release. A release group, a recording, or an explicitly entered ID never counts as edition evidence on its own.
 - Identifier discovery was not truncated or left unhydrated.
 
-Everything else is queued or reviewed. In review you may override score or identity uncertainty after seeing the warnings, but never an invalid, incomplete, or unsupported mapping. New decisions store `musicbrainz-match-v7` or `discogs-match-v8`; historical algorithm versions and accepted matches are preserved.
+Everything else is queued or reviewed. In review you may override score or identity uncertainty after seeing the warnings, but never an invalid, incomplete, or unsupported mapping. New decisions store `musicbrainz-match-v8` or `discogs-match-v9`; historical algorithm versions and accepted matches are preserved.
 
 ### Review
 

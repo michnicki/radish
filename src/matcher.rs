@@ -11,13 +11,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v8";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v7";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v9";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v8";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
 pub const TITLE_SIMILARITY_THRESHOLD: f64 = 0.90;
 pub const DURATION_TOLERANCE_SECS: f64 = 3.0;
+
+/// The lowest title score a single track may have, with a matching duration,
+/// and still not block an album-level match.
+pub const NEAR_MISS_TITLE_FLOOR: f64 = 0.75;
 
 /// A primary candidate this close to the fallback is plausible evidence that
 /// both services describe the same edition, so discrepancies matter.
@@ -2111,6 +2115,8 @@ fn evaluate_at_scope(
     // Per-track evidence.
     let mut worst_title = 1.0f64;
     let mut worst_title_track = String::new();
+    let mut worst_title_duration_gap: Option<f64> = None;
+    let mut titles_below_minimum = 0usize;
     let mut worst_duration: Option<f64> = None;
     let mut worst_duration_track = String::new();
 
@@ -2158,10 +2164,19 @@ fn evaluate_at_scope(
             candidate
                 .mapping
                 .title_similarity(local_index, remote_index, local_track, remote_track)
-            && score < worst_title
         {
-            worst_title = score;
-            worst_title_track = remote_track.title.clone();
+            if score < minimum_title_similarity {
+                titles_below_minimum += 1;
+            }
+            if score < worst_title {
+                worst_title = score;
+                worst_title_track = remote_track.title.clone();
+                worst_title_duration_gap =
+                    match (local_track.duration_secs, remote_track.duration_secs) {
+                        (Some(a), Some(b)) if a.is_finite() && b.is_finite() => Some((a - b).abs()),
+                        _ => None,
+                    };
+            }
         }
 
         if let (Some(a), Some(b)) = (local_track.duration_secs, remote_track.duration_secs) {
@@ -2173,10 +2188,25 @@ fn evaluate_at_scope(
         }
     }
 
+    // One title a little off, with the right length, is a spelling variant of
+    // the same recording rather than a different track. Only for an album-level
+    // match, where every other track already agrees and the total still has to
+    // clear the acceptance threshold.
+    let near_miss_title = policy == AcceptancePolicy::Measured
+        && match_scope == MatchScope::Album
+        && titles_below_minimum == 1
+        && worst_title >= NEAR_MISS_TITLE_FLOOR
+        && worst_title_duration_gap.is_some_and(|gap| gap <= DURATION_TOLERANCE_SECS);
     if worst_title < minimum_title_similarity {
-        blockers.push(format!(
-            "track title '{worst_title_track}' only scores {worst_title:.3} against the local file"
-        ));
+        if near_miss_title {
+            warnings.push(format!(
+                "track title '{worst_title_track}' scores {worst_title:.3} but its duration agrees"
+            ));
+        } else {
+            blockers.push(format!(
+                "track title '{worst_title_track}' only scores {worst_title:.3} against the local file"
+            ));
+        }
     }
 
     if let Some(difference) = worst_duration
@@ -3509,10 +3539,10 @@ mod tests {
 
     #[test]
     fn algorithm_versions_are_provider_specific() {
-        assert_eq!(algorithm_version(ProviderKind::Discogs), "discogs-match-v8");
+        assert_eq!(algorithm_version(ProviderKind::Discogs), "discogs-match-v9");
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v7"
+            "musicbrainz-match-v8"
         );
     }
 
@@ -3624,6 +3654,51 @@ mod tests {
         // And with no group on either side there is nothing to rely on.
         let ungrouped = Candidate::new(&local, remote_release(&["One", "Two"]));
         assert!(!in_same_release_group(&ungrouped, &ungrouped));
+    }
+
+    #[test]
+    fn one_slightly_different_title_with_the_right_duration_does_not_block_an_album() {
+        let titles = ["One", "Two", "Three", "Four", "Five", "Six"];
+        let mut local = local_release(&titles);
+        local.tracks[2].title = Some("Thre".to_string()); // 0.80 against "Three"
+        let remote = remote_release(&titles);
+        let candidate = Candidate::new(&local, remote.clone());
+        let evaluation =
+            evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default());
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert!(
+            evaluation
+                .warnings
+                .iter()
+                .any(|note| note.contains("Three")),
+            "{:?}",
+            evaluation.warnings
+        );
+
+        // The same title with a duration well off is a different track.
+        let mut off = local.clone();
+        off.tracks[2].duration_secs = Some(off.tracks[2].duration_secs.unwrap() + 10.0);
+        let candidate = Candidate::new(&off, remote.clone());
+        assert!(
+            !evaluate_for_matching(&off, &candidate, &[], &DiscoveryEvidence::default())
+                .auto_accept
+        );
+
+        // Two weak titles, or one below the floor, still block.
+        let mut two = local.clone();
+        two.tracks[4].title = Some("Fiv".to_string());
+        let candidate = Candidate::new(&two, remote.clone());
+        assert!(
+            !evaluate_for_matching(&two, &candidate, &[], &DiscoveryEvidence::default())
+                .auto_accept
+        );
+        let mut far = local;
+        far.tracks[2].title = Some("Tr".to_string());
+        let candidate = Candidate::new(&far, remote);
+        assert!(
+            !evaluate_for_matching(&far, &candidate, &[], &DiscoveryEvidence::default())
+                .auto_accept
+        );
     }
 
     #[test]
