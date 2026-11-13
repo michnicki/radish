@@ -363,3 +363,136 @@ async fn a_proven_edition_takes_precedence_over_an_album_score_advantage() {
     assert_eq!(row, (MBID.to_string(), "edition".to_string()));
     pool.close().await;
 }
+
+/// Two folders of one two-disc set, `CD1` and `CD2`, and a release of two media.
+/// No file carries a disc number, so only the folder names say which disc is which.
+const SET_TITLES: [&[&str]; 2] = [&["Track 1!", "Track 2!"], &["Track 3!", "Track 4!"]];
+const SET_DURATIONS: [&[f64]; 2] = [&[180.0, 181.0], &[182.0, 183.0]];
+
+fn two_disc_handler(target: &str) -> (u16, String) {
+    if target.contains(&format!("/ws/2/release/{MBID}")) {
+        (
+            200,
+            musicbrainz_two_disc_release_json(MBID, SET_TITLES, SET_DURATIONS),
+        )
+    } else if target.contains("/ws/2/release") {
+        (
+            200,
+            serde_json::json!({"count": 1, "offset": 0, "releases": [{
+                "id": MBID, "title": "Blue", "date": "2001-05-01",
+                "artist-credit": [{"name": "Test Artist", "joinphrase": ""}]
+            }]})
+            .to_string(),
+        )
+    } else {
+        (500, "unexpected Discogs request".to_string())
+    }
+}
+
+/// Seeds one folder per `(directory, first title number)`: two tracks numbered 1
+/// and 2, untagged for disc, titled `Track N` from the folder's first number.
+async fn seed_folders(db: &Path, folders: &[(&str, i64)]) {
+    let pool = radish::db::connect(db).await.unwrap();
+    for (folder, first) in folders {
+        let directory = Path::new(folder);
+        let directory_id = store::upsert_directory(&pool, directory).await.unwrap();
+        for number in 1..=2i64 {
+            let title_number = first + number - 1;
+            let track = ScannedTrack {
+                path: directory.join(format!("0{number}.flac")),
+                title: Some(format!("Track {title_number}")),
+                artist: Some("Test Artist".to_string()),
+                album: Some("Blue".to_string()),
+                album_artist: Some("Test Artist".to_string()),
+                year: Some(2001),
+                track_number: Some(number),
+                disc_number: None,
+                barcode: None,
+                catalog_number: None,
+                discogs_release_id: None,
+                musicbrainz: ObservedMusicBrainzIds::default(),
+                duration_secs: Some(179.0 + title_number as f64),
+                modified_at: 1,
+            };
+            store::upsert_track(&pool, &track, directory_id)
+                .await
+                .unwrap();
+        }
+    }
+    store::rebuild_local_releases(&pool, None).await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn disc_folders_match_their_own_disc_of_a_two_disc_release() {
+    let db = db_path("disc-folders");
+    seed_folders(&db, &[("/music/Set-2CD/CD1", 1), ("/music/Set-2CD/CD2", 3)]).await;
+    let server = MockServer::start(two_disc_handler);
+
+    let output = run(&db, &server, &["match"]);
+    let text = stdout(&output);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("Accepted: 2"), "{text}");
+    assert!(text.contains("matched disc 1 of 2"), "{text}");
+    assert!(text.contains("matched disc 2 of 2"), "{text}");
+
+    let pool = radish::db::connect(&db).await.unwrap();
+    let rows: Vec<(String, Option<i64>, String)> = sqlx::query_as(
+        "SELECT remote_release_id, medium_position, match_scope FROM release_matches
+         ORDER BY medium_position",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (MBID.to_string(), Some(1), "album".to_string()),
+            (MBID.to_string(), Some(2), "album".to_string()),
+        ]
+    );
+    let tracks = store::list_tracks(&pool).await.unwrap();
+    let shown: Vec<(String, Option<i64>, Option<i64>)> = tracks
+        .iter()
+        .map(|track| (track.display_title(), track.disc_number, track.track_number))
+        .collect();
+    assert_eq!(
+        shown,
+        vec![
+            ("Track 1!".to_string(), Some(1), Some(1)),
+            ("Track 2!".to_string(), Some(1), Some(2)),
+            ("Track 3!".to_string(), Some(2), Some(1)),
+            ("Track 4!".to_string(), Some(2), Some(2)),
+        ]
+    );
+    pool.close().await;
+
+    let listed = stdout(&run(&db, &server, &["list"]));
+    assert!(listed.contains("2-1"), "{listed}");
+    assert!(listed.contains("2-2"), "{listed}");
+    let releases = stdout(&run(&db, &server, &["releases"]));
+    assert!(releases.contains("(Blue, disc 2)"), "{releases}");
+    assert!(releases.contains("(Blue, disc 1)"), "{releases}");
+}
+
+#[tokio::test]
+async fn a_folder_without_a_disc_number_is_not_matched_to_one_disc() {
+    let db = db_path("disc-folder-unnumbered");
+    seed_folders(&db, &[("/music/Set-2CD/Bonus", 3)]).await;
+    let server = MockServer::start(two_disc_handler);
+
+    let output = run(&db, &server, &["match"]);
+    let text = stdout(&output);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("Accepted: 0"), "{text}");
+    assert!(text.contains("Queued for review: 1"), "{text}");
+    assert!(text.contains("track mapping is incomplete"), "{text}");
+
+    let pool = radish::db::connect(&db).await.unwrap();
+    let matches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_matches")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(matches, 0);
+    pool.close().await;
+}

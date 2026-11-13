@@ -9,11 +9,11 @@
 use crate::providers::{GroupId, Mbid, ProviderKind, ReleaseId};
 use crate::scanner::AUDIO_EXTENSIONS;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v23";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v22";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v24";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v23";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -276,8 +276,15 @@ impl RemoteTrack {
         self.artists.join(", ")
     }
 
+    /// The disc this track is on, from its position. `None` for a position that
+    /// names no disc, such as a vinyl side (`A1`) or a plain number on a release
+    /// that may have several media.
+    pub fn medium(&self) -> Option<u32> {
+        self.position_key().map(|(medium, _)| medium)
+    }
+
     /// Explicit medium/track position, then a Discogs-style position string.
-    fn position_key(&self) -> Option<(u32, u32)> {
+    pub fn position_key(&self) -> Option<(u32, u32)> {
         if let (Some(medium), Some(position)) = (self.medium_position, self.track_position) {
             return Some((medium, position));
         }
@@ -354,10 +361,17 @@ impl RemoteRelease {
 
     /// Playable entries in release order, paired with their tracklist index.
     pub fn playable_tracks(&self) -> Vec<(usize, &RemoteTrack)> {
+        self.playable_tracks_in(None)
+    }
+
+    /// [`Self::playable_tracks`], limited to one medium when `medium` is given.
+    pub fn playable_tracks_in(&self, medium: Option<u32>) -> Vec<(usize, &RemoteTrack)> {
         self.tracklist
             .iter()
             .enumerate()
-            .filter(|(_, track)| track.is_playable())
+            .filter(|(_, track)| {
+                track.is_playable() && medium.is_none_or(|medium| track.medium() == Some(medium))
+            })
             .collect()
     }
 
@@ -1386,7 +1400,13 @@ fn compact_chars(text: &str) -> Vec<char> {
 /// so nothing is stripped from either title. A title that was shortened is not
 /// read as a cut-off tag.
 pub fn album_title_similarity(local: &str, remote: &str) -> f64 {
-    let mut best = local_similarity(local, remote);
+    album_title_similarity_with(local, remote, true)
+}
+
+/// [`album_title_similarity`], where `allow_cut_off` is false when the local
+/// title was shortened on purpose, so it is never read as a cut-off tag.
+fn album_title_similarity_with(local: &str, remote: &str, allow_cut_off: bool) -> f64 {
+    let mut best = local_similarity_with(local, remote, allow_cut_off);
     let (local_discs, remote_discs) = (
         numbered_release_types(local),
         numbered_release_types(remote),
@@ -1410,8 +1430,11 @@ pub fn album_title_similarity(local: &str, remote: &str) -> f64 {
         for remote_album in albums(&remote_readings, remote) {
             if reduced_any {
                 // The cut-off readings only apply when the local text is the raw tag.
-                let reduced =
-                    local_similarity_with(&local_album, &remote_album, local_readings.is_empty());
+                let reduced = local_similarity_with(
+                    &local_album,
+                    &remote_album,
+                    allow_cut_off && local_readings.is_empty(),
+                );
                 best = best.max((reduced - ALBUM_TYPE_PENALTY).max(0.0));
             }
             let compact =
@@ -1712,6 +1735,11 @@ pub struct Mapping {
     /// Two pairings were indistinguishable, so the result needs review.
     pub ambiguous: bool,
     pub notes: Vec<String>,
+    /// The one medium of the release that the files were mapped onto, when they
+    /// are a single disc of a multi-disc release. `None` maps the whole release,
+    /// which is also what a mapping stored before this field existed meant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub medium: Option<u32>,
     /// Per local track, the assigned remote index and the title similarity
     /// that `map_tracks` measured for it. A cache only: never serialized, so
     /// decoded mappings start empty and readers recompute.
@@ -1762,6 +1790,190 @@ impl Mapping {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Disc folders
+// ---------------------------------------------------------------------------
+
+/// Words that name a disc in a folder or album title: `CD2`, `Disc 2`, `Disk 2`.
+const DISC_WORDS: [&str; 3] = ["cd", "disc", "disk"];
+/// A disc number has one to three digits (`CD1234` is no disc).
+const DISC_NUMBER_MAX_DIGITS: usize = 3;
+
+/// Where a [`DiscHint`] was read from. When several sources are present they
+/// agree, and the first of these names the hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscHintSource {
+    /// The last component of the folder path (`.../CD2`).
+    Folder,
+    /// A disc marker ending the album title (`Album (Disc 2)`).
+    AlbumTitle,
+    /// The disc tag, which every file carries with the same value.
+    DiscTags,
+}
+
+impl DiscHintSource {
+    /// The source as it reads in the evidence line.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Folder => "folder name",
+            Self::AlbumTitle => "album title",
+            Self::DiscTags => "disc tags",
+        }
+    }
+}
+
+/// Which disc of a multi-disc release the files of a local release claim to be.
+///
+/// Used only to compare against a candidate's media; nothing is stored for it,
+/// since the path, album tag and disc tags it comes from are already part of the
+/// local release's source revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscHint {
+    pub number: u32,
+    pub source: DiscHintSource,
+}
+
+/// A disc number of one to three digits, at least 1.
+fn disc_number(digits: &str) -> Option<u32> {
+    if digits.is_empty()
+        || digits.len() > DISC_NUMBER_MAX_DIGITS
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    digits.parse().ok().filter(|number| *number >= 1)
+}
+
+/// The disc a folder is named after: its last path component (split on `/` and
+/// `\`) is exactly `cd`, `disc` or `disk` in any case, one optional separator
+/// from ` _.-`, and a disc number. `CD1`, `disc_2` and `Disk 2` qualify;
+/// `Discography`, `CD1 Bonus` and `DVD` do not.
+pub fn folder_disc_number(directory: &str) -> Option<u32> {
+    let name = directory
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()?;
+    let lower = name.to_ascii_lowercase();
+    let rest = DISC_WORDS
+        .iter()
+        .find_map(|word| lower.strip_prefix(word))?;
+    disc_number(rest.strip_prefix([' ', '_', '.', '-']).unwrap_or(rest))
+}
+
+/// A disc marker ending an album title, with the album before it: `Album CD2`,
+/// `Album Disc 2`, `Album (Disc 2)`, `Album [CD2]`, an unclosed `Album (CD2`, or
+/// `Album - CD2`. The marker is a word of its own (`CDS2` and `Hitdisc 2` are
+/// not markers) and at least one word must remain.
+pub fn title_disc_suffix(title: &str) -> Option<(String, u32)> {
+    let mut rest = title.trim_end();
+    if let Some(open) = rest.strip_suffix([')', ']']) {
+        rest = open.trim_end();
+    }
+    let digits_start = rest.trim_end_matches(|ch: char| ch.is_ascii_digit()).len();
+    let number = disc_number(&rest[digits_start..])?;
+    let before = &rest[..digits_start];
+    let before = before.strip_suffix(' ').unwrap_or(before);
+    let word_start = before
+        .trim_end_matches(|ch: char| ch.is_ascii_alphabetic())
+        .len();
+    if !DISC_WORDS
+        .iter()
+        .any(|word| before[word_start..].eq_ignore_ascii_case(word))
+    {
+        return None;
+    }
+    let head = &before[..word_start];
+    if head
+        .chars()
+        .next_back()
+        .is_some_and(|ch| !(ch.is_whitespace() || matches!(ch, '(' | '[' | '-' | '_')))
+    {
+        return None;
+    }
+    let album =
+        head.trim_end_matches(|ch: char| ch.is_whitespace() || matches!(ch, '(' | '[' | '-' | '_'));
+    album
+        .chars()
+        .any(char::is_alphanumeric)
+        .then(|| (album.to_string(), number))
+}
+
+/// The disc every file's tag names, when they all name the same one.
+fn disc_tag_number(local: &LocalRelease) -> Option<u32> {
+    let first = local.tracks.first()?.disc?;
+    local
+        .tracks
+        .iter()
+        .all(|track| track.disc == Some(first))
+        .then(|| u32::try_from(first).ok())
+        .flatten()
+        .filter(|number| *number >= 1)
+}
+
+/// The disc a local release says it is, from its folder name, its album title
+/// and its disc tags. The sources that say anything must agree, or there is no
+/// hint. Disc tags alone only count from disc 2 on, because a missing tag already
+/// reads as disc 1; mixed or partly tagged files give no tag hint at all.
+pub fn local_disc_hint(local: &LocalRelease) -> Option<DiscHint> {
+    let sources: Vec<DiscHint> = [
+        folder_disc_number(&local.directory).map(|number| (number, DiscHintSource::Folder)),
+        local
+            .album_title
+            .as_deref()
+            .and_then(title_disc_suffix)
+            .map(|(_, number)| (number, DiscHintSource::AlbumTitle)),
+        disc_tag_number(local).map(|number| (number, DiscHintSource::DiscTags)),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|(number, source)| DiscHint { number, source })
+    .collect();
+    let first = *sources.first()?;
+    if sources.iter().any(|hint| hint.number != first.number) {
+        return None;
+    }
+    if first.source == DiscHintSource::DiscTags && first.number < 2 {
+        return None;
+    }
+    Some(first)
+}
+
+/// Whether a Discogs release names a video format (`DVD`, `Blu-ray`, `VHS`).
+///
+/// Discogs positions do not say which medium is the video one, so such a release
+/// cannot be split into discs safely. MusicBrainz reports video media in its
+/// structure issues, which block on their own, so it is never refused here.
+pub fn lists_video_format(remote: &RemoteRelease) -> bool {
+    remote.provider() == ProviderKind::Discogs
+        && remote.formats.iter().any(|format| {
+            let lower = format.to_ascii_lowercase();
+            ["dvd", "blu-ray", "bluray", "vhs"]
+                .iter()
+                .any(|video| lower.contains(video))
+        })
+}
+
+/// `disc m of M` for the medium of a release that files were mapped onto, with
+/// `M` the highest medium number (numbering may have gaps), or `disc m` when the
+/// release does not name its media.
+pub fn disc_label(remote: &RemoteRelease, medium: u32) -> String {
+    match remote_media(remote).and_then(|media| media.keys().next_back().copied()) {
+        Some(last) => format!("disc {medium} of {last}"),
+        None => format!("disc {medium}"),
+    }
+}
+
+/// The playable tracks on each medium of a release, when it has several and
+/// every playable track says which one it is on. Vinyl sides (`A1`) and
+/// positions such as `CD1-1` name no medium, so those releases give `None`.
+pub fn remote_media(remote: &RemoteRelease) -> Option<BTreeMap<u32, usize>> {
+    let mut media = BTreeMap::new();
+    for (_, track) in remote.playable_tracks() {
+        *media.entry(track.medium()?).or_insert(0usize) += 1;
+    }
+    (media.len() >= 2).then_some(media)
+}
+
 /// Maps local files to remote tracklist entries.
 ///
 /// Strong identifiers anchor first: unique release-track IDs, then unique
@@ -1770,8 +1982,46 @@ impl Mapping {
 /// similarity and duration, with ties broken deterministically and flagged as
 /// ambiguous. Repeated recording IDs are legal on a release, so they only
 /// anchor when both sides are unambiguous.
+///
+/// The whole release is mapped first. When that is not complete because the
+/// counts differ (a structure issue alone does not count) and the files are one
+/// disc of a multi-disc release (see [`local_disc_hint`]) that the release has,
+/// they are mapped onto that medium alone instead, complete or not, so that a
+/// review sees the disc they claim to be. No other medium is tried. A Discogs
+/// release that lists a video format ([`lists_video_format`]) is never split
+/// into discs, since its tracklist does not say which medium is the video.
 pub fn map_tracks(local: &LocalRelease, remote: &RemoteRelease) -> Mapping {
-    let playable = remote.playable_tracks();
+    let whole = map_tracks_within(local, remote, None);
+    if whole.complete
+        || local.tracks.len() == remote.playable_tracks().len()
+        || lists_video_format(remote)
+    {
+        return whole;
+    }
+    let Some(hint) = local_disc_hint(local) else {
+        return whole;
+    };
+    match remote_media(remote) {
+        Some(media) if media.contains_key(&hint.number) => {
+            map_tracks_within(local, remote, Some(hint.number))
+        }
+        _ => whole,
+    }
+}
+
+/// [`map_tracks`] onto the whole release (`medium` is `None`) or onto the
+/// playable tracks of one medium. Every pass, identifier anchors included, only
+/// sees that medium's tracks, and every file is keyed by `(medium, track number)`
+/// whatever its own disc tag says: the folder, title or tags said which disc the
+/// files are.
+fn map_tracks_within(local: &LocalRelease, remote: &RemoteRelease, medium: Option<u32>) -> Mapping {
+    let playable = remote.playable_tracks_in(medium);
+    let key_of = |track: &LocalTrack, number: i64| -> (u32, u32) {
+        (
+            medium.unwrap_or_else(|| track.disc.unwrap_or(1).max(0) as u32),
+            number.max(0) as u32,
+        )
+    };
     let mut pairs: Vec<Option<usize>> = vec![None; local.tracks.len()];
     let mut used: Vec<bool> = vec![false; remote.tracklist.len()];
     let mut notes = Vec::new();
@@ -1808,13 +2058,25 @@ pub fn map_tracks(local: &LocalRelease, remote: &RemoteRelease) -> Mapping {
             Some(_) => notes.push(format!(
                 "release-track ID {id} appears on several remote tracks"
             )),
-            None => notes.push(format!(
-                "release-track ID {id} from '{}' is not on the remote release",
-                local.tracks[local_indexes[0]]
+            None => {
+                let title = local.tracks[local_indexes[0]]
                     .title
                     .as_deref()
-                    .unwrap_or(&local.tracks[local_indexes[0]].path)
-            )),
+                    .unwrap_or(&local.tracks[local_indexes[0]].path);
+                // Within one disc, an ID that the release has elsewhere is on another disc.
+                let elsewhere = medium.is_some()
+                    && remote
+                        .tracklist
+                        .iter()
+                        .any(|track| track.is_playable() && track.release_track_id == Some(*id));
+                notes.push(if elsewhere {
+                    format!(
+                        "release-track ID {id} from '{title}' is on another disc of this release"
+                    )
+                } else {
+                    format!("release-track ID {id} from '{title}' is not on the remote release")
+                });
+            }
         }
     }
     anchors.sort_unstable();
@@ -1883,9 +2145,8 @@ pub fn map_tracks(local: &LocalRelease, remote: &RemoteRelease) -> Mapping {
             let mut local_by_key: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
             for index in &remaining_local {
                 let track = &local.tracks[*index];
-                let disc = track.disc.unwrap_or(1).max(0) as u32;
-                let number = track.track_number.unwrap_or_default() as u32;
-                local_by_key.entry((disc, number)).or_default().push(*index);
+                let key = key_of(track, track.track_number.unwrap_or_default());
+                local_by_key.entry(key).or_default().push(*index);
             }
 
             let mut remote_by_key: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
@@ -1931,10 +2192,7 @@ pub fn map_tracks(local: &LocalRelease, remote: &RemoteRelease) -> Mapping {
         let Some(local_number) = local_track.track_number else {
             continue;
         };
-        let local_key = (
-            local_track.disc.unwrap_or(1).max(0) as u32,
-            local_number.max(0) as u32,
-        );
+        let local_key = key_of(local_track, local_number);
         if local_key != remote_key {
             notes.push(format!(
                 "identifier for '{}' points to remote {} but its tags say {}-{}",
@@ -2030,11 +2288,18 @@ pub fn map_tracks(local: &LocalRelease, remote: &RemoteRelease) -> Mapping {
     }
 
     if local.tracks.len() != remote_count {
-        notes.push(format!(
-            "{} local file(s) versus {} playable remote track(s)",
-            local.tracks.len(),
-            remote_count
-        ));
+        notes.push(match medium {
+            Some(medium) => format!(
+                "{} local file(s) versus {} playable track(s) on disc {medium}",
+                local.tracks.len(),
+                remote_count
+            ),
+            None => format!(
+                "{} local file(s) versus {} playable remote track(s)",
+                local.tracks.len(),
+                remote_count
+            ),
+        });
     }
 
     let pair_similarity = pairs
@@ -2051,6 +2316,7 @@ pub fn map_tracks(local: &LocalRelease, remote: &RemoteRelease) -> Mapping {
         complete,
         ambiguous,
         notes,
+        medium,
         pair_similarity,
     }
 }
@@ -2305,7 +2571,23 @@ impl ScoreBreakdown {
 /// nothing is renormalized into false confidence.
 pub fn score(local: &LocalRelease, remote: &RemoteRelease, mapping: &Mapping) -> ScoreBreakdown {
     let album_title = match &local.album_title {
-        Some(title) if !title.trim().is_empty() => album_title_similarity(title, &remote.title),
+        Some(title) if !title.trim().is_empty() => {
+            let mut value = album_title_similarity(title, &remote.title);
+            // A disc marker on the title of the matched disc is not part of the
+            // album's name. Nothing else is dropped: the album part is short on
+            // purpose, so it is never read as a cut-off tag.
+            if let Some(medium) = mapping.medium
+                && let Some((album, number)) = title_disc_suffix(title)
+                && number == medium
+            {
+                value = value.max(
+                    (album_title_similarity_with(&album, &remote.title, false)
+                        - ALBUM_TYPE_PENALTY)
+                        .max(0.0),
+                );
+            }
+            value
+        }
         _ => 0.0,
     };
 
@@ -2773,7 +3055,8 @@ fn mapped_in_local_order(local: &LocalRelease, candidate: &Candidate) -> bool {
     if !mapping.complete || mapping.ambiguous {
         return false;
     }
-    let playable = candidate.release.playable_tracks();
+    // A disc is compared with its own medium's tracks, not with the release's.
+    let playable = candidate.release.playable_tracks_in(mapping.medium);
     local.tracks.len() == playable.len()
         && mapping.pairs.len() == playable.len()
         && mapping
@@ -3269,6 +3552,17 @@ fn evaluate_with(
                 runner_up.release.id, gap
             ));
         }
+    }
+
+    if let Some(medium) = candidate.mapping.medium {
+        let source = local_disc_hint(local)
+            .filter(|hint| hint.number == medium)
+            .map(|hint| format!(" (disc number from the {})", hint.source.describe()))
+            .unwrap_or_default();
+        evidence.push(format!(
+            "the files are {} of this release{source}",
+            disc_label(remote, medium)
+        ));
     }
 
     // Per-track evidence.
@@ -5459,11 +5753,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v23"
+            "discogs-match-v24"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v22"
+            "musicbrainz-match-v23"
         );
     }
 
@@ -7752,5 +8046,631 @@ mod tests {
         }
         let cleaned = cleaned_track_titles(&local);
         assert_eq!(cleaned[2].as_ref().unwrap().text, "Charlie");
+    }
+
+    // -----------------------------------------------------------------------
+    // Disc folders
+    // -----------------------------------------------------------------------
+
+    /// A release of several media in MusicBrainz style: medium `m` (from 1) holds
+    /// `counts[m - 1]` tracks titled `Song m-k`, `200 + 10m + k` seconds long.
+    fn disc_set(counts: &[usize]) -> RemoteRelease {
+        let mut remote = remote_release(&[]);
+        for (index, count) in counts.iter().enumerate() {
+            let medium = index as u32 + 1;
+            for position in 1..=*count as u32 {
+                remote.tracklist.push(RemoteTrack {
+                    position: Some(format!("{medium}-{position}")),
+                    title: format!("Song {medium}-{position}"),
+                    artists: Vec::new(),
+                    duration_secs: Some(f64::from(200 + 10 * medium + position)),
+                    entry_type: TrackEntryType::Track,
+                    medium_position: Some(medium),
+                    track_position: Some(position),
+                    release_track_id: None,
+                    recording_id: None,
+                    artist_credit: None,
+                });
+            }
+        }
+        remote
+    }
+
+    /// The files of one disc of `disc_set`, numbered from 1, untagged for disc.
+    fn disc_folder(directory: &str, medium: u32, count: usize) -> LocalRelease {
+        let titles: Vec<String> = (1..=count).map(|k| format!("Song {medium}-{k}")).collect();
+        let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let mut local = local_release(&titles);
+        local.directory = directory.to_string();
+        for (index, track) in local.tracks.iter_mut().enumerate() {
+            track.path = format!("{directory}/{:02}.flac", index + 1);
+            track.duration_secs = Some(f64::from(200 + 10 * medium + index as u32 + 1));
+        }
+        local
+    }
+
+    #[test]
+    fn disc_hints_come_from_folder_names_titles_and_disc_tags() {
+        let hint = |directory: &str, album: &str, discs: &[Option<i64>]| {
+            let mut local = local_release(&["One", "Two"]);
+            local.directory = directory.to_string();
+            local.album_title = Some(album.to_string());
+            for (track, disc) in local.tracks.iter_mut().zip(discs) {
+                track.disc = *disc;
+            }
+            local_disc_hint(&local).map(|hint| (hint.number, hint.source))
+        };
+        let none = [None, None];
+        let folder = |number| Some((number, DiscHintSource::Folder));
+
+        for (name, number) in [
+            ("CD1", 1),
+            ("Cd1", 1),
+            ("cd02", 2),
+            ("Disc_2", 2),
+            ("Disk 2", 2),
+            ("CD 2", 2),
+            ("disc-3", 3),
+            ("CD.4", 4),
+            ("CD12", 12),
+            ("CD123", 123),
+        ] {
+            assert_eq!(
+                hint(&format!("/music/Set-2CD/{name}"), "Set", &none),
+                folder(number),
+                "{name}"
+            );
+        }
+        assert_eq!(hint("C:\\Music\\Set\\CD2", "Set", &none), folder(2));
+        assert_eq!(hint("/music/Set/CD2/", "Set", &none), folder(2));
+        for name in [
+            "Discography",
+            "Disco 2",
+            "Disco2",
+            "CD1 Bonus",
+            "DVD",
+            "DVD2",
+            "CD",
+            "CD0",
+            "CD1234",
+            "CDS2",
+            "Disc2x",
+            "Bonus",
+        ] {
+            assert_eq!(
+                hint(&format!("/music/Set/{name}"), "Set", &none),
+                None,
+                "{name}"
+            );
+        }
+
+        // A disc marker ending the album title.
+        let title = |album: &str| hint("/music/Set", album, &none);
+        let titled = |number| Some((number, DiscHintSource::AlbumTitle));
+        for (album, number) in [
+            ("Set CD2", 2),
+            ("Set Cd 2", 2),
+            ("Set Disc2", 2),
+            ("Set (Disc 2)", 2),
+            ("Set [CD2]", 2),
+            ("Set (CD2", 2),
+            ("Set - CD2", 2),
+            ("Set Disk 3", 3),
+        ] {
+            assert_eq!(title(album), titled(number), "{album}");
+        }
+        for album in [
+            "Set CDS2",
+            "Hitdisc 434D",
+            "Hit Disc 54 June 2002",
+            "CD2",
+            "(Disc 2)",
+            "Set CD",
+            "Set CD0",
+            "Set CD1234",
+            "Set Discs 2",
+            "Set",
+        ] {
+            assert_eq!(title(album), None, "{album}");
+        }
+        assert_eq!(title_disc_suffix("Set (Disc 2)"), Some(("Set".into(), 2)));
+        assert_eq!(title_disc_suffix("Set - CD2"), Some(("Set".into(), 2)));
+        assert_eq!(title_disc_suffix("Set (CD2"), Some(("Set".into(), 2)));
+        assert_eq!(title_disc_suffix("Hitdisc 434D"), None);
+
+        // The folder and the title say the same, or they conflict.
+        assert_eq!(hint("/music/Set/CD2", "Set CD2", &none), folder(2));
+        assert_eq!(hint("/music/Set/CD2", "Set CD1", &none), None);
+
+        // Disc tags alone count from disc 2 on; disc 1 is what an absent tag means.
+        assert_eq!(hint("/music/Set", "Set", &[Some(1), Some(1)]), None);
+        assert_eq!(
+            hint("/music/Set", "Set", &[Some(2), Some(2)]),
+            Some((2, DiscHintSource::DiscTags))
+        );
+        // Mixed or partly tagged files give no tag hint at all.
+        assert_eq!(hint("/music/Set", "Set", &[Some(1), Some(2)]), None);
+        assert_eq!(hint("/music/Set", "Set", &[Some(2), None]), None);
+        assert_eq!(hint("/music/Set", "Set", &[Some(0), Some(0)]), None);
+        // The sources must agree.
+        assert_eq!(hint("/music/Set/CD2", "Set", &[Some(1), Some(1)]), None);
+        assert_eq!(
+            hint("/music/Set/CD1", "Set", &[Some(1), Some(1)]),
+            folder(1)
+        );
+        assert_eq!(
+            hint("/music/Set/CD2", "Set", &[Some(2), Some(2)]),
+            folder(2)
+        );
+        assert_eq!(
+            hint("/music/Set", "Set CD2", &[Some(2), Some(2)]),
+            Some((2, DiscHintSource::AlbumTitle))
+        );
+        assert_eq!(hint("/music/Set", "Set CD2", &[Some(3), Some(3)]), None);
+    }
+
+    #[test]
+    fn a_disc_folder_maps_onto_its_own_medium() {
+        let remote = disc_set(&[16, 17]);
+        let local = disc_folder("/music/Set-2CD/CD2", 2, 17);
+
+        let mapping = map_tracks(&local, &remote);
+        assert_eq!(mapping.medium, Some(2));
+        assert!(mapping.complete, "{:?}", mapping.notes);
+        assert!(!mapping.ambiguous, "{:?}", mapping.notes);
+        assert_eq!(mapping.assigned_count(), 17);
+        for (local_index, remote_index) in mapping.assigned_pairs() {
+            assert_eq!(remote.tracklist[remote_index].medium(), Some(2));
+            assert_eq!(
+                remote.tracklist[remote_index].track_position,
+                Some(local_index as u32 + 1)
+            );
+        }
+        // The same files in a folder that names no disc stay incomplete.
+        let mut unnumbered = local.clone();
+        unnumbered.directory = "/music/Set-2CD/Bonus".to_string();
+        let mapping = map_tracks(&unnumbered, &remote);
+        assert_eq!(mapping.medium, None);
+        assert!(!mapping.complete);
+
+        // A disc anchors on identifiers within its medium as well.
+        let mut anchored = disc_set(&[16, 17]);
+        let ids: Vec<Mbid> = (1..=33)
+            .map(|n| mbid(&format!("{n:08}-1111-4111-8111-{n:012}")))
+            .collect();
+        for (track, id) in anchored.tracklist.iter_mut().zip(&ids) {
+            track.release_track_id = Some(*id);
+        }
+        let mut local = disc_folder("/music/Set-2CD/CD2", 2, 17);
+        for (track, id) in local.tracks.iter_mut().zip(&ids[16..]) {
+            track.release_track_id = Some(*id);
+        }
+        let mapping = map_tracks(&local, &anchored);
+        assert_eq!(mapping.medium, Some(2));
+        assert!(mapping.complete, "{:?}", mapping.notes);
+        assert!(!mapping.ambiguous, "{:?}", mapping.notes);
+        assert_eq!(mapping.pairs[0], Some(16));
+    }
+
+    #[test]
+    fn a_complete_whole_release_mapping_wins_over_a_medium() {
+        let remote = disc_set(&[2, 2]);
+        let titles = ["Song 1-1", "Song 1-2", "Song 2-1", "Song 2-2"];
+        let mut local = local_release(&titles);
+        local.directory = "/music/Set/CD2".to_string();
+        for (track, (disc, number)) in local
+            .tracks
+            .iter_mut()
+            .zip([(1, 1), (1, 2), (2, 1), (2, 2)])
+        {
+            track.disc = Some(disc);
+            track.track_number = Some(number);
+            track.duration_secs = Some(200.0 + 10.0 * disc as f64 + number as f64);
+        }
+        assert_eq!(local_disc_hint(&local).map(|hint| hint.number), Some(2));
+        let mapping = map_tracks(&local, &remote);
+        assert_eq!(mapping.medium, None);
+        assert!(mapping.complete, "{:?}", mapping.notes);
+    }
+
+    #[test]
+    fn a_disc_with_a_different_track_count_stays_incomplete_on_its_medium() {
+        let remote = disc_set(&[16, 17]);
+        let local = disc_folder("/music/Set-2CD/CD2", 2, 16);
+        let mapping = map_tracks(&local, &remote);
+        assert_eq!(mapping.medium, Some(2));
+        assert!(!mapping.complete);
+        assert!(
+            mapping
+                .notes
+                .contains(&"16 local file(s) versus 17 playable track(s) on disc 2".to_string()),
+            "{:?}",
+            mapping.notes
+        );
+        // Every file still maps within the medium, for review.
+        assert!(
+            mapping
+                .assigned_pairs()
+                .all(|(_, remote_index)| remote.tracklist[remote_index].medium() == Some(2))
+        );
+    }
+
+    #[test]
+    fn a_disc_number_the_release_does_not_have_falls_back_to_the_whole_release() {
+        let remote = disc_set(&[3, 3]);
+        let local = disc_folder("/music/Set/CD3", 2, 3);
+        let mapping = map_tracks(&local, &remote);
+        assert_eq!(mapping.medium, None);
+        assert!(!mapping.complete);
+        assert!(
+            mapping
+                .notes
+                .contains(&"3 local file(s) versus 6 playable remote track(s)".to_string()),
+            "{:?}",
+            mapping.notes
+        );
+
+        // A release of one medium has no disc to choose.
+        let single = disc_set(&[3]);
+        let local = disc_folder("/music/Set/CD2", 1, 2);
+        assert_eq!(map_tracks(&local, &single).medium, None);
+    }
+
+    #[test]
+    fn unsupported_media_elsewhere_still_block_a_disc_match() {
+        let mut remote = disc_set(&[2, 2]);
+        remote
+            .structure_issues
+            .push("medium 3 uses unsupported format 'DVD-Video'".to_string());
+        let local = disc_folder("/music/Set/CD2", 2, 2);
+        let candidate = Candidate::new(&local, remote);
+        assert_eq!(candidate.mapping.medium, Some(2));
+        let evaluation =
+            evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default());
+        assert!(!evaluation.auto_accept);
+        assert!(!evaluation.can_apply(&candidate));
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("unsupported")),
+            "{:?}",
+            evaluation.blockers
+        );
+
+        // An index track on another disc blocks as well.
+        let mut remote = disc_set(&[2, 2]);
+        remote.tracklist[0].entry_type = TrackEntryType::Index;
+        let candidate = Candidate::new(&local, remote);
+        let evaluation =
+            evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default());
+        assert!(!evaluation.can_apply(&candidate));
+    }
+
+    #[test]
+    fn discogs_disc_positions_split_media_but_vinyl_sides_do_not() {
+        let with_positions = |positions: &[&str]| {
+            let mut remote = remote_release(&vec!["Song"; positions.len()]);
+            for (track, position) in remote.tracklist.iter_mut().zip(positions) {
+                track.position = Some((*position).to_string());
+            }
+            remote
+        };
+        assert_eq!(
+            remote_media(&with_positions(&["1-1", "1-2", "2-1"])),
+            Some(BTreeMap::from([(1, 2), (2, 1)]))
+        );
+        assert_eq!(
+            remote_media(&with_positions(&["A1", "A2", "B1", "D4"])),
+            None
+        );
+        assert_eq!(
+            remote_media(&with_positions(&["CD1-1", "CD1-2", "CD2-1"])),
+            None
+        );
+        // One medium is no choice, and a track without a position is no medium.
+        assert_eq!(remote_media(&with_positions(&["1", "2", "3"])), None);
+        assert_eq!(remote_media(&with_positions(&["1-1", "1-2"])), None);
+        let mut missing = with_positions(&["1-1", "2-1", "2-2"]);
+        missing.tracklist[1].position = None;
+        assert_eq!(remote_media(&missing), None);
+        // Headings are not playable and need no medium.
+        let mut heading = with_positions(&["1-1", "", "2-1"]);
+        heading.tracklist[1].entry_type = TrackEntryType::Heading;
+        assert_eq!(
+            remote_media(&heading),
+            Some(BTreeMap::from([(1, 1), (2, 1)]))
+        );
+
+        // A Discogs release of `N-M` positions maps a disc folder onto its disc.
+        let mut remote = with_positions(&["1-1", "1-2", "2-1", "2-2"]);
+        for (track, title) in remote
+            .tracklist
+            .iter_mut()
+            .zip(["Song 1-1", "Song 1-2", "Song 2-1", "Song 2-2"])
+        {
+            track.title = title.to_string();
+        }
+        let local = disc_folder("/music/Set/Disc 2", 2, 2);
+        let mapping = map_tracks(&local, &remote);
+        assert_eq!(mapping.medium, Some(2));
+        assert_eq!(mapping.pairs, vec![Some(2), Some(3)]);
+        assert!(mapping.complete, "{:?}", mapping.notes);
+    }
+
+    #[test]
+    fn a_disc_marker_in_the_album_title_drops_only_for_the_matched_medium() {
+        let remote = disc_set(&[3, 3]);
+        let mut local = disc_folder("/music/Set/Disc 2", 2, 3);
+        local.album_title = Some("Test Album Disc 2".to_string());
+
+        let candidate = Candidate::new(&local, remote.clone());
+        assert_eq!(candidate.mapping.medium, Some(2));
+        assert!(
+            candidate.score.album_title >= 0.96,
+            "{}",
+            candidate.score.album_title
+        );
+        assert!(candidate.score.album_title < 1.0);
+
+        // A mapping of another medium, or of none, leaves the title as it is.
+        let mut other = candidate.mapping.clone();
+        other.medium = Some(1);
+        let kept = score(&local, &remote, &other);
+        assert!(kept.album_title < 0.9, "{}", kept.album_title);
+        other.medium = None;
+        assert_eq!(score(&local, &remote, &other).album_title, kept.album_title);
+
+        // The marker also names the disc when the folder does not.
+        let mut loose = local.clone();
+        loose.directory = "/music/Set".to_string();
+        let hint = local_disc_hint(&loose).unwrap();
+        assert_eq!(hint.source, DiscHintSource::AlbumTitle);
+        assert_eq!(map_tracks(&loose, &remote).medium, Some(2));
+    }
+
+    #[test]
+    fn one_complete_disc_is_accepted_as_an_album_match() {
+        let remote = disc_set(&[4, 4]);
+        let local = disc_folder("/music/Set-2CD/CD2", 2, 4);
+        let candidate = Candidate::new(&local, remote.clone());
+        assert_eq!(candidate.mapping.medium, Some(2));
+        let evaluation =
+            evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default());
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert_eq!(evaluation.match_scope, MatchScope::Album);
+        assert!(
+            evaluation.evidence.contains(
+                &"the files are disc 2 of 2 of this release (disc number from the folder name)"
+                    .to_string()
+            ),
+            "{:?}",
+            evaluation.evidence
+        );
+        assert!(evaluation.can_apply(&candidate));
+
+        // Disc tags name their source too.
+        let mut tagged = local.clone();
+        tagged.directory = "/music/Set".to_string();
+        for track in &mut tagged.tracks {
+            track.disc = Some(2);
+        }
+        let candidate = Candidate::new(&tagged, remote.clone());
+        let evaluation =
+            evaluate_for_matching(&tagged, &candidate, &[], &DiscoveryEvidence::default());
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert!(
+            evaluation
+                .evidence
+                .iter()
+                .any(|line| line.ends_with("(disc number from the disc tags)")),
+            "{:?}",
+            evaluation.evidence
+        );
+
+        // The same files in a folder that names no disc are not accepted.
+        let mut unnumbered = local.clone();
+        unnumbered.directory = "/music/Set-2CD/Bonus".to_string();
+        let candidate = Candidate::new(&unnumbered, remote);
+        let evaluation =
+            evaluate_for_matching(&unnumbered, &candidate, &[], &DiscoveryEvidence::default());
+        assert!(!evaluation.auto_accept);
+        assert!(
+            evaluation
+                .blockers
+                .contains(&"track mapping is incomplete".to_string())
+        );
+    }
+
+    #[test]
+    fn fallback_conflicts_compare_disc_matches_track_by_track() {
+        let local = disc_folder("/music/Set/CD2", 2, 4);
+        let mut primary_release = disc_set(&[4, 4]);
+        primary_release.id = ReleaseId::MusicBrainz(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"));
+        let primary = Candidate::new(&local, primary_release);
+        assert_eq!(primary.mapping.medium, Some(2));
+
+        let fallback = Candidate::new(&local, disc_set(&[4, 4]));
+        assert_eq!(fallback.mapping.medium, Some(2));
+        let agreeing = fallback_conflicts(
+            &local,
+            std::slice::from_ref(&primary),
+            &fallback,
+            true,
+            false,
+        );
+        assert!(agreeing.is_empty(), "{agreeing:?}");
+
+        // A length of the fallback's disc 2 that the primary's disc 2 contradicts.
+        let mut longer = disc_set(&[4, 4]);
+        longer.tracklist[6].duration_secs = Some(longer.tracklist[6].duration_secs.unwrap() + 5.0);
+        let fallback = Candidate::new(&local, longer);
+        let conflicts = fallback_conflicts(&local, &[primary], &fallback, true, false);
+        assert_eq!(
+            conflicts,
+            vec!["primary and fallback durations differ for local track 3".to_string()]
+        );
+    }
+
+    #[test]
+    fn mapping_medium_round_trips_and_defaults_to_the_whole_release() {
+        let remote = disc_set(&[2, 2]);
+        let local = disc_folder("/music/Set/CD2", 2, 2);
+        let disc = map_tracks(&local, &remote);
+        assert_eq!(disc.medium, Some(2));
+        let json = serde_json::to_string(&disc).unwrap();
+        assert!(json.contains("\"medium\":2"), "{json}");
+        let decoded: Mapping = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.medium, Some(2));
+        assert_eq!(decoded.pairs, disc.pairs);
+
+        let whole = map_tracks(
+            &local_release(&["One", "Two"]),
+            &remote_release(&["One", "Two"]),
+        );
+        assert_eq!(whole.medium, None);
+        let json = serde_json::to_string(&whole).unwrap();
+        assert!(!json.contains("medium"), "{json}");
+
+        // A mapping stored before the field existed is a whole-release mapping.
+        let old: Mapping =
+            serde_json::from_str(r#"{"pairs":[0,1],"complete":true,"ambiguous":false,"notes":[]}"#)
+                .unwrap();
+        assert_eq!(old.medium, None);
+    }
+
+    #[test]
+    fn lengths_identify_the_tracks_of_a_disc_in_medium_order() {
+        let remote = disc_set(&[6, 6]);
+        let mut local = disc_folder("/music/Set/CD2", 2, 6);
+        for (index, track) in local.tracks.iter_mut().enumerate() {
+            track.title = Some(format!("Track{:02}", index + 1));
+        }
+        let candidate = Candidate::new(&local, remote.clone());
+        assert_eq!(candidate.mapping.medium, Some(2));
+        assert!(candidate.mapping.complete, "{:?}", candidate.mapping.notes);
+        assert!(mapped_in_local_order(&local, &candidate));
+        assert!(durations_identify_tracks(&local, &candidate));
+        let evaluation =
+            evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default());
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+
+        // Pairs on the wrong tracks of the medium are not in order.
+        let mut swapped = candidate.clone();
+        swapped.mapping.pairs.swap(0, 1);
+        assert!(!mapped_in_local_order(&local, &swapped));
+    }
+
+    #[test]
+    fn a_structure_issue_alone_keeps_the_whole_release_mapping() {
+        // Four files fill the four tracks of the release, but a medium that is not
+        // a CD makes the release unusable: the review shows the 4/4 mapping.
+        let mut remote = disc_set(&[2, 2]);
+        remote
+            .structure_issues
+            .push("medium 3 uses unsupported format 'DVD-Video'".to_string());
+        let mut local = local_release(&["Song 1-1", "Song 1-2", "Song 2-1", "Song 2-2"]);
+        local.directory = "/music/Set/CD2".to_string();
+        for (track, (disc, number)) in local
+            .tracks
+            .iter_mut()
+            .zip([(1, 1), (1, 2), (2, 1), (2, 2)])
+        {
+            track.disc = Some(disc);
+            track.track_number = Some(number);
+            track.duration_secs = Some(200.0 + 10.0 * disc as f64 + number as f64);
+        }
+        let mapping = map_tracks(&local, &remote);
+        assert_eq!(mapping.medium, None);
+        assert_eq!(mapping.assigned_count(), 4);
+        assert!(!mapping.complete);
+
+        // With a differing count the disc mapping is still chosen.
+        let disc = disc_folder("/music/Set/CD2", 2, 2);
+        assert_eq!(map_tracks(&disc, &remote).medium, Some(2));
+    }
+
+    #[test]
+    fn disc_labels_use_the_highest_medium_number() {
+        let remote = disc_set(&[2, 2]);
+        assert_eq!(disc_label(&remote, 2), "disc 2 of 2");
+        // Numbering with a gap: media 1 and 3.
+        let mut gap = disc_set(&[2, 2]);
+        for track in gap.tracklist.iter_mut().skip(2) {
+            track.medium_position = Some(3);
+            track.position = Some(format!("3-{}", track.track_position.unwrap()));
+        }
+        assert_eq!(disc_label(&gap, 3), "disc 3 of 3");
+        let local = disc_folder("/music/Set/CD3", 2, 2);
+        let candidate = Candidate::new(&local, gap.clone());
+        assert_eq!(candidate.mapping.medium, Some(3));
+        let evaluation =
+            evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default());
+        assert!(
+            evaluation
+                .evidence
+                .iter()
+                .any(|line| line.starts_with("the files are disc 3 of 3 of this release")),
+            "{:?}",
+            evaluation.evidence
+        );
+        // A release that does not name its media has no total.
+        assert_eq!(disc_label(&remote_release(&["One"]), 2), "disc 2");
+    }
+
+    #[test]
+    fn a_discogs_release_with_a_video_format_is_not_split_into_discs() {
+        let local = disc_folder("/music/Set/CD2", 2, 2);
+        let mut discogs = disc_set(&[2, 2]);
+        assert_eq!(map_tracks(&local, &discogs).medium, Some(2));
+        for format in ["DVD (NTSC)", "Blu-ray", "VHS", "dvd video"] {
+            discogs.formats = vec!["CD (Album)".to_string(), format.to_string()];
+            assert!(lists_video_format(&discogs), "{format}");
+            let mapping = map_tracks(&local, &discogs);
+            assert_eq!(mapping.medium, None, "{format}");
+            assert!(!mapping.complete);
+        }
+        // MusicBrainz reports its video media as structure issues instead.
+        let mut musicbrainz = discogs.clone();
+        musicbrainz.id = ReleaseId::MusicBrainz(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"));
+        assert!(!lists_video_format(&musicbrainz));
+        assert_eq!(map_tracks(&local, &musicbrainz).medium, Some(2));
+    }
+
+    #[test]
+    fn an_identifier_from_another_disc_is_reported_as_such() {
+        let mut remote = disc_set(&[2, 2]);
+        let ids = [
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+        ];
+        for (track, id) in remote.tracklist.iter_mut().zip(ids) {
+            track.release_track_id = Some(mbid(id));
+        }
+        let mut local = disc_folder("/music/Set/CD2", 2, 2);
+        // The first file carries an ID of disc 1, the second one the release lacks.
+        local.tracks[0].release_track_id = Some(mbid(ids[0]));
+        local.tracks[1].release_track_id = Some(mbid("99999999-9999-4999-8999-999999999999"));
+        let mapping = map_tracks(&local, &remote);
+        assert_eq!(mapping.medium, Some(2));
+        assert!(
+            mapping.notes.contains(
+                &"release-track ID 11111111-1111-4111-8111-111111111111 from 'Song 2-1' \
+                  is on another disc of this release"
+                    .to_string()
+            ),
+            "{:?}",
+            mapping.notes
+        );
+        assert!(
+            mapping.notes.contains(
+                &"release-track ID 99999999-9999-4999-8999-999999999999 from 'Song 2-2' \
+                  is not on the remote release"
+                    .to_string()
+            ),
+            "{:?}",
+            mapping.notes
+        );
     }
 }

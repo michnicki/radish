@@ -20,6 +20,7 @@ use anyhow::{Context, Result, bail};
 use futures_util::stream::{self, StreamExt};
 use sqlx::SqlitePool;
 use std::cell::{OnceCell, RefCell};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::{self, Write as _};
 use std::io::{self, IsTerminal, Write};
@@ -289,16 +290,11 @@ impl ProviderAttempt {
                 a.score
                     .total
                     .total_cmp(&b.score.total)
+                    .then_with(|| a.mapping.medium.is_none().cmp(&b.mapping.medium.is_none()))
                     .then_with(|| b.release.id.cmp(&a.release.id))
             })
             .map(|candidate| candidate.release.id.clone());
-        candidates.sort_by(|a, b| {
-            (exact_id.as_ref() == Some(&b.release.id))
-                .cmp(&(exact_id.as_ref() == Some(&a.release.id)))
-                .then_with(|| b.score.album_score().total_cmp(&a.score.album_score()))
-                .then_with(|| b.score.total.total_cmp(&a.score.total))
-                .then_with(|| a.release.id.cmp(&b.release.id))
-        });
+        candidates.sort_by(|a, b| candidate_order(exact_id.as_ref(), a, b));
 
         let evaluations = candidates
             .iter()
@@ -1094,6 +1090,13 @@ async fn accept(
                 candidate.release.id.storage_id()
             );
             outln_to!(transcript, "    {}", Clean(&candidate.release.url));
+            if let Some(medium) = candidate.mapping.medium {
+                outln_to!(
+                    transcript,
+                    "    matched {}",
+                    matcher::disc_label(&candidate.release, medium)
+                );
+            }
             if evaluation.match_scope == MatchScope::Album {
                 outln_to!(
                     transcript,
@@ -1394,6 +1397,18 @@ fn print_candidate(
     );
 }
 
+/// The order candidates are shown and judged in: the proven edition first, then
+/// album score, then total score. On a full tie a release the files make up whole
+/// comes before one of whose discs they are only one, then the release ID.
+fn candidate_order(exact_id: Option<&ReleaseId>, a: &Candidate, b: &Candidate) -> Ordering {
+    (exact_id == Some(&b.release.id))
+        .cmp(&(exact_id == Some(&a.release.id)))
+        .then_with(|| b.score.album_score().total_cmp(&a.score.album_score()))
+        .then_with(|| b.score.total.total_cmp(&a.score.total))
+        .then_with(|| b.mapping.medium.is_none().cmp(&a.mapping.medium.is_none()))
+        .then_with(|| a.release.id.cmp(&b.release.id))
+}
+
 fn render_candidate(
     local: &LocalRelease,
     provider: ProviderKind,
@@ -1476,9 +1491,14 @@ fn render_candidate(
         })
         .collect();
     let _ = writeln!(text, "      score: {}", components.join("  "));
+    let disc = candidate
+        .mapping
+        .medium
+        .map(|medium| format!(" to {}", matcher::disc_label(release, medium)))
+        .unwrap_or_default();
     let _ = writeln!(
         text,
-        "      mapping: {}/{} files mapped",
+        "      mapping: {}/{} files mapped{disc}",
         candidate.mapping.assigned_count(),
         local.tracks.len()
     );
@@ -2269,6 +2289,39 @@ mod tests {
     }
 
     #[test]
+    fn a_candidate_for_one_disc_names_its_disc() {
+        let (mut local, mut remote) = album_fixture();
+        let whole = Candidate::new(&local, remote.clone());
+        let evaluation =
+            matcher::evaluate(&local, &whole, None, &matcher::DiscoveryEvidence::default());
+        let text = render_candidate(&local, ProviderKind::Discogs, 0, &whole, &evaluation, None);
+        assert!(
+            text.contains("      mapping: 12/12 files mapped\n"),
+            "{text}"
+        );
+
+        // The files are the second disc of a release of two six-track discs.
+        local.directory = "/music/album/CD2".into();
+        local.tracks.retain(|track| track.id > 6);
+        for track in &mut local.tracks {
+            track.track_number = track.track_number.map(|number| number - 6);
+        }
+        for (index, track) in remote.tracklist.iter_mut().enumerate() {
+            track.medium_position = Some(if index < 6 { 1 } else { 2 });
+            track.track_position = Some(index as u32 % 6 + 1);
+        }
+        let disc = Candidate::new(&local, remote);
+        assert_eq!(disc.mapping.medium, Some(2));
+        let evaluation =
+            matcher::evaluate(&local, &disc, None, &matcher::DiscoveryEvidence::default());
+        let text = render_candidate(&local, ProviderKind::Discogs, 0, &disc, &evaluation, None);
+        assert!(
+            text.contains("      mapping: 6/6 files mapped to disc 2 of 2\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn rendered_candidates_and_headers_escape_every_untrusted_field() {
         let (mut local, mut remote) = album_fixture();
         local.album_title = Some("title\x1b[2Jlocal".into());
@@ -2328,5 +2381,48 @@ mod tests {
             "{text:?}"
         );
         assert!(!text.contains('\u{202e}'), "{text:?}");
+    }
+
+    #[test]
+    fn a_full_tie_prefers_the_release_the_files_make_up_whole() {
+        use crate::matcher::{RemoteTrack, TrackEntryType};
+        let (mut local, whole_release) = album_fixture();
+        // The six files are the first of two six-track discs, and also all of
+        // a six-track release whose ID sorts after the two-disc release's.
+        let mut two_discs = whole_release.clone();
+        two_discs.id = ReleaseId::Discogs(7);
+        for (index, track) in two_discs.tracklist.iter_mut().enumerate() {
+            track.medium_position = Some(if index < 6 { 1 } else { 2 });
+            track.track_position = Some(index as u32 % 6 + 1);
+        }
+        local.directory = "/music/album/CD1".into();
+        let first_disc: Vec<RemoteTrack> = two_discs.tracklist[..6].to_vec();
+        local.tracks.truncate(6);
+        let mut whole = whole_release;
+        whole.id = ReleaseId::Discogs(9);
+        whole.tracklist = first_disc
+            .into_iter()
+            .map(|track| RemoteTrack {
+                entry_type: TrackEntryType::Track,
+                medium_position: None,
+                track_position: None,
+                ..track
+            })
+            .collect();
+
+        let disc = Candidate::new(&local, two_discs);
+        let whole = Candidate::new(&local, whole);
+        assert_eq!(disc.mapping.medium, Some(1));
+        assert_eq!(whole.mapping.medium, None);
+        let mut disc = disc;
+        disc.score = whole.score;
+
+        let mut candidates = [disc, whole];
+        candidates.sort_by(|a, b| candidate_order(None, a, b));
+        let order: Vec<ReleaseId> = candidates.iter().map(|c| c.release.id.clone()).collect();
+        assert_eq!(order, vec![ReleaseId::Discogs(9), ReleaseId::Discogs(7)]);
+        candidates.reverse();
+        candidates.sort_by(|a, b| candidate_order(None, a, b));
+        assert_eq!(candidates[0].release.id, ReleaseId::Discogs(9));
     }
 }

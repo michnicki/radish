@@ -437,11 +437,19 @@ fn render_releases(rows: &[store::LocalReleaseStatus]) -> Vec<String> {
         ));
         lines.push(format!("{indent}{tracks} · {status}"));
         if let (Some(provider), Some(id)) = (&row.provider, &row.remote_release_id) {
-            let remote_title = row
+            // The title, then the disc when the files are one disc of the release.
+            let mut detail: Vec<String> = row
                 .remote_title
                 .as_deref()
-                .map(|title| format!(" ({})", Clean(title)))
-                .unwrap_or_default();
+                .map(|title| Clean(title).to_string())
+                .into_iter()
+                .collect();
+            detail.extend(row.medium.map(|medium| format!("disc {medium}")));
+            let remote_title = if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", detail.join(", "))
+            };
             lines.push(format!(
                 "{indent}match:  {provider} {}{remote_title}",
                 Clean(id)
@@ -751,6 +759,7 @@ mod tests {
             remote_url: None,
             remote_title: None,
             match_scope: None,
+            medium: None,
             stale: false,
             queued_providers: Vec::new(),
         }
@@ -783,6 +792,25 @@ mod tests {
                 "",
                 "2 local releases.",
             ]
+        );
+    }
+
+    #[test]
+    fn a_disc_match_names_its_disc_on_the_match_line() {
+        let mut row = release(12);
+        row.status = store::STATUS_MATCHED.into();
+        row.provider = Some(ProviderKind::MusicBrainz);
+        row.remote_release_id = Some("76df3287-6cda-33eb-8e9a-044b5e15ffdd".into());
+        row.remote_title = Some("Sandinista!".into());
+        row.medium = Some(2);
+        assert_eq!(
+            render_releases(std::slice::from_ref(&row))[2],
+            "     match:  musicbrainz 76df3287-6cda-33eb-8e9a-044b5e15ffdd (Sandinista!, disc 2)"
+        );
+        row.remote_title = None;
+        assert_eq!(
+            render_releases(&[row])[2],
+            "     match:  musicbrainz 76df3287-6cda-33eb-8e9a-044b5e15ffdd (disc 2)"
         );
     }
 

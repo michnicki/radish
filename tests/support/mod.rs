@@ -209,6 +209,76 @@ pub fn musicbrainz_release_json(mbid: &str, titles: &[&str], durations: &[f64]) 
     )
 }
 
+/// A synthetic MusicBrainz release of two CDs, one document with two media.
+/// `titles[d]` and `durations[d]` describe medium `d + 1`; track IDs and
+/// recording IDs are unique across the whole release.
+pub fn musicbrainz_two_disc_release_json(
+    mbid: &str,
+    titles: [&[&str]; 2],
+    durations: [&[f64]; 2],
+) -> String {
+    let mut ordinal = 0usize;
+    let media: Vec<String> = titles
+        .iter()
+        .zip(durations.iter())
+        .enumerate()
+        .map(|(medium, (titles, durations))| {
+            let tracks: Vec<String> = titles
+                .iter()
+                .zip(durations.iter())
+                .enumerate()
+                .map(|(index, (title, duration))| {
+                    ordinal += 1;
+                    let track_id = format!("{ordinal:08}-aaaa-4aaa-8aaa-{ordinal:012}");
+                    let recording_id = format!("{ordinal:08}-bbbb-4bbb-8bbb-{ordinal:012}");
+                    let length = (duration * 1000.0) as u64;
+                    format!(
+                        r#"{{
+                            "id": "{track_id}",
+                            "number": "{}",
+                            "title": "{title}",
+                            "length": {length},
+                            "artist-credit": [{{"name": "Test Artist", "joinphrase": ""}}],
+                            "recording": {{"id": "{recording_id}", "title": "{title}", "length": {length}}}
+                        }}"#,
+                        index + 1
+                    )
+                })
+                .collect();
+            format!(
+                r#"{{"position": {}, "format": "CD", "track-count": {}, "tracks": [{}]}}"#,
+                medium + 1,
+                titles.len(),
+                tracks.join(",")
+            )
+        })
+        .collect();
+
+    format!(
+        r#"{{
+            "id": "{mbid}",
+            "title": "Blue",
+            "status": "Official",
+            "disambiguation": "",
+            "date": "2001-05-01",
+            "country": "US",
+            "barcode": "",
+            "artist-credit": [{{"name": "Test Artist", "joinphrase": ""}}],
+            "release-group": {{
+                "id": "4642ee19-7790-3c8d-ab5e-d133de942db6",
+                "title": "Blue",
+                "primary-type": "Album",
+                "secondary-types": [],
+                "first-release-date": "2001"
+            }},
+            "label-info": [{{"catalog-number": "CAT-1", "label": {{"name": "Label"}}}}],
+            "release-events": [{{"date": "2001-05-01", "area": {{"name": "United States"}}}}],
+            "media": [{}]
+        }}"#,
+        media.join(",")
+    )
+}
+
 /// Writes a WAV file carrying the tags the grouper and matcher read.
 pub fn write_tagged_wav(
     path: &Path,

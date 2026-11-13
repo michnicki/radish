@@ -288,7 +288,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(applied, 6);
+        assert_eq!(applied, 7);
     }
 
     /// A database migrated up to and including the album-matching migration.
@@ -603,6 +603,35 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(retired, 0);
+    }
+
+    #[tokio::test]
+    async fn existing_matches_read_no_medium_and_a_medium_must_be_positive() {
+        let pool = populated_discogs_pool().await;
+        for migration in [
+            include_str!("../migrations/20261111000000_musicbrainz_matching.sql"),
+            include_str!("../migrations/20261111000001_album_matching.sql"),
+            include_str!("../migrations/20261114000000_medium_matches.sql"),
+        ] {
+            sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+        }
+        let medium: Option<i64> = sqlx::query_scalar("SELECT medium_position FROM release_matches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(medium, None);
+
+        sqlx::query("UPDATE release_matches SET medium_position = 2")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for invalid in [0, -1] {
+            let error = sqlx::query("UPDATE release_matches SET medium_position = ?1")
+                .bind(invalid)
+                .execute(&pool)
+                .await;
+            assert!(error.is_err(), "medium_position {invalid} was accepted");
+        }
     }
 
     #[tokio::test]

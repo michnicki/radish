@@ -1528,6 +1528,9 @@ pub struct LocalReleaseStatus {
     pub remote_url: Option<String>,
     pub remote_title: Option<String>,
     pub match_scope: Option<String>,
+    /// The disc of the matched release that the files are, when they match one
+    /// disc of a multi-disc release rather than all of it.
+    pub medium: Option<i64>,
     pub stale: bool,
     pub queued_providers: Vec<ProviderKind>,
 }
@@ -1572,6 +1575,7 @@ struct StatusRow {
     remote_url: Option<String>,
     remote_title: Option<String>,
     match_scope: Option<String>,
+    medium: Option<i64>,
     stale: Option<i64>,
 }
 
@@ -1582,7 +1586,8 @@ pub async fn list_local_releases(
     let rows = sqlx::query_as::<_, StatusRow>(
         "SELECT lr.id, lr.directory_path, lr.album_title, lr.album_artist, lr.track_count,
                 lr.status, m.provider AS provider, m.remote_release_id AS remote_release_id,
-                m.release_url AS remote_url, m.title AS remote_title, m.stale AS stale, m.match_scope
+                m.release_url AS remote_url, m.title AS remote_title, m.stale AS stale, m.match_scope,
+                m.medium_position AS medium
          FROM local_releases lr
          LEFT JOIN release_matches m ON m.local_release_id = lr.id
          ORDER BY lr.directory_path, lr.album_title_norm",
@@ -1623,6 +1628,7 @@ pub async fn list_local_releases(
             remote_url: row.remote_url,
             remote_title: row.remote_title,
             match_scope: row.match_scope,
+            medium: row.medium,
             stale: row.stale.unwrap_or(0) != 0,
             queued_providers: queued_by_release.remove(&row.id).unwrap_or_default(),
         })
@@ -2003,6 +2009,21 @@ pub async fn accept_match(
         ));
     }
 
+    // The files are one disc of the release. Every track they map to must be on
+    // it; checked before the write lock is taken.
+    if let Some(medium) = candidate.mapping.medium {
+        for (_, remote_index) in candidate.mapping.assigned_pairs() {
+            if candidate
+                .release
+                .tracklist
+                .get(remote_index)
+                .is_none_or(|track| track.medium() != Some(medium))
+            {
+                bail!("refusing to accept a mapping with a track outside disc {medium}");
+            }
+        }
+    }
+
     let mut tx = begin_write(pool).await?;
 
     let current: Option<(String, Option<i64>)> = sqlx::query_as(
@@ -2064,6 +2085,7 @@ pub async fn accept_match(
     }
 
     let remote = &candidate.release;
+    let medium = candidate.mapping.medium;
     let edition = (match_scope == MatchScope::Edition).then_some(remote);
     let provider = remote.provider();
     let metadata = serde_json::to_value(remote)?;
@@ -2099,9 +2121,9 @@ pub async fn accept_match(
             local_release_id, provider, remote_release_id, remote_group_id, release_url, title,
             artist, year, country, label, catalog_number, format, barcode, score,
             algorithm_version, acceptance_method, source_revision, stale, snapshot_version,
-            metadata_json, match_scope
+            metadata_json, match_scope, medium_position
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 0, ?18, ?19, ?20)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 0, ?18, ?19, ?20, ?21)
          RETURNING id",
     )
     .bind(local_release_id)
@@ -2124,6 +2146,7 @@ pub async fn accept_match(
     .bind(SNAPSHOT_VERSION)
     .bind(&metadata_json)
     .bind(match_scope.as_str())
+    .bind(medium.map(i64::from))
     .fetch_one(&mut *tx)
     .await?;
 
@@ -2167,8 +2190,24 @@ pub async fn accept_match(
         .bind(non_empty(&remote_track.title))
         .bind(non_empty(&track_artist))
         .bind(remote_track.duration_secs)
-        .bind(edition_track.and_then(|track| track.medium_position.map(i64::from)))
-        .bind(edition_track.and_then(|track| track.track_position.map(i64::from)))
+        // A disc matched on its own keeps its disc number at album scope too: the
+        // folder said which disc it is. Its track number at edition scope comes
+        // from the disc's own position, which a Discogs release only spells in
+        // its position string.
+        .bind(
+            medium
+                .or_else(|| edition_track.and_then(|track| track.medium_position))
+                .map(i64::from),
+        )
+        .bind(
+            edition_track
+                .and_then(|track| {
+                    track.track_position.or_else(|| {
+                        medium.and_then(|_| track.position_key().map(|(_, position)| position))
+                    })
+                })
+                .map(i64::from),
+        )
         .bind(edition_track.and_then(|track| track.release_track_id.map(|id| id.to_string())))
         .bind(remote_track.recording_id.map(|id| id.to_string()))
         .execute(&mut *tx)
@@ -4690,5 +4729,243 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    /// A release of two media with two tracks each, `Song m-k`. A MusicBrainz
+    /// release carries explicit medium and track positions; a Discogs one only the
+    /// position strings `m-k`.
+    fn two_disc_release(id: ReleaseId) -> RemoteRelease {
+        let explicit = matches!(id, ReleaseId::MusicBrainz(_));
+        let mut release = if explicit {
+            musicbrainz_release()
+        } else {
+            remote_release()
+        };
+        release.id = id;
+        release.tracklist = (1..=2u32)
+            .flat_map(|medium| (1..=2u32).map(move |position| (medium, position)))
+            .map(|(medium, position)| RemoteTrack {
+                position: Some(format!("{medium}-{position}")),
+                title: format!("Song {medium}-{position}"),
+                artists: Vec::new(),
+                duration_secs: Some(180.0),
+                entry_type: TrackEntryType::Track,
+                medium_position: explicit.then_some(medium),
+                track_position: explicit.then_some(position),
+                release_track_id: None,
+                recording_id: None,
+                artist_credit: None,
+            })
+            .collect();
+        release
+    }
+
+    async fn insert_disc_folders(pool: &SqlitePool) -> Vec<LocalRelease> {
+        for disc in 1..=2 {
+            let root = format!("/music/Set-2CD/CD{disc}");
+            insert(
+                pool,
+                &root,
+                &[
+                    scanned(&format!("{root}/01.flac"), Some("Blue"), Some("Artist"), 1),
+                    scanned(&format!("{root}/02.flac"), Some("Blue"), Some("Artist"), 2),
+                ],
+            )
+            .await;
+        }
+        let mut releases = load_local_releases(pool, None).await.unwrap();
+        releases.sort_by(|a, b| a.directory.cmp(&b.directory));
+        releases
+    }
+
+    #[tokio::test]
+    async fn accepting_a_disc_records_its_medium_and_disc_numbers() {
+        let pool = test_pool().await;
+        let releases = insert_disc_folders(&pool).await;
+        let disc_two = &releases[1];
+        let mbid = ReleaseId::MusicBrainz(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"));
+        let candidate = Candidate::new(disc_two, two_disc_release(mbid));
+        assert_eq!(candidate.mapping.medium, Some(2));
+        assert!(candidate.mapping.complete, "{:?}", candidate.mapping.notes);
+
+        // A pair that lies outside the disc is refused.
+        let mut outside = candidate.clone();
+        outside.mapping.pairs[0] = Some(0);
+        let guard = load_match_guard(&pool, disc_two.id).await.unwrap();
+        let error = accept_match(
+            &pool,
+            disc_two,
+            &outside,
+            AcceptanceMethod::Automatic,
+            MatchScope::Album,
+            &guard,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("outside disc 2"), "{error:#}");
+
+        accept_match(
+            &pool,
+            disc_two,
+            &candidate,
+            AcceptanceMethod::Automatic,
+            MatchScope::Album,
+            &guard,
+        )
+        .await
+        .unwrap();
+
+        let medium: Option<i64> = sqlx::query_scalar("SELECT medium_position FROM release_matches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(medium, Some(2));
+        let rows: Vec<(i64, Option<i64>, Option<i64>)> = sqlx::query_as(
+            "SELECT remote_ordinal, medium_position, track_position FROM release_track_matches
+             ORDER BY remote_ordinal",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        // The ordinal stays the place in the whole release; the album scope keeps
+        // edition track positions absent but the folder said which disc this is.
+        assert_eq!(rows, vec![(3, Some(2), None), (4, Some(2), None)]);
+
+        let shown: Vec<(String, Option<i64>, Option<i64>)> = list_tracks(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.display_title(), row.disc_number, row.track_number))
+            .collect();
+        assert!(
+            shown.contains(&("Song 2-1".to_string(), Some(2), Some(1))),
+            "{shown:?}"
+        );
+        assert!(
+            shown.contains(&("Song 2-2".to_string(), Some(2), Some(2))),
+            "{shown:?}"
+        );
+        let status = list_local_releases(&pool, None).await.unwrap();
+        let status = status.iter().find(|row| row.id == disc_two.id).unwrap();
+        assert_eq!(status.medium, Some(2));
+
+        // At edition scope the disc's own positions are shown, for Discogs too.
+        let guard = load_match_guard(&pool, disc_two.id).await.unwrap();
+        let discogs = Candidate::new(disc_two, two_disc_release(ReleaseId::Discogs(42)));
+        assert_eq!(discogs.mapping.medium, Some(2));
+        accept_match(
+            &pool,
+            disc_two,
+            &discogs,
+            AcceptanceMethod::Manual,
+            MatchScope::Edition,
+            &guard,
+        )
+        .await
+        .unwrap();
+        let rows: Vec<(i64, Option<i64>, Option<i64>)> = sqlx::query_as(
+            "SELECT remote_ordinal, medium_position, track_position FROM release_track_matches
+             ORDER BY remote_ordinal",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, vec![(3, Some(2), Some(1)), (4, Some(2), Some(2))]);
+        let shown: Vec<(String, Option<i64>, Option<i64>)> = list_tracks(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.display_title(), row.disc_number, row.track_number))
+            .collect();
+        assert!(
+            shown.contains(&("Song 2-1".to_string(), Some(2), Some(1))),
+            "{shown:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_whole_release_match_has_no_medium() {
+        let pool = test_pool().await;
+        insert(
+            &pool,
+            "/music/a",
+            &[scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1)],
+        )
+        .await;
+        let release = load_local_releases(&pool, None).await.unwrap().remove(0);
+        let candidate = Candidate::new(&release, remote_release());
+        let guard = load_match_guard(&pool, release.id).await.unwrap();
+        accept_match(
+            &pool,
+            &release,
+            &candidate,
+            AcceptanceMethod::Manual,
+            MatchScope::Edition,
+            &guard,
+        )
+        .await
+        .unwrap();
+        let medium: Option<i64> = sqlx::query_scalar("SELECT medium_position FROM release_matches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(medium, None);
+        let status = list_local_releases(&pool, None).await.unwrap();
+        assert_eq!(status[0].medium, None);
+    }
+
+    #[tokio::test]
+    async fn sibling_discs_can_accept_the_same_remote_release() {
+        let pool = test_pool().await;
+        let releases = insert_disc_folders(&pool).await;
+        let id = ReleaseId::MusicBrainz(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"));
+        for release in &releases {
+            let candidate = Candidate::new(release, two_disc_release(id.clone()));
+            let guard = load_match_guard(&pool, release.id).await.unwrap();
+            accept_match(
+                &pool,
+                release,
+                &candidate,
+                AcceptanceMethod::Automatic,
+                MatchScope::Album,
+                &guard,
+            )
+            .await
+            .unwrap();
+        }
+        let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT remote_release_id, medium_position FROM release_matches
+             ORDER BY medium_position",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let remote = id.storage_id();
+        assert_eq!(
+            rows,
+            vec![(remote.clone(), Some(1)), (remote.clone(), Some(2))]
+        );
+        let tracks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_track_matches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(tracks, 4);
+
+        // Clearing one disc leaves the other matched.
+        assert!(clear_match(&pool, releases[0].id).await.unwrap());
+        let rows: Vec<(i64, Option<i64>)> =
+            sqlx::query_as("SELECT local_release_id, medium_position FROM release_matches")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, vec![(releases[1].id, Some(2))]);
+        let tracks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_track_matches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(tracks, 2);
+        let statuses = status_by_id(&pool).await.unwrap();
+        assert_eq!(statuses[&releases[0].id], STATUS_UNMATCHED);
+        assert_eq!(statuses[&releases[1].id], STATUS_MATCHED);
     }
 }

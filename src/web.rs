@@ -496,12 +496,20 @@ fn render_match(row: &store::LocalReleaseStatus) -> String {
         ),
         None => id,
     };
-    let title = row
+    // The title, then the disc when the files are one disc of the release.
+    let mut detail: Vec<String> = row
         .remote_title
         .as_deref()
-        .map(|title| format!(" ({})", escape_html(title)))
-        .unwrap_or_default();
-    format!("{provider} {id}{title}")
+        .map(escape_html)
+        .into_iter()
+        .collect();
+    detail.extend(row.medium.map(|medium| format!("disc {medium}")));
+    let detail = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", detail.join(", "))
+    };
+    format!("{provider} {id}{detail}")
 }
 
 /// Whether `url` starts with an `http` or `https` scheme.
@@ -683,6 +691,7 @@ mod tests {
             remote_url: Some("javascript:alert(1)".into()),
             remote_title: Some("<i>Blue</i>".into()),
             match_scope: None,
+            medium: None,
             stale: false,
             queued_providers: Vec::new(),
         }
@@ -706,6 +715,21 @@ mod tests {
         );
 
         assert!(render_releases(&[], 1, false).contains("No local releases found."));
+    }
+
+    #[test]
+    fn a_disc_match_shows_its_disc() {
+        let mut row = release(12);
+        row.medium = Some(2);
+        let html = render_match(&row);
+        assert!(
+            html.ends_with("(&lt;i&gt;Blue&lt;/i&gt;, disc 2)"),
+            "{html}"
+        );
+        row.remote_title = None;
+        assert!(render_match(&row).ends_with("(disc 2)"));
+        row.medium = None;
+        assert!(!render_match(&row).contains("disc"));
     }
 
     #[test]
