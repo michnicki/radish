@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v12";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v11";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v13";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v12";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -28,6 +28,15 @@ pub const NEAR_MISS_TITLE_FLOOR: f64 = 0.75;
 /// when it does.
 pub const LONE_TRACK_DURATION_GAP_SECS: f64 = 1.5;
 pub const LONE_TRACK_MIN_ALBUM_TRACKS: usize = 5;
+
+/// How far a few tracks may drift from the provider's durations, as a different
+/// master or a trailing silence does, while the album still agrees as a whole:
+/// at most this many tracks, each within this many seconds, and the summed
+/// length within this fraction. Needs at least this many tracks in the album.
+pub const SOFT_DURATION_MAX_TRACKS: usize = 2;
+pub const SOFT_DURATION_MAX_SECS: f64 = 10.0;
+pub const SOFT_DURATION_TOTAL_RATIO: f64 = 0.02;
+pub const SOFT_DURATION_MIN_ALBUM_TRACKS: usize = 4;
 
 /// A primary candidate this close to the fallback is plausible evidence that
 /// both services describe the same edition, so discrepancies matter.
@@ -2225,6 +2234,8 @@ fn evaluate_at_scope(
     let mut titles_below_minimum = 0usize;
     let mut worst_duration: Option<f64> = None;
     let mut worst_duration_track = String::new();
+    let mut tracks_over_tolerance = 0usize;
+    let (mut local_total, mut remote_total) = (0.0f64, 0.0f64);
 
     for (local_index, remote_index) in candidate.mapping.assigned_pairs() {
         let Some(local_track) = local.tracks.get(local_index) else {
@@ -2287,6 +2298,13 @@ fn evaluate_at_scope(
 
         if let (Some(a), Some(b)) = (local_track.duration_secs, remote_track.duration_secs) {
             let difference = (a - b).abs();
+            if difference > DURATION_TOLERANCE_SECS {
+                tracks_over_tolerance += 1;
+            }
+            if a.is_finite() && b.is_finite() {
+                local_total += a;
+                remote_total += b;
+            }
             if worst_duration.is_none_or(|worst| difference > worst) {
                 worst_duration = Some(difference);
                 worst_duration_track = remote_track.title.clone();
@@ -2325,9 +2343,25 @@ fn evaluate_at_scope(
     if let Some(difference) = worst_duration
         && difference > DURATION_TOLERANCE_SECS
     {
-        blockers.push(format!(
-            "track '{worst_duration_track}' differs by {difference:.1}s from the {provider} duration"
-        ));
+        // A different master or a trailing silence moves a track or two by a few
+        // seconds without changing the album, which shows in the summed length.
+        // Only for an album-level match, never for an exact edition.
+        let drifted_album = policy == AcceptancePolicy::Measured
+            && match_scope == MatchScope::Album
+            && local.tracks.len() >= SOFT_DURATION_MIN_ALBUM_TRACKS
+            && tracks_over_tolerance <= SOFT_DURATION_MAX_TRACKS
+            && difference <= SOFT_DURATION_MAX_SECS
+            && remote_total > 0.0
+            && (local_total - remote_total).abs() / remote_total <= SOFT_DURATION_TOTAL_RATIO;
+        if drifted_album {
+            warnings.push(format!(
+                "track '{worst_duration_track}' differs by {difference:.1}s from the {provider} duration but the album length agrees"
+            ));
+        } else {
+            blockers.push(format!(
+                "track '{worst_duration_track}' differs by {difference:.1}s from the {provider} duration"
+            ));
+        }
     }
 
     // Embedded identifier contradictions. Provider IDs are only ever compared
@@ -3719,11 +3753,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v12"
+            "discogs-match-v13"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v11"
+            "musicbrainz-match-v12"
         );
     }
 
@@ -3918,6 +3952,52 @@ mod tests {
             !evaluate_for_matching(&short, &candidate, &[], &DiscoveryEvidence::default())
                 .auto_accept
         );
+    }
+
+    #[test]
+    fn a_few_drifting_durations_pass_only_while_the_album_length_agrees() {
+        let titles = [
+            "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten",
+            "Eleven", "Twelve",
+        ];
+        let remote = remote_release(&titles);
+        let accepts = |local: &LocalRelease, remote: &RemoteRelease| {
+            let candidate = Candidate::new(local, remote.clone());
+            evaluate_for_matching(local, &candidate, &[], &DiscoveryEvidence::default()).auto_accept
+        };
+
+        // One track six seconds long.
+        let mut local = local_release(&titles);
+        local.tracks[3].duration_secs = Some(local.tracks[3].duration_secs.unwrap() + 6.0);
+        assert!(accepts(&local, &remote));
+
+        // Two tracks: still within the allowance.
+        local.tracks[7].duration_secs = Some(local.tracks[7].duration_secs.unwrap() - 8.0);
+        assert!(accepts(&local, &remote));
+
+        // Three is a different pressing, not drift.
+        let mut three = local.clone();
+        three.tracks[9].duration_secs = Some(three.tracks[9].duration_secs.unwrap() + 5.0);
+        assert!(!accepts(&three, &remote));
+
+        // A track more than ten seconds off is not drift.
+        let mut far = local_release(&titles);
+        far.tracks[3].duration_secs = Some(far.tracks[3].duration_secs.unwrap() + 11.0);
+        assert!(!accepts(&far, &remote));
+
+        // On a short album the same drift is too much of the whole.
+        let short_titles = ["One", "Two", "Three", "Four"];
+        let short_remote = remote_release(&short_titles);
+        let mut short = local_release(&short_titles);
+        short.tracks[0].duration_secs = Some(short.tracks[0].duration_secs.unwrap() + 9.0);
+        short.tracks[1].duration_secs = Some(short.tracks[1].duration_secs.unwrap() + 9.0);
+        assert!(!accepts(&short, &short_remote));
+
+        // Too few tracks to judge the album by its length.
+        let tiny_titles = ["One", "Two", "Three"];
+        let mut tiny = local_release(&tiny_titles);
+        tiny.tracks[0].duration_secs = Some(tiny.tracks[0].duration_secs.unwrap() + 5.0);
+        assert!(!accepts(&tiny, &remote_release(&tiny_titles)));
     }
 
     #[test]
