@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v20";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v19";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v21";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v20";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -1631,6 +1631,27 @@ fn remote_edition_qualifiers(remote: &RemoteRelease) -> BTreeSet<&'static str> {
     qualifiers
 }
 
+/// The default channel layout, which does not distinguish an edition.
+const STEREO: &str = "stereo";
+
+/// True when two qualifier sets describe the same edition.
+///
+/// `stereo` is the default, so it is ignored in a set that does not also say
+/// `mono`. A set with both (`Mono` and `Stereo` formats, or a disambiguation
+/// like `mono & stereo`) names a distinct edition and keeps `stereo`, so it
+/// agrees only with an identical set. `mono` on one side only is therefore a
+/// contradiction. `edition_qualifiers` still reports `stereo`, which keeps it
+/// in messages.
+fn qualifiers_agree(a: &BTreeSet<&'static str>, b: &BTreeSet<&'static str>) -> bool {
+    fn significant<'a>(set: &'a BTreeSet<&'static str>) -> impl Iterator<Item = &'static str> + 'a {
+        let keep_stereo = set.contains("mono");
+        set.iter()
+            .copied()
+            .filter(move |qualifier| *qualifier != STEREO || keep_stereo)
+    }
+    significant(a).eq(significant(b))
+}
+
 // ---------------------------------------------------------------------------
 // Track mapping
 // ---------------------------------------------------------------------------
@@ -2693,7 +2714,10 @@ fn equivalent_audio(a: &Candidate, b: &Candidate) -> bool {
     if normalize_text(&a.release.title) != normalize_text(&b.release.title)
         || normalize_artist_for(a.release.provider(), &a.release.artist_display())
             != normalize_artist_for(b.release.provider(), &b.release.artist_display())
-        || remote_edition_qualifiers(&a.release) != remote_edition_qualifiers(&b.release)
+        || !qualifiers_agree(
+            &remote_edition_qualifiers(&a.release),
+            &remote_edition_qualifiers(&b.release),
+        )
         || a.mapping.pairs.len() != b.mapping.pairs.len()
     {
         return false;
@@ -2868,9 +2892,10 @@ fn evaluate_at_scope(
                         .to_string(),
                 );
             }
-            if album_track_qualifiers(local_track.title.as_deref().unwrap_or_default())
-                != album_track_qualifiers(&remote_track.title)
-            {
+            if !qualifiers_agree(
+                &album_track_qualifiers(local_track.title.as_deref().unwrap_or_default()),
+                &album_track_qualifiers(&remote_track.title),
+            ) {
                 blockers.push(format!(
                     "track version qualifiers differ for '{}'",
                     remote_track.title
@@ -3071,7 +3096,7 @@ fn evaluate_at_scope(
     if let Some(local_title) = &local.album_title {
         let local_qualifiers = edition_qualifiers(local_title);
         let remote_qualifiers = remote_edition_qualifiers(remote);
-        if local_qualifiers != remote_qualifiers {
+        if !qualifiers_agree(&local_qualifiers, &remote_qualifiers) {
             blockers.push(format!(
                 "edition qualifiers differ: local {:?} versus {provider} {:?}",
                 local_qualifiers, remote_qualifiers
@@ -3188,7 +3213,7 @@ pub fn fallback_conflicts(
             continue;
         }
         let primary_qualifiers = remote_edition_qualifiers(&primary.release);
-        if primary_qualifiers != fallback_qualifiers {
+        if !qualifiers_agree(&primary_qualifiers, &fallback_qualifiers) {
             conflicts.push(format!(
                 "primary candidates describe {:?} but the fallback describes {:?}",
                 primary_qualifiers, fallback_qualifiers
@@ -4583,6 +4608,200 @@ mod tests {
     }
 
     #[test]
+    fn stereo_is_ignored_unless_the_same_set_says_mono() {
+        let set = |words: &[&'static str]| words.iter().copied().collect::<BTreeSet<_>>();
+        for (a, b) in [
+            (set(&[]), set(&["stereo"])),
+            (set(&["live"]), set(&["live", "stereo"])),
+            (set(&["stereo"]), set(&["stereo"])),
+            (set(&["mono", "stereo"]), set(&["mono", "stereo"])),
+        ] {
+            assert!(qualifiers_agree(&a, &b), "{a:?} versus {b:?}");
+            assert!(qualifiers_agree(&b, &a), "{b:?} versus {a:?}");
+        }
+        for (a, b) in [
+            (set(&["mono"]), set(&["stereo"])),
+            (set(&[]), set(&["mono"])),
+            (set(&[]), set(&["remastered", "stereo"])),
+            (set(&["live"]), set(&["stereo"])),
+            (set(&["mono"]), set(&["mono", "stereo"])),
+            (set(&[]), set(&["mono", "stereo"])),
+            (set(&["stereo"]), set(&["mono", "stereo"])),
+        ] {
+            assert!(!qualifiers_agree(&a, &b), "{a:?} versus {b:?}");
+            assert!(!qualifiers_agree(&b, &a), "{b:?} versus {a:?}");
+        }
+    }
+
+    #[test]
+    fn a_stereo_format_does_not_block_a_silent_local_title() {
+        let local = local_release(&["One", "Two"]);
+        let mut remote = remote_release(&["One", "Two"]);
+        remote.formats = vec!["Vinyl (LP, Album, Stereo)".to_string()];
+        assert!(remote_edition_qualifiers(&remote).contains("stereo"));
+        let candidate = Candidate::new(&local, remote);
+        let evaluation =
+            evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default());
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert!(
+            !evaluation
+                .blockers
+                .iter()
+                .any(|reason| reason.contains("edition qualifiers")),
+            "{:?}",
+            evaluation.blockers
+        );
+    }
+
+    #[test]
+    fn a_live_title_still_agrees_with_live_and_stereo() {
+        let mut local = local_release(&["One", "Two"]);
+        local.album_title = Some("Test Album (Live)".to_string());
+        let mut remote = remote_release(&["One", "Two"]);
+        remote.title = "Test Album (Live)".to_string();
+        remote.formats = vec!["Vinyl (LP, Album, Stereo)".to_string()];
+        let candidate = Candidate::new(&local, remote);
+        let evaluation = evaluate(&local, &candidate, None, &DiscoveryEvidence::default());
+        assert!(
+            !evaluation
+                .blockers
+                .iter()
+                .any(|reason| reason.contains("edition qualifiers")),
+            "{:?}",
+            evaluation.blockers
+        );
+    }
+
+    #[test]
+    fn mono_still_blocks_against_stereo_or_silence() {
+        for (local_title, formats, problem) in [
+            (
+                "Test Album (Mono)",
+                &["Vinyl (LP, Album, Stereo)"][..],
+                "local mono",
+            ),
+            ("Test Album", &["Vinyl (LP, Album, Mono)"], "remote mono"),
+            (
+                "Test Album (Stereo)",
+                &["Vinyl (LP, Album, Mono)"],
+                "local stereo, remote mono",
+            ),
+            (
+                "Test Album (Mono)",
+                &["Vinyl (LP, Album, Mono)", "Vinyl (LP, Album, Stereo)"],
+                "local mono, remote mono and stereo",
+            ),
+        ] {
+            let mut local = local_release(&["One", "Two"]);
+            local.album_title = Some(local_title.to_string());
+            let mut remote = remote_release(&["One", "Two"]);
+            remote.formats = formats.iter().map(|format| (*format).to_string()).collect();
+            let candidate = Candidate::new(&local, remote);
+            let evaluation = evaluate(&local, &candidate, None, &DiscoveryEvidence::default());
+            assert!(!evaluation.auto_accept, "accepted {problem}");
+            assert!(
+                evaluation
+                    .blockers
+                    .iter()
+                    .any(|reason| reason.contains("edition qualifiers differ")),
+                "{problem}: {:?}",
+                evaluation.blockers
+            );
+        }
+    }
+
+    #[test]
+    fn a_remastered_stereo_format_still_blocks_a_silent_title() {
+        let local = local_release(&["One", "Two"]);
+        let mut remote = remote_release(&["One", "Two"]);
+        remote.formats = vec!["Vinyl (LP, Album, Remastered, Stereo)".to_string()];
+        let candidate = Candidate::new(&local, remote);
+        let evaluation = evaluate(&local, &candidate, None, &DiscoveryEvidence::default());
+        assert!(!evaluation.auto_accept);
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|reason| reason.contains("edition qualifiers differ")),
+            "{:?}",
+            evaluation.blockers
+        );
+    }
+
+    #[test]
+    fn track_stereo_qualifier_is_ignored_but_mono_is_not() {
+        let blocked = |remote_title: &str| {
+            let local = local_release(&["Song", "Other"]);
+            let remote = remote_release(&[remote_title, "Other"]);
+            let candidate = Candidate::new(&local, remote);
+            evaluate_at_scope(
+                &local,
+                &candidate,
+                None,
+                &DiscoveryEvidence::default(),
+                MatchScope::Album,
+            )
+            .blockers
+            .iter()
+            .any(|reason| reason.contains("track version qualifiers"))
+        };
+        assert!(!blocked("Song (Stereo)"));
+        assert!(blocked("Song (Mono)"));
+    }
+
+    #[test]
+    fn an_alternative_that_differs_only_by_stereo_is_equivalent_audio() {
+        let local = local_release(&["One", "Two"]);
+        let first = Candidate::new(&local, remote_release(&["One", "Two"]));
+        let mut stereo = remote_release(&["One", "Two"]);
+        stereo.id = ReleaseId::Discogs(43);
+        stereo.formats = vec!["Vinyl (LP, Album, Stereo)".to_string()];
+        let stereo = Candidate::new(&local, stereo);
+        assert!(equivalent_audio(&first, &stereo));
+
+        let mut mono = remote_release(&["One", "Two"]);
+        mono.id = ReleaseId::Discogs(44);
+        mono.formats = vec!["Vinyl (LP, Album, Mono)".to_string()];
+        let mono = Candidate::new(&local, mono);
+        assert!(!equivalent_audio(&first, &mono));
+        assert!(!equivalent_audio(&stereo, &mono));
+
+        let mut both = remote_release(&["One", "Two"]);
+        both.id = ReleaseId::Discogs(45);
+        both.formats = vec![
+            "Vinyl (LP, Album, Mono)".to_string(),
+            "CD (Album, Stereo)".to_string(),
+        ];
+        let both = Candidate::new(&local, both);
+        assert!(!equivalent_audio(&mono, &both));
+    }
+
+    #[test]
+    fn fallback_conflicts_ignore_stereo_but_not_mono() {
+        let local = local_release(&["One", "Two"]);
+        let with_format = |format: &str| {
+            let mut release = remote_release(&["One", "Two"]);
+            release.formats = vec![format.to_string()];
+            Candidate::new(&local, release)
+        };
+        let silent = with_format("CD");
+        let stereo = with_format("Vinyl (LP, Album, Stereo)");
+        let mono = with_format("Vinyl (LP, Album, Mono)");
+        assert!(silent.score.total >= PLAUSIBLE_PRIMARY_SCORE);
+
+        let conflicts = fallback_conflicts(&local, &[silent], &stereo, true);
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+
+        let conflicts = fallback_conflicts(&local, &[mono], &stereo, true);
+        assert!(
+            conflicts
+                .iter()
+                .any(|conflict| conflict.contains("primary candidates describe")),
+            "{conflicts:?}"
+        );
+    }
+
+    #[test]
     fn compilation_artist_matches_various_artists() {
         let mut local = local_release(&["One", "Two"]);
         local.album_artist = Some("Various Artists".to_string());
@@ -4775,11 +4994,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v20"
+            "discogs-match-v21"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v19"
+            "musicbrainz-match-v20"
         );
     }
 
