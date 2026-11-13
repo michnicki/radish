@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v24";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v23";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v25";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v24";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -1366,6 +1366,140 @@ fn reduce_album_title(text: &str) -> Option<String> {
     reduce_album_title_with(text, false)
 }
 
+/// Score of a placeholder title against a remote title that is itself a
+/// placeholder (`S/T`, `Self-Titled`) or names the artist: the same reading as
+/// the placeholder, at a small cost.
+const SELF_TITLED_REMOTE_SCORE: f64 = 0.97;
+
+/// Score of a placeholder title against a remote title of `Untitled`. It sits
+/// under the `0.90` title gate, so it can pass only through the weak album
+/// title rule, which needs every track and length to agree.
+const SELF_TITLED_UNTITLED_SCORE: f64 = 0.80;
+
+/// Whether an album tag is a placeholder for "named after the artist":
+/// `Self Titled`, `Self-Titled`, `S/T`, `ST`, `Same` or `Eponymous`, with or
+/// without trailing release-type and format words (`Self Titled EP`,
+/// `S/T 7inch`, `Same-7 Inch Vinyl`). `Self Titled Demo` is not one, since
+/// `demo` says which release it is.
+pub fn is_self_titled(title: &str) -> bool {
+    let normalized = normalize_text(title);
+    // Dropping trailing words keeps the start of the title; a leading `The` or
+    // marker dropped as well would make `The Same` a placeholder.
+    let reduced = reduce_album_title(title)
+        .map(|reduced| normalize_text(&reduced))
+        .filter(|reduced| normalized.starts_with(reduced.as_str()));
+    let compact: String = reduced
+        .as_deref()
+        .unwrap_or(&normalized)
+        .chars()
+        .filter(|ch| *ch != ' ')
+        .collect();
+    matches!(compact.as_str(), "selftitled" | "st" | "same" | "eponymous")
+}
+
+/// Whether an album tag is a writer's filler (`Unknown Title`, `Unknown Album`,
+/// `.`) rather than a title. `Untitled` is not: many releases are called that.
+pub fn is_junk_title(title: &str) -> bool {
+    title.trim() == "."
+        || matches!(
+            normalize_text(title).as_str(),
+            "unknown title" | "unknown album"
+        )
+}
+
+/// Whether an artist tag is a writer's filler (`Unknown Artist`).
+pub fn is_junk_artist(artist: &str) -> bool {
+    normalize_text(artist) == "unknown artist"
+}
+
+/// What a local release's album and artist tags say, with filler left out and
+/// a self-titled placeholder read as the artist's name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TagIdentity {
+    /// `None` when the artist is missing, junk or Various Artists.
+    pub artist: Option<String>,
+    /// `None` when the title is missing or junk. A self-titled placeholder reads
+    /// as the artist's name, or stays as written when there is no artist to name.
+    pub title: Option<String>,
+}
+
+pub(crate) fn tag_identity(local: &LocalRelease) -> TagIdentity {
+    let artist = local
+        .album_artist
+        .as_deref()
+        .map(str::trim)
+        .filter(|artist| {
+            !artist.is_empty()
+                && !is_junk_artist(artist)
+                && !matches!(local.artist_kind, ArtistKind::VariousArtists)
+                && !matches!(
+                    normalize_text(artist).as_str(),
+                    "various" | "various artists"
+                )
+        })
+        .map(str::to_string);
+    let title = local
+        .album_title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty() && !is_junk_title(title))
+        .map(|title| match &artist {
+            Some(artist) if is_self_titled(title) => artist.clone(),
+            _ => title.to_string(),
+        });
+    TagIdentity { artist, title }
+}
+
+/// The album title to search with: the tag, or the artist's name for a
+/// self-titled placeholder. A junk title is searched as written, since the
+/// search may still turn up the artist's releases.
+pub(crate) fn search_title(local: &LocalRelease) -> Option<String> {
+    tag_identity(local).title.or_else(|| {
+        local
+            .album_title
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+            .map(str::to_string)
+    })
+}
+
+/// Album-title score of a self-titled placeholder against a remote release,
+/// beyond the placeholder compared as written: the artist's name as the title
+/// (at the release-type cost), a remote title that names one of its credited
+/// artists or is a placeholder itself, and `Untitled`.
+fn self_titled_score(local: &LocalRelease, remote: &RemoteRelease) -> f64 {
+    let remote_title = normalize_text(&remote.title);
+    if is_self_titled(&remote.title) {
+        return SELF_TITLED_REMOTE_SCORE;
+    }
+    let mut best = if remote_title == "untitled" {
+        SELF_TITLED_UNTITLED_SCORE
+    } else {
+        0.0
+    };
+    if let Some(artist) = tag_identity(local).artist {
+        best = best
+            .max((album_title_similarity(&artist, &remote.title) - ALBUM_TYPE_PENALTY).max(0.0));
+        // The credit the title names must be the local artist: `Self Titled` by
+        // `Band B` is not `Band A`, however many artists that release credits.
+        let provider = remote.provider();
+        if !remote_title.is_empty()
+            && remote.artists.iter().any(|name| {
+                normalize_artist_for(provider, name) == remote_title
+                    && local_artist_similarity(
+                        &artist,
+                        &match provider {
+                            ProviderKind::Discogs => strip_disambiguator(name),
+                            ProviderKind::MusicBrainz => name.clone(),
+                        },
+                    ) >= TITLE_SIMILARITY_THRESHOLD
+            })
+        {
+            best = best.max(SELF_TITLED_REMOTE_SCORE);
+        }
+    }
+    best
+}
+
 /// The reduced readings of an album title: the one that drops the most, and
 /// the one that keeps the companion words in front of the other decoration
 /// when that differs. Empty when the title is not reduced.
@@ -2571,8 +2705,15 @@ impl ScoreBreakdown {
 /// nothing is renormalized into false confidence.
 pub fn score(local: &LocalRelease, remote: &RemoteRelease, mapping: &Mapping) -> ScoreBreakdown {
     let album_title = match &local.album_title {
+        // Filler is not a title, so it is no evidence for or against an album.
+        Some(title) if is_junk_title(title) => 0.0,
         Some(title) if !title.trim().is_empty() => {
             let mut value = album_title_similarity(title, &remote.title);
+            // A placeholder reads as the artist's name too; the better reading
+            // counts, so a real album called `Same` still matches itself.
+            if is_self_titled(title) {
+                value = value.max(self_titled_score(local, remote));
+            }
             // A disc marker on the title of the matched disc is not part of the
             // album's name. Nothing else is dropped: the album part is short on
             // purpose, so it is never read as a cut-off tag.
@@ -2660,7 +2801,7 @@ fn album_artist_score(local: &LocalRelease, remote: &RemoteRelease) -> f64 {
     let Some(artist) = &local.album_artist else {
         return 0.0;
     };
-    if remote.artists.is_empty() {
+    if remote.artists.is_empty() || is_junk_artist(artist) {
         return 0.0;
     }
 
@@ -2737,14 +2878,73 @@ fn album_artist_score(local: &LocalRelease, remote: &RemoteRelease) -> f64 {
 // Candidate ranking and acceptance
 // ---------------------------------------------------------------------------
 
+/// What a local release is ranked as: every album title it may go by, and its
+/// artist. Built once per release by [`rank_identity`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RankIdentity {
+    /// A self-titled placeholder is two readings, the artist's name and the tag
+    /// as written, since a provider may list the album under either. Junk and
+    /// missing titles have none.
+    titles: Vec<String>,
+    artist: Option<String>,
+}
+
+pub(crate) fn rank_identity(local: &LocalRelease) -> RankIdentity {
+    let identity = tag_identity(local);
+    let mut titles: Vec<String> = identity.title.into_iter().collect();
+    if let Some(tag) = local.album_title.as_deref()
+        && !is_junk_title(tag)
+        && !tag.trim().is_empty()
+        && !titles.iter().any(|title| title == tag)
+    {
+        titles.push(tag.to_string());
+    }
+    // Not `identity.artist`: a Various Artists release still ranks on its
+    // credit, which providers list as `Various Artists`. Only junk is no hint.
+    let artist = local
+        .album_artist
+        .as_deref()
+        .filter(|artist| !is_junk_artist(artist))
+        .map(str::to_string);
+    RankIdentity { titles, artist }
+}
+
+impl RankIdentity {
+    /// The best [`rank_search_summary_with`] over the title readings.
+    pub(crate) fn rank(&self, local: &LocalRelease, summary: &SearchSummary) -> f64 {
+        let artist = self.artist.as_deref();
+        if self.titles.is_empty() {
+            return rank_search_summary_with(local, None, artist, summary);
+        }
+        self.titles
+            .iter()
+            .map(|title| rank_search_summary_with(local, Some(title), artist, summary))
+            .fold(0.0, f64::max)
+    }
+}
+
 /// Ranks a search summary before spending a detailed release fetch on it.
+///
+/// A self-titled placeholder ranks as the better of the artist's name and the
+/// tag as written, and junk tags rank as nothing (see [`tag_identity`]).
 pub fn rank_search_summary(local: &LocalRelease, summary: &SearchSummary) -> f64 {
+    rank_identity(local).rank(local, summary)
+}
+
+/// [`rank_search_summary`] for the given album title and artist, which may
+/// differ from the tags.
+pub(crate) fn rank_search_summary_with(
+    local: &LocalRelease,
+    title: Option<&str>,
+    artist: Option<&str>,
+    summary: &SearchSummary,
+) -> f64 {
     let mut rank = 0.0;
 
-    if let Some(title) = &local.album_title {
+    if let Some(title) = title {
         rank += 0.5 * album_title_similarity(title, &summary.title);
     }
-    if let Some(artist) = &local.album_artist {
+    if let Some(artist) = artist {
         rank += 0.3 * summary_artist_hint(artist, summary);
     }
     if let (Some(year), Some(remote_year)) = (local.year, summary.year)
@@ -5753,11 +5953,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v24"
+            "discogs-match-v25"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v23"
+            "musicbrainz-match-v24"
         );
     }
 
@@ -8672,5 +8872,256 @@ mod tests {
             "{:?}",
             mapping.notes
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Self-titled placeholders and junk tags
+    // -----------------------------------------------------------------------
+
+    const SELF_TITLED_TRACKS: [&str; 6] = ["One", "Two", "Three", "Four", "Five", "Six"];
+
+    fn self_titled_pair(artist: &str, remote_title: &str) -> (LocalRelease, RemoteRelease) {
+        let mut local = local_release(&SELF_TITLED_TRACKS);
+        local.album_title = Some("Self Titled".to_string());
+        local.album_artist = Some(artist.to_string());
+        let mut remote = remote_release(&SELF_TITLED_TRACKS);
+        remote.title = remote_title.to_string();
+        remote.artists = vec![artist.to_string()];
+        (local, remote)
+    }
+
+    fn album_title_score(local: &LocalRelease, remote: &RemoteRelease) -> f64 {
+        Candidate::new(local, remote.clone()).score.album_title
+    }
+
+    #[test]
+    fn recognizes_self_titled_placeholders() {
+        for title in [
+            "Self Titled",
+            "Self-Titled",
+            "self titled",
+            "S/T",
+            "s/t",
+            "ST",
+            "st",
+            "Same",
+            "Eponymous",
+            "Self Titled EP",
+            "S/T 7inch",
+            "Same-7 Inch Vinyl",
+        ] {
+            assert!(is_self_titled(title), "{title}");
+        }
+        for title in [
+            "Self Titled Demo",
+            "Untitled",
+            "Stage",
+            "Stay",
+            "Samey",
+            "The Same Old Story",
+            "",
+        ] {
+            assert!(!is_self_titled(title), "{title}");
+        }
+    }
+
+    #[test]
+    fn recognizes_junk_titles_and_artists() {
+        for title in ["Unknown Title", "unknown album", " . ", "."] {
+            assert!(is_junk_title(title), "{title}");
+        }
+        for title in ["Untitled", "Unknown Pleasures", "Self Titled", ""] {
+            assert!(!is_junk_title(title), "{title}");
+        }
+        assert!(is_junk_artist("Unknown Artist"));
+        assert!(is_junk_artist("  unknown artist "));
+        assert!(!is_junk_artist("Unknown Mortal Orchestra"));
+    }
+
+    #[test]
+    fn the_tag_identity_names_the_artist_for_a_placeholder() {
+        let (mut local, _) = self_titled_pair("Goldfinger", "Goldfinger");
+        let identity = tag_identity(&local);
+        assert_eq!(identity.artist.as_deref(), Some("Goldfinger"));
+        assert_eq!(identity.title.as_deref(), Some("Goldfinger"));
+
+        // A real title stays, a junk or missing one is no title.
+        local.album_title = Some("Hello".to_string());
+        assert_eq!(tag_identity(&local).title.as_deref(), Some("Hello"));
+        local.album_title = Some("Unknown Title".to_string());
+        assert_eq!(tag_identity(&local).title, None);
+        local.album_title = None;
+        assert_eq!(tag_identity(&local).title, None);
+
+        // No artist to name: the placeholder stays as written.
+        local.album_title = Some("Self Titled".to_string());
+        local.artist_kind = ArtistKind::VariousArtists;
+        let identity = tag_identity(&local);
+        assert_eq!(identity.artist, None);
+        assert_eq!(identity.title.as_deref(), Some("Self Titled"));
+        local.artist_kind = ArtistKind::AlbumArtist;
+        local.album_artist = Some("Unknown Artist".to_string());
+        let identity = tag_identity(&local);
+        assert_eq!(identity.artist, None);
+        assert_eq!(identity.title.as_deref(), Some("Self Titled"));
+        local.album_artist = None;
+        assert_eq!(tag_identity(&local).title.as_deref(), Some("Self Titled"));
+    }
+
+    #[test]
+    fn a_self_titled_release_compares_with_the_artist_name() {
+        let (local, remote) = self_titled_pair("Goldfinger", "Goldfinger");
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(
+            (candidate.score.album_title - 0.97).abs() < 1e-9,
+            "{}",
+            candidate.score.album_title
+        );
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert_eq!(evaluation.match_scope, MatchScope::Album);
+    }
+
+    #[test]
+    fn a_self_titled_reading_never_outweighs_the_tracks() {
+        // The 1999-era EP tracklist against the 2001 album, retitled
+        // `Jimmy Eat World` after its first release.
+        let local_titles = [
+            "Christmas Card",
+            "Rockstar",
+            "Sweetheart",
+            "Lucky Denver Mint",
+        ];
+        let remote_titles = [
+            "Bleed American",
+            "A Praise Chorus",
+            "The Middle",
+            "Sweetness",
+        ];
+        let mut local = local_release(&local_titles);
+        local.album_title = Some("Self Titled".to_string());
+        local.album_artist = Some("Jimmy Eat World".to_string());
+        let mut remote = remote_release(&remote_titles);
+        remote.title = "Jimmy Eat World".to_string();
+        remote.artists = vec!["Jimmy Eat World".to_string()];
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(candidate.score.album_title >= 0.96);
+        assert!(!album_evaluation(&local, &remote, &[]).auto_accept);
+    }
+
+    #[test]
+    fn a_remote_placeholder_matches_but_untitled_needs_every_track() {
+        let (local, mut remote) = self_titled_pair("Goldfinger", "S/T");
+        assert!((album_title_score(&local, &remote) - 0.97).abs() < 1e-9);
+        // Spelled differently from the tag, a placeholder still reads as one;
+        // spelled the same, the literal comparison is exact.
+        remote.title = "Eponymous".to_string();
+        assert!((album_title_score(&local, &remote) - 0.97).abs() < 1e-9);
+        remote.title = "Self-Titled".to_string();
+        assert!(album_title_score(&local, &remote) >= 0.97);
+        assert!(album_evaluation(&local, &remote, &[]).auto_accept);
+
+        for title in ["Untitled", "[untitled]"] {
+            remote.title = title.to_string();
+            assert!(
+                (album_title_score(&local, &remote) - 0.80).abs() < 1e-9,
+                "{title}"
+            );
+            let evaluation = album_evaluation(&local, &remote, &[]);
+            assert!(evaluation.auto_accept, "{title}: {:?}", evaluation.blockers);
+            assert!(
+                evaluation
+                    .warnings
+                    .iter()
+                    .any(|note| note.contains("album title")),
+                "{:?}",
+                evaluation.warnings
+            );
+
+            let mut drifting = local.clone();
+            drifting.tracks[2].duration_secs =
+                Some(drifting.tracks[2].duration_secs.unwrap() + 2.0);
+            assert!(
+                !album_evaluation(&drifting, &remote, &[]).auto_accept,
+                "{title}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_album_called_same_matches_itself() {
+        let (mut local, mut remote) = self_titled_pair("Goldfinger", "Same");
+        local.album_title = Some("Same".to_string());
+        assert_eq!(album_title_score(&local, &remote), 1.0);
+        // Another artist's name is not what a placeholder reads as here.
+        remote.title = "Other".to_string();
+        assert!(album_title_score(&local, &remote) < 0.5);
+    }
+
+    #[test]
+    fn a_numbered_discogs_credit_is_the_artist_name_for_a_self_titled_release() {
+        let (local, mut remote) = self_titled_pair("Name", "Name");
+        remote.artists = vec!["Name (3)".to_string()];
+        assert!((album_title_score(&local, &remote) - 0.97).abs() < 1e-9);
+        // The credit the title names must be the local artist's.
+        let (local, mut remote) = self_titled_pair("Other Band", "Name");
+        remote.artists = vec!["Name (3)".to_string()];
+        assert!(album_title_score(&local, &remote) < 0.5);
+        assert!(!album_evaluation(&local, &remote, &[]).auto_accept);
+    }
+
+    #[test]
+    fn a_shared_credit_is_not_the_artist_the_title_names() {
+        // `Self Titled` by Band B against a release titled `Band A`, credited
+        // to both: the title names the other band.
+        let (local, mut remote) = self_titled_pair("Band B", "Band A");
+        remote.artists = vec!["Band A".to_string(), "Band B".to_string()];
+        let score = album_title_score(&local, &remote);
+        assert!(score < TITLE_SIMILARITY_THRESHOLD, "{score}");
+        // The same release titled for the local band's own name is the album.
+        remote.title = "Band B".to_string();
+        assert!((album_title_score(&local, &remote) - 0.97).abs() < 1e-9);
+    }
+
+    #[test]
+    fn no_artist_name_stands_in_for_a_various_or_missing_artist() {
+        let (mut local, remote) = self_titled_pair("Goldfinger", "Goldfinger");
+        local.artist_kind = ArtistKind::VariousArtists;
+        assert!(album_title_score(&local, &remote) < 0.5);
+        local.artist_kind = ArtistKind::Unknown;
+        local.album_artist = None;
+        assert!(album_title_score(&local, &remote) < 0.5);
+    }
+
+    #[test]
+    fn junk_tags_are_not_album_evidence() {
+        let (mut local, mut remote) = self_titled_pair("Goldfinger", "Unknown Title");
+        local.album_title = Some("Unknown Title".to_string());
+        assert_eq!(album_title_score(&local, &remote), 0.0);
+        remote.title = "Goldfinger".to_string();
+        assert_eq!(album_title_score(&local, &remote), 0.0);
+        remote.title = "Unknown Album".to_string();
+        local.album_title = Some("Unknown Album".to_string());
+        assert_eq!(album_title_score(&local, &remote), 0.0);
+
+        let (mut local, remote) = self_titled_pair("Goldfinger", "Goldfinger");
+        local.album_title = Some("Goldfinger".to_string());
+        assert_eq!(
+            Candidate::new(&local, remote.clone()).score.album_artist,
+            1.0
+        );
+        local.album_artist = Some("Unknown Artist".to_string());
+        let mut remote = remote;
+        remote.artists = vec!["Unknown Artist".to_string()];
+        assert_eq!(Candidate::new(&local, remote).score.album_artist, 0.0);
+    }
+
+    #[test]
+    fn untitled_stays_a_literal_title() {
+        let (mut local, mut remote) = self_titled_pair("Goldfinger", "Untitled");
+        local.album_title = Some("Untitled".to_string());
+        assert_eq!(album_title_score(&local, &remote), 1.0);
+        remote.title = "Goldfinger".to_string();
+        assert!(album_title_score(&local, &remote) < 0.5);
     }
 }

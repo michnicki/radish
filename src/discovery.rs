@@ -81,6 +81,14 @@ pub fn strategies_for(
     local: &LocalRelease,
 ) -> Vec<(String, SearchStrategy)> {
     let mut strategies = Vec::new();
+    // A self-titled placeholder is searched as the artist's name first, and then
+    // as written, because most providers need every title word to match: the
+    // artist-named search never reaches a release titled `Self Titled` or `S/T`.
+    let title = matcher::search_title(local);
+    let as_tagged = local
+        .album_title
+        .as_deref()
+        .filter(|tag| !tag.trim().is_empty() && title.as_deref() != Some(*tag));
     let release_group = local
         .embedded_evidence
         .release_group_id
@@ -111,11 +119,7 @@ pub fn strategies_for(
                     SearchStrategy::CatalogNumber(catalog.to_string()),
                 ));
             }
-            if let Some(title) = local
-                .album_title
-                .as_deref()
-                .filter(|title| !title.trim().is_empty())
-            {
+            if let Some(title) = title.as_deref() {
                 strategies.push((
                     "title and artist".to_string(),
                     SearchStrategy::TitleArtist {
@@ -138,6 +142,18 @@ pub fn strategies_for(
                     ));
                 }
             }
+            // The last title search, so a full budget (barcode, catalog number,
+            // title and artist, and title only) drops it and nothing else.
+            if let Some(tag) = as_tagged {
+                strategies.push((
+                    "title as tagged".to_string(),
+                    SearchStrategy::TitleArtist {
+                        title: tag.to_string(),
+                        artist: local.album_artist.clone(),
+                        release_group,
+                    },
+                ));
+            }
         }
         ProviderKind::Discogs => {
             if let Some(barcode) = barcode {
@@ -151,11 +167,7 @@ pub fn strategies_for(
                     SearchStrategy::CatalogNumber(catalog.to_string()),
                 ));
             }
-            if let Some(title) = local
-                .album_title
-                .as_deref()
-                .filter(|title| !title.trim().is_empty())
-            {
+            if let Some(title) = title.as_deref() {
                 strategies.push((
                     "title".to_string(),
                     SearchStrategy::TitleArtist {
@@ -174,6 +186,18 @@ pub fn strategies_for(
                         },
                     ));
                 }
+            }
+            // The last title search, so a full budget (an identifier, title and
+            // relaxed) drops it and nothing else.
+            if let Some(tag) = as_tagged {
+                strategies.push((
+                    "title as tagged".to_string(),
+                    SearchStrategy::TitleArtist {
+                        title: tag.to_string(),
+                        artist: local.album_artist.clone(),
+                        release_group: None,
+                    },
+                ));
             }
         }
     }
@@ -389,9 +413,10 @@ pub async fn discover<P: MetadataProvider>(
         identifier_complete = false;
     }
 
+    let rank_identity = matcher::rank_identity(local);
     let mut ranked: Vec<(f64, SearchSummary)> = summaries
         .into_values()
-        .map(|summary| (matcher::rank_search_summary(local, &summary), summary))
+        .map(|summary| (rank_identity.rank(local, &summary), summary))
         .collect();
     ranked
         .sort_by(|(a_rank, a), (b_rank, b)| b_rank.total_cmp(a_rank).then_with(|| a.id.cmp(&b.id)));
@@ -1017,5 +1042,211 @@ mod tests {
         let strategies = strategies_for(ProviderKind::Discogs, &local());
         let labels: Vec<&str> = strategies.iter().map(|(label, _)| label.as_str()).collect();
         assert_eq!(labels, vec!["identifier", "title"]);
+    }
+
+    fn title_searches(kind: ProviderKind, local: &LocalRelease) -> Vec<(String, String)> {
+        strategies_for(kind, local)
+            .into_iter()
+            .filter_map(|(label, strategy)| match strategy {
+                SearchStrategy::TitleArtist { title, .. } => Some((label, title)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_self_titled_release_searches_with_the_artist_as_title() {
+        let mut local = local();
+        local.album_title = Some("Self Titled".to_string());
+        local.barcode = None;
+        let expected = |first: &str, second: &str| {
+            vec![
+                (first.to_string(), "Test Artist".to_string()),
+                (second.to_string(), "Self Titled".to_string()),
+            ]
+        };
+        // The artist's name first, then the tag as written.
+        assert_eq!(
+            title_searches(ProviderKind::MusicBrainz, &local),
+            expected("title and artist", "title as tagged")
+        );
+        assert_eq!(
+            title_searches(ProviderKind::Discogs, &local),
+            expected("title", "title as tagged")
+        );
+        for kind in [ProviderKind::MusicBrainz, ProviderKind::Discogs] {
+            for (_, strategy) in strategies_for(kind, &local) {
+                match strategy {
+                    SearchStrategy::TitleArtist { artist, .. } => {
+                        assert_eq!(artist.as_deref(), Some("Test Artist"));
+                    }
+                    other => panic!("expected a title strategy, got {other:?}"),
+                }
+            }
+        }
+
+        // The requests that reach the provider come in that order.
+        let provider = FakeProvider::new(ProviderKind::MusicBrainz, Vec::new(), Vec::new());
+        let _ = discover(&provider, &local, None).await;
+        let calls = provider.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls[0].contains("title: \"Test Artist\""), "{calls:?}");
+        assert!(calls[1].contains("title: \"Self Titled\""), "{calls:?}");
+
+        // Various Artists and a missing artist have no name to search with, so the
+        // placeholder is searched once, as written.
+        let mut various = local.clone();
+        various.artist_kind = ArtistKind::VariousArtists;
+        various.album_artist = Some("Various Artists".to_string());
+        assert_eq!(
+            title_searches(ProviderKind::MusicBrainz, &various),
+            vec![("title and artist".to_string(), "Self Titled".to_string())]
+        );
+        let mut missing = local.clone();
+        missing.album_artist = None;
+        missing.artist_kind = ArtistKind::Unknown;
+        assert_eq!(
+            title_searches(ProviderKind::Discogs, &missing),
+            vec![("title".to_string(), "Self Titled".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_full_budget_drops_the_as_tagged_search_and_nothing_else() {
+        let mut local = local();
+        local.album_title = Some("Self Titled".to_string());
+        local.catalog_number = Some("CAT-1".to_string());
+        local.is_compilation = true;
+        let labels = |kind| -> Vec<String> {
+            strategies_for(kind, &local)
+                .into_iter()
+                .map(|(label, _)| label)
+                .collect()
+        };
+        let musicbrainz = labels(ProviderKind::MusicBrainz);
+        assert_eq!(musicbrainz.len(), 5, "{musicbrainz:?}");
+        assert_eq!(musicbrainz.last().unwrap(), "title as tagged");
+        assert!(
+            musicbrainz.len() - 1
+                == DiscoveryBudget::for_provider(ProviderKind::MusicBrainz).max_strategies
+        );
+        let discogs = labels(ProviderKind::Discogs);
+        assert_eq!(
+            discogs,
+            vec!["identifier", "title", "relaxed", "title as tagged"]
+        );
+        assert!(
+            discogs.len() - 1
+                == DiscoveryBudget::for_provider(ProviderKind::Discogs).max_strategies
+        );
+    }
+
+    #[test]
+    fn releases_without_a_placeholder_keep_exactly_their_searches() {
+        let local = local();
+        let labels = |kind, local: &LocalRelease| -> Vec<String> {
+            strategies_for(kind, local)
+                .into_iter()
+                .map(|(label, _)| label)
+                .collect()
+        };
+        assert_eq!(
+            labels(ProviderKind::MusicBrainz, &local),
+            vec!["barcode", "title and artist"]
+        );
+        assert_eq!(
+            labels(ProviderKind::Discogs, &local),
+            vec!["identifier", "title"]
+        );
+        // A junk title is searched as written, once.
+        let mut junk = local.clone();
+        junk.album_title = Some("Unknown Title".to_string());
+        assert_eq!(
+            title_searches(ProviderKind::MusicBrainz, &junk),
+            vec![("title and artist".to_string(), "Unknown Title".to_string())]
+        );
+        // `Untitled` is a literal title.
+        let mut untitled = local.clone();
+        untitled.album_title = Some("Untitled".to_string());
+        assert_eq!(
+            title_searches(ProviderKind::Discogs, &untitled),
+            vec![("title".to_string(), "Untitled".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_release_literally_titled_as_the_placeholder_is_found() {
+        let literal = "11111111-1111-1111-1111-111111111111";
+        let mut local = local();
+        local.album_title = Some("Self Titled".to_string());
+        local.barcode = None;
+        let mut hit = summary(literal);
+        hit.title = "Self Titled".to_string();
+        hit.barcodes.clear();
+        let empty = || {
+            Ok(SearchPage {
+                hits: Vec::new(),
+                total: Some(0),
+                next_offset: None,
+            })
+        };
+        // The artist-named search finds nothing; the as-tagged one finds the release.
+        let provider = FakeProvider::new(
+            ProviderKind::MusicBrainz,
+            vec![
+                empty(),
+                Ok(SearchPage {
+                    hits: vec![hit.clone()],
+                    total: Some(1),
+                    next_offset: None,
+                }),
+            ],
+            vec![Ok(remote(literal))],
+        );
+        // Another band's unrelated release (and year) is below the floor.
+        let mut unrelated = hit.clone();
+        unrelated.title = "Something Else".to_string();
+        unrelated.artists = vec!["Another Band".to_string()];
+        unrelated.year = None;
+        assert!(matcher::rank_search_summary(&local, &hit) >= MIN_DETAIL_RANK);
+        assert!(
+            matcher::rank_search_summary(&local, &unrelated) < MIN_DETAIL_RANK,
+            "{}",
+            matcher::rank_search_summary(&local, &unrelated)
+        );
+        let result = discover(&provider, &local, None).await.unwrap();
+        assert_eq!(result.releases.len(), 1, "{:?}", result.notes);
+    }
+
+    #[test]
+    fn the_rank_floor_uses_the_better_of_the_artist_and_the_tag_for_a_placeholder() {
+        let mut local = local();
+        local.album_title = Some("Self Titled".to_string());
+        let mut named = summary("11111111-1111-1111-1111-111111111111");
+        named.title = "Test Artist".to_string();
+        named.barcodes.clear();
+        let mut literal = named.clone();
+        literal.title = "Self Titled".to_string();
+        let rank = |hit: &SearchSummary| matcher::rank_search_summary(&local, hit);
+        // Either reading of the title clears the floor with the right artist.
+        assert!(rank(&named) >= 0.8, "{}", rank(&named));
+        assert!(rank(&literal) >= 0.8, "{}", rank(&literal));
+
+        // The tag as written clears the floor on its title alone, whoever made
+        // the release; the artist gate decides later. It ranks below the same
+        // title by the right artist.
+        let mut other = literal.clone();
+        other.artists = vec!["Another Band".to_string()];
+        assert!(rank(&other) > MIN_DETAIL_RANK, "{}", rank(&other));
+        assert!(rank(&other) < rank(&literal));
+        // A different title by another artist, from another year, does not.
+        let mut unrelated = other.clone();
+        unrelated.title = "Something Else".to_string();
+        unrelated.year = None;
+        assert!(rank(&unrelated) < MIN_DETAIL_RANK, "{}", rank(&unrelated));
+
+        // The ranking is made once per release.
+        let identity = matcher::rank_identity(&local);
+        assert_eq!(identity.rank(&local, &named), rank(&named));
     }
 }
