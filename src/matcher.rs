@@ -276,11 +276,20 @@ impl RemoteTrack {
         self.artists.join(", ")
     }
 
-    /// The disc this track is on, from its position. `None` for a position that
-    /// names no disc, such as a vinyl side (`A1`) or a plain number on a release
-    /// that may have several media.
+    /// The disc this track is on, when its position names one explicitly: a
+    /// medium and track position (MusicBrainz) or a Discogs `N-M` position.
+    /// `None` for a vinyl side (`A1`), `CD1-1`, and a bare number such as `10`,
+    /// which [`Self::position_key`] reads as a track on disc 1 for pairing but
+    /// which says nothing about the medium.
     pub fn medium(&self) -> Option<u32> {
-        self.position_key().map(|(medium, _)| medium)
+        if let (Some(medium), Some(_)) = (self.medium_position, self.track_position) {
+            return Some(medium);
+        }
+        let parsed = parse_position(self.position.as_deref()?);
+        if parsed.side.is_some() {
+            return None;
+        }
+        parsed.track.and(parsed.disc)
     }
 
     /// Explicit medium/track position, then a Discogs-style position string.
@@ -2098,8 +2107,10 @@ pub fn disc_label(remote: &RemoteRelease, medium: u32) -> String {
 }
 
 /// The playable tracks on each medium of a release, when it has several and
-/// every playable track says which one it is on. Vinyl sides (`A1`) and
-/// positions such as `CD1-1` name no medium, so those releases give `None`.
+/// every playable track names its medium explicitly (see
+/// [`RemoteTrack::medium`]). Vinyl sides (`A1`), positions such as `CD1-1`, and
+/// bare Discogs positions (`1`, `10`) name no medium, so a release with any of
+/// them gives `None`: one stray `10-68` entry does not make a single CD a set.
 pub fn remote_media(remote: &RemoteRelease) -> Option<BTreeMap<u32, usize>> {
     let mut media = BTreeMap::new();
     for (_, track) in remote.playable_tracks() {
@@ -9123,5 +9134,27 @@ mod tests {
         assert_eq!(album_title_score(&local, &remote), 1.0);
         remote.title = "Goldfinger".to_string();
         assert!(album_title_score(&local, &remote) < 0.5);
+    }
+
+    #[test]
+    fn a_stray_disc_style_position_does_not_make_a_single_cd_a_set() {
+        // Discogs 549611 shape: plain positions 1..10 and a filler `10-68` entry.
+        let titles: Vec<String> = (1..=10).map(|n| format!("Song {n}")).collect();
+        let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let mut remote = remote_release(&titles);
+        let mut filler = remote.tracklist[9].clone();
+        filler.position = Some("10-68".to_string());
+        filler.title = "(no audio)".to_string();
+        filler.duration_secs = None;
+        remote.tracklist.push(filler);
+        assert_eq!(remote_media(&remote), None);
+
+        let mut local = local_release(&titles);
+        local.directory = "/music/Undertow/CD1".to_string();
+        assert_eq!(local_disc_hint(&local).map(|hint| hint.number), Some(1));
+        let mapping = map_tracks(&local, &remote);
+        assert_eq!(mapping.medium, None);
+        assert_eq!(mapping.assigned_count(), 10);
+        assert_eq!(mapping.pairs[9], Some(9));
     }
 }
