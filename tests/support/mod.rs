@@ -16,6 +16,8 @@ pub struct MockServer {
     pub url: String,
     shutdown: Arc<AtomicBool>,
     requests: Arc<Mutex<Vec<String>>>,
+    /// The raw header block of each request, in the same order as `requests`.
+    headers: Arc<Mutex<Vec<String>>>,
 }
 
 impl MockServer {
@@ -27,8 +29,10 @@ impl MockServer {
         let address = listener.local_addr().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let headers = Arc::new(Mutex::new(Vec::new()));
         let flag = shutdown.clone();
         let recorded = requests.clone();
+        let recorded_headers = headers.clone();
 
         thread::spawn(move || {
             for stream in listener.incoming() {
@@ -41,11 +45,13 @@ impl MockServer {
                 if reader.read_line(&mut request_line).is_err() {
                     continue;
                 }
+                let mut header_block = String::new();
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
                         break;
                     }
+                    header_block.push_str(&line);
                 }
 
                 let target = request_line
@@ -54,6 +60,7 @@ impl MockServer {
                     .unwrap_or("/")
                     .to_string();
                 recorded.lock().unwrap().push(target.clone());
+                recorded_headers.lock().unwrap().push(header_block);
 
                 let (status, body) = handler(&target);
                 let payload = format!(
@@ -68,6 +75,7 @@ impl MockServer {
             url: format!("http://{address}"),
             shutdown,
             requests,
+            headers,
         }
     }
 
@@ -77,6 +85,16 @@ impl MockServer {
 
     pub fn request_count(&self) -> usize {
         self.requests.lock().unwrap().len()
+    }
+
+    /// How many requests carried a header block containing `needle`.
+    pub fn requests_with_header(&self, needle: &str) -> usize {
+        self.headers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|block| block.contains(needle))
+            .count()
     }
 
     pub fn requests_matching(&self, needle: &str) -> usize {

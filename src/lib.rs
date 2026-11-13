@@ -13,7 +13,6 @@
 //! - [`runner`]: CLI orchestration and the interactive review screen.
 //! - [`web`]: the read-only web interface behind `radish serve`.
 
-pub mod clef;
 pub mod db;
 pub mod discogs;
 pub mod discovery;

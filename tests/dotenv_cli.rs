@@ -1,4 +1,8 @@
 //! Startup configuration uses isolated working directories and fake credentials.
+//!
+//! The probe is the Discogs personal token: `match --provider discogs` sends it
+//! in the `Authorization` header, which the loopback mock records, so each test
+//! observes exactly which value, if any, the process picked up.
 
 mod support;
 
@@ -9,8 +13,8 @@ use std::process::{Command, Output, Stdio};
 use support::{MockServer, musicbrainz_empty_search, musicbrainz_release_json, temp_dir};
 
 const MBID: &str = "76df3287-6cda-33eb-8e9a-044b5e15ffdd";
-const FILE_ACCOUNT: &str = "synthetic-file-account";
 const FILE_TOKEN: &str = "synthetic-file-token";
+const ENV_TOKEN: &str = "synthetic-env-token";
 
 async fn seed(db: &Path) {
     let pool = radish::db::connect(db).await.unwrap();
@@ -49,18 +53,12 @@ async fn seed(db: &Path) {
 
 fn server() -> MockServer {
     MockServer::start(|target| {
-        if target.contains("/ai/run/") {
-            let model = if target.ends_with("/@cf/cloudflare/clef") {
-                "clef"
-            } else {
-                "clef-flash"
-            };
-            return (200, serde_json::json!({"success":true,"result":{
-                "model":model, "answers":{"match":{
-                    "type":"choice", "choice":"none", "confidence":1.0,
-                    "probabilities":{format!("musicbrainz:{MBID}"):0.0,"none":1.0,"equivalent_editions":0.0}
-                }}
-            }}).to_string());
+        if target.contains("/database/search") {
+            return (
+                200,
+                r#"{"pagination":{"page":1,"pages":1,"per_page":50,"items":0},"results":[]}"#
+                    .to_string(),
+            );
         }
         if target.contains(&format!("/ws/2/release/{MBID}")) {
             return (
@@ -78,10 +76,6 @@ fn command(cwd: &Path, db: &Path, server: &MockServer) -> Command {
         .current_dir(cwd)
         .arg("--db")
         .arg(db)
-        .env_remove("RADISH_CLOUDFLARE_ACCOUNT_ID")
-        .env_remove("RADISH_CLOUDFLARE_API_TOKEN")
-        .env_remove("RADISH_CLOUDFLARE_BASE_URL")
-        .env_remove("RADISH_CLOUDFLARE_MODEL")
         .env_remove("RADISH_DISCOGS_TOKEN")
         // A developer's proxy exemptions must not let a test reach a real host.
         .env_remove("NO_PROXY")
@@ -94,42 +88,54 @@ fn command(cwd: &Path, db: &Path, server: &MockServer) -> Command {
     command
 }
 
-fn assert_reviewed(output: &Output, server: &MockServer, account: &str) {
-    assert!(output.status.success(), "{output:?}");
+/// A Discogs-only match run, which searches Discogs when a token is available.
+/// Proxy variables are cleared so a `.env` value could only come from the file.
+fn discogs_match(cwd: &Path, db: &Path, server: &MockServer) -> Command {
+    let mut command = command(cwd, db, server);
+    command
+        .env_remove("HTTP_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("ALL_PROXY")
+        .env_remove("all_proxy")
+        .args(["match", "--provider", "discogs"]);
+    command
+}
+
+/// Every Discogs search carried exactly this token and no other.
+fn assert_token_used(output: &Output, server: &MockServer, token: &str) {
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("AI advice"), "{text}");
-    assert!(text.contains("Queued for review: 1"), "{text}");
-    assert_eq!(server.requests_matching("/ai/run/"), 1);
-    assert_eq!(
-        server.requests_matching(&format!("/accounts/{account}/ai/run/")),
-        1
+    let errors = String::from_utf8_lossy(&output.stderr);
+    let searches = server.requests_matching("/database/search");
+    assert!(
+        searches >= 1,
+        "no Discogs search was made: {text}\n{errors}"
     );
-    assert!(!text.contains(FILE_TOKEN));
-    assert!(!String::from_utf8_lossy(&output.stderr).contains(FILE_TOKEN));
+    assert_eq!(
+        server.requests_with_header(&format!("Discogs token={token}")),
+        searches,
+        "{:?}",
+        server.targets()
+    );
+    assert_eq!(server.requests_with_header("token="), searches);
+    // The token never reaches the terminal.
+    assert!(!text.contains(token), "{text}");
+    assert!(!errors.contains(token), "{errors}");
 }
 
 #[tokio::test]
-async fn loads_fake_ai_credentials_from_working_directory_dotenv() {
+async fn loads_the_discogs_token_from_working_directory_dotenv() {
     let cwd = temp_dir("dotenv-current");
     let db = cwd.join("library.db");
     seed(&db).await;
     let server = server();
-    std::fs::write(cwd.join(".env"), format!(
-        "RADISH_CLOUDFLARE_ACCOUNT_ID={FILE_ACCOUNT}\nRADISH_CLOUDFLARE_API_TOKEN={FILE_TOKEN}\nRADISH_CLOUDFLARE_MODEL=clef\n"
-    )).unwrap();
-    // The base URL is not an allowed .env key, so the mock comes from the real environment.
-    let output = command(&cwd, &db, &server)
-        .env("RADISH_CLOUDFLARE_BASE_URL", &server.url)
-        .args(["match", "--provider", "musicbrainz", "--ai-review"])
-        .output()
-        .unwrap();
-    assert_reviewed(&output, &server, FILE_ACCOUNT);
-    assert!(
-        server
-            .targets()
-            .iter()
-            .any(|target| target.ends_with("/ai/run/@cf/cloudflare/clef"))
-    );
+    std::fs::write(
+        cwd.join(".env"),
+        format!("RADISH_DISCOGS_TOKEN={FILE_TOKEN}\n"),
+    )
+    .unwrap();
+    let output = discogs_match(&cwd, &db, &server).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_token_used(&output, &server, FILE_TOKEN);
 }
 
 #[tokio::test]
@@ -140,54 +146,42 @@ async fn ignores_dotenv_in_parent_of_working_directory() {
     let db = parent.join("library.db");
     seed(&db).await;
     let server = server();
-    std::fs::write(parent.join(".env"), format!(
-        "RADISH_CLOUDFLARE_ACCOUNT_ID={FILE_ACCOUNT}\nRADISH_CLOUDFLARE_API_TOKEN={FILE_TOKEN}\n"
-    )).unwrap();
-    let output = command(&cwd, &db, &server)
-        .env("RADISH_CLOUDFLARE_BASE_URL", &server.url)
-        .args(["match", "--provider", "musicbrainz", "--ai-review"])
-        .output()
-        .unwrap();
-    // Without credentials the AI review cannot start, so no AI request is made.
+    std::fs::write(
+        parent.join(".env"),
+        format!("RADISH_DISCOGS_TOKEN={FILE_TOKEN}\n"),
+    )
+    .unwrap();
+    let output = discogs_match(&cwd, &db, &server).output().unwrap();
+    // Without a token Discogs cannot start, so nothing is requested at all.
     let text = String::from_utf8_lossy(&output.stdout);
     let errors = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(server.requests_matching("/ai/run/"), 0, "{text}\n{errors}");
-    assert!(!text.contains("AI advice"), "{text}");
+    assert_eq!(server.request_count(), 0, "{text}\n{errors}");
+    assert!(!text.contains(FILE_TOKEN), "{text}");
+    assert!(!errors.contains(FILE_TOKEN), "{errors}");
 }
 
 #[tokio::test]
-async fn dotenv_loads_only_allowed_keys_and_ignores_endpoint_overrides() {
+async fn dotenv_loads_only_allowed_keys() {
     let cwd = temp_dir("dotenv-allowlist");
     let db = cwd.join("library.db");
     seed(&db).await;
     let server = server();
-    // Route HTTPS through the mock: if the file's base URL were ignored, the
-    // default Cloudflare origin is contacted via this proxy and recorded here
-    // instead of reaching the network.
-    std::fs::write(cwd.join(".env"), format!(
-        "RADISH_CLOUDFLARE_ACCOUNT_ID={FILE_ACCOUNT}\nRADISH_CLOUDFLARE_API_TOKEN={FILE_TOKEN}\nRADISH_CLOUDFLARE_BASE_URL={}\n", server.url
-    )).unwrap();
-    let output = command(&cwd, &db, &server)
-        .env("HTTPS_PROXY", &server.url)
-        .env("https_proxy", &server.url)
-        .args(["match", "--provider", "musicbrainz", "--ai-review"])
-        .output()
-        .unwrap();
-    let text = String::from_utf8_lossy(&output.stdout);
-    let errors = String::from_utf8_lossy(&output.stderr);
-    // The file's endpoint override was not applied: no AI request reached the
-    // mock as an origin-form path, only a proxy tunnel to the default origin.
-    assert_eq!(server.requests_matching("/ai/run/"), 0, "{text}\n{errors}");
-    assert!(
-        server
-            .targets()
-            .iter()
-            .any(|target| target.starts_with("api.cloudflare.com")),
-        "the credential from .env was not used for the default origin: {:?}",
-        server.targets()
-    );
-    assert!(!text.contains(FILE_TOKEN));
-    assert!(!errors.contains(FILE_TOKEN));
+    let decoy = MockServer::start(|_| (200, String::new()));
+    // HTTP_PROXY is not an allowed key. If the file's value were applied, the
+    // Discogs requests to the plain-HTTP mock would be sent through the decoy.
+    std::fs::write(
+        cwd.join(".env"),
+        format!(
+            "RADISH_DISCOGS_TOKEN={FILE_TOKEN}\nHTTP_PROXY={}\nhttp_proxy={}\n",
+            decoy.url, decoy.url
+        ),
+    )
+    .unwrap();
+    let output = discogs_match(&cwd, &db, &server).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    // The allowed key took effect, the other did not.
+    assert_token_used(&output, &server, FILE_TOKEN);
+    assert_eq!(decoy.request_count(), 0, "{:?}", decoy.targets());
 }
 
 #[tokio::test]
@@ -275,16 +269,15 @@ async fn a_byte_order_mark_does_not_hide_the_first_dotenv_key() {
     let db = cwd.join("library.db");
     seed(&db).await;
     let server = server();
-    // PowerShell 5 writes a UTF-8 BOM; the account ID is the first line.
-    std::fs::write(cwd.join(".env"), format!(
-        "\u{feff}RADISH_CLOUDFLARE_ACCOUNT_ID={FILE_ACCOUNT}\nRADISH_CLOUDFLARE_API_TOKEN={FILE_TOKEN}\n"
-    )).unwrap();
-    let output = command(&cwd, &db, &server)
-        .env("RADISH_CLOUDFLARE_BASE_URL", &server.url)
-        .args(["match", "--provider", "musicbrainz", "--ai-review"])
-        .output()
-        .unwrap();
-    assert_reviewed(&output, &server, FILE_ACCOUNT);
+    // PowerShell 5 writes a UTF-8 BOM; the token is the first line.
+    std::fs::write(
+        cwd.join(".env"),
+        format!("\u{feff}RADISH_DISCOGS_TOKEN={FILE_TOKEN}\n"),
+    )
+    .unwrap();
+    let output = discogs_match(&cwd, &db, &server).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_token_used(&output, &server, FILE_TOKEN);
 }
 
 #[tokio::test]
@@ -293,15 +286,14 @@ async fn a_malformed_dotenv_line_does_not_stop_later_keys_loading() {
     let db = cwd.join("library.db");
     seed(&db).await;
     let server = server();
-    std::fs::write(cwd.join(".env"), format!(
-        "RADISH_CLOUDFLARE_ACCOUNT_ID={FILE_ACCOUNT}\nthis line is not an assignment\nRADISH_CLOUDFLARE_API_TOKEN={FILE_TOKEN}\n"
-    )).unwrap();
-    let output = command(&cwd, &db, &server)
-        .env("RADISH_CLOUDFLARE_BASE_URL", &server.url)
-        .args(["match", "--provider", "musicbrainz", "--ai-review"])
-        .output()
-        .unwrap();
-    assert_reviewed(&output, &server, FILE_ACCOUNT);
+    std::fs::write(
+        cwd.join(".env"),
+        format!("this line is not an assignment\nRADISH_DISCOGS_TOKEN={FILE_TOKEN}\n"),
+    )
+    .unwrap();
+    let output = discogs_match(&cwd, &db, &server).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_token_used(&output, &server, FILE_TOKEN);
 }
 
 #[tokio::test]
@@ -310,17 +302,18 @@ async fn process_environment_overrides_conflicting_dotenv_values() {
     let db = cwd.join("library.db");
     seed(&db).await;
     let server = server();
-    // Each file value would prevent a request if it replaced the process value.
-    std::fs::write(cwd.join(".env"), "RADISH_CLOUDFLARE_ACCOUNT_ID=invalid/account\nRADISH_CLOUDFLARE_API_TOKEN=\"invalid\\ntoken\"\nRADISH_CLOUDFLARE_BASE_URL=http://127.0.0.1:1\nRADISH_CLOUDFLARE_MODEL=unsupported\n").unwrap();
-    let output = command(&cwd, &db, &server)
-        .env("RADISH_CLOUDFLARE_ACCOUNT_ID", "synthetic-env-account")
-        .env("RADISH_CLOUDFLARE_API_TOKEN", "synthetic-env-token")
-        .env("RADISH_CLOUDFLARE_MODEL", "clef-flash")
-        .env("RADISH_CLOUDFLARE_BASE_URL", &server.url)
-        .args(["match", "--provider", "musicbrainz", "--ai-review"])
+    std::fs::write(
+        cwd.join(".env"),
+        format!("RADISH_DISCOGS_TOKEN={FILE_TOKEN}\n"),
+    )
+    .unwrap();
+    let output = discogs_match(&cwd, &db, &server)
+        .env("RADISH_DISCOGS_TOKEN", ENV_TOKEN)
         .output()
         .unwrap();
-    assert_reviewed(&output, &server, "synthetic-env-account");
+    assert!(output.status.success(), "{output:?}");
+    assert_token_used(&output, &server, ENV_TOKEN);
+    assert_eq!(server.requests_with_header(FILE_TOKEN), 0);
 }
 
 #[test]

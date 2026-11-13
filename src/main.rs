@@ -36,13 +36,6 @@ enum Command {
         /// Restrict matching to one service and disable fallback
         #[arg(long, value_name = "PROVIDER", requires = "match_releases")]
         provider: Option<ProviderKind>,
-        /// Automatically resolve strongly supported album matches with Clef
-        #[arg(
-            long = "ai-match",
-            visible_alias = "ai-review",
-            requires = "match_releases"
-        )]
-        ai_review: bool,
         /// Read every file again, even when its modification time is unchanged
         #[arg(long)]
         rescan: bool,
@@ -106,9 +99,6 @@ enum Command {
         /// Search and show decisions without storing matches
         #[arg(long = "dry-run")]
         dry_run: bool,
-        /// Automatically resolve strongly supported album matches with Clef
-        #[arg(long = "ai-match", visible_alias = "ai-review")]
-        ai_review: bool,
         /// Match against locally built dump indexes instead of the network
         #[arg(long, conflicts_with = "clear")]
         offline: bool,
@@ -123,8 +113,7 @@ enum Command {
                 "musicbrainz_release",
                 "discogs_release",
                 "review",
-                "dry_run",
-                "ai_review"
+                "dry_run"
             ]
         )]
         clear: Option<i64>,
@@ -162,13 +151,7 @@ fn parse_direct(musicbrainz: Option<&str>, discogs: Option<u64>) -> Result<Optio
 
 /// The only keys read from `.env`. Endpoint overrides are deliberately excluded
 /// so a stray `.env` can never redirect real credentials to another host.
-const DOTENV_KEYS: [&str; 5] = [
-    "RADISH_CLOUDFLARE_ACCOUNT_ID",
-    "RADISH_CLOUDFLARE_API_TOKEN",
-    "RADISH_CLOUDFLARE_MODEL",
-    "RADISH_DISCOGS_TOKEN",
-    "RADISH_INDEX_DIR",
-];
+const DOTENV_KEYS: [&str; 2] = ["RADISH_DISCOGS_TOKEN", "RADISH_INDEX_DIR"];
 
 /// Loads allowed keys from `./.env` in the current directory only, never from a
 /// parent. Existing environment variables win. Anything but a readable regular
@@ -270,7 +253,6 @@ async fn run() -> Result<()> {
             path,
             match_releases,
             provider: _,
-            ai_review,
             rescan,
             offline,
         } => {
@@ -279,7 +261,6 @@ async fn run() -> Result<()> {
                 let options = runner::MatchOptions {
                     scope: Some(canonical),
                     policy: policy.unwrap_or_default(),
-                    ai_review,
                     ..runner::MatchOptions::default()
                 };
                 let summary = if offline {
@@ -319,7 +300,6 @@ async fn run() -> Result<()> {
             discogs_release: _,
             review,
             dry_run,
-            ai_review,
             offline,
             clear,
         } => {
@@ -337,7 +317,6 @@ async fn run() -> Result<()> {
                     direct_release: direct,
                     review,
                     dry_run,
-                    ai_review,
                     policy: policy.unwrap_or_default(),
                 };
                 let summary = if offline {
@@ -532,17 +511,6 @@ mod tests {
     fn import_provider_requires_match() {
         assert!(parse(&["import", "/music", "--provider", "discogs"]).is_err());
         assert!(parse(&["import", "/music", "--match", "--provider", "discogs"]).is_ok());
-    }
-
-    #[test]
-    fn ai_review_is_explicit_and_requires_matching() {
-        assert!(parse(&["match", "--ai-match"]).is_ok());
-        assert!(parse(&["match", "--ai-review"]).is_ok());
-        assert!(parse(&["match", "--clear", "3", "--ai-match"]).is_err());
-        assert!(parse(&["match", "--clear", "3", "--ai-review"]).is_err());
-        assert!(parse(&["import", "/music", "--ai-review"]).is_err());
-        assert!(parse(&["import", "/music", "--match", "--ai-review"]).is_ok());
-        assert!(parse(&["import", "/music", "--match", "--ai-match"]).is_ok());
     }
 
     #[test]

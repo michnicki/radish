@@ -1750,9 +1750,6 @@ pub struct StoredCandidate {
     pub blockers: Vec<String>,
     pub warnings: Vec<String>,
     pub evidence: Vec<String>,
-    /// Optional advisory evidence, independent of deterministic acceptance.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ai_advice: Option<crate::clef::Advice>,
 }
 
 /// Immutable inputs an acceptance decision was based on. Reloading them inside
@@ -1964,7 +1961,6 @@ pub fn decode_stored_candidates(
                     blockers: candidate.blockers,
                     warnings: candidate.warnings,
                     evidence: candidate.evidence,
-                    ai_advice: None,
                 })
                 .collect())
         }
@@ -1993,39 +1989,6 @@ pub async fn accept_match(
     method: AcceptanceMethod,
     match_scope: MatchScope,
     guard: &MatchGuard,
-) -> Result<()> {
-    accept_recorded_match(pool, release, candidate, method, match_scope, guard, None).await
-}
-
-/// Applies an AI-supported album overlay while retaining the decision evidence.
-pub async fn accept_ai_match(
-    pool: &SqlitePool,
-    release: &LocalRelease,
-    candidate: &Candidate,
-    guard: &MatchGuard,
-    advice: &crate::clef::Advice,
-) -> Result<()> {
-    accept_recorded_match(
-        pool,
-        release,
-        candidate,
-        AcceptanceMethod::Automatic,
-        MatchScope::Album,
-        guard,
-        Some(advice),
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn accept_recorded_match(
-    pool: &SqlitePool,
-    release: &LocalRelease,
-    candidate: &Candidate,
-    method: AcceptanceMethod,
-    match_scope: MatchScope,
-    guard: &MatchGuard,
-    ai_advice: Option<&crate::clef::Advice>,
 ) -> Result<()> {
     let local_release_id = release.id;
     if !candidate.mapping.complete {
@@ -2117,15 +2080,8 @@ async fn accept_recorded_match(
     let remote = &candidate.release;
     let edition = (match_scope == MatchScope::Edition).then_some(remote);
     let provider = remote.provider();
-    let mut metadata = serde_json::to_value(remote)?;
-    let algorithm_version = if let Some(advice) = ai_advice {
-        metadata["radish_ai_decision"] = serde_json::json!({
-            "policy_version": crate::clef::POLICY_VERSION, "advice": advice,
-        });
-        format!("{provider}-{}", crate::clef::POLICY_VERSION)
-    } else {
-        matcher::algorithm_version(provider).to_string()
-    };
+    let metadata = serde_json::to_value(remote)?;
+    let algorithm_version = matcher::algorithm_version(provider).to_string();
     let metadata_json = serde_json::to_string(&metadata)?;
 
     sqlx::query("DELETE FROM release_matches WHERE local_release_id = ?1")
@@ -3252,7 +3208,6 @@ mod tests {
             blockers: vec!["review".to_string()],
             warnings: Vec::new(),
             evidence: Vec::new(),
-            ai_advice: None,
         };
 
         queue_review(
@@ -3294,6 +3249,45 @@ mod tests {
         assert_eq!(review.candidates.len(), 1);
         assert_eq!(review.reasons, vec!["primary uncertain".to_string()]);
         assert_eq!(review.guard.source_revision, release.revision);
+    }
+
+    #[tokio::test]
+    async fn saved_reviews_written_with_ai_advice_still_decode() {
+        // Snapshots queued by versions that could ask Clef for advice carry an
+        // `ai_advice` object inside the candidate. Decoding must ignore it.
+        let pool = test_pool().await;
+        insert(
+            &pool,
+            "/music/a",
+            &[scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1)],
+        )
+        .await;
+        let release = load_local_releases(&pool, None).await.unwrap().remove(0);
+        let candidate = Candidate::new(&release, remote_release());
+        let stored = StoredCandidate {
+            release: candidate.release.clone(),
+            mapping: candidate.mapping.clone(),
+            score: candidate.score,
+            auto_accept: false,
+            match_scope: MatchScope::Edition,
+            blockers: vec!["review".to_string()],
+            warnings: Vec::new(),
+            evidence: Vec::new(),
+        };
+        let mut value = serde_json::to_value(&stored).unwrap();
+        value["ai_advice"] = serde_json::json!({
+            "model": "clef-flash",
+            "prompt_version": "radish-clef-album-v3",
+            "choice": {"type": "no_match"},
+            "probabilities": {"none": 1.0},
+            "confidence": 1.0,
+        });
+        let json = serde_json::to_string(&vec![value]).unwrap();
+
+        let decoded =
+            decode_stored_candidates(SNAPSHOT_VERSION, ProviderKind::Discogs, &json).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].blockers, vec!["review".to_string()]);
     }
 
     #[tokio::test]
@@ -3348,7 +3342,6 @@ mod tests {
             blockers: vec!["review".to_string()],
             warnings: Vec::new(),
             evidence: Vec::new(),
-            ai_advice: None,
         };
         queue_review(
             &pool,

@@ -2014,14 +2014,7 @@ pub fn evaluate(
     runner_up: Option<&Candidate>,
     discovery: &DiscoveryEvidence,
 ) -> Evaluation {
-    evaluate_at_scope(
-        local,
-        candidate,
-        runner_up,
-        discovery,
-        MatchScope::Edition,
-        AcceptancePolicy::Measured,
-    )
+    evaluate_at_scope(local, candidate, runner_up, discovery, MatchScope::Edition)
 }
 
 /// Prefer a proven edition, otherwise accept strong album/track evidence.
@@ -2040,14 +2033,7 @@ pub fn evaluate_for_matching(
     if exact.auto_accept {
         return exact;
     }
-    let mut album = evaluate_at_scope(
-        local,
-        candidate,
-        None,
-        discovery,
-        MatchScope::Album,
-        AcceptancePolicy::Measured,
-    );
+    let mut album = evaluate_at_scope(local, candidate, None, discovery, MatchScope::Album);
     for other in alternatives {
         if other.release.id != candidate.release.id
             && within_gap(candidate.score.album_score() - other.score.album_score())
@@ -2070,144 +2056,6 @@ pub fn evaluate_for_matching(
 /// boundary itself counts as close.
 pub(crate) fn within_gap(diff: f64) -> bool {
     diff <= RUNNER_UP_GAP + TIE_EPSILON
-}
-
-/// Applies album gates after a high-confidence semantic agreement.
-pub fn evaluate_ai_album(
-    local: &LocalRelease,
-    candidate: &Candidate,
-    alternatives: &[Candidate],
-) -> Evaluation {
-    let mut album = evaluate_at_scope(
-        local,
-        candidate,
-        None,
-        &DiscoveryEvidence::default(),
-        MatchScope::Album,
-        AcceptancePolicy::Semantic,
-    );
-    for other in alternatives {
-        if (!other.score.album_score().is_finite()
-            || within_gap(candidate.score.album_score() - other.score.album_score()))
-            && !compatible_album_audio(candidate, other)
-        {
-            album.blockers.push(format!(
-                "close alternative {} does not establish compatible known album audio",
-                other.release.id
-            ));
-        }
-    }
-    album.auto_accept = album.blockers.is_empty();
-    album
-}
-
-/// Checks known audio independently of spelling and artist-credit variations.
-/// Release and release-track IDs may differ between editions of the same album.
-pub fn compatible_album_audio(a: &Candidate, b: &Candidate) -> bool {
-    let row_count = a.mapping.pairs.len();
-    if !supported_album_mapping(a, row_count)
-        || !supported_album_mapping(b, row_count)
-        || remote_edition_qualifiers(&a.release) != remote_edition_qualifiers(&b.release)
-    {
-        return false;
-    }
-    if a.release.provider() == b.release.provider()
-        && a.release.group_id.is_some()
-        && b.release.group_id.is_some()
-        && a.release.group_id != b.release.group_id
-    {
-        return false;
-    }
-    a.mapping
-        .assigned_pairs()
-        .all(|(local_index, remote_index)| {
-            // Both mappings have been checked for bounds, complete coverage, and uniqueness.
-            let other_index = b.mapping.pairs[local_index].expect("validated mapping");
-            let x = &a.release.tracklist[remote_index];
-            let y = &b.release.tracklist[other_index];
-            edition_qualifiers(&x.title) == edition_qualifiers(&y.title)
-                && matches!((x.duration_secs, y.duration_secs), (Some(x), Some(y))
-            if x.is_finite() && y.is_finite() && x > 0.0 && y > 0.0
-                && (x - y).abs() <= DURATION_TOLERANCE_SECS)
-                && !matches!((x.recording_id, y.recording_id), (Some(x), Some(y)) if x != y)
-        })
-}
-
-/// Checks alternatives outside the semantic review request budget.
-/// Each mapped recording needs matching text and credits or a shared recording
-/// ID. Track version qualifiers must agree even when recording IDs match.
-pub fn equivalent_unassessed_audio(a: &Candidate, b: &Candidate) -> bool {
-    if !compatible_album_audio(a, b) {
-        return false;
-    }
-    a.mapping
-        .assigned_pairs()
-        .all(|(local_index, remote_index)| {
-            let other_index = b.mapping.pairs[local_index].expect("validated mapping");
-            let x = &a.release.tracklist[remote_index];
-            let y = &b.release.tracklist[other_index];
-            matches!((x.recording_id, y.recording_id), (Some(x), Some(y)) if x == y)
-                || (normalize_text(&x.title) == normalize_text(&y.title)
-                    && normalized_track_credit(&a.release, x)
-                        == normalized_track_credit(&b.release, y))
-        })
-}
-
-fn normalized_track_credit(release: &RemoteRelease, track: &RemoteTrack) -> String {
-    let credit = track.artist_credit.clone().unwrap_or_else(|| {
-        if track.artists.is_empty() {
-            release.artist_display()
-        } else {
-            track.artist_display()
-        }
-    });
-    normalize_artist_for(release.provider(), &credit)
-}
-
-/// Do not trust a serialized mapping's summary flags without checking its pairs.
-pub(crate) fn supported_album_mapping(candidate: &Candidate, row_count: usize) -> bool {
-    if row_count == 0
-        || !candidate.mapping.complete
-        || candidate.mapping.ambiguous
-        || candidate.release.has_unsupported_entries()
-        || candidate.mapping.pairs.len() != row_count
-        || candidate.release.playable_tracks().len() != row_count
-    {
-        return false;
-    }
-    let mut targets = HashSet::new();
-    candidate.mapping.pairs.iter().all(|pair| {
-        pair.is_some_and(|index| {
-            candidate
-                .release
-                .tracklist
-                .get(index)
-                .is_some_and(RemoteTrack::is_playable)
-                && targets.insert(index)
-        })
-    })
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AcceptancePolicy {
-    Measured,
-    Semantic,
-}
-
-impl AcceptancePolicy {
-    fn minimum_score(self) -> f64 {
-        match self {
-            Self::Measured => SCORE_THRESHOLD,
-            Self::Semantic => 0.85,
-        }
-    }
-
-    fn minimum_title_similarity(self) -> f64 {
-        match self {
-            Self::Measured => TITLE_SIMILARITY_THRESHOLD,
-            Self::Semantic => 0.50,
-        }
-    }
 }
 
 /// Track version qualifiers that distinguish recordings. A remastering is a
@@ -2390,7 +2238,6 @@ fn evaluate_at_scope(
     runner_up: Option<&Candidate>,
     discovery: &DiscoveryEvidence,
     match_scope: MatchScope,
-    policy: AcceptancePolicy,
 ) -> Evaluation {
     let mut blockers = Vec::new();
     let mut warnings = Vec::new();
@@ -2398,31 +2245,8 @@ fn evaluate_at_scope(
 
     let remote = &candidate.release;
     let provider = remote.provider();
-    let minimum_score = policy.minimum_score();
-    let minimum_title_similarity = policy.minimum_title_similarity();
-
-    if policy == AcceptancePolicy::Semantic {
-        evidence.push("high-confidence semantic agreement on album identity".to_string());
-        if !supported_album_mapping(candidate, local.tracks.len()) {
-            blockers.push(
-                "album matching requires a supported, complete, unambiguous one-to-one mapping"
-                    .to_string(),
-            );
-        }
-        if local
-            .album_title
-            .as_deref()
-            .is_none_or(|title| title.trim().is_empty())
-            || local
-                .album_artist
-                .as_deref()
-                .is_none_or(|artist| artist.trim().is_empty())
-        {
-            blockers.push(
-                "album matching requires a nonempty local album title and artist".to_string(),
-            );
-        }
-    }
+    let minimum_score = SCORE_THRESHOLD;
+    let minimum_title_similarity = TITLE_SIMILARITY_THRESHOLD;
 
     let embedded_consistent = match &remote.id {
         ReleaseId::Discogs(id) => local.embedded_discogs_id == Some(*id),
@@ -2443,16 +2267,12 @@ fn evaluate_at_scope(
     }
 
     // A weak album title outweighed by tracks and durations that all agree.
-    // Album scope and the measured policy only.
-    let corroborated_title = policy == AcceptancePolicy::Measured
-        && match_scope == MatchScope::Album
-        && corroborated_album(local, candidate);
+    // Album scope only.
+    let corroborated_title =
+        match_scope == MatchScope::Album && corroborated_album(local, candidate);
 
     let acceptance_score = match_scope.score(&candidate.score);
-    if !corroborated_title
-        && (acceptance_score + 1e-9 < minimum_score
-            || (policy == AcceptancePolicy::Semantic && !acceptance_score.is_finite()))
-    {
+    if !corroborated_title && acceptance_score + 1e-9 < minimum_score {
         blockers.push(format!(
             "score {:.3} is below the {:.2} acceptance threshold",
             acceptance_score, minimum_score
@@ -2574,10 +2394,8 @@ fn evaluate_at_scope(
     // an album-level match. These exceptions do not stack with the weak album
     // title rule: when that rule is in play, which replaces the acceptance score
     // gate, any track title below the minimum blocks.
-    let lone_weak_title = policy == AcceptancePolicy::Measured
-        && match_scope == MatchScope::Album
-        && !corroborated_title
-        && titles_below_minimum == 1;
+    let lone_weak_title =
+        match_scope == MatchScope::Album && !corroborated_title && titles_below_minimum == 1;
     let near_miss_title = lone_weak_title
         && worst_title >= NEAR_MISS_TITLE_FLOOR
         && worst_title_duration_gap.is_some_and(|gap| gap <= DURATION_TOLERANCE_SECS);
@@ -2602,8 +2420,7 @@ fn evaluate_at_scope(
         // A different master or a trailing silence moves a track or two by a few
         // seconds without changing the album, which shows in the summed length.
         // Only for an album-level match, never for an exact edition.
-        let drifted_album = policy == AcceptancePolicy::Measured
-            && match_scope == MatchScope::Album
+        let drifted_album = match_scope == MatchScope::Album
             && local.tracks.len() >= SOFT_DURATION_MIN_ALBUM_TRACKS
             && tracks_over_tolerance <= SOFT_DURATION_MAX_TRACKS
             && difference <= SOFT_DURATION_MAX_SECS
@@ -2622,7 +2439,7 @@ fn evaluate_at_scope(
 
     // Embedded identifier contradictions. Provider IDs are only ever compared
     // within their own namespace.
-    if provider == ProviderKind::MusicBrainz || policy == AcceptancePolicy::Semantic {
+    if provider == ProviderKind::MusicBrainz {
         for problem in &local.embedded_evidence.problems {
             blockers.push(problem.clone());
         }
@@ -4695,94 +4512,17 @@ mod tests {
     }
 
     #[test]
-    fn ai_album_rescues_modest_text_mismatch_without_claiming_an_edition() {
-        let mut local = local_release(&["One", "Two"]);
-        local.embedded_discogs_id = Some(42);
-        let mut remote = remote_release(&["Ones", "Two"]);
-        remote.title = "Tast Album".to_string();
-        remote.artists = vec!["Tast Artist".to_string()];
-        let candidate = Candidate::new(&local, remote);
-        let original_score = candidate.score;
-        assert!(
-            !evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default())
-                .auto_accept
-        );
-        let result = evaluate_ai_album(&local, &candidate, &[]);
-        assert!(result.auto_accept, "{:?}", result.blockers);
-        assert_eq!(result.match_scope, MatchScope::Album);
-        assert!(result.evidence.iter().any(|note| note.contains("semantic")));
-        assert!(
-            result
-                .warnings
-                .iter()
-                .any(|note| note.contains("exact edition unconfirmed"))
-        );
-        assert_eq!(candidate.score, original_score);
-    }
-
-    #[test]
-    fn ai_album_requires_minimum_measured_album_score() {
-        let local = local_release(&["One", "Two"]);
-        let mut remote = remote_release(&["Ones", "Twos"]);
-        remote.title = "Best Albums".to_string();
-        remote.artists = vec!["Best Artists".to_string()];
-        let candidate = Candidate::new(&local, remote);
-        assert!(candidate.score.album_score() < 0.85);
-        assert!(!evaluate_ai_album(&local, &candidate, &[]).auto_accept);
-    }
-
-    #[test]
-    fn ai_album_rejects_low_album_title_and_artist_similarity() {
-        let mut local = local_release(&["One"]);
-        local.album_title = Some("a".repeat(100));
-        local.album_artist = Some("b".repeat(100));
-        for change_title in [true, false] {
-            let mut remote = remote_release(&["One"]);
-            remote.title = if change_title {
-                format!("{}{}", "a".repeat(49), "x".repeat(51))
-            } else {
-                "a".repeat(100)
-            };
-            remote.artists = vec![if change_title {
-                "b".repeat(100)
-            } else {
-                format!("{}{}", "b".repeat(49), "x".repeat(51))
-            }];
-            let candidate = Candidate::new(&local, remote);
-            assert!(candidate.score.album_score() >= 0.85);
-            let result = evaluate_ai_album(&local, &candidate, &[]);
-            assert!(!result.auto_accept);
-            assert!(
-                result
-                    .blockers
-                    .iter()
-                    .any(|reason| reason.contains("album title or artist"))
-            );
-        }
-    }
-
-    #[test]
-    fn ai_album_checks_each_title_instead_of_only_the_average() {
-        let local = local_release(&["One", "Two", "Three", "Four", "Five", "Six"]);
-        let remote = remote_release(&["ZZZ", "Two", "Three", "Four", "Five", "Six"]);
-        let candidate = Candidate::new(&local, remote);
-        assert!(candidate.score.album_score() > 0.85);
-        let result = evaluate_ai_album(&local, &candidate, &[]);
-        assert!(!result.auto_accept);
-        assert!(
-            result
-                .blockers
-                .iter()
-                .any(|reason| reason.contains("track title"))
-        );
-    }
-
-    #[test]
     fn album_scope_blocks_track_version_qualifier_mismatches() {
         let local = local_release(&["Yesterday", "Michelle"]);
         let remote = remote_release(&["Yesterday (Live)", "Michelle (Live)"]);
         let candidate = Candidate::new(&local, remote);
-        let result = evaluate_ai_album(&local, &candidate, &[]);
+        let result = evaluate_at_scope(
+            &local,
+            &candidate,
+            None,
+            &DiscoveryEvidence::default(),
+            MatchScope::Album,
+        );
         assert!(!result.auto_accept);
         assert!(
             result
@@ -4799,366 +4539,22 @@ mod tests {
         let local = local_release(&["Here Comes the Sun", "Something"]);
         let remote = remote_release(&["Here Comes the Sun (Remastered)", "Something"]);
         let candidate = Candidate::new(&local, remote);
-        let result = evaluate_ai_album(&local, &candidate, &[]);
-        assert!(result.auto_accept, "{:?}", result.blockers);
-    }
-
-    #[test]
-    fn ai_album_keeps_every_non_text_gate() {
-        for problem in [
-            "album missing",
-            "artist blank",
-            "track title missing",
-            "remote title blank",
-            "local duration missing",
-            "remote duration missing",
-            "zero duration",
-            "negative duration",
-            "nan duration",
-            "infinite duration",
-            "long duration",
-            "incomplete",
-            "ambiguous",
-            "unsupported",
-            "structure",
-            "barcode",
-            "catalog",
-            "qualifier",
-            "embedded release",
-            "release group",
-            "recording",
-            "release track",
-            "release identifier problem",
-            "track identifier problem",
-        ] {
-            let mut local = local_release(&["One", "Two"]);
-            let mut remote = remote_release(&["One", "Two"]);
-            let id_a = mbid("11111111-1111-1111-1111-111111111111");
-            let id_b = mbid("22222222-2222-2222-2222-222222222222");
-            match problem {
-                "album missing" => local.album_title = None,
-                "artist blank" => local.album_artist = Some("  ".to_string()),
-                "track title missing" => local.tracks[0].title = None,
-                "remote title blank" => remote.tracklist[0].title = "  ".to_string(),
-                "local duration missing" => local.tracks[0].duration_secs = None,
-                "remote duration missing" => remote.tracklist[0].duration_secs = None,
-                "zero duration" => remote.tracklist[0].duration_secs = Some(0.0),
-                "negative duration" => local.tracks[0].duration_secs = Some(-1.0),
-                "nan duration" => remote.tracklist[0].duration_secs = Some(f64::NAN),
-                "infinite duration" => local.tracks[0].duration_secs = Some(f64::INFINITY),
-                "long duration" => remote.tracklist[0].duration_secs = Some(183.01),
-                "incomplete" => {
-                    remote.tracklist.pop();
-                }
-                "ambiguous" => {
-                    for track in &mut local.tracks {
-                        track.title = Some("Intro".to_string());
-                        track.track_number = None;
-                        track.duration_secs = Some(180.0);
-                    }
-                    for track in &mut remote.tracklist {
-                        track.title = "Intro".to_string();
-                        track.position = None;
-                        track.duration_secs = Some(180.0);
-                    }
-                }
-                "unsupported" => remote.tracklist[0].entry_type = TrackEntryType::Index,
-                "structure" => remote.structure_issues.push("pregap".to_string()),
-                "barcode" => local.barcode = Some("9999999999999".to_string()),
-                "catalog" => local.catalog_number = Some("OTHER".to_string()),
-                "qualifier" => remote.edition_notes.push("Live".to_string()),
-                "embedded release" => local.embedded_discogs_id = Some(999),
-                "release group" => {
-                    remote.id = ReleaseId::MusicBrainz(id_a);
-                    remote.group_id = Some(GroupId::MusicBrainzReleaseGroup(id_a));
-                    local.embedded_evidence.release_group_id = Some(id_b);
-                }
-                "recording" => {
-                    local.tracks[0].recording_id = Some(id_a);
-                    remote.tracklist[0].recording_id = Some(id_b);
-                }
-                "release track" => {
-                    local.tracks[0].release_track_id = Some(id_a);
-                    remote.tracklist[0].release_track_id = Some(id_b);
-                }
-                "release identifier problem" => local
-                    .embedded_evidence
-                    .problems
-                    .push("conflicting observed release IDs".to_string()),
-                "track identifier problem" => local.tracks[0]
-                    .identifier_problems
-                    .push("malformed observed recording ID".to_string()),
-                _ => unreachable!(),
-            }
-            let candidate = Candidate::new(&local, remote);
-            assert!(
-                !evaluate_ai_album(&local, &candidate, &[]).auto_accept,
-                "accepted {problem}"
-            );
-        }
-    }
-
-    #[test]
-    fn ai_album_rejects_invalid_mapping_payloads_without_panicking() {
-        let local = local_release(&["One", "Two"]);
-        let baseline = Candidate::new(&local, remote_release(&["One", "Two"]));
-        for pairs in [
-            vec![Some(0), Some(0)],
-            vec![Some(0), Some(99)],
-            vec![Some(0)],
-            vec![Some(0), None],
-        ] {
-            let mut candidate = baseline.clone();
-            candidate.mapping.pairs = pairs;
-            assert!(!evaluate_ai_album(&local, &candidate, &[]).auto_accept);
-            assert!(!compatible_album_audio(&baseline, &candidate));
-            assert!(!compatible_album_audio(&candidate, &baseline));
-        }
-    }
-
-    #[test]
-    fn ai_audio_compatibility_allows_credit_spelling_and_cross_provider_group_differences() {
-        let local = local_release(&["One", "Two"]);
-        let mut first = remote_release(&["One", "Two"]);
-        first.group_id = Some(GroupId::DiscogsMaster(1));
-        let first = Candidate::new(&local, first);
-        let mut other = remote_release(&["Ones", "Twos"]);
-        other.id = ReleaseId::MusicBrainz(mbid("11111111-1111-1111-1111-111111111111"));
-        other.group_id = Some(GroupId::MusicBrainzReleaseGroup(mbid(
-            "22222222-2222-2222-2222-222222222222",
-        )));
-        other.title = "Tast Album".to_string();
-        other.artists = vec!["Tast Artist".to_string()];
-        other.tracklist[0].artist_credit = Some("Different spelling".to_string());
-        let other = Candidate::new(&local, other);
-        assert!(compatible_album_audio(&first, &other));
-        assert!(compatible_album_audio(&other, &first));
-    }
-
-    #[test]
-    fn ai_audio_compatibility_allows_edition_ids_but_checks_recordings() {
-        let local = local_release(&["One", "Two"]);
-        let id_a = mbid("11111111-1111-1111-1111-111111111111");
-        let id_b = mbid("22222222-2222-2222-2222-222222222222");
-        let mut first = remote_release(&["One", "Two"]);
-        first.id = ReleaseId::MusicBrainz(id_a);
-        first.tracklist[0].release_track_id = Some(id_a);
-        first.tracklist[0].recording_id = Some(id_a);
-        let first = Candidate::new(&local, first);
-        let mut other = first.release.clone();
-        other.id = ReleaseId::MusicBrainz(id_b);
-        other.tracklist[0].release_track_id = Some(id_b);
-        let other = Candidate::new(&local, other);
-        assert!(compatible_album_audio(&first, &other));
-        let mut conflicting = other.clone();
-        conflicting.release.tracklist[0].recording_id = Some(id_b);
-        assert!(!compatible_album_audio(&first, &conflicting));
-    }
-
-    #[test]
-    fn ai_audio_compatibility_refuses_unknown_audio_and_edition_conflicts() {
-        let local = local_release(&["One", "Two"]);
-        let mut release = remote_release(&["One", "Two"]);
-        release.group_id = Some(GroupId::DiscogsMaster(1));
-        let baseline = Candidate::new(&local, release);
-        for problem in [
-            "missing duration",
-            "zero duration",
-            "nan duration",
-            "infinite duration",
-            "timing",
-            "group",
-            "qualifier",
-            "unsupported",
-            "ambiguous",
-            "incomplete",
-            "row count",
-        ] {
-            let mut other = baseline.clone();
-            match problem {
-                "missing duration" => other.release.tracklist[0].duration_secs = None,
-                "zero duration" => other.release.tracklist[0].duration_secs = Some(0.0),
-                "nan duration" => other.release.tracklist[0].duration_secs = Some(f64::NAN),
-                "infinite duration" => {
-                    other.release.tracklist[0].duration_secs = Some(f64::INFINITY)
-                }
-                "timing" => other.release.tracklist[0].duration_secs = Some(183.01),
-                "group" => other.release.group_id = Some(GroupId::DiscogsMaster(2)),
-                "qualifier" => other.release.formats.push("Remastered".to_string()),
-                "unsupported" => other.release.structure_issues.push("pregap".to_string()),
-                "ambiguous" => other.mapping.ambiguous = true,
-                "incomplete" => other.mapping.complete = false,
-                "row count" => {
-                    other.mapping.pairs.pop();
-                }
-                _ => unreachable!(),
-            }
-            assert!(
-                !compatible_album_audio(&baseline, &other),
-                "accepted {problem}"
-            );
-            assert!(
-                !compatible_album_audio(&other, &baseline),
-                "accepted reversed {problem}"
-            );
-        }
-    }
-
-    #[test]
-    fn ai_album_checks_all_close_and_higher_alternatives() {
-        let local = local_release(&["One", "Two"]);
-        let first = Candidate::new(&local, remote_release(&["One", "Two"]));
-        for score in [1.0, 0.96, 0.95] {
-            let mut compatible = first.clone();
-            compatible.release.id = ReleaseId::Discogs(43);
-            let mut conflicting = first.clone();
-            conflicting.release.id = ReleaseId::Discogs(44);
-            conflicting.release.tracklist[0].duration_secs = None;
-            // Only the score determines whether an alternative is close;
-            // its actual incomplete audio evidence must still block acceptance.
-            conflicting.score.album_title = score;
-            conflicting.score.album_artist = score;
-            conflicting.score.track_titles = score;
-            conflicting.score.durations = score;
-            let result = evaluate_ai_album(&local, &first, &[compatible, conflicting]);
-            assert!(!result.auto_accept, "accepted alternative at score {score}");
-            assert!(result.blockers.iter().any(|reason| reason.contains("44")));
-        }
-        let mut selected = first.clone();
-        selected.score.album_title = 0.9;
-        let mut higher = first.clone();
-        higher.release.id = ReleaseId::Discogs(45);
-        higher.release.structure_issues.push("pregap".to_string());
-        assert!(!evaluate_ai_album(&local, &selected, &[higher]).auto_accept);
-    }
-
-    #[test]
-    fn ai_album_accepts_compatible_twins_and_ignores_distant_conflicts() {
-        let local = local_release(&["One", "Two"]);
-        let first = Candidate::new(&local, remote_release(&["One", "Two"]));
-        let mut twin = first.clone();
-        twin.release.id = ReleaseId::Discogs(43);
-        twin.release.title = "Tast Album".to_string();
-        let mut distant = first.clone();
-        distant.release.id = ReleaseId::Discogs(44);
-        distant.release.tracklist[0].duration_secs = None;
-        distant.score.album_title = 0.8;
-        distant.score.album_artist = 0.8;
-        distant.score.track_titles = 0.8;
-        distant.score.durations = 0.8;
-        assert!(evaluate_ai_album(&local, &first, &[twin, distant]).auto_accept);
-    }
-
-    #[test]
-    fn ai_album_accepts_the_text_floor_and_duration_boundary() {
-        let mut local = local_release(&["One", "Two"]);
-        local.album_title = Some("aaaaaaaaaa".to_string());
-        let mut remote = remote_release(&["One", "Two"]);
-        remote.title = "aaaaaxxxxx".to_string();
-        let candidate = Candidate::new(&local, remote);
-        assert!(evaluate_ai_album(&local, &candidate, &[]).auto_accept);
-
-        let local = local_release(&["One", "Two"]);
-        let mut remote = remote_release(&["One", "Two"]);
-        remote.tracklist[0].duration_secs = Some(183.0);
-        let candidate = Candidate::new(&local, remote);
-        assert!(evaluate_ai_album(&local, &candidate, &[]).auto_accept);
-        assert!(compatible_album_audio(
-            &Candidate::new(&local, remote_release(&["One", "Two"])),
+        let result = evaluate_at_scope(
+            &local,
             &candidate,
-        ));
-    }
-
-    #[test]
-    fn ai_album_never_upgrades_to_an_exact_edition() {
-        let mut local = local_release(&["One", "Two"]);
-        local.embedded_discogs_id = Some(42);
-        let candidate = Candidate::new(&local, remote_release(&["One", "Two"]));
-        assert!(evaluate(&local, &candidate, None, &DiscoveryEvidence::default()).auto_accept);
-        let evaluation = evaluate_ai_album(&local, &candidate, &[]);
-        assert!(evaluation.auto_accept);
-        assert_eq!(evaluation.match_scope, MatchScope::Album);
-    }
-
-    #[test]
-    fn ai_audio_compatibility_rejects_mapped_track_version_disagreements() {
-        let local = local_release(&["One", "Two"]);
-        let recording = mbid("11111111-1111-1111-1111-111111111111");
-        for qualifier in ["Live", "Instrumental"] {
-            for recording_id in [None, Some(recording)] {
-                let mut first = Candidate::new(&local, remote_release(&["One", "Two"]));
-                first.release.tracklist[1].recording_id = recording_id;
-                let mut other = first.clone();
-                other.release.id = ReleaseId::Discogs(43);
-                other.release.tracklist[1].title = format!("Two ({qualifier})");
-                assert!(
-                    !compatible_album_audio(&first, &other),
-                    "accepted {qualifier} with {recording_id:?}"
-                );
-                assert!(!equivalent_unassessed_audio(&first, &other));
-            }
-        }
-    }
-
-    #[test]
-    fn ai_album_blocks_close_twelve_track_alternative_with_a_changed_version() {
-        let titles: Vec<String> = (1..=12).map(|n| format!("Track {n}")).collect();
-        let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
-        let mut local = local_release(&refs);
-        local.tracks[0].title = Some("Track One".to_string());
-        let selected = Candidate::new(&local, remote_release(&refs));
-        let mut other_release = selected.release.clone();
-        other_release.id = ReleaseId::Discogs(43);
-        other_release.tracklist[11].title = "Entirely Different Recording (Live)".to_string();
-        let other = Candidate::new(&local, other_release);
-        assert!(selected.score.album_score() - other.score.album_score() < 0.05);
-        assert!(!evaluate_ai_album(&local, &selected, &[other]).auto_accept);
-    }
-
-    #[test]
-    fn unassessed_audio_requires_text_credit_agreement_or_a_shared_recording() {
-        let local = local_release(&["One", "Two"]);
-        let baseline = Candidate::new(&local, remote_release(&["One", "Two"]));
-        for changed_field in ["title", "credit"] {
-            let mut other = baseline.clone();
-            other.release.id = ReleaseId::Discogs(43);
-            match changed_field {
-                "title" => {
-                    other.release.tracklist[1].title = "Entirely Different Recording".to_string()
-                }
-                "credit" => {
-                    other.release.tracklist[1].artists = vec!["Another Performer".to_string()]
-                }
-                _ => unreachable!(),
-            }
-            assert!(compatible_album_audio(&baseline, &other));
-            assert!(
-                !equivalent_unassessed_audio(&baseline, &other),
-                "accepted unassessed {changed_field}"
-            );
-            let mut with_recording = baseline.clone();
-            let recording = mbid("11111111-1111-1111-1111-111111111111");
-            with_recording.release.tracklist[1].recording_id = Some(recording);
-            other.release.tracklist[1].recording_id = Some(recording);
-            assert!(equivalent_unassessed_audio(&with_recording, &other));
-            other.release.tracklist[1].recording_id =
-                Some(mbid("22222222-2222-2222-2222-222222222222"));
-            assert!(!equivalent_unassessed_audio(&with_recording, &other));
-        }
-    }
-
-    #[test]
-    fn unassessed_audio_compares_normalized_titles_and_effective_credits() {
-        let local = local_release(&["One", "Two"]);
-        let baseline = Candidate::new(&local, remote_release(&["One", "Two"]));
-        let mut other = baseline.clone();
-        other.release.id = ReleaseId::Discogs(43);
-        other.release.tracklist[0].title = "ONE!".to_string();
-        other.release.tracklist[0].artist_credit = Some("Test Artist (2)".to_string());
-        other.release.tracklist[1].artists = vec!["TEST ARTIST".to_string()];
-        assert!(equivalent_unassessed_audio(&baseline, &other));
-        assert!(equivalent_unassessed_audio(&other, &baseline));
-        other.release.tracklist[1].artists = vec!["Different Artist".to_string()];
-        assert!(!equivalent_unassessed_audio(&baseline, &other));
+            None,
+            &DiscoveryEvidence::default(),
+            MatchScope::Album,
+        );
+        // The measured text gates may still object to the changed title; the
+        // qualifier rule itself must not.
+        assert!(
+            !result
+                .blockers
+                .iter()
+                .any(|reason| reason.contains("track version qualifiers")),
+            "{:?}",
+            result.blockers
+        );
     }
 }

@@ -36,8 +36,7 @@ All logic lives in the library crate (`src/lib.rs`). `src/main.rs` holds the Cla
 
 1. `discovery` runs bounded searches and lookups through the `providers::MetadataProvider` trait (`search` and `fetch_release`).
 2. `matcher` maps tracks, scores candidates, and applies the acceptance gates. It is pure: no network, no database.
-3. With `--ai-match`, `clef` asks Cloudflare Workers AI for advice when the normal gates do not settle the release.
-4. `store` accepts the match in one transaction, or queues a review per provider.
+3. `store` accepts the match in one transaction, or queues a review per provider.
 
 MusicBrainz runs first. Discogs is a fallback, constructed only when MusicBrainz does not settle the release.
 
@@ -63,7 +62,7 @@ Layering rules:
 - Write to stdout with the `outln!` / `out!` macros, not `println!`, so `radish list | head` exits cleanly. Wrap any path, tag value, or provider response, on stdout or stderr, in `output::Clean` / `output::clean_path` so control and bidirectional characters are escaped.
 - Reject invalid flag combinations before the database is opened or any client is built: Clap constraints, `parse_direct`, and `runner::resolve_policy` in `main.rs::run`.
 - `.env` is read from the current directory only, and only for the keys in `DOTENV_KEYS` (`src/main.rs`); add new config keys there. The `RADISH_*_BASE_URL` overrides are for tests only, accept loopback hosts only (`providers::loopback_override`), and are never read from `.env`.
-- Decisions are versioned. `matcher::MUSICBRAINZ_ALGORITHM_VERSION` / `DISCOGS_ALGORITHM_VERSION` are stored with accepted matches. Bump `clef::POLICY_VERSION` when the AI prompt version, thresholds, or gates change (see its doc comment).
+- Decisions are versioned. `matcher::MUSICBRAINZ_ALGORITHM_VERSION` / `DISCOGS_ALGORITHM_VERSION` are stored with accepted matches.
 
 ## Tests
 

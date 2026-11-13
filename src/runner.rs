@@ -5,7 +5,6 @@
 //! unsatisfactory MusicBrainz stage and only when a token is available. An
 //! explicit provider or direct selector uses one service and no fallback.
 
-use crate::clef::{Advice, AdviceChoice, ClefClient, ReviewCandidate, choice_key};
 use crate::discogs::{AdapterError, DiscogsAdapter};
 use crate::discovery::{self, DiscoveryResult};
 use crate::index::{IndexKind, IndexPaths, local::LocalIndex};
@@ -24,6 +23,7 @@ use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
+/// How many candidates per provider a queued review snapshot keeps.
 const REVIEW_CANDIDATE_LIMIT: usize = 5;
 
 #[derive(Debug, Clone, Default)]
@@ -33,7 +33,6 @@ pub struct MatchOptions {
     pub direct_release: Option<ReleaseId>,
     pub review: bool,
     pub dry_run: bool,
-    pub ai_review: bool,
     pub policy: ProviderPolicy,
 }
 
@@ -45,8 +44,6 @@ pub struct MatchSummary {
     pub skipped: usize,
     pub failed: usize,
     pub dry_run: bool,
-    /// Why AI review was turned off partway through the run, if it was.
-    pub ai_disabled: Option<String>,
 }
 
 impl MatchSummary {
@@ -66,41 +63,6 @@ impl MatchSummary {
             self.skipped,
             self.failed
         );
-        if let Some(reason) = &self.ai_disabled {
-            outln!("AI review was disabled during this run: {}", Clean(reason));
-        }
-    }
-}
-
-/// The run's single AI client. It is built on first use so a run that never
-/// needs AI never reports missing credentials, and a failure that would repeat
-/// for every release turns AI off once instead of being retried and re-reported.
-enum AiState {
-    Unbuilt,
-    Ready(ClefClient),
-    /// Off for the rest of the run, with the reason for the final summary.
-    Disabled(String),
-}
-
-impl AiState {
-    /// The client, or `None` once the run has turned AI off. Building can fail
-    /// (for example, missing credentials); that is reported once.
-    fn client(&mut self) -> Option<&ClefClient> {
-        if matches!(self, Self::Unbuilt) {
-            *self = match ClefClient::from_env() {
-                Ok(client) => Self::Ready(client),
-                Err(error) => {
-                    outln!(
-                        "  AI review disabled for this run: {error}; continuing without AI matching"
-                    );
-                    Self::Disabled(error.to_string())
-                }
-            };
-        }
-        match self {
-            Self::Ready(client) => Some(client),
-            Self::Unbuilt | Self::Disabled(_) => None,
-        }
     }
 }
 
@@ -153,8 +115,6 @@ pub struct ProviderAttempt {
     /// Failures discovery worked around because other results arrived.
     pub partial_failures: Vec<ProviderError>,
     pub embedded_release_resolved: bool,
-    /// Shared model assessment, subject to separate conservative album gates.
-    pub ai_advice: Option<Advice>,
 }
 
 impl ProviderAttempt {
@@ -167,7 +127,6 @@ impl ProviderAttempt {
             error: Some(error),
             partial_failures: Vec::new(),
             embedded_release_resolved: false,
-            ai_advice: None,
         }
     }
 
@@ -246,7 +205,6 @@ impl ProviderAttempt {
             error,
             partial_failures: result.failures,
             embedded_release_resolved,
-            ai_advice: None,
         }
     }
 
@@ -455,7 +413,6 @@ where
     }
     let mut discogs_client: Option<D> = None;
     let mut discogs_disabled: Option<ProviderError> = None;
-    let mut ai = AiState::Unbuilt;
 
     for release in &selected {
         let label = format!(
@@ -535,16 +492,12 @@ where
             &mut musicbrainz_client,
             &mut discogs_client,
             &mut discogs_disabled,
-            &mut ai,
             refreshing,
             &make_musicbrainz,
             &make_discogs,
             &guard,
         )
         .await;
-        if let AiState::Disabled(reason) = &ai {
-            summary.ai_disabled = Some(reason.clone());
-        }
 
         match outcome {
             Ok(Outcome::Accepted) => summary.accepted += 1,
@@ -633,7 +586,6 @@ async fn process_release<M, D>(
     musicbrainz_client: &mut Option<M>,
     discogs_client: &mut Option<D>,
     discogs_disabled: &mut Option<ProviderError>,
-    ai: &mut AiState,
     refreshing: bool,
     make_musicbrainz: impl Fn() -> Result<M>,
     make_discogs: impl Fn() -> Result<D>,
@@ -791,7 +743,6 @@ where
             AcceptanceMethod::Automatic,
             options.dry_run,
             guard,
-            None,
         )
         .await;
     }
@@ -840,7 +791,6 @@ where
                 AcceptanceMethod::Automatic,
                 options.dry_run,
                 guard,
-                None,
             )
             .await;
         }
@@ -858,39 +808,6 @@ where
         .is_some_and(|attempt| attempt.error.is_some());
 
     if has_candidates {
-        if options.ai_review {
-            add_ai_advice(pool, release, guard, &mut attempts, ai).await;
-        }
-        if !options.review
-            && direct.is_none()
-            && attempts.iter().any(|attempt| attempt.ai_advice.is_some())
-        {
-            match choose_ai_match(release, &attempts) {
-                Ok((candidate, evaluation, advice)) => {
-                    return accept(
-                        pool,
-                        release,
-                        candidate.release.provider(),
-                        &candidate,
-                        &evaluation,
-                        AcceptanceMethod::Automatic,
-                        options.dry_run,
-                        guard,
-                        Some(&advice),
-                    )
-                    .await;
-                }
-                Err(reason) => {
-                    let note = format!("AI match not applied: {reason}");
-                    outln!("  {}", Clean(&note));
-                    for attempt in &mut attempts {
-                        if !attempt.candidates.is_empty() {
-                            attempt.notes.push(note.clone());
-                        }
-                    }
-                }
-            }
-        }
         if options.dry_run {
             for attempt in &attempts {
                 print_decision(attempt);
@@ -898,11 +815,6 @@ where
             return Ok(Outcome::Queued);
         }
         if options.review {
-            // Keep paid advisory evidence even when the user skips or quits.
-            // Accepting a candidate clears these queued snapshots atomically.
-            if attempts.iter().any(|attempt| attempt.ai_advice.is_some()) {
-                queue_attempts(pool, release, &attempts, guard).await?;
-            }
             return review_attempts(
                 pool,
                 release,
@@ -937,216 +849,6 @@ where
     Ok(Outcome::Unmatched)
 }
 
-async fn add_ai_advice(
-    pool: &SqlitePool,
-    release: &LocalRelease,
-    guard: &MatchGuard,
-    attempts: &mut [ProviderAttempt],
-    ai: &mut AiState,
-) {
-    let Some(client) = ai.client() else {
-        return;
-    };
-    let candidates: Vec<ReviewCandidate<'_>> = attempts
-        .iter()
-        .flat_map(|attempt| {
-            attempt
-                .candidates
-                .iter()
-                .zip(&attempt.evaluations)
-                .take(REVIEW_CANDIDATE_LIMIT)
-                .map(|(candidate, evaluation)| ReviewCandidate {
-                    candidate,
-                    evaluation,
-                })
-        })
-        .collect();
-
-    // Paid advice is reused while everything it was based on is unchanged.
-    let saved = match saved_advice(pool, release, guard, attempts, client, &candidates).await {
-        Ok(saved) => saved,
-        Err(_) => {
-            // A damaged saved review only costs a new request.
-            outln!("  saved AI advice could not be read; asking again");
-            None
-        }
-    };
-    let result = match saved {
-        Some(advice) => {
-            outln!("  reusing saved AI advice; no new request was made");
-            Ok(advice)
-        }
-        None => client.advise(release, &candidates).await,
-    };
-    match result {
-        Ok(advice) => {
-            print_ai_advice(&advice);
-            let assessed = candidates
-                .iter()
-                .filter(|item| advice_assessed(&advice, item.candidate))
-                .count();
-            if assessed < candidates.len() {
-                outln!(
-                    "  AI assessed {assessed} of {} candidates with complete tracklists",
-                    candidates.len()
-                );
-            }
-            for attempt in attempts {
-                if !attempt.candidates.is_empty() {
-                    attempt.ai_advice = Some(advice.clone());
-                }
-            }
-        }
-        Err(error) if error.disables_run() => {
-            outln!("  AI review disabled for this run: {error}; continuing without AI matching");
-            *ai = AiState::Disabled(error.to_string());
-        }
-        Err(error) => outln!("  AI review unavailable: {error}; continuing without AI matching"),
-    }
-}
-
-/// Advice stored with a queued review, if it still answers the question that
-/// would be asked now: unchanged files and edition, same candidates, same
-/// model and prompt.
-async fn saved_advice(
-    pool: &SqlitePool,
-    release: &LocalRelease,
-    guard: &MatchGuard,
-    attempts: &[ProviderAttempt],
-    client: &ClefClient,
-    candidates: &[ReviewCandidate<'_>],
-) -> Result<Option<Advice>> {
-    let Ok(digest) = client.request_digest(release, candidates) else {
-        return Ok(None);
-    };
-    for attempt in attempts {
-        let Some(saved) = store::load_review(pool, release.id, attempt.provider).await? else {
-            continue;
-        };
-        if saved.guard != *guard {
-            continue;
-        }
-        let advice = saved
-            .candidates
-            .into_iter()
-            .filter_map(|candidate| candidate.ai_advice)
-            .find(|advice| advice.answers(client.model(), &digest));
-        if advice.is_some() {
-            return Ok(advice);
-        }
-    }
-    Ok(None)
-}
-
-fn print_ai_advice(advice: &Advice) {
-    outln!("  AI advice: {}", advice.summary());
-}
-
-fn advice_assessed(advice: &Advice, candidate: &Candidate) -> bool {
-    advice
-        .probabilities
-        .contains_key(&choice_key(&candidate.release.id))
-}
-
-fn choose_ai_match(
-    release: &LocalRelease,
-    attempts: &[ProviderAttempt],
-) -> Result<(Candidate, Evaluation, Advice), String> {
-    let advice = attempts
-        .iter()
-        .find_map(|attempt| attempt.ai_advice.as_ref())
-        .ok_or_else(|| "no model assessment is available".to_string())?;
-    let primary_provider = attempts.first().map(|attempt| attempt.provider);
-    if matches!(advice.choice, AdviceChoice::NoMatch) {
-        return Err("the model found no supported match".into());
-    }
-    if !advice.can_automate() {
-        return Err("model confidence or selected probability does not meet the automatic acceptance policy".into());
-    }
-    // The client may narrow its request to complete candidates that fit. Only
-    // actual returned option keys establish which evidence the model assessed.
-    let offered: Vec<&Candidate> = attempts
-        .iter()
-        .flat_map(|attempt| attempt.candidates.iter())
-        .filter(|candidate| advice_assessed(advice, candidate))
-        .collect();
-    let candidate = match &advice.choice {
-        AdviceChoice::Candidate { release: id } => *offered
-            .iter()
-            .find(|candidate| candidate.release.id == *id)
-            .ok_or_else(|| "the selected release was not assessed".to_string())?,
-        AdviceChoice::EquivalentEditions => {
-            let candidate = *offered
-                .first()
-                .ok_or_else(|| "no candidates were assessed".to_string())?;
-            if offered.len() < 2 {
-                return Err("equivalent editions requires at least two assessed candidates".into());
-            }
-            if !offered
-                .iter()
-                .all(|other| matcher::compatible_album_audio(candidate, other))
-            {
-                return Err("the assessed editions do not establish equivalent audio".into());
-            }
-            candidate
-        }
-        AdviceChoice::NoMatch => unreachable!(),
-    };
-    if primary_failed_transiently(attempts)
-        && Some(candidate.release.provider()) != primary_provider
-    {
-        return Err(TRANSIENT_PRIMARY_NOTE.to_string());
-    }
-    // Include candidates outside the model budget when checking ambiguity.
-    let alternatives: Vec<Candidate> = attempts
-        .iter()
-        .flat_map(|attempt| attempt.candidates.iter().cloned())
-        .collect();
-    let evaluation = matcher::evaluate_ai_album(release, candidate, &alternatives);
-    if !evaluation.auto_accept {
-        return Err(evaluation.blockers.join("; "));
-    }
-    // The model cannot supply semantic agreement for evidence it never saw.
-    if let Some(other) = alternatives.iter().find(|other| {
-        !advice_assessed(advice, other)
-            && matcher::within_gap(candidate.score.album_score() - other.score.album_score())
-            && !matcher::equivalent_unassessed_audio(candidate, other)
-    }) {
-        return Err(format!(
-            "unassessed close alternative {} does not establish the same album and recordings",
-            other.release.id
-        ));
-    }
-    if matches!(advice.choice, AdviceChoice::EquivalentEditions) {
-        for other in &offered {
-            let other_evaluation = matcher::evaluate_ai_album(release, other, &alternatives);
-            if !other_evaluation.auto_accept {
-                return Err(format!(
-                    "equivalent edition {}: {}",
-                    other.release.id,
-                    other_evaluation.blockers.join("; ")
-                ));
-            }
-        }
-    }
-    if candidate.release.provider() == ProviderKind::Discogs
-        && let Some(primary) = attempts
-            .iter()
-            .find(|attempt| attempt.provider == ProviderKind::MusicBrainz)
-    {
-        let conflicts = matcher::fallback_conflicts(
-            release,
-            &primary.candidates,
-            candidate,
-            primary.embedded_release_resolved,
-        );
-        if !conflicts.is_empty() {
-            return Err(conflicts.join("; "));
-        }
-    }
-    Ok((candidate.clone(), evaluation, advice.clone()))
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn accept(
     pool: &SqlitePool,
@@ -1157,7 +859,6 @@ async fn accept(
     method: AcceptanceMethod,
     dry_run: bool,
     guard: &MatchGuard,
-    ai_advice: Option<&Advice>,
 ) -> Result<Outcome> {
     if !evaluation.can_apply(candidate) {
         outln!(
@@ -1179,19 +880,15 @@ async fn accept(
         return Ok(Outcome::Accepted);
     }
 
-    let result = if let Some(advice) = ai_advice {
-        store::accept_ai_match(pool, release, candidate, guard, advice).await
-    } else {
-        store::accept_match(
-            pool,
-            release,
-            candidate,
-            method,
-            evaluation.match_scope,
-            guard,
-        )
-        .await
-    };
+    let result = store::accept_match(
+        pool,
+        release,
+        candidate,
+        method,
+        evaluation.match_scope,
+        guard,
+    )
+    .await;
     match result {
         Ok(()) => {
             outln!(
@@ -1202,9 +899,6 @@ async fn accept(
             );
             outln!("    {} {}", provider, candidate.release.id.storage_id());
             outln!("    {}", Clean(&candidate.release.url));
-            if ai_advice.is_some() {
-                outln!("    AI-supported album match; decision evidence saved");
-            }
             if evaluation.match_scope == MatchScope::Album {
                 outln!("    album and tracks matched; exact edition unconfirmed");
             }
@@ -1230,8 +924,7 @@ fn stored_candidates(attempt: &ProviderAttempt) -> Vec<StoredCandidate> {
         .iter()
         .zip(attempt.evaluations.iter())
         .take(REVIEW_CANDIDATE_LIMIT)
-        .enumerate()
-        .map(|(index, (candidate, evaluation))| StoredCandidate {
+        .map(|(candidate, evaluation)| StoredCandidate {
             release: candidate.release.clone(),
             mapping: candidate.mapping.clone(),
             score: candidate.score,
@@ -1240,7 +933,6 @@ fn stored_candidates(attempt: &ProviderAttempt) -> Vec<StoredCandidate> {
             blockers: evaluation.blockers.clone(),
             warnings: evaluation.warnings.clone(),
             evidence: evaluation.evidence.clone(),
-            ai_advice: (index == 0).then(|| attempt.ai_advice.clone()).flatten(),
         })
         .collect()
 }
@@ -1340,13 +1032,6 @@ async fn review_saved_release(
         .collect();
 
     print_release_header(release);
-    if let Some(advice) = saved
-        .iter()
-        .flat_map(|review| &review.candidates)
-        .find_map(|candidate| candidate.ai_advice.as_ref())
-    {
-        print_ai_advice(advice);
-    }
     for (provider, candidates, evaluations) in &groups {
         for (index, (candidate, evaluation)) in
             candidates.iter().zip(evaluations.iter()).enumerate()
@@ -1380,7 +1065,6 @@ async fn review_saved_release(
                 AcceptanceMethod::Manual,
                 false,
                 guard,
-                None,
             )
             .await
         }
@@ -1450,7 +1134,6 @@ where
                 AcceptanceMethod::Manual,
                 false,
                 guard,
-                None,
             )
             .await
         }
@@ -1812,7 +1495,6 @@ fn print_decision_for(provider: ProviderKind, candidate: &Candidate, evaluation:
         error: None,
         partial_failures: Vec::new(),
         embedded_release_resolved: false,
-        ai_advice: None,
     });
 }
 
@@ -1851,7 +1533,7 @@ mod tests {
         assert!(resolve_policy(Some(ProviderKind::Discogs), Some(&id)).is_err());
     }
 
-    fn ai_album_fixture() -> (LocalRelease, RemoteRelease) {
+    fn album_fixture() -> (LocalRelease, RemoteRelease) {
         use crate::matcher::{
             ArtistKind, EmbeddedReleaseEvidence, LocalTrack, RemoteTrack, TrackEntryType,
         };
@@ -1924,7 +1606,7 @@ mod tests {
 
     #[test]
     fn review_summary_uses_fallback_reasons_when_the_primary_failed() {
-        let (local, mut remote) = ai_album_fixture();
+        let (local, mut remote) = album_fixture();
         // One mismatched title is settled by its duration; two still need review.
         remote.tracklist[1].title = "A different song".into();
         let primary = ProviderAttempt::failed(
@@ -1955,7 +1637,7 @@ mod tests {
 
     #[test]
     fn review_summary_explains_unresolved_selection_without_inventing_conflicts() {
-        let (local, mut remote) = ai_album_fixture();
+        let (local, mut remote) = album_fixture();
         remote.tracklist[0].title = "Track One".into();
         let attempt = ProviderAttempt::from_discovery(
             ProviderKind::Discogs,
@@ -1972,79 +1654,6 @@ mod tests {
             review_reason_summary(&[attempt]),
             "candidate selection requires review"
         );
-    }
-
-    #[test]
-    fn unoffered_close_candidates_cannot_inherit_semantic_agreement() {
-        let (local, remote) = ai_album_fixture();
-        for change_credit in [false, true] {
-            let releases = (42..=47)
-                .map(|id| {
-                    let mut release = remote.clone();
-                    release.id = ReleaseId::Discogs(id);
-                    if id == 47 {
-                        if change_credit {
-                            release.tracklist[11].artists =
-                                vec!["Entirely Different Artist".into()];
-                        } else {
-                            release.tracklist[11].title = "Entirely Different Recording".into();
-                        }
-                    }
-                    release
-                })
-                .collect();
-            let mut attempt = ProviderAttempt::from_discovery(
-                ProviderKind::Discogs,
-                &local,
-                DiscoveryResult {
-                    releases,
-                    ..Default::default()
-                },
-                None,
-                false,
-            );
-            assert_eq!(attempt.candidates[5].release.id, ReleaseId::Discogs(47));
-            attempt.ai_advice = Some(Advice {
-                model: "clef-flash".into(),
-                prompt_version: "radish-clef-album-v3".into(),
-                choice: AdviceChoice::Candidate {
-                    release: ReleaseId::Discogs(42),
-                },
-                probabilities: (42..=46)
-                    .map(|id| (format!("discogs:{id}"), if id == 42 { 1.0 } else { 0.0 }))
-                    .chain([("none".into(), 0.0), ("equivalent_editions".into(), 0.0)])
-                    .collect(),
-                confidence: 1.0,
-                request_digest: None,
-            });
-            assert!(
-                choose_ai_match(&local, std::slice::from_ref(&attempt)).is_err(),
-                "unassessed text/credit conflict accepted"
-            );
-            attempt.candidates.pop();
-            attempt.evaluations.pop();
-            assert!(
-                choose_ai_match(&local, std::slice::from_ref(&attempt)).is_ok(),
-                "compatible assessed editions must still be eligible"
-            );
-            // A reduced request may assess fewer than the usual five candidates.
-            // Candidates omitted to fit the request must retain the stricter
-            // unassessed-evidence check, even when they are in the first five.
-            attempt
-                .ai_advice
-                .as_mut()
-                .unwrap()
-                .probabilities
-                .retain(|key, _| {
-                    !key.starts_with("discogs:") || key == "discogs:42" || key == "discogs:43"
-                });
-            attempt.candidates[3].release.tracklist[11].artists =
-                vec!["Entirely Different Artist".into()];
-            assert!(
-                choose_ai_match(&local, &[attempt]).is_err(),
-                "budget-omitted candidates cannot inherit semantic agreement"
-            );
-        }
     }
 
     fn scanned_track(path: &str, album: &str, number: i64) -> crate::scanner::ScannedTrack {
@@ -2186,7 +1795,7 @@ mod tests {
             .remove(0);
         let guard = store::load_match_guard(&pool, release.id).await.unwrap();
 
-        let (_, mut remote) = ai_album_fixture();
+        let (_, mut remote) = album_fixture();
         remote.tracklist.truncate(1);
         let candidate = Candidate::new(&release, remote);
         let evaluation = matcher::evaluate(
@@ -2215,7 +1824,6 @@ mod tests {
             AcceptanceMethod::Manual,
             false,
             &guard,
-            None,
         )
         .await
         .unwrap();
@@ -2288,7 +1896,7 @@ mod tests {
 
     #[test]
     fn rendered_candidates_and_headers_escape_every_untrusted_field() {
-        let (mut local, mut remote) = ai_album_fixture();
+        let (mut local, mut remote) = album_fixture();
         local.album_title = Some("title\x1b[2Jlocal".into());
         local.album_artist = Some("artist\x1b[3Jlocal".into());
         local.directory = "/music/\x1b]0;folder\x07".into();

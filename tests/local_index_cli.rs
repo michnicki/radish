@@ -96,8 +96,6 @@ fn radish(db: &Path, index_dir: &Path, args: &[&str]) -> Output {
         .env("RADISH_MUSICBRAINZ_BASE_URL", "http://127.0.0.1:9")
         .env("RADISH_DISCOGS_BASE_URL", "http://127.0.0.1:9")
         .env_remove("RADISH_DISCOGS_TOKEN")
-        .env_remove("RADISH_CLOUDFLARE_ACCOUNT_ID")
-        .env_remove("RADISH_CLOUDFLARE_API_TOKEN")
         .args(args)
         .output()
         .unwrap()
