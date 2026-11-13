@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v4";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v3";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v5";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v4";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -377,11 +377,83 @@ pub fn normalize_artist_for(provider: ProviderKind, input: &str) -> String {
 /// Text that normalizes to nothing, such as `÷`, is compared by its original
 /// characters instead, so distinct symbol-only titles do not look identical.
 pub fn similarity(a: &str, b: &str) -> f64 {
-    similarity_of_normalized(a, &normalized_chars(a), b, &normalized_chars(b))
+    comparison_similarity(a, &normalized_chars(a), b, &normalized_chars(b))
 }
 
+/// [`similarity`] over titles whose apostrophe-joined text the caller already
+/// has: the better of that and the apostrophe-as-space reading.
+///
+/// A tag may write `Dont`, `Don t`, or `Don't` for the same word, so neither
+/// reading alone is right; taking the better of the two never scores a pair
+/// lower than either one would.
+fn comparison_similarity(a: &str, a_chars: &[char], b: &str, b_chars: &[char]) -> f64 {
+    let joined = similarity_of_normalized(a, a_chars, b, b_chars);
+    if joined >= 1.0 || !(has_apostrophe(a) || has_apostrophe(b)) {
+        return joined;
+    }
+    let spaced = similarity_of_normalized(
+        a,
+        &normalize_text(a).chars().collect::<Vec<_>>(),
+        b,
+        &normalize_text(b).chars().collect::<Vec<_>>(),
+    );
+    joined.max(spaced)
+}
+
+fn has_apostrophe(text: &str) -> bool {
+    text.chars().any(is_apostrophe)
+}
+
+/// Text for comparison: [`normalize_text`] with apostrophes joined, not split.
+///
+/// `Don't`, `Don’t` and a tag's `Dont` all compare as `dont`. Only comparison
+/// does this: [`normalize_text`] also feeds the search indexes and the stored
+/// album key, so changing it would desynchronize both. [`comparison_similarity`]
+/// also tries the apostrophe-as-space form.
 fn normalized_chars(text: &str) -> Vec<char> {
-    normalize_text(text).chars().collect()
+    let joined: String = text.chars().filter(|ch| !is_apostrophe(*ch)).collect();
+    normalize_text(&joined).chars().collect()
+}
+
+fn is_apostrophe(ch: char) -> bool {
+    matches!(
+        ch,
+        '\'' | '\u{2019}' | '\u{2018}' | '\u{02BC}' | '`' | '\u{00B4}'
+    )
+}
+
+/// Width of an ID3v1 text field. Software that wrote those tags cut longer
+/// titles and artists to this many characters, and the library keeps the value
+/// as it was read, padded or cut.
+const ID3V1_FIELD_CHARS: usize = 30;
+
+/// The first [`ID3V1_FIELD_CHARS`] characters of `remote`, when `local` fills a
+/// whole ID3v1 field and `remote` is longer than one.
+///
+/// A local value of exactly that width may be a cut-off copy of `remote`, which
+/// no full-length comparison can ever match. Shorter local values are complete
+/// as written. A padded short value is also a full-width one, but it is still
+/// far from any unrelated prefix, so it stays well below the match threshold.
+fn id3v1_prefix<'a>(local: &str, remote: &'a str) -> Option<&'a str> {
+    if local.chars().count() != ID3V1_FIELD_CHARS {
+        return None;
+    }
+    let (end, _) = remote.char_indices().nth(ID3V1_FIELD_CHARS)?;
+    Some(&remote[..end])
+}
+
+/// [`similarity`] for a value read from a local file: the better of the full
+/// comparison and, for a 30-character local value, a comparison with the
+/// remote's first 30 characters.
+pub fn local_similarity(local: &str, remote: &str) -> f64 {
+    let full = similarity(local, remote);
+    id3v1_prefix(local, remote).map_or(full, |prefix| full.max(similarity(local, prefix)))
+}
+
+/// [`artist_similarity`] with the same allowance for a cut-off local artist.
+pub fn local_artist_similarity(local: &str, remote: &str) -> f64 {
+    let full = artist_similarity(local, remote);
+    id3v1_prefix(local, remote).map_or(full, |prefix| full.max(artist_similarity(local, prefix)))
 }
 
 /// [`similarity`] over titles that were normalized once by the caller.
@@ -627,7 +699,7 @@ impl Mapping {
         {
             return Some(*recorded);
         }
-        Some(similarity(title, &remote_track.title))
+        Some(local_similarity(title, &remote_track.title))
     }
 
     pub fn assigned_pairs(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
@@ -970,12 +1042,21 @@ impl<'a> TitleMatrix<'a> {
         if let Some(known) = self.cache[local_index][remote_index] {
             return Some(known);
         }
-        let value = similarity_of_normalized(
+        let remote_title = &self.remote.tracklist[remote_index].title;
+        let mut value = comparison_similarity(
             title,
             &self.local_chars[local_index],
-            &self.remote.tracklist[remote_index].title,
+            remote_title,
             &self.remote_chars[remote_index],
         );
+        if let Some(prefix) = id3v1_prefix(title, remote_title) {
+            value = value.max(comparison_similarity(
+                title,
+                &self.local_chars[local_index],
+                prefix,
+                &normalized_chars(prefix),
+            ));
+        }
         self.cache[local_index][remote_index] = Some(value);
         Some(value)
     }
@@ -1132,7 +1213,7 @@ impl ScoreBreakdown {
 /// nothing is renormalized into false confidence.
 pub fn score(local: &LocalRelease, remote: &RemoteRelease, mapping: &Mapping) -> ScoreBreakdown {
     let album_title = match &local.album_title {
-        Some(title) if !title.trim().is_empty() => similarity(title, &remote.title),
+        Some(title) if !title.trim().is_empty() => local_similarity(title, &remote.title),
         _ => 0.0,
     };
 
@@ -1237,19 +1318,23 @@ fn album_artist_score(local: &LocalRelease, remote: &RemoteRelease) -> f64 {
 
     let joined_original = remote_originals.join(" ");
     let joined_chars: Vec<char> = remote_chars.join(&' ');
-    let mut best = similarity_of_normalized(
-        &local_original,
-        &local_chars,
-        &joined_original,
-        &joined_chars,
-    );
+    // A 30-character local artist may be a cut-off copy of a longer credit.
+    let compare = |original: &str, chars: &[char]| {
+        let mut value = similarity_of_normalized(&local_original, &local_chars, original, chars);
+        if let Some(prefix) = id3v1_prefix(artist, original) {
+            let prefix_chars: Vec<char> = normalize_artist_for(provider, prefix).chars().collect();
+            value = value.max(similarity_of_normalized(
+                &local_original,
+                &local_chars,
+                prefix,
+                &prefix_chars,
+            ));
+        }
+        value
+    };
+    let mut best = compare(&joined_original, &joined_chars);
     for (original, chars) in remote_originals.iter().zip(&remote_chars) {
-        best = best.max(similarity_of_normalized(
-            &local_original,
-            &local_chars,
-            original,
-            chars,
-        ));
+        best = best.max(compare(original, chars));
     }
     best
 }
@@ -1263,7 +1348,7 @@ pub fn rank_search_summary(local: &LocalRelease, summary: &SearchSummary) -> f64
     let mut rank = 0.0;
 
     if let Some(title) = &local.album_title {
-        rank += 0.5 * similarity(title, &summary.title);
+        rank += 0.5 * local_similarity(title, &summary.title);
     }
     if let Some(artist) = &local.album_artist {
         rank += 0.3 * summary_artist_hint(artist, summary);
@@ -1308,16 +1393,16 @@ fn summary_artist_hint(local_artist: &str, summary: &SearchSummary) -> f64 {
         .as_deref()
         .filter(|c| !c.trim().is_empty())
     {
-        return artist_similarity(local_artist, credit);
+        return local_artist_similarity(local_artist, credit);
     }
     if !summary.artists.is_empty() {
-        return artist_similarity(local_artist, &summary.artists.join(" "));
+        return local_artist_similarity(local_artist, &summary.artists.join(" "));
     }
     let (hint, _) = summary
         .title
         .split_once(" - ")
         .unwrap_or(("", &summary.title));
-    artist_similarity(local_artist, hint)
+    local_artist_similarity(local_artist, hint)
 }
 
 pub fn normalize_barcode(raw: &str) -> String {
@@ -2191,6 +2276,110 @@ mod tests {
     }
 
     #[test]
+    fn apostrophes_join_letters_for_comparison_but_not_for_normalization() {
+        // A tag without the apostrophe and either apostrophe style in the
+        // dump are the same words.
+        assert_eq!(
+            similarity("I Dont Want to Grow Up", "I Don't Want to Grow Up"),
+            1.0
+        );
+        assert_eq!(
+            similarity("I Dont Want to Grow Up", "I Don\u{2019}t Want to Grow Up"),
+            1.0
+        );
+        assert_eq!(similarity("Rock 'n' Roll", "Rock n Roll"), 1.0);
+        assert_eq!(similarity("Don`t", "Dont"), 1.0);
+        // A tag that spells the break as a space still matches the apostrophe.
+        assert_eq!(similarity("Jo anna", "Jo'anna"), 1.0);
+        assert_eq!(similarity("Jo'anna", "Jo anna"), 1.0);
+        // Different words stay different.
+        assert!(similarity("Dont Stop", "Dont Go") < 0.7);
+        // Search indexes and album keys still see the apostrophe as a break.
+        assert_eq!(normalize_text("Don't"), "don t");
+    }
+
+    #[test]
+    fn a_full_width_local_value_may_be_a_cut_off_copy() {
+        let remote = "The Mouth Licking What You\u{2019}ve Bled";
+        let cut = "the mouth licking what you've ";
+        assert_eq!(cut.chars().count(), ID3V1_FIELD_CHARS);
+        assert!(similarity(cut, remote) < 0.9);
+        assert_eq!(local_similarity(cut, remote), 1.0);
+
+        // Cut mid-word, as old taggers did.
+        let mid_word = "Zion I-Sunshine, Beats, and Rh";
+        assert_eq!(mid_word.chars().count(), ID3V1_FIELD_CHARS);
+        assert_eq!(
+            local_similarity(mid_word, "Zion I-Sunshine, Beats, and Rhymes"),
+            1.0
+        );
+    }
+
+    #[test]
+    fn the_cut_off_allowance_does_not_make_other_values_match() {
+        // Padded to the field width but complete: still nowhere near a match.
+        let padded = format!("{:<30}", "Intro");
+        assert_eq!(padded.chars().count(), ID3V1_FIELD_CHARS);
+        let remote = "Intro: A Much Longer Title That Goes On";
+        assert!(local_similarity(&padded, remote) < 0.3);
+
+        // Shorter than a field: complete as written, never treated as cut.
+        let short = "Zion I-Sunshine, Beats, and R";
+        assert_eq!(short.chars().count(), ID3V1_FIELD_CHARS - 1);
+        let remote = "Zion I-Sunshine, Beats, and Rhymes";
+        assert_eq!(local_similarity(short, remote), similarity(short, remote));
+
+        // A full-width value that differs inside the first 30 characters.
+        let other = "Zion I-Moonlight, Beats, and R";
+        assert_eq!(other.chars().count(), ID3V1_FIELD_CHARS);
+        assert!(local_similarity(other, remote) < 0.9);
+
+        // A remote value no longer than a field has no prefix to compare.
+        assert_eq!(id3v1_prefix(&padded, "Intro"), None);
+        assert_eq!(id3v1_prefix(&padded, &"x".repeat(30)), None);
+        assert_eq!(
+            id3v1_prefix(&padded, &"x".repeat(31)),
+            Some("x".repeat(30).as_str())
+        );
+    }
+
+    #[test]
+    fn the_prefix_is_cut_on_a_character_boundary() {
+        let remote = format!("{}\u{00E9}\u{00E9}", "a".repeat(29));
+        assert_eq!(remote.chars().count(), 31);
+        let local = format!("{}\u{00E9}", "a".repeat(29));
+        assert_eq!(id3v1_prefix(&local, &remote), Some(local.as_str()));
+    }
+
+    #[test]
+    fn a_cut_off_artist_matches_the_full_credit() {
+        let remote = "Everything But The Girl & Tracey Thorn";
+        let cut: String = remote.chars().take(ID3V1_FIELD_CHARS).collect();
+        assert!(artist_similarity(&cut, remote) < 0.9);
+        assert_eq!(local_artist_similarity(&cut, remote), 1.0);
+    }
+
+    #[test]
+    fn cut_off_titles_score_as_the_full_titles_when_ranking_and_mapping() {
+        let long = [
+            "The Mouth Licking What You\u{2019}ve Bled",
+            "Little Rich Working Class Oi Boys",
+        ];
+        let cut: Vec<String> = long
+            .iter()
+            .map(|title| title.chars().take(ID3V1_FIELD_CHARS).collect())
+            .collect();
+        let cut: Vec<&str> = cut.iter().map(String::as_str).collect();
+        let local = local_release(&cut);
+        let remote = remote_release(&long);
+
+        let mapping = map_tracks(&local, &remote);
+        assert!(mapping.complete, "{mapping:?}");
+        let breakdown = score(&local, &remote, &mapping);
+        assert!(breakdown.track_titles > 0.99, "{breakdown:?}");
+    }
+
+    #[test]
     fn strips_numeric_artist_disambiguators_for_comparison_only() {
         assert_eq!(strip_disambiguator("Nirvana (2)"), "Nirvana");
         assert_eq!(
@@ -2958,10 +3147,10 @@ mod tests {
 
     #[test]
     fn algorithm_versions_are_provider_specific() {
-        assert_eq!(algorithm_version(ProviderKind::Discogs), "discogs-match-v4");
+        assert_eq!(algorithm_version(ProviderKind::Discogs), "discogs-match-v5");
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v3"
+            "musicbrainz-match-v4"
         );
     }
 
