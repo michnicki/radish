@@ -152,6 +152,18 @@ fn stdout_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// The `releases` block whose heading names `album`: its lines up to the next
+/// blank line, joined with newlines.
+fn release_block(listing: &str, album: &str) -> String {
+    let heading = format!("— {album}");
+    listing
+        .lines()
+        .skip_while(|line| !line.contains(&heading))
+        .take_while(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
@@ -421,12 +433,12 @@ fn a_stale_discogs_match_missing_from_the_index_stays_stale_while_the_run_contin
     // The vanished release keeps its old overlay, still marked stale, because a
     // miss never erases an accepted match.
     let after = stdout_of(&radish(&db, &index_dir, &["releases"]));
-    let blue = after.lines().find(|line| line.contains("— Blue")).unwrap();
+    let blue = release_block(&after, "Blue");
     assert!(
         blue.contains("stale") && blue.contains("discogs 42"),
         "{after}"
     );
-    let green = after.lines().find(|line| line.contains("— Green")).unwrap();
+    let green = release_block(&after, "Green");
     assert!(
         green.contains("matched") && green.contains("discogs 77"),
         "{after}"

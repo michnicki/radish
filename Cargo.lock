@@ -25,6 +25,7 @@ dependencies = [
  "tar",
  "tokio",
  "unicode-normalization",
+ "unicode-width",
  "uuid",
  "walkdir",
 ]

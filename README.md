@@ -309,7 +309,7 @@ Cloudflare is contacted only with `--ai-match` (or its alias), after normal matc
 - Each local release has at most one accepted overlay across all providers. Accepting a different provider replaces the previous overlay atomically.
 - Import and watcher updates refresh observed metadata without overwriting accepted metadata.
 - A deterministic `release-input-v2:` revision covers membership, year, barcode, catalog number, and all four identifier lists. The first rebuild after upgrade changes older revisions once and marks existing matches stale while keeping their overlays visible.
-- Reimporting unchanged tags keeps a match valid. Changed observations mark it stale with a `[stale match]` marker until it is reviewed or cleared. A stale match is refreshed from its accepted provider; preferring a different source requires review. Refreshing a stale Discogs match needs `RADISH_DISCOGS_TOKEN`; without one the release is skipped (not failed) with a note. The same applies after Discogs rejected the token earlier in the run: the remaining stale Discogs matches are skipped rather than failed.
+- Reimporting unchanged tags keeps a match valid. Changed observations mark it stale (`stale match` in `list` and `search`, `stale` in `releases`) until it is reviewed or cleared. A stale match is refreshed from its accepted provider; preferring a different source requires review. Refreshing a stale Discogs match needs `RADISH_DISCOGS_TOKEN`; without one the release is skipped (not failed) with a note. The same applies after Discogs rejected the token earlier in the run: the remaining stale Discogs matches are skipped rather than failed.
 - Ordinary runs skip current accepted matches. Clearing restores scanned values and contacts no provider.
 
 ### Known limits
@@ -433,9 +433,31 @@ The SQLite database contains these tables:
 
 The base schema is embedded in the binary and initialized on connection; additive changes are applied through versioned SQLx migrations in [`migrations/`](migrations). The MusicBrainz migration copies existing Discogs accepted rows, track mappings, timestamps, scores, revisions, and review reasons into the provider-qualified tables before retiring the old ones. Historical snapshots stay version 1 and decode through the legacy Discogs codec. Existing databases keep their rows and IDs. The upgrade itself never reads files, so new observed fields start empty; it resets each track's stored modification time, which makes the next `import` or `watch` read every file once and fill them from the real tags. See [the schema](src/schema.sql) and [storage queries](src/store.rs) for exact matching rules.
 
-`list` and `search` read the database without checking the audio files. Output includes artist, title, available album, disc and track number, rounded duration in `minutes:seconds`, a `[stale match]` marker when accepted metadata no longer matches the group, and a final track count. A missing title displays the filename; a missing artist displays `(unknown artist)`. An empty result prints `No tracks found.`
+`list` and `search` read the database without checking the audio files. Output is a header line and one aligned row per track:
 
-`radish releases` prints each local release's ID, artist, title, track count, status (`unmatched`, `matched`, `stale`, plus queued providers), folder, and the accepted provider, release ID, and title when present.
+```text
+ARTIST            TITLE                ALBUM            #   TIME
+Test Artist       Blue Moon            Blue             3   3:45
+Test Artist       A Much Longer Title  Live in Tokyo  2-1  12:10  stale match
+(unknown artist)  untitled.wav         -                -   ?:??
+
+3 tracks.
+```
+
+`#` is the track number, or `disc-track` when the disc number is above 1. `TIME` is the rounded duration in `minutes:seconds`. A trailing `stale match` note appears when accepted metadata no longer matches the group. A missing title displays the filename, a missing artist displays `(unknown artist)`, and a missing album or number displays `-`. Columns are padded to the widest value, measured in terminal columns so wide characters line up. When stdout is a terminal, artist, title and album are cut to 40 columns with a trailing `…`; piped or redirected output is never cut. An empty result prints `No tracks found.`
+
+`radish releases` prints one block per local release, followed by a total:
+
+```text
+#12  Test Artist — Blue
+     2 tracks · matched
+     match:  musicbrainz 76df3287-6cda-33eb-8e9a-044b5e15ffdd (Blue)
+     path:   /music/Test Artist/Blue
+
+1 local release.
+```
+
+The heading has the ID, artist, and title. The next line has the track count and status (`unmatched`, `matched`, `stale`, plus queued providers). The `match:` line shows the accepted provider, the full release ID, and the title, and appears only when a match exists. The `path:` line shows the folder. Releases without an artist or album tag show `(unknown artist)` and `(no album tag)`.
 
 File databases use SQLite's WAL journal mode, so `<db>-wal` and `<db>-shm` files appear next to the database while it is open. They are part of the database: keep them with it when you move or back it up, and do not delete them while Radish is running.
 

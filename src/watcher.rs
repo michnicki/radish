@@ -1,3 +1,4 @@
+use crate::layout::plural;
 use crate::output::{Clean, clean_path};
 use crate::progress::ImportProgress;
 use crate::{importer, outln, scanner, store};
@@ -43,8 +44,12 @@ pub async fn watch_directory(pool: SqlitePool, root: &Path, db_path: &Path) -> R
     let summary = importer::sync_directory(&pool, &root, &progress, false).await?;
     drop(progress);
     outln!(
-        "Synced {} tracks ({} unchanged, {} removed). Watching for changes... (Ctrl+C to stop)",
-        summary.scanned + summary.unchanged,
+        "Synced {} ({} unchanged, {} removed). Watching for changes... (Ctrl+C to stop)",
+        plural(
+            (summary.scanned + summary.unchanged) as u64,
+            "track",
+            "tracks"
+        ),
         summary.unchanged,
         summary.removed
     );
@@ -343,10 +348,18 @@ async fn apply_path(
             outcome.synced += summary.saved;
             outcome.removed += summary.removed;
             if summary.saved > 0 {
-                outln!("synced: {} ({} tracks)", clean_path(path), summary.saved);
+                outln!(
+                    "synced: {} ({})",
+                    clean_path(path),
+                    plural(summary.saved, "track", "tracks")
+                );
             }
             if summary.removed > 0 {
-                outln!("removed: {} ({} tracks)", clean_path(path), summary.removed);
+                outln!(
+                    "removed: {} ({})",
+                    clean_path(path),
+                    plural(summary.removed, "track", "tracks")
+                );
             }
         }
         Ok(metadata) if metadata.is_file() && scanner::is_audio_file(path) => {

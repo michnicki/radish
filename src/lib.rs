@@ -18,6 +18,7 @@ pub mod discogs;
 pub mod discovery;
 pub mod importer;
 pub mod index;
+pub mod layout;
 pub mod matcher;
 pub mod musicbrainz;
 pub mod output;

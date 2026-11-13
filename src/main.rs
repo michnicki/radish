@@ -1,9 +1,11 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use radish::layout::{Column, Table, plural};
 use radish::output::{Clean, clean_path};
 use radish::progress::ImportProgress;
 use radish::providers::{ProviderKind, ReleaseId};
 use radish::{db, importer, index, outln, runner, store, watcher};
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -359,12 +361,33 @@ fn canonical_scope(path: Option<&Path>) -> Result<Option<PathBuf>> {
     }
 }
 
+/// Display columns kept for artist, title and album on a terminal.
+///
+/// Wide enough for most titles on an 80-column terminal alongside the
+/// number and duration columns; piped output is never cut.
+const TEXT_COLUMN_CAP: usize = 40;
+
 fn print_releases(rows: &[store::LocalReleaseStatus]) {
     if rows.is_empty() {
         outln!("No local releases found.");
         return;
     }
+    for line in render_releases(rows) {
+        outln!("{line}");
+    }
+}
 
+/// Lays out one block per local release, then the total.
+fn render_releases(rows: &[store::LocalReleaseStatus]) -> Vec<String> {
+    // Continuation lines line up under the artist, past the widest `#id`.
+    let id_width = rows
+        .iter()
+        .map(|row| format!("#{}", row.id).len())
+        .max()
+        .unwrap_or(0);
+    let indent = " ".repeat(id_width + 2);
+
+    let mut lines = Vec::new();
     for row in rows {
         let artist = row.album_artist.as_deref().unwrap_or("(unknown artist)");
         let title = row.album_title.as_deref().unwrap_or("(no album tag)");
@@ -383,27 +406,33 @@ fn print_releases(rows: &[store::LocalReleaseStatus]) {
                 .collect();
             status.push_str(&format!(", queued ({})", providers.join(", ")));
         }
-        let remote = match (&row.provider, &row.remote_release_id) {
-            (Some(provider), Some(id)) => format!(
-                " -> {provider} {}{}",
-                Clean(id),
-                row.remote_title
-                    .as_deref()
-                    .map(|title| format!(" ({})", Clean(title)))
-                    .unwrap_or_default()
-            ),
-            _ => String::new(),
-        };
-        outln!(
-            "#{} {} — {}  [{} track(s)]  {status}{remote}\n     {}",
-            row.id,
+        let tracks = plural(row.track_count.max(0) as u64, "track", "tracks");
+        lines.push(format!(
+            "{:<id_width$}  {} — {}",
+            format!("#{}", row.id),
             Clean(artist),
-            Clean(title),
-            row.track_count,
-            Clean(&row.directory)
-        );
+            Clean(title)
+        ));
+        lines.push(format!("{indent}{tracks} · {status}"));
+        if let (Some(provider), Some(id)) = (&row.provider, &row.remote_release_id) {
+            let remote_title = row
+                .remote_title
+                .as_deref()
+                .map(|title| format!(" ({})", Clean(title)))
+                .unwrap_or_default();
+            lines.push(format!(
+                "{indent}match:  {provider} {}{remote_title}",
+                Clean(id)
+            ));
+        }
+        lines.push(format!("{indent}path:   {}", Clean(&row.directory)));
+        lines.push(String::new());
     }
-    outln!("\n{} local release(s).", rows.len());
+    lines.push(format!(
+        "{}.",
+        plural(rows.len() as u64, "local release", "local releases")
+    ));
+    lines
 }
 
 fn print_tracks(rows: &[store::TrackRow]) {
@@ -411,31 +440,48 @@ fn print_tracks(rows: &[store::TrackRow]) {
         outln!("No tracks found.");
         return;
     }
+    for line in render_tracks(rows, io::stdout().is_terminal()) {
+        outln!("{line}");
+    }
+}
 
+/// Lays out the tracks as aligned columns, then the total.
+///
+/// `truncate` shortens long text cells; leave it off for piped output.
+fn render_tracks(rows: &[store::TrackRow], truncate: bool) -> Vec<String> {
+    let mut table = Table::new(vec![
+        Column::new("ARTIST").capped(TEXT_COLUMN_CAP),
+        Column::new("TITLE").capped(TEXT_COLUMN_CAP),
+        Column::new("ALBUM").capped(TEXT_COLUMN_CAP),
+        Column::new("#").right(),
+        Column::new("TIME").right(),
+        // Header-less and last, so the stale marker stays unpadded.
+        Column::new(""),
+    ]);
     for row in rows {
-        let filename = std::path::Path::new(&row.path)
+        let filename = Path::new(&row.path)
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| row.path.clone());
-        let title = row.title.as_deref().unwrap_or(&filename);
-        let artist = row.artist.as_deref().unwrap_or("(unknown artist)");
-        let duration = format_duration(row.duration_secs);
-        let stale = if row.stale { "  [stale match]" } else { "" };
-        let location = match (&row.album, row.disc_number, row.track_number) {
-            (Some(album), Some(disc), Some(number)) if disc > 1 => {
-                format!("  [{} disc {disc} #{number}]", Clean(album))
-            }
-            (Some(album), _, Some(number)) => format!("  [{} #{number}]", Clean(album)),
-            (Some(album), _, None) => format!("  [{}]", Clean(album)),
-            _ => String::new(),
+        let number = match (row.disc_number, row.track_number) {
+            (Some(disc), Some(number)) if disc > 1 => format!("{disc}-{number}"),
+            (_, Some(number)) => number.to_string(),
+            _ => "-".to_string(),
         };
-        outln!(
-            "{} - {}{location}  {duration}{stale}",
-            Clean(artist),
-            Clean(title)
-        );
+        table.push([
+            row.artist.as_deref().unwrap_or("(unknown artist)"),
+            row.title.as_deref().unwrap_or(&filename),
+            row.album.as_deref().unwrap_or("-"),
+            &number,
+            &format_duration(row.duration_secs),
+            if row.stale { "stale match" } else { "" },
+        ]);
     }
-    outln!("\n{} track(s).", rows.len());
+
+    let mut lines = table.render(truncate);
+    lines.push(String::new());
+    lines.push(format!("{}.", plural(rows.len() as u64, "track", "tracks")));
+    lines
 }
 
 fn format_duration(secs: Option<f64>) -> String {
@@ -471,11 +517,19 @@ async fn run_import(
         ));
     }
     outln!(
-        "Imported {} new or changed tracks ({} unchanged, {} removed{kept}) into {} local release(s).",
-        summary.saved,
+        "Imported {} into {}: {} unchanged, {} removed{kept}.",
+        plural(
+            summary.saved,
+            "new or changed track",
+            "new or changed tracks"
+        ),
+        plural(
+            summary.rebuild.groups as u64,
+            "local release",
+            "local releases"
+        ),
         summary.unchanged,
-        summary.removed,
-        summary.rebuild.groups
+        summary.removed
     );
     importer::report_rebuild(&summary.rebuild);
     Ok(path)
@@ -663,6 +717,132 @@ mod tests {
             _ => panic!("expected match"),
         };
         assert!(selection.is_err());
+    }
+
+    fn release(id: i64) -> store::LocalReleaseStatus {
+        store::LocalReleaseStatus {
+            id,
+            directory: "/music/Test Artist/Blue".into(),
+            album_title: Some("Blue".into()),
+            album_artist: Some("Test Artist".into()),
+            track_count: 2,
+            status: "unmatched".into(),
+            provider: None,
+            remote_release_id: None,
+            remote_url: None,
+            remote_title: None,
+            match_scope: None,
+            stale: false,
+            queued_providers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn releases_render_as_blocks_with_a_match_line_only_when_matched() {
+        let mut matched = release(12);
+        matched.status = store::STATUS_MATCHED.into();
+        matched.provider = Some(ProviderKind::MusicBrainz);
+        matched.remote_release_id = Some("76df3287-6cda-33eb-8e9a-044b5e15ffdd".into());
+        matched.remote_title = Some("Blue".into());
+        let mut bare = release(130);
+        bare.album_title = None;
+        bare.album_artist = None;
+        bare.track_count = 1;
+        bare.directory = "/music/misc".into();
+
+        assert_eq!(
+            render_releases(&[matched, bare]),
+            [
+                "#12   Test Artist — Blue",
+                "      2 tracks · matched",
+                "      match:  musicbrainz 76df3287-6cda-33eb-8e9a-044b5e15ffdd (Blue)",
+                "      path:   /music/Test Artist/Blue",
+                "",
+                "#130  (unknown artist) — (no album tag)",
+                "      1 track · unmatched",
+                "      path:   /music/misc",
+                "",
+                "2 local releases.",
+            ]
+        );
+    }
+
+    #[test]
+    fn release_status_keeps_its_album_stale_and_queue_notes() {
+        let mut row = release(1);
+        row.status = store::STATUS_MATCHED.into();
+        row.match_scope = Some("album".into());
+        row.stale = true;
+        let lines = render_releases(&[row]);
+        assert_eq!(
+            lines[1],
+            "    2 tracks · matched, album match; edition unconfirmed, stale"
+        );
+
+        let mut queued = release(1);
+        queued.queued_providers = vec![ProviderKind::MusicBrainz];
+        assert_eq!(
+            render_releases(&[queued])[1],
+            "    2 tracks · unmatched, queued (musicbrainz)"
+        );
+        assert_eq!(
+            render_releases(&[release(1)]).last().unwrap(),
+            "1 local release."
+        );
+    }
+
+    fn track(path: &str) -> store::TrackRow {
+        store::TrackRow {
+            path: path.into(),
+            title: Some("Blue Moon".into()),
+            artist: Some("Test Artist".into()),
+            album: Some("Blue".into()),
+            track_number: Some(3),
+            disc_number: Some(1),
+            duration_secs: Some(225.0),
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn tracks_render_as_aligned_columns() {
+        let mut second = track("/m/2.flac");
+        second.title = Some("A Much Longer Title".into());
+        second.album = Some("Live in Tokyo".into());
+        second.disc_number = Some(2);
+        second.track_number = Some(1);
+        second.duration_secs = Some(730.0);
+        second.stale = true;
+        let mut bare = track("/m/untitled.wav");
+        bare.title = None;
+        bare.artist = None;
+        bare.album = None;
+        bare.track_number = None;
+        bare.duration_secs = None;
+
+        assert_eq!(
+            render_tracks(&[track("/m/1.flac"), second, bare], false),
+            [
+                "ARTIST            TITLE                ALBUM            #   TIME",
+                "Test Artist       Blue Moon            Blue             3   3:45",
+                "Test Artist       A Much Longer Title  Live in Tokyo  2-1  12:10  stale match",
+                "(unknown artist)  untitled.wav         -                -   ?:??",
+                "",
+                "3 tracks.",
+            ]
+        );
+    }
+
+    #[test]
+    fn long_track_text_is_cut_only_for_terminals() {
+        let long = || {
+            let mut row = track("/m/1.flac");
+            row.title = Some("x".repeat(60));
+            row
+        };
+        assert!(render_tracks(&[long()], false)[1].contains(&"x".repeat(60)));
+        let cut = render_tracks(&[long()], true);
+        assert!(cut[1].contains(&format!("{}…", "x".repeat(TEXT_COLUMN_CAP - 1))));
     }
 
     #[test]

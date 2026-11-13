@@ -246,7 +246,7 @@ async fn redirected_import_keeps_warnings_without_live_progress() {
     assert!(text.starts_with("Scanning "), "{text}");
     assert!(
         text.contains(
-            "Imported 1 new or changed tracks (0 unchanged, 0 removed) into 1 local release(s)."
+            "Imported 1 new or changed track into 1 local release: 0 unchanged, 0 removed."
         ),
         "{text}"
     );
@@ -280,7 +280,7 @@ fn redirected_empty_import_has_no_progress_output() {
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
     assert!(stdout(&output).contains(
-        "Imported 0 new or changed tracks (0 unchanged, 0 removed) into 0 local release(s)."
+        "Imported 0 new or changed tracks into 0 local releases: 0 unchanged, 0 removed."
     ));
 }
 
@@ -309,11 +309,14 @@ async fn import_is_kept_when_matching_fails() {
 
     assert!(!output.status.success(), "matching failure must be nonzero");
     let text = stdout(&output);
-    assert!(text.contains("Imported 1 new or changed tracks"), "{text}");
+    assert!(
+        text.contains("Imported 1 new or changed track into"),
+        "{text}"
+    );
 
     let list = run(&db, &server, &["list"], None);
     assert!(list.status.success());
-    assert!(stdout(&list).contains("1 track(s)"), "{}", stdout(&list));
+    assert!(stdout(&list).contains("1 track."), "{}", stdout(&list));
 }
 
 #[tokio::test]
@@ -332,7 +335,10 @@ async fn default_import_requires_no_discogs_token() {
 
     assert!(output.status.success(), "{:?}", output);
     let text = stdout(&output);
-    assert!(text.contains("Imported 1 new or changed tracks"), "{text}");
+    assert!(
+        text.contains("Imported 1 new or changed track into"),
+        "{text}"
+    );
     assert_eq!(server.requests_matching("/database/search"), 0);
 }
 
@@ -345,7 +351,7 @@ async fn releases_reports_provider_qualified_status() {
     let output = run(&db, &server, &["releases"], None);
     assert!(output.status.success(), "{:?}", output);
     let text = stdout(&output);
-    assert!(text.contains("local release(s)"), "{text}");
+    assert!(text.contains("1 local release."), "{text}");
     assert!(text.contains("unmatched"), "{text}");
 }
 

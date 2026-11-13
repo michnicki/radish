@@ -41,7 +41,7 @@ fn importing_an_emptied_directory_warns_and_keeps_the_library() {
     );
     let list = radish(&db, &["list".as_ref()]);
     assert!(
-        String::from_utf8_lossy(&list.stdout).contains("2 track(s)"),
+        String::from_utf8_lossy(&list.stdout).contains("2 tracks."),
         "{list:?}"
     );
 }
@@ -242,7 +242,7 @@ fn rescan_rereads_files_whose_modification_time_did_not_change() {
     let plain = radish(&db, &["import".as_ref(), music.as_ref()]);
     let plain_out = String::from_utf8_lossy(&plain.stdout);
     assert!(
-        plain_out.contains("Imported 0 new or changed tracks (1 unchanged"),
+        plain_out.contains("Imported 0 new or changed tracks into 1 local release: 1 unchanged"),
         "{plain_out}"
     );
 
@@ -253,7 +253,7 @@ fn rescan_rereads_files_whose_modification_time_did_not_change() {
     assert!(rescan.status.success(), "{rescan:?}");
     let rescan_out = String::from_utf8_lossy(&rescan.stdout);
     assert!(
-        rescan_out.contains("Imported 1 new or changed tracks (0 unchanged"),
+        rescan_out.contains("Imported 1 new or changed track into 1 local release: 0 unchanged"),
         "{rescan_out}"
     );
 }
