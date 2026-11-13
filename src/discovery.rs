@@ -12,6 +12,8 @@ use crate::matcher::{
 use crate::providers::{
     MetadataProvider, ProviderError, ProviderKind, ReleaseId, SearchRequest, SearchStrategy,
 };
+use crate::scene;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 /// Lowest [`matcher::rank_search_summary`] score that earns a detailed lookup
@@ -26,6 +28,10 @@ use std::collections::{HashMap, HashSet};
 /// are always looked up, and so is everything when no hit reaches the floor
 /// or the local release lacks an album title or artist.
 const MIN_DETAIL_RANK: f64 = 0.25;
+
+/// Lowest artist similarity at which an artist tag picks the cut of an ambiguous
+/// directory name (`Wu-Tang_Clan-Wu-Tang_Forever`).
+const DIRECTORY_ARTIST_HINT: f64 = 0.90;
 
 /// Per-provider search and lookup limits. Weak title hits are skipped before
 /// they can use up `detail_attempts`; see [`MIN_DETAIL_RANK`].
@@ -74,9 +80,79 @@ impl DiscoveryResult {
     }
 }
 
+/// The release as it is searched and ranked: its tags, with a missing or junk
+/// album title or artist read from a scene directory name instead.
+///
+/// The second value is the note to record when the directory supplied anything.
+/// Real tags are never replaced, and a name that cannot be read with certainty
+/// (see [`scene`]) leaves the release as it is. The directory is only a search
+/// and ranking hint: [`matcher::score`] still sees the release's own tags.
+fn search_view(local: &LocalRelease) -> (Cow<'_, LocalRelease>, Option<String>) {
+    let identity = matcher::tag_identity(local);
+    let artist_unusable = local
+        .album_artist
+        .as_deref()
+        .is_none_or(|artist| artist.trim().is_empty() || matcher::is_junk_artist(artist));
+    if identity.title.is_some() && !artist_unusable {
+        return (Cow::Borrowed(local), None);
+    }
+    let Some(name) = scene::parse_release_directory(&local.directory) else {
+        return (Cow::Borrowed(local), None);
+    };
+    // A real artist tag settles a name whose structure leaves the cut open.
+    let split = match identity.artist.as_deref() {
+        Some(tag) if !artist_unusable => name.split_matching(|part| {
+            matcher::local_artist_similarity(tag, part) >= DIRECTORY_ARTIST_HINT
+        }),
+        _ => name.split(),
+    };
+    let Some(split) = split else {
+        return (Cow::Borrowed(local), None);
+    };
+
+    let mut view = local.clone();
+    let mut title_read = None;
+    let mut artist_read = None;
+    // Filler in the directory is as little use as filler in the tag.
+    if identity.title.is_none() && !matcher::is_junk_title(&split.title) {
+        title_read = Some(split.title.clone());
+        view.album_title = Some(split.title);
+    }
+    if artist_unusable {
+        if split.various {
+            artist_read = Some("Various Artists".to_string());
+            view.artist_kind = matcher::ArtistKind::VariousArtists;
+        } else {
+            artist_read = split.artist;
+        }
+        view.album_artist.clone_from(&artist_read);
+    }
+    let read = match (&title_read, &artist_read) {
+        (Some(title), Some(artist)) => format!("album '{title}' and artist '{artist}'"),
+        (Some(title), None) => format!("album '{title}'"),
+        (None, Some(artist)) => format!("artist '{artist}'"),
+        (None, None) => return (Cow::Borrowed(local), None),
+    };
+    (
+        Cow::Owned(view),
+        Some(format!("searched with {read} read from the directory name")),
+    )
+}
+
 /// Strategies in provider-specific order. Identifiers come first so a unique
 /// barcode or catalog number can settle identity before title searches.
+///
+/// A release whose album title or artist is missing or junk is searched with
+/// what its directory name says instead, when the name is a scene release name.
 pub fn strategies_for(
+    provider: ProviderKind,
+    local: &LocalRelease,
+) -> Vec<(String, SearchStrategy)> {
+    let (view, _) = search_view(local);
+    strategies_for_view(provider, &view)
+}
+
+fn strategies_for_view(
     provider: ProviderKind,
     local: &LocalRelease,
 ) -> Vec<(String, SearchStrategy)> {
@@ -334,7 +410,15 @@ pub async fn discover<P: MetadataProvider>(
     let mut identifier_complete = identifier_applicable;
     let mut outcomes: Vec<StrategyOutcome> = Vec::new();
 
-    for (index, (label, strategy)) in strategies_for(provider_kind, local).into_iter().enumerate() {
+    let (view, directory_note) = search_view(local);
+    // Ranking, the weak-result floor and the searches all use the same identity.
+    let searched: &LocalRelease = &view;
+    notes.extend(directory_note);
+
+    for (index, (label, strategy)) in strategies_for_view(provider_kind, searched)
+        .into_iter()
+        .enumerate()
+    {
         if index >= budget.max_strategies {
             notes.push(format!(
                 "omitted strategies after the first {}",
@@ -413,10 +497,10 @@ pub async fn discover<P: MetadataProvider>(
         identifier_complete = false;
     }
 
-    let rank_identity = matcher::rank_identity(local);
+    let rank_identity = matcher::rank_identity(searched);
     let mut ranked: Vec<(f64, SearchSummary)> = summaries
         .into_values()
-        .map(|summary| (rank_identity.rank(local, &summary), summary))
+        .map(|summary| (rank_identity.rank(searched, &summary), summary))
         .collect();
     ranked
         .sort_by(|(a_rank, a), (b_rank, b)| b_rank.total_cmp(a_rank).then_with(|| a.id.cmp(&b.id)));
@@ -426,8 +510,8 @@ pub async fn discover<P: MetadataProvider>(
     // both a title and an artist to be meaningful.
     let has_nonempty =
         |value: &Option<String>| value.as_deref().is_some_and(|v| !v.trim().is_empty());
-    let skip_weak = has_nonempty(&local.album_title)
-        && has_nonempty(&local.album_artist)
+    let skip_weak = has_nonempty(&searched.album_title)
+        && has_nonempty(&searched.album_artist)
         && ranked.iter().any(|(rank, _)| *rank >= MIN_DETAIL_RANK);
     let mut skipped_weak = 0usize;
 
@@ -1216,6 +1300,242 @@ mod tests {
         );
         let result = discover(&provider, &local, None).await.unwrap();
         assert_eq!(result.releases.len(), 1, "{:?}", result.notes);
+    }
+
+    const SCENE_DIRECTORY: &str = "/mnt/mp3/2001/Straight_Faced_-_Broken-1996-SDR";
+
+    /// A release with no tags to search with, in a scene-named directory.
+    fn untagged() -> LocalRelease {
+        let mut local = local();
+        local.directory = SCENE_DIRECTORY.to_string();
+        local.album_title = None;
+        local.album_artist = None;
+        local.artist_kind = ArtistKind::Unknown;
+        local.barcode = None;
+        local.has_album_tag = false;
+        local
+    }
+
+    type TitleSearch = (String, String, Option<String>);
+
+    fn title_and_artist(kind: ProviderKind, local: &LocalRelease) -> Vec<TitleSearch> {
+        strategies_for(kind, local)
+            .into_iter()
+            .filter_map(|(label, strategy)| match strategy {
+                SearchStrategy::TitleArtist { title, artist, .. } => Some((label, title, artist)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn search(label: &str, title: &str, artist: Option<&str>) -> TitleSearch {
+        (
+            label.to_string(),
+            title.to_string(),
+            artist.map(str::to_string),
+        )
+    }
+
+    #[test]
+    fn an_empty_album_tag_searches_with_the_directory_name() {
+        let local = untagged();
+        // The same strategies a tagged release gets, with the directory's text.
+        assert_eq!(
+            title_and_artist(ProviderKind::MusicBrainz, &local),
+            vec![
+                search("title and artist", "Broken", Some("Straight Faced")),
+                search("title only", "Broken", None),
+            ]
+        );
+        assert_eq!(
+            title_and_artist(ProviderKind::Discogs, &local),
+            vec![search("title", "Broken", Some("Straight Faced"))]
+        );
+
+        // An album tag of only spaces is as empty.
+        let mut blank = local.clone();
+        blank.album_title = Some("  ".to_string());
+        assert_eq!(
+            title_and_artist(ProviderKind::Discogs, &blank),
+            vec![search("title", "Broken", Some("Straight Faced"))]
+        );
+        // A disc folder reads as the release above it.
+        let mut disc = local.clone();
+        disc.directory = format!("{SCENE_DIRECTORY}/CD2");
+        assert_eq!(
+            title_and_artist(ProviderKind::Discogs, &disc),
+            vec![search("title", "Broken", Some("Straight Faced"))]
+        );
+    }
+
+    #[test]
+    fn junk_tags_are_replaced_by_the_directory_name() {
+        let mut junk = untagged();
+        junk.album_title = Some("Unknown Title".to_string());
+        junk.album_artist = Some("Unknown Artist".to_string());
+        junk.artist_kind = ArtistKind::AlbumArtist;
+        assert_eq!(
+            title_and_artist(ProviderKind::MusicBrainz, &junk),
+            vec![search("title and artist", "Broken", Some("Straight Faced"))]
+        );
+        // Only the unusable half is replaced: a real artist stays, and a real
+        // title stays.
+        let mut artist_only = junk.clone();
+        artist_only.album_artist = Some("Real Artist".to_string());
+        assert_eq!(
+            title_and_artist(ProviderKind::Discogs, &artist_only),
+            vec![search("title", "Broken", Some("Real Artist"))]
+        );
+        let mut title_only = junk.clone();
+        title_only.album_title = Some("Real Title".to_string());
+        assert_eq!(
+            title_and_artist(ProviderKind::Discogs, &title_only),
+            vec![search("title", "Real Title", Some("Straight Faced"))]
+        );
+        // A title that is filler in the directory too is no title.
+        let mut filler = junk.clone();
+        filler.directory = "/mp3/Squeezetoy-Unknown_Title-2001-PMS".to_string();
+        assert_eq!(
+            title_and_artist(ProviderKind::Discogs, &filler),
+            vec![search("title", "Unknown Title", Some("Squeezetoy"))]
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_directory_name_is_resolved_by_a_real_artist_tag() {
+        let mut local = untagged();
+        local.directory = "/mp3/Wu-Tang_Clan-Wu-Tang_Forever-1997-KSi_INT".to_string();
+        // Without an artist the split is a guess, so nothing is searched.
+        assert!(strategies_for(ProviderKind::Discogs, &local).is_empty());
+        local.album_artist = Some("Wu-Tang Clan".to_string());
+        assert_eq!(
+            title_and_artist(ProviderKind::Discogs, &local),
+            vec![search("title", "Wu-Tang Forever", Some("Wu-Tang Clan"))]
+        );
+        // A tag that fits no cut point leaves the release as it was.
+        local.album_artist = Some("Someone Else".to_string());
+        assert_eq!(title_and_artist(ProviderKind::Discogs, &local), vec![]);
+    }
+
+    #[test]
+    fn a_various_artists_directory_searches_the_title_as_a_compilation() {
+        let mut local = untagged();
+        local.directory = "/mp3/VA-Thirteen_Days_OST-2000-RNS".to_string();
+        assert_eq!(
+            title_and_artist(ProviderKind::MusicBrainz, &local),
+            vec![search(
+                "title and artist",
+                "Thirteen Days",
+                Some("Various Artists")
+            )]
+        );
+    }
+
+    #[test]
+    fn a_self_titled_directory_is_searched_as_the_artists_name() {
+        let mut local = untagged();
+        local.directory = "/mp3/Plasticland-S-T-1985-SDR".to_string();
+        assert_eq!(
+            title_and_artist(ProviderKind::Discogs, &local),
+            vec![
+                search("title", "Plasticland", Some("Plasticland")),
+                search("title as tagged", "S/T", Some("Plasticland")),
+            ]
+        );
+    }
+
+    #[test]
+    fn real_tags_never_search_with_the_directory() {
+        // A real title and artist keep their searches whatever the directory says.
+        let mut tagged = local();
+        tagged.directory = SCENE_DIRECTORY.to_string();
+        assert_eq!(
+            title_and_artist(ProviderKind::MusicBrainz, &tagged),
+            vec![search("title and artist", "Blue", Some("Test Artist"))]
+        );
+        // A directory that is no scene name changes nothing for an untagged release.
+        let mut plain = untagged();
+        plain.directory = "/music/blue".to_string();
+        assert!(strategies_for(ProviderKind::MusicBrainz, &plain).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_directory_search_records_what_it_read() {
+        let provider = FakeProvider::new(ProviderKind::MusicBrainz, Vec::new(), Vec::new());
+        let result = discover(&provider, &untagged(), None).await.unwrap();
+        assert!(
+            result.notes.contains(
+                &"searched with album 'Broken' and artist 'Straight Faced' read from the directory name"
+                    .to_string()
+            ),
+            "{:?}",
+            result.notes
+        );
+        let calls = provider.calls.lock().unwrap().clone();
+        assert!(calls[0].contains("title: \"Broken\""), "{calls:?}");
+        assert!(calls[0].contains("Straight Faced"), "{calls:?}");
+
+        // A tagged release records no such note.
+        let provider = FakeProvider::new(ProviderKind::MusicBrainz, Vec::new(), Vec::new());
+        let mut tagged = local();
+        tagged.directory = SCENE_DIRECTORY.to_string();
+        let result = discover(&provider, &tagged, None).await.unwrap();
+        assert!(
+            result
+                .notes
+                .iter()
+                .all(|note| !note.contains("directory name")),
+            "{:?}",
+            result.notes
+        );
+    }
+
+    #[tokio::test]
+    async fn the_rank_floor_uses_the_directory_identity() {
+        let right = "11111111-1111-1111-1111-111111111111";
+        let wrong = "22222222-2222-2222-2222-222222222222";
+        let mut hit = summary(right);
+        hit.title = "Broken".to_string();
+        hit.artists = vec!["Straight Faced".to_string()];
+        hit.barcodes.clear();
+        let mut unrelated = summary(wrong);
+        unrelated.title = "Something Else".to_string();
+        unrelated.artists = vec!["Another Band".to_string()];
+        unrelated.year = None;
+        unrelated.barcodes.clear();
+        let local = untagged();
+        let (view, _) = search_view(&local);
+        let identity = matcher::rank_identity(&view);
+        assert!(identity.rank(&view, &hit) >= MIN_DETAIL_RANK);
+        assert!(identity.rank(&view, &unrelated) < MIN_DETAIL_RANK);
+
+        let provider = FakeProvider::new(
+            ProviderKind::Discogs,
+            vec![Ok(SearchPage {
+                hits: vec![unrelated, hit],
+                total: Some(2),
+                next_offset: None,
+            })],
+            vec![Ok(remote(right))],
+        );
+        let result = discover(&provider, &local, None).await.unwrap();
+        assert_eq!(result.releases.len(), 1, "{:?}", result.notes);
+        let fetches = provider
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.starts_with("fetch:"))
+            .count();
+        assert_eq!(fetches, 1);
+        assert!(
+            result
+                .notes
+                .iter()
+                .any(|note| note.contains("skipped detailed lookups for 1")),
+            "{:?}",
+            result.notes
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@
 //! - [`discovery`]: bounded provider-neutral candidate discovery.
 //! - [`index`]: local provider indexes built from the official data dumps.
 //! - [`matcher`]: pure normalization, mapping, scoring, and acceptance rules.
+//! - [`scene`]: artist and album read from a scene release directory name.
 //! - [`store`]: grouping, revisions, review queue, and transactional overlay.
 //! - [`runner`]: CLI orchestration and the interactive review screen.
 //! - [`web`]: the read-only web interface behind `radish serve`.
@@ -26,6 +27,7 @@ pub mod progress;
 pub mod providers;
 pub mod runner;
 pub mod scanner;
+pub mod scene;
 pub mod store;
 #[cfg(test)]
 mod test_support;

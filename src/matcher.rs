@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v25";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v24";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v26";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v25";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -25,7 +25,9 @@ pub const DURATION_TOLERANCE_SECS: f64 = 3.0;
 /// The rest of the album, scored without the title, must reach
 /// `CORROBORATED_SCORE`, every mapped duration must be within
 /// `CORROBORATED_DURATION_SECS`, and the mean track-title score must reach
-/// `CORROBORATED_MEAN_TITLE`.
+/// `CORROBORATED_MEAN_TITLE`. A local release with no usable album title
+/// (missing or filler) skips the title floor and the title condition, and
+/// follows the rest of the rule.
 pub const CORROBORATED_TITLE_FLOOR: f64 = 0.70;
 pub const CORROBORATED_SCORE: f64 = 0.97;
 pub const CORROBORATED_DURATION_SECS: f64 = 1.5;
@@ -3636,6 +3638,11 @@ fn equivalent_audio(a: &Candidate, b: &Candidate) -> bool {
 /// evidence, so it no longer gates the album. The release needs at least
 /// [`CORROBORATED_MIN_TRACKS`] local tracks, or
 /// [`CORROBORATED_MIN_VARIOUS_TRACKS`] for Various Artists.
+///
+/// A local release with no usable album title (missing or filler, see
+/// [`tag_identity`]) has no title to weigh, so the title floor and the title
+/// condition do not apply to it; everything else does. Its artist has to be a
+/// real tag: a junk or missing one scores zero and keeps the release in review.
 fn corroborated_album(local: &LocalRelease, candidate: &Candidate) -> bool {
     let score = &candidate.score;
     let min_tracks = if matches!(local.artist_kind, ArtistKind::VariousArtists) {
@@ -3643,9 +3650,11 @@ fn corroborated_album(local: &LocalRelease, candidate: &Candidate) -> bool {
     } else {
         CORROBORATED_MIN_TRACKS
     };
+    let title_weighs_in = !lacks_album_title(local);
     if local.tracks.len() < min_tracks
-        || score.album_title < CORROBORATED_TITLE_FLOOR
-        || score.album_title >= TITLE_SIMILARITY_THRESHOLD
+        || (title_weighs_in
+            && (score.album_title < CORROBORATED_TITLE_FLOOR
+                || score.album_title >= TITLE_SIMILARITY_THRESHOLD))
         || score.album_artist < TITLE_SIMILARITY_THRESHOLD
         || score.track_titles < CORROBORATED_MEAN_TITLE
         || score.album_score_without_title() + 1e-9 < CORROBORATED_SCORE
@@ -3659,6 +3668,12 @@ fn corroborated_album(local: &LocalRelease, candidate: &Candidate) -> bool {
     candidate.mapping.assigned_pairs().all(|(l, r)| {
         duration_gap(local, candidate, l, r).is_some_and(|gap| gap <= CORROBORATED_DURATION_SECS)
     })
+}
+
+/// Whether the local release has no usable album title: it is missing or
+/// filler, and not a self-titled placeholder, which reads as the artist's name.
+fn lacks_album_title(local: &LocalRelease) -> bool {
+    tag_identity(local).title.is_none()
 }
 
 fn evaluate_at_scope(
@@ -3743,7 +3758,12 @@ fn evaluate_with(
         ));
     }
 
-    if corroborated_title {
+    if corroborated_title && lacks_album_title(local) {
+        warnings.push(
+            "local release has no usable album title, but every track and duration agrees"
+                .to_string(),
+        );
+    } else if corroborated_title {
         warnings.push(format!(
             "album title scores {:.3} but every track and duration agrees",
             candidate.score.album_title
@@ -5964,11 +5984,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v25"
+            "discogs-match-v26"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v24"
+            "musicbrainz-match-v25"
         );
     }
 
@@ -6257,6 +6277,157 @@ mod tests {
             "{:?}",
             evaluation.blockers
         );
+    }
+
+    const NO_TITLE_WARNING: &str =
+        "local release has no usable album title, but every track and duration agrees";
+
+    /// The six-track release with its album title replaced, and the evaluation
+    /// of the matching candidate.
+    fn evaluate_untitled(
+        title: Option<&str>,
+        change: impl Fn(&mut LocalRelease, &mut RemoteRelease),
+    ) -> Evaluation {
+        let titles = ["One", "Two", "Three", "Four", "Five", "Six"];
+        let mut local = local_release(&titles);
+        local.album_title = title.map(str::to_string);
+        let mut remote = remote_release(&titles);
+        change(&mut local, &mut remote);
+        let candidate = Candidate::new(&local, remote);
+        evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default())
+    }
+
+    #[test]
+    fn a_missing_album_title_is_carried_by_the_tracks_and_durations() {
+        for title in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("Unknown Title"),
+            Some("Unknown Album"),
+            Some("."),
+        ] {
+            let evaluation = evaluate_untitled(title, |_, _| {});
+            assert!(
+                evaluation.auto_accept,
+                "{title:?}: {:?}",
+                evaluation.blockers
+            );
+            assert!(
+                evaluation
+                    .warnings
+                    .iter()
+                    .any(|note| note == NO_TITLE_WARNING),
+                "{title:?}: {:?}",
+                evaluation.warnings
+            );
+            // The title is no evidence either way, so it is not reported as a
+            // weak title.
+            assert!(
+                evaluation
+                    .warnings
+                    .iter()
+                    .all(|note| !note.contains("album title scores")),
+                "{:?}",
+                evaluation.warnings
+            );
+        }
+        // A real title that is simply wrong still blocks.
+        let evaluation = evaluate_untitled(Some("Completely Different Thing"), |_, _| {});
+        assert!(!evaluation.auto_accept);
+        // A real but different title is evidence against the album, so the
+        // title floor still blocks it, with everything else agreeing. The same
+        // release with no title is accepted.
+        let retitle = |_: &mut LocalRelease, remote: &mut RemoteRelease| {
+            remote.title = "Self Titled".to_string();
+        };
+        let evaluation = evaluate_untitled(Some("Something Else"), retitle);
+        assert!(!evaluation.auto_accept);
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|note| note.contains("album title or artist does not agree")),
+            "{:?}",
+            evaluation.blockers
+        );
+        assert!(evaluate_untitled(None, retitle).auto_accept);
+    }
+
+    #[test]
+    fn a_missing_album_title_still_needs_everything_else_to_agree() {
+        let blocked = |change: &dyn Fn(&mut LocalRelease, &mut RemoteRelease)| {
+            let evaluation = evaluate_untitled(None, change);
+            assert!(!evaluation.auto_accept, "{:?}", evaluation.warnings);
+            evaluation
+        };
+        // Too few tracks.
+        blocked(&|local, remote| {
+            local.tracks.truncate(2);
+            remote.tracklist.truncate(2);
+        });
+        // A length two seconds off: inside the three-second tolerance, outside
+        // the one and a half seconds this rule needs.
+        blocked(&|local, _| {
+            local.tracks[2].duration_secs = Some(local.tracks[2].duration_secs.unwrap() + 2.0);
+        });
+        // A different artist.
+        blocked(&|_, remote| remote.artists = vec!["Another Band".to_string()]);
+        // A junk or missing artist tag is no artist evidence.
+        for artist in [None, Some("Unknown Artist")] {
+            blocked(&|local, _| local.album_artist = artist.map(str::to_string));
+        }
+        // One track title that is only close.
+        let evaluation = blocked(&|local, _| local.tracks[3].title = Some("Fou".to_string()));
+        assert!(
+            !evaluation
+                .warnings
+                .iter()
+                .any(|note| note == NO_TITLE_WARNING)
+        );
+    }
+
+    #[test]
+    fn a_missing_album_title_does_not_stack_with_a_weak_track_title() {
+        let mut local = local_release(&TEN_TITLES);
+        local.album_title = None;
+        let remote = remote_release(&TEN_TITLES);
+        // 0.80 against "Seven": the mean stays above 0.97, and the lone-title
+        // exceptions do not apply to a release the title does not identify.
+        local.tracks[6].title = Some("Seve".to_string());
+        let candidate = Candidate::new(&local, remote);
+        assert!(
+            candidate.score.track_titles >= CORROBORATED_MEAN_TITLE,
+            "{}",
+            candidate.score.track_titles
+        );
+        let evaluation =
+            evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default());
+        assert!(!evaluation.auto_accept);
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|note| note.contains("only scores")),
+            "{:?}",
+            evaluation.blockers
+        );
+    }
+
+    #[test]
+    fn a_missing_album_title_needs_five_tracks_for_various_artists() {
+        let accepted = |titles: &[&str]| {
+            let mut local = local_release(titles);
+            local.album_title = None;
+            local.artist_kind = ArtistKind::VariousArtists;
+            let mut remote = remote_release(titles);
+            remote.artists = vec!["Various Artists".to_string()];
+            let candidate = Candidate::new(&local, remote);
+            evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default())
+                .auto_accept
+        };
+        assert!(!accepted(&["One", "Two", "Three", "Four"]));
+        assert!(accepted(&["One", "Two", "Three", "Four", "Five"]));
     }
 
     #[test]
