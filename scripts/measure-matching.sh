@@ -34,8 +34,13 @@ start=$(date +%s)
 ) >"$out/$label.log" 2>&1
 echo "$label wall_seconds=$(( $(date +%s) - start ))" | tee "$out/$label.time"
 
+# A disc matched on its own records its medium; older schemas lack the column.
+medium_column=""
+if sqlite3 "$db" "PRAGMA table_info(release_matches)" | grep -q '|medium_position|'; then
+  medium_column=", medium_position"
+fi
 sqlite3 -tabs "$db" \
-  "SELECT local_release_id, provider, remote_release_id, match_scope, score, algorithm_version
+  "SELECT local_release_id, provider, remote_release_id, match_scope, score, algorithm_version$medium_column
      FROM release_matches ORDER BY local_release_id" >"$out/$label.accepted.tsv"
 echo "release status counts:"
 sqlite3 "$db" "SELECT status, COUNT(*) FROM local_releases GROUP BY status"
