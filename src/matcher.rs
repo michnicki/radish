@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v19";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v18";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v20";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v19";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -955,11 +955,14 @@ const ALBUM_TYPE_PENALTY: f64 = 0.03;
 /// Words a tag or a store appends to an album title to say what kind of release
 /// it is, not which album: `No Distance Left to Run EP`, `... OST`, `... Japan`.
 /// Versions (live, remix, remastered, and the rest of [`VERSION_WORDS`]) are not
-/// here, so they are never dropped.
+/// here, so they are never dropped. The one exception is `explicit`, which
+/// [`RELEASE_TYPE_COMPANIONS`] drops next to a release-type word.
 const RELEASE_TYPE_WORDS: &[&str] = &[
+    "advance",
     "aust",
     "australian",
     "bonus",
+    "bootleg",
     "cd",
     "cdep",
     "cdm",
@@ -978,11 +981,29 @@ const RELEASE_TYPE_WORDS: &[&str] = &[
     "mcd",
     "ost",
     "promo",
+    "reissue",
     "retail",
     "single",
     "soundtrack",
     "st",
+    "vinyl",
+    "vls",
 ];
+
+/// Words that are only a decoration next to a release-type word or a record
+/// size: `Explicit`, `Proper` and `Tape` are dropped from
+/// `The Truth (RETAIL EXPLICIT)`, but `Album (Explicit)` and `Demo Tape` keep
+/// theirs. In front of the other decoration they are dropped only when
+/// [`DecorationUnit::marked`] says they are one too (`Democrazy-TAPE ADVANCE`),
+/// since `Sex Tape Retail` is not `Sex`.
+const RELEASE_TYPE_COMPANIONS: &[&str] = &["explicit", "proper", "tape"];
+
+/// The record sizes, in inches, that a scene tag writes after a title
+/// (`7"`, `12 Inch`, `10inch`).
+const RECORD_SIZES: &[&str] = &["7", "10", "12"];
+
+/// The spellings of the inch unit that follow a record size.
+const INCH_UNITS: &[&str] = &["in", "inch", "inches"];
 
 /// `text` without a leading `O.S.T.`/`V.A.` marker (`O.S.T. Mary Reilly`,
 /// `v.a-smells like team spirit`).
@@ -1014,65 +1035,288 @@ fn numbered_release_type(word: &str) -> bool {
     stem.len() < word.len() && RELEASE_TYPE_WORDS.contains(&stem)
 }
 
-/// The numbered release-type word (`CD1`, `CDS2`) a title ends with, compared
-/// as lowercase letters and digits.
-fn numbered_release_type_suffix(title: &str) -> Option<String> {
-    let last: String = title
-        .split_whitespace()
-        .next_back()?
-        .chars()
+/// `text` as lowercase letters and digits only.
+fn alphanumeric_lowercase(text: &str) -> String {
+    text.chars()
         .filter(|ch| ch.is_alphanumeric())
         .flat_map(char::to_lowercase)
-        .collect();
-    numbered_release_type(&last).then_some(last)
+        .collect()
+}
+
+/// Whether `ch` splits a title into the tokens of a decoration run.
+fn is_decoration_separator(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '-' | '_')
+}
+
+/// The tokens of `text` split at whitespace, `-` and `_`, each with the byte
+/// offset where it starts.
+fn decoration_tokens(text: &str) -> Vec<(usize, &str)> {
+    let mut tokens = Vec::new();
+    let mut start = None;
+    for (index, ch) in text.char_indices() {
+        if is_decoration_separator(ch) {
+            if let Some(from) = start.take() {
+                tokens.push((from, &text[from..index]));
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+    }
+    if let Some(from) = start {
+        tokens.push((from, &text[from..]));
+    }
+    tokens
+}
+
+/// Whether `letters` (a token's letters and digits) is a record size in one
+/// piece: `7inch`, `12in`.
+fn is_sized_unit(letters: &str) -> bool {
+    RECORD_SIZES.iter().any(|size| {
+        letters
+            .strip_prefix(size)
+            .is_some_and(|unit| INCH_UNITS.contains(&unit))
+    })
+}
+
+/// Whether `token` marks its number as a size in inches: the number is
+/// directly followed by `"`, `''`, `”` or `″` (`7"`, `12''`, `(10″)`). A quote
+/// before the number or further away is not a mark (`"7"`).
+fn carries_inch_mark(token: &str) -> bool {
+    let token = token.trim_start_matches(is_opening_bracket);
+    if !token.starts_with(|ch: char| ch.is_ascii_digit()) {
+        return false;
+    }
+    let after_number = token.trim_start_matches(|ch: char| ch.is_ascii_digit());
+    after_number.starts_with(['"', '\u{201D}', '\u{2033}']) || after_number.starts_with("''")
+}
+
+/// Whether `ch` opens a bracketed group.
+fn is_opening_bracket(ch: char) -> bool {
+    matches!(ch, '(' | '[' | '{')
+}
+
+/// What one token of a decoration run is.
+enum DecorationToken {
+    /// A release-type word, or a record size.
+    Word,
+    /// A numbered release-type word (`cd2`).
+    Numbered,
+    /// A companion word.
+    Companion,
+}
+
+/// One word or size of a decoration run: a record size written as two tokens
+/// (`7 Inch`) is one unit.
+#[derive(Debug, PartialEq, Eq)]
+struct DecorationUnit {
+    /// Byte offset where the unit starts.
+    start: usize,
+    /// Whether the unit is a companion word.
+    companion: bool,
+    /// For a companion word: whether it is joined to the text before it by `-`,
+    /// `_` or an opening bracket, or written in capitals after text that has a
+    /// lowercase letter, so that it is read as decoration even in front of the
+    /// other decoration (`Democrazy-TAPE ADVANCE`, `Breakin News PROPER
+    /// RETAIL`, `Boy Hits Car (Explicit Retail)`). Capitals say nothing in a
+    /// title that is all capitals.
+    marked: bool,
+}
+
+/// The decoration at the end of an album title: release-type words and sizes
+/// that say what kind of release it is, not which album.
+#[derive(Debug, PartialEq, Eq)]
+struct DecorationRun {
+    /// The units of the run, in the order they are written.
+    units: Vec<DecorationUnit>,
+    /// The numbered release-type words in the run (`cd2`).
+    numbered: BTreeSet<String>,
+}
+
+/// What `token` is in a decoration run, given its `letters`, or `None` when it
+/// ends the run. A unit on its own (`Inch`) is not decided here, since it needs
+/// the size before it.
+fn classify_decoration_token(token: &str, letters: &str) -> Option<DecorationToken> {
+    if numbered_release_type(letters) {
+        Some(DecorationToken::Numbered)
+    } else if RELEASE_TYPE_COMPANIONS.contains(&letters) {
+        Some(DecorationToken::Companion)
+    } else if RELEASE_TYPE_WORDS.contains(&letters)
+        || is_sized_unit(letters)
+        || (RECORD_SIZES.contains(&letters) && carries_inch_mark(token))
+    {
+        Some(DecorationToken::Word)
+    } else {
+        None
+    }
+}
+
+/// Whether the companion word `token`, which starts at byte `start` of `text`,
+/// is [marked](DecorationUnit::marked).
+fn is_marked_companion(text: &str, start: usize, token: &str) -> bool {
+    let joined = text[..start]
+        .trim_end()
+        .chars()
+        .next_back()
+        .is_some_and(|ch| matches!(ch, '-' | '_') || is_opening_bracket(ch))
+        || token.starts_with(is_opening_bracket);
+    let capitals = token
+        .chars()
+        .filter(|ch| ch.is_alphabetic())
+        .all(char::is_uppercase)
+        && text[..start].chars().any(char::is_lowercase);
+    joined || capitals
+}
+
+/// The run of decoration tokens at the end of `text`, or `None` when it does
+/// not end in one. Tokens are split at whitespace, `-` and `_`, so
+/// `Clocks-RETAIL CDS` and `Mandatory Music - Vinyl` are read as well as
+/// `Boombox VLS`, and brackets around a token do not matter (`(Vinyl)`).
+/// Scanning from the end, punctuation-only tokens are skipped and the run
+/// stops at the first other token. A token is part of the run when it is:
+///
+/// - a release-type word ([`RELEASE_TYPE_WORDS`]) or a numbered one (`CD2`);
+/// - a companion word ([`RELEASE_TYPE_COMPANIONS`]);
+/// - a record size: `7`, `10` or `12` with an inch unit in the same token
+///   (`7inch`) or the token after it (`7 Inch`), or with an inch mark directly
+///   after the number (`7"`, `12''`).
+fn decoration_run(text: &str) -> Option<DecorationRun> {
+    let tokens = decoration_tokens(text);
+    let mut units = Vec::new();
+    let mut numbered = BTreeSet::new();
+    let mut index = tokens.len();
+    while index > 0 {
+        index -= 1;
+        let (mut start, token) = tokens[index];
+        let letters = alphanumeric_lowercase(token);
+        if letters.is_empty() {
+            continue;
+        }
+        let kind = if INCH_UNITS.contains(&letters.as_str()) {
+            // The size is the nearest token before the unit that has letters or
+            // digits.
+            let size = (0..index).rev().find_map(|before| {
+                let size = alphanumeric_lowercase(tokens[before].1);
+                (!size.is_empty()).then_some((before, size))
+            });
+            match size {
+                Some((before, size)) if RECORD_SIZES.contains(&size.as_str()) => {
+                    index = before;
+                    start = tokens[before].0;
+                    Some(DecorationToken::Word)
+                }
+                _ => None,
+            }
+        } else {
+            classify_decoration_token(token, &letters)
+        };
+        let Some(kind) = kind else {
+            break;
+        };
+        let companion = matches!(kind, DecorationToken::Companion);
+        units.push(DecorationUnit {
+            start,
+            companion,
+            marked: companion && is_marked_companion(text, start, token),
+        });
+        if matches!(kind, DecorationToken::Numbered) {
+            numbered.insert(letters);
+        }
+    }
+    units.reverse();
+    (!units.is_empty()).then_some(DecorationRun { units, numbered })
+}
+
+/// The numbered release-type words (`cd1`, `cds2`) in the decoration run at the
+/// end of `title`, as lowercase letters and digits.
+fn numbered_release_types(title: &str) -> BTreeSet<String> {
+    decoration_run(title).map_or_else(BTreeSet::new, |run| run.numbered)
 }
 
 /// Whether `word` is a volume number: digits or a roman numeral.
 fn is_volume_number(word: &str) -> bool {
-    let word: String = word
-        .chars()
-        .filter(|ch| ch.is_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect();
+    let word = alphanumeric_lowercase(word);
     !word.is_empty()
         && (word.chars().all(|ch| ch.is_ascii_digit())
             || word.chars().all(|ch| matches!(ch, 'i' | 'v' | 'x')))
 }
 
+/// Words that are no album title on their own: kept text that is only one of
+/// them (`The` from `The-Bootleg`) means the decoration was the title.
+const BARE_ARTICLES: &[&str] = &["a", "an", "the"];
+
+/// The byte offset in `body` where its decoration run is cut off, or `None`
+/// when the run is not dropped: it needs a token other than a companion word,
+/// and some letter or digit that is not a bare article must remain before it.
+///
+/// A title made only of decoration (`Japan EP`) keeps its first unit, so a
+/// single unit (`12 Inch`, `Vinyl`) is never dropped. A companion word in front
+/// of the other decoration goes with it only when it is
+/// [marked](DecorationUnit::marked) or `keep_companions` is false; with
+/// `keep_companions` the cut is at the first other unit.
+fn decoration_cut(body: &str, run: &DecorationRun, keep_companions: bool) -> Option<usize> {
+    let mut units = run.units.as_slice();
+    if units.len() >= 2 && !body[..units[0].start].contains(char::is_alphanumeric) {
+        units = &units[1..];
+    }
+    let first = units.iter().position(|unit| !unit.companion)?;
+    let mut cut = first;
+    while !keep_companions && cut > 0 && units[cut - 1].marked {
+        cut -= 1;
+    }
+    let start = units[cut].start;
+    let album = alphanumeric_lowercase(&body[..start]);
+    (!album.is_empty() && !BARE_ARTICLES.contains(&album.as_str())).then_some(start)
+}
+
 /// An album title reduced to the album: no leading `The` or `O.S.T.`/`V.A.`
-/// marker, no trailing release-type words (also numbered ones such as `CDS2`),
-/// and no `Vol.`/`Volume` word in front of a final number. `None` when nothing
-/// is removed or nothing would be left.
-fn reduce_album_title(text: &str) -> Option<String> {
-    let body = without_leading_marker(text);
+/// marker, no trailing decoration run ([`decoration_run`]: release-type words,
+/// also numbered ones such as `CDS2`, record sizes, and companion words that
+/// come with them), and no `Vol.`/`Volume` word in front of a final number.
+/// `None` when nothing is removed or nothing would be left.
+///
+/// With `keep_companions`, a companion word in front of the other decoration
+/// always stays (`Sex TAPE Retail` becomes `Sex TAPE`, not `Sex`).
+fn reduce_album_title_with(text: &str, keep_companions: bool) -> Option<String> {
+    let mut body = without_leading_marker(text);
+    if let Some((first, rest)) = body.split_once(char::is_whitespace)
+        && first.eq_ignore_ascii_case("the")
+        && !rest.trim().is_empty()
+    {
+        body = rest.trim_start();
+    }
+    if let Some(run) = decoration_run(body)
+        && let Some(cut) = decoration_cut(body, &run, keep_companions)
+    {
+        body = body[..cut]
+            .trim_end_matches(|ch: char| is_decoration_separator(ch) || is_opening_bracket(ch));
+    }
     let mut words: Vec<&str> = body.split_whitespace().collect();
-    if words.len() > 1 && words[0].eq_ignore_ascii_case("the") {
-        words.remove(0);
-    }
-    while words.len() > 1 {
-        let last: String = words[words.len() - 1]
-            .chars()
-            .filter(|ch| ch.is_alphanumeric())
-            .flat_map(char::to_lowercase)
-            .collect();
-        if RELEASE_TYPE_WORDS.contains(&last.as_str()) || numbered_release_type(&last) {
-            words.pop();
-        } else {
-            break;
-        }
-    }
     if words.len() > 2 && is_volume_number(words[words.len() - 1]) {
-        let marker: String = words[words.len() - 2]
-            .chars()
-            .filter(|ch| ch.is_alphanumeric())
-            .flat_map(char::to_lowercase)
-            .collect();
+        let marker = alphanumeric_lowercase(words[words.len() - 2]);
         if matches!(marker.as_str(), "vol" | "vols" | "volume" | "volumes") {
             words.remove(words.len() - 2);
         }
     }
     let reduced = words.join(" ");
     (reduced != text.trim() && reduced.chars().any(char::is_alphanumeric)).then_some(reduced)
+}
+
+/// [`reduce_album_title_with`] dropping every companion word the run allows.
+fn reduce_album_title(text: &str) -> Option<String> {
+    reduce_album_title_with(text, false)
+}
+
+/// The reduced readings of an album title: the one that drops the most, and
+/// the one that keeps the companion words in front of the other decoration
+/// when that differs. Empty when the title is not reduced.
+fn album_readings(text: &str) -> Vec<String> {
+    let mut readings: Vec<String> = reduce_album_title(text).into_iter().collect();
+    if let Some(reading) = reduce_album_title_with(text, true)
+        && !readings.contains(&reading)
+    {
+        readings.push(reading);
+    }
+    readings
 }
 
 /// Comparison text with the spaces taken out, for `Rock 'n' Roll` against
@@ -1087,34 +1331,49 @@ fn compact_chars(text: &str) -> Vec<char> {
 /// [`local_similarity`] for an album title, also comparing the albums behind
 /// the titles (`Iron Icon EP` against `The Iron Icon`, `Vol. 2` against
 /// `Volume 2`) and the titles with their spaces removed (`Rock 'n' Roll`
-/// against `Rocknroll`), each at a small cost.
+/// against `Rocknroll`), each at a small cost. A title with companion words in
+/// front of its decoration has two readings (`Sex Tape Retail`: `Sex` and
+/// `Sex Tape`), and the better pair counts.
 ///
-/// Two different numbered release-type words (`CD1` against `CD2`) are
-/// different discs, so nothing is stripped from either title. A title that was
-/// shortened is not read as a cut-off tag.
+/// Two different numbered release-type words in the titles' decoration runs
+/// (`CD1` against `CD2`, `Album-CD2` against `Album CD1`) are different discs,
+/// so nothing is stripped from either title. A title that was shortened is not
+/// read as a cut-off tag.
 pub fn album_title_similarity(local: &str, remote: &str) -> f64 {
     let mut best = local_similarity(local, remote);
-    let different_discs = matches!(
-        (
-            numbered_release_type_suffix(local),
-            numbered_release_type_suffix(remote)
-        ),
-        (Some(a), Some(b)) if a != b
+    let (local_discs, remote_discs) = (
+        numbered_release_types(local),
+        numbered_release_types(remote),
     );
-    let (local_reduced, remote_reduced) = if different_discs {
-        (None, None)
+    let different_discs =
+        !local_discs.is_empty() && !remote_discs.is_empty() && local_discs != remote_discs;
+    let (local_readings, remote_readings) = if different_discs {
+        (Vec::new(), Vec::new())
     } else {
-        (reduce_album_title(local), reduce_album_title(remote))
+        (album_readings(local), album_readings(remote))
     };
-    let local_album = local_reduced.as_deref().unwrap_or(local);
-    let remote_album = remote_reduced.as_deref().unwrap_or(remote);
-    if local_reduced.is_some() || remote_reduced.is_some() {
-        // The cut-off readings only apply when the local text is the raw tag.
-        let reduced = local_similarity_with(local_album, remote_album, local_reduced.is_none());
-        best = best.max((reduced - ALBUM_TYPE_PENALTY).max(0.0));
+    let albums = |readings: &'_ [String], raw: &'_ str| -> Vec<String> {
+        if readings.is_empty() {
+            vec![raw.to_string()]
+        } else {
+            readings.to_vec()
+        }
+    };
+    let reduced_any = !local_readings.is_empty() || !remote_readings.is_empty();
+    for local_album in albums(&local_readings, local) {
+        for remote_album in albums(&remote_readings, remote) {
+            if reduced_any {
+                // The cut-off readings only apply when the local text is the raw tag.
+                let reduced =
+                    local_similarity_with(&local_album, &remote_album, local_readings.is_empty());
+                best = best.max((reduced - ALBUM_TYPE_PENALTY).max(0.0));
+            }
+            let compact =
+                similarity_chars(&compact_chars(&local_album), &compact_chars(&remote_album));
+            best = best.max((compact - ALBUM_TYPE_PENALTY).max(0.0));
+        }
     }
-    let compact = similarity_chars(&compact_chars(local_album), &compact_chars(remote_album));
-    best.max((compact - ALBUM_TYPE_PENALTY).max(0.0))
+    best
 }
 
 /// [`artist_similarity`] with the same allowance for a cut-off local artist.
@@ -3405,10 +3664,14 @@ mod tests {
         assert!((0.95..1.0).contains(&value), "{value}");
         assert_eq!(album_title_similarity("Album CD1", "Album CD1"), 1.0);
         assert_eq!(
-            numbered_release_type_suffix("Album CD1"),
-            Some("cd1".to_string())
+            numbered_release_types("Album CD1"),
+            BTreeSet::from(["cd1".to_string()])
         );
-        assert_eq!(numbered_release_type_suffix("Album"), None);
+        assert_eq!(
+            numbered_release_types("Album CDM_CD2"),
+            BTreeSet::from(["cd2".to_string()])
+        );
+        assert!(numbered_release_types("Album").is_empty());
     }
 
     #[test]
@@ -3478,6 +3741,240 @@ mod tests {
         assert_eq!(reduce_album_title("Blue Single").as_deref(), Some("Blue"));
         assert_eq!(reduce_album_title("Ostrich Eggs"), None);
         assert_eq!(reduce_album_title("The Cure").as_deref(), Some("Cure"));
+    }
+
+    #[test]
+    fn scene_decorations_on_an_album_title_do_not_change_the_album() {
+        for (local, remote) in [
+            ("Eyes Bleed Silver 7inch", "Eyes Bleed Silver"),
+            ("Fat Club 7 Inch", "Fat Club"),
+            ("Fools Gold 7\"", "Fools Gold"),
+            ("Whenever You See Fit 12''", "Whenever You See Fit"),
+            ("Whenever You See Fit 12\u{2033} EP", "Whenever You See Fit"),
+            ("The Racer 100 EP 12 Inch", "The Racer 100 EP"),
+            ("Fefe Dobson-RETAIL", "Fefe Dobson"),
+            ("Name-RETAIL CDS", "Name"),
+            ("Be A Man-PROMO CDM", "Be A Man"),
+            ("Hello-CD Single", "Hello"),
+            ("The Truth (RETAIL EXPLICIT)", "The Truth"),
+            ("Boy Hits Car (Explicit Retail)", "Boy Hits Car"),
+            ("Album PROPER RETAIL", "Album"),
+            ("Title-TAPE ADVANCE", "Title"),
+            ("Beneath The Surface -ADVANCE-", "Beneath The Surface"),
+            ("Craig Olive EP (Vinyl)", "Craig Olive"),
+            ("Mandatory Music - Vinyl", "Mandatory Music"),
+            ("Chief Rocka VLS", "Chief Rocka"),
+            ("Pain I Feel promo 12inch", "Pain I Feel"),
+            ("Old School Recess - 7 Inch", "Old School Recess"),
+            ("Tapin' Up My Heart (7-Inch)", "Tapin' Up My Heart"),
+            ("The Best Of Offspring Bootleg", "The Best Of Offspring"),
+            ("Psoriasis Reissue", "Psoriasis"),
+            ("Name CDM_CD2", "Name"),
+            ("Everyone Says \"hi\" CDM_CD2", "Everyone Says \"hi\""),
+        ] {
+            let value = album_title_similarity(local, remote);
+            assert!(
+                (0.95..1.0).contains(&value),
+                "{local:?} against {remote:?}: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_decoration_next_to_a_non_ascii_letter_is_read_without_slicing_inside_it() {
+        for (local, remote) in [
+            ("\u{00C9}t\u{00E9} 12''", "\u{00C9}t\u{00E9}"),
+            (
+                "\u{00C9}ire\u{2019}s Best-RETAIL",
+                "\u{00C9}ire\u{2019}s Best",
+            ),
+            (
+                "Ça va\u{2019}s \u{00C9}P (Vinyl)",
+                "Ça va\u{2019}s \u{00C9}P",
+            ),
+            ("Caf\u{00E9} \u{2013} Reissue", "Caf\u{00E9}"),
+        ] {
+            let value = album_title_similarity(local, remote);
+            assert!(
+                (0.95..1.0).contains(&value),
+                "{local:?} against {remote:?}: {value}"
+            );
+        }
+        assert_eq!(
+            reduce_album_title("Caf\u{00E9}-RETAIL").as_deref(),
+            Some("Caf\u{00E9}")
+        );
+    }
+
+    #[test]
+    fn a_decoration_joined_to_the_title_keeps_the_title_whole() {
+        assert_eq!(reduce_album_title("Jay-Z EP").as_deref(), Some("Jay-Z"));
+        assert_eq!(
+            reduce_album_title("Beneath The Surface -ADVANCE-").as_deref(),
+            Some("Beneath The Surface")
+        );
+        assert_eq!(
+            reduce_album_title("Foo (Bar)-RETAIL").as_deref(),
+            Some("Foo (Bar)")
+        );
+        assert_eq!(reduce_album_title("Blink-182"), None);
+        assert!(album_title_similarity("Blink-182", "Blink") < 0.9);
+    }
+
+    #[test]
+    fn a_companion_word_is_dropped_only_with_a_release_type_word() {
+        assert_eq!(reduce_album_title("Album (Explicit)"), None);
+        assert_eq!(reduce_album_title("Demo Tape"), None);
+        assert_eq!(reduce_album_title("Album Proper"), None);
+        assert_eq!(
+            reduce_album_title("Album PROPER RETAIL").as_deref(),
+            Some("Album")
+        );
+        assert_eq!(
+            reduce_album_title("Democrazy-TAPE ADVANCE").as_deref(),
+            Some("Democrazy")
+        );
+        // A companion after a size goes with it, one in front of it needs a mark.
+        assert_eq!(
+            reduce_album_title("Album 7\" Proper").as_deref(),
+            Some("Album")
+        );
+        assert_eq!(
+            reduce_album_title("Album Proper 7\"").as_deref(),
+            Some("Album Proper")
+        );
+        assert_eq!(
+            reduce_album_title("Album PROPER 7\"").as_deref(),
+            Some("Album")
+        );
+        // A companion that is part of the title and written like it stays.
+        assert_eq!(
+            reduce_album_title("Album Proper Retail").as_deref(),
+            Some("Album Proper")
+        );
+    }
+
+    #[test]
+    fn a_companion_word_in_the_title_is_not_read_as_decoration() {
+        for (local, remote) in [
+            ("Demo Tape EP", "Demo Tape"),
+            ("Demo Tape", "Demo Tape EP"),
+            ("Prim and Proper EP", "Prim and Proper"),
+            ("Sexually Explicit EP", "Sexually Explicit"),
+            ("Sex Tape Single", "Sex Tape"),
+            ("Sex Tape-RETAIL", "Sex Tape"),
+            // Written in capitals, the title's own word is still found.
+            ("Sex TAPE EP", "Sex TAPE"),
+        ] {
+            let value = album_title_similarity(local, remote);
+            assert!(
+                (0.95..=1.0).contains(&value),
+                "{local:?} against {remote:?}: {value}"
+            );
+        }
+        for (local, remote) in [
+            ("Sex Tape Retail", "Sex"),
+            ("Mix Tape Retail", "Mix"),
+            // Capitals mean nothing in a title that is all capitals.
+            ("DEMO TAPE EP", "Demo"),
+            ("PRIM AND PROPER EP", "Prim and"),
+            ("SEXUALLY EXPLICIT SINGLE", "Sexually"),
+            ("SEX TAPE RETAIL", "Sex"),
+            ("X PROPER EP", "X TAPE EP"),
+        ] {
+            let value = album_title_similarity(local, remote);
+            assert!(value < 0.9, "{local:?} against {remote:?}: {value}");
+        }
+        let value = album_title_similarity("Breakin News PROPER RETAIL", "Breakin News");
+        assert!((0.95..=1.0).contains(&value), "{value}");
+        // An all-caps title keeps its companion word, so only the release-type
+        // word goes.
+        assert_eq!(
+            reduce_album_title("BREAKIN NEWS PROPER RETAIL").as_deref(),
+            Some("BREAKIN NEWS PROPER")
+        );
+        assert_eq!(
+            reduce_album_title("X PROPER EP").as_deref(),
+            Some("X PROPER")
+        );
+    }
+
+    #[test]
+    fn a_title_made_only_of_decoration_keeps_its_first_unit() {
+        for (local, remote) in [
+            ("Japan EP", "Japan"),
+            ("Bonus EP", "Bonus"),
+            ("The Promo EP", "Promo"),
+            ("Vinyl Single", "Vinyl"),
+            ("Limited Edition", "Limited"),
+            ("The Bootleg EP", "The Bootleg"),
+        ] {
+            let value = album_title_similarity(local, remote);
+            assert!(
+                (0.95..=1.0).contains(&value),
+                "{local:?} against {remote:?}: {value}"
+            );
+        }
+        assert_eq!(reduce_album_title("Japan EP").as_deref(), Some("Japan"));
+        assert_eq!(reduce_album_title("12 Inch"), None);
+        assert_eq!(reduce_album_title("Vinyl"), None);
+    }
+
+    #[test]
+    fn a_bare_article_is_not_an_album() {
+        assert_eq!(reduce_album_title("The-Bootleg"), None);
+        assert_eq!(reduce_album_title("A Bootleg"), None);
+        assert!(album_title_similarity("The-Bootleg", "The") < 0.9);
+        assert!(album_title_similarity("A Bootleg", "A") < 0.9);
+    }
+
+    #[test]
+    fn an_inch_mark_must_follow_the_number() {
+        assert_eq!(reduce_album_title("Number \"7\""), None);
+        assert_eq!(reduce_album_title("Seven \"7"), None);
+        assert_eq!(
+            reduce_album_title("Fools Gold (7\")").as_deref(),
+            Some("Fools Gold")
+        );
+        assert_eq!(
+            reduce_album_title("Fools Gold 10\u{2033}").as_deref(),
+            Some("Fools Gold")
+        );
+    }
+
+    #[test]
+    fn a_bare_number_is_not_a_size_and_versions_stop_the_decoration_run() {
+        assert!(album_title_similarity("Album 7", "Album") < 0.9);
+        assert!(album_title_similarity("Album Inch", "Album") < 0.9);
+        assert!(album_title_similarity("Album 8 Inch", "Album") < 0.9);
+        assert!(album_title_similarity("Album-LIVE", "Album") < 0.9);
+        assert!(album_title_similarity("Album Live Bootleg", "Album") < 0.9);
+        assert_eq!(
+            reduce_album_title("Album Live Bootleg").as_deref(),
+            Some("Album Live")
+        );
+        // Nothing would remain.
+        assert_eq!(reduce_album_title("12 Inch"), None);
+        assert_eq!(reduce_album_title("Vinyl"), None);
+    }
+
+    #[test]
+    fn a_decorated_title_is_not_read_as_an_id3v1_cut_off() {
+        let remote = "Detailed Instructions For The Self Involved";
+        assert!(album_title_similarity("Detailed Instructions For The-RETAIL", remote) < 0.9);
+        let cut = "Detailed Instructions For The";
+        assert!(album_title_similarity(cut, remote) >= 0.96);
+    }
+
+    #[test]
+    fn different_disc_numbers_in_a_decoration_run_are_never_stripped() {
+        for local in ["Album-CD2", "Album CD2 Retail", "Album CDM_CD2"] {
+            let value = album_title_similarity(local, "Album CD1");
+            assert!(value < 0.95, "{local:?}: {value}");
+            assert_eq!(value, local_similarity(local, "Album CD1"), "{local:?}");
+        }
+        let value = album_title_similarity("Album CDM_CD2", "Album CD2");
+        assert!((0.95..=1.0).contains(&value), "{value}");
     }
 
     #[test]
@@ -4278,11 +4775,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v19"
+            "discogs-match-v20"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v18"
+            "musicbrainz-match-v19"
         );
     }
 
