@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v6";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v5";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v7";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v6";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -452,8 +452,51 @@ pub fn local_similarity(local: &str, remote: &str) -> f64 {
 
 /// [`artist_similarity`] with the same allowance for a cut-off local artist.
 pub fn local_artist_similarity(local: &str, remote: &str) -> f64 {
-    let full = artist_similarity(local, remote);
-    id3v1_prefix(local, remote).map_or(full, |prefix| full.max(artist_similarity(local, prefix)))
+    let full = artist_similarity(local, remote).max(folded_artist_similarity(local, remote));
+    id3v1_prefix(local, remote).map_or(full, |prefix| {
+        full.max(artist_similarity(local, prefix))
+            .max(folded_artist_similarity(local, prefix))
+    })
+}
+
+/// Taken off a comparison that needed a leading `The` or an `&` folded away, so
+/// it never scores as a perfect match.
+const ARTIST_FOLD_PENALTY: f64 = 0.02;
+
+/// Artist text for the folded comparison: `&` read as `and` and one leading
+/// `the` dropped, as in `Belle & Sebastian` against `Belle and Sebastian`, or
+/// `Sisters of Mercy` against `The Sisters of Mercy`.
+fn folded_artist_chars(normalize: impl Fn(&str) -> String, text: &str) -> Vec<char> {
+    let spelled = text.replace('&', " and ");
+    let normalized = normalize(&spelled);
+    normalized
+        .strip_prefix("the ")
+        .unwrap_or(&normalized)
+        .chars()
+        .collect()
+}
+
+/// [`artist_similarity`] after folding, less [`ARTIST_FOLD_PENALTY`], or zero
+/// when folding changes neither side.
+fn folded_artist_similarity(a: &str, b: &str) -> f64 {
+    let (a_folded, b_folded) = (
+        folded_artist_chars(normalize_artist, a),
+        folded_artist_chars(normalize_artist, b),
+    );
+    if a_folded == normalized_artist_chars(a) && b_folded == normalized_artist_chars(b) {
+        return 0.0;
+    }
+    let value = similarity_of_normalized(
+        &strip_disambiguator(a),
+        &a_folded,
+        &strip_disambiguator(b),
+        &b_folded,
+    );
+    (value - ARTIST_FOLD_PENALTY).max(0.0)
+}
+
+fn normalized_artist_chars(text: &str) -> Vec<char> {
+    normalize_artist(text).chars().collect()
 }
 
 /// [`similarity`] over titles that were normalized once by the caller.
@@ -1319,8 +1362,24 @@ fn album_artist_score(local: &LocalRelease, remote: &RemoteRelease) -> f64 {
     let joined_original = remote_originals.join(" ");
     let joined_chars: Vec<char> = remote_chars.join(&' ');
     // A 30-character local artist may be a cut-off copy of a longer credit.
+    let local_folded = folded_artist_chars(|text| normalize_artist_for(provider, text), artist);
     let compare = |original: &str, chars: &[char]| {
         let mut value = similarity_of_normalized(&local_original, &local_chars, original, chars);
+        // `The Sisters of Mercy` and `Sisters of Mercy`, `Belle & Sebastian` and
+        // `Belle and Sebastian`: the same artist, at a small cost.
+        let remote_folded =
+            folded_artist_chars(|text| normalize_artist_for(provider, text), original);
+        if local_folded != local_chars || remote_folded != chars {
+            value = value.max(
+                (similarity_of_normalized(
+                    &local_original,
+                    &local_folded,
+                    original,
+                    &remote_folded,
+                ) - ARTIST_FOLD_PENALTY)
+                    .max(0.0),
+            );
+        }
         if let Some(prefix) = id3v1_prefix(artist, original) {
             let prefix_chars: Vec<char> = normalize_artist_for(provider, prefix).chars().collect();
             value = value.max(similarity_of_normalized(
@@ -2395,6 +2454,40 @@ mod tests {
     }
 
     #[test]
+    fn a_leading_the_and_an_ampersand_fold_away_at_a_small_cost() {
+        for (local, remote) in [
+            ("Sisters Of Mercy", "The Sisters of Mercy"),
+            ("The Sisters Of Mercy", "Sisters of Mercy"),
+            ("Belle And Sebastian", "Belle & Sebastian"),
+            ("Jesus and Mary Chain", "The Jesus And Mary Chain"),
+        ] {
+            let value = local_artist_similarity(local, remote);
+            assert!(
+                (0.97..1.0).contains(&value),
+                "{local:?} against {remote:?}: {value}"
+            );
+        }
+        // Different artists stay different, and a name that is only `The`
+        // does not fold to nothing.
+        assert!(local_artist_similarity("Sisters Of Mercy", "The Sisterhood") < 0.8);
+        assert!(local_artist_similarity("The", "Mercy") < 0.5);
+        assert_eq!(local_artist_similarity("The Who", "The Who"), 1.0);
+    }
+
+    #[test]
+    fn the_album_artist_score_folds_the_article_for_either_provider() {
+        let mut local = local_release(&["One", "Two"]);
+        local.album_artist = Some("Sisters Of Mercy".to_string());
+        let mut remote = remote_release(&["One", "Two"]);
+        remote.artists = vec!["The Sisters of Mercy".to_string()];
+        let value = album_artist_score(&local, &remote);
+        assert!((0.97..1.0).contains(&value), "{value}");
+
+        local.album_artist = Some("Different Band".to_string());
+        assert!(album_artist_score(&local, &remote) < 0.6);
+    }
+
+    #[test]
     fn a_cut_off_artist_matches_the_full_credit() {
         let remote = "Everything But The Girl & Tracey Thorn";
         let cut: String = remote.chars().take(ID3V1_FIELD_CHARS).collect();
@@ -3190,10 +3283,10 @@ mod tests {
 
     #[test]
     fn algorithm_versions_are_provider_specific() {
-        assert_eq!(algorithm_version(ProviderKind::Discogs), "discogs-match-v6");
+        assert_eq!(algorithm_version(ProviderKind::Discogs), "discogs-match-v7");
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v5"
+            "musicbrainz-match-v6"
         );
     }
 
