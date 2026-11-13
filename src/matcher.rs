@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v14";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v13";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v15";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v14";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -665,6 +665,8 @@ const ALBUM_TYPE_PENALTY: f64 = 0.03;
 /// Versions (live, remix, remastered, and the rest of [`VERSION_WORDS`]) are not
 /// here, so they are never dropped.
 const RELEASE_TYPE_WORDS: &[&str] = &[
+    "aust",
+    "australian",
     "bonus",
     "cd",
     "cdep",
@@ -687,6 +689,7 @@ const RELEASE_TYPE_WORDS: &[&str] = &[
     "retail",
     "single",
     "soundtrack",
+    "st",
 ];
 
 /// `text` without a leading `O.S.T.`/`V.A.` marker (`O.S.T. Mary Reilly`,
@@ -712,9 +715,29 @@ fn without_leading_marker(text: &str) -> &str {
     trimmed
 }
 
+/// Whether `word` is a release-type word with a disc or part number on it
+/// (`CDS2`, `CD2`).
+fn numbered_release_type(word: &str) -> bool {
+    let stem = word.trim_end_matches(|ch: char| ch.is_ascii_digit());
+    stem.len() < word.len() && RELEASE_TYPE_WORDS.contains(&stem)
+}
+
+/// Whether `word` is a volume number: digits or a roman numeral.
+fn is_volume_number(word: &str) -> bool {
+    let word: String = word
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    !word.is_empty()
+        && (word.chars().all(|ch| ch.is_ascii_digit())
+            || word.chars().all(|ch| matches!(ch, 'i' | 'v' | 'x')))
+}
+
 /// An album title reduced to the album: no leading `The` or `O.S.T.`/`V.A.`
-/// marker and no trailing release-type words. `None` when nothing is removed or
-/// nothing would be left.
+/// marker, no trailing release-type words (also numbered ones such as `CDS2`),
+/// and no `Vol.`/`Volume` word in front of a final number. `None` when nothing
+/// is removed or nothing would be left.
 fn reduce_album_title(text: &str) -> Option<String> {
     let body = without_leading_marker(text);
     let mut words: Vec<&str> = body.split_whitespace().collect();
@@ -727,29 +750,50 @@ fn reduce_album_title(text: &str) -> Option<String> {
             .filter(|ch| ch.is_alphanumeric())
             .flat_map(char::to_lowercase)
             .collect();
-        if RELEASE_TYPE_WORDS.contains(&last.as_str()) {
+        if RELEASE_TYPE_WORDS.contains(&last.as_str()) || numbered_release_type(&last) {
             words.pop();
         } else {
             break;
+        }
+    }
+    if words.len() > 2 && is_volume_number(words[words.len() - 1]) {
+        let marker: String = words[words.len() - 2]
+            .chars()
+            .filter(|ch| ch.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect();
+        if matches!(marker.as_str(), "vol" | "vols" | "volume" | "volumes") {
+            words.remove(words.len() - 2);
         }
     }
     let reduced = words.join(" ");
     (reduced != text.trim() && reduced.chars().any(char::is_alphanumeric)).then_some(reduced)
 }
 
+/// Comparison text with the spaces taken out, for `Rock 'n' Roll` against
+/// `Rocknroll`.
+fn compact_chars(text: &str) -> Vec<char> {
+    normalized_chars(text)
+        .into_iter()
+        .filter(|ch| *ch != ' ')
+        .collect()
+}
+
 /// [`local_similarity`] for an album title, also comparing the albums behind
-/// the titles (`Iron Icon EP` against `The Iron Icon`) at a small cost.
+/// the titles (`Iron Icon EP` against `The Iron Icon`, `Vol. 2` against
+/// `Volume 2`) and the titles with their spaces removed (`Rock 'n' Roll`
+/// against `Rocknroll`), each at a small cost.
 pub fn album_title_similarity(local: &str, remote: &str) -> f64 {
-    let base = local_similarity(local, remote);
+    let mut best = local_similarity(local, remote);
     let (local_reduced, remote_reduced) = (reduce_album_title(local), reduce_album_title(remote));
-    if local_reduced.is_none() && remote_reduced.is_none() {
-        return base;
+    let local_album = local_reduced.as_deref().unwrap_or(local);
+    let remote_album = remote_reduced.as_deref().unwrap_or(remote);
+    if local_reduced.is_some() || remote_reduced.is_some() {
+        best =
+            best.max((local_similarity(local_album, remote_album) - ALBUM_TYPE_PENALTY).max(0.0));
     }
-    let reduced = local_similarity(
-        local_reduced.as_deref().unwrap_or(local),
-        remote_reduced.as_deref().unwrap_or(remote),
-    );
-    base.max((reduced - ALBUM_TYPE_PENALTY).max(0.0))
+    let compact = similarity_chars(&compact_chars(local_album), &compact_chars(remote_album));
+    best.max((compact - ALBUM_TYPE_PENALTY).max(0.0))
 }
 
 /// [`artist_similarity`] with the same allowance for a cut-off local artist.
@@ -3044,6 +3088,43 @@ mod tests {
     }
 
     #[test]
+    fn numbered_release_types_volume_words_and_spacing_do_not_change_the_album() {
+        for (local, remote) in [
+            ("These Wooden Ideas CDS2", "These Wooden Ideas"),
+            ("Another Pearl CDS2", "Another Pearl"),
+            ("Love & Basketball ST", "Love & Basketball"),
+            ("Some Record Aust", "Some Record"),
+            ("Some Record Australian", "Some Record"),
+            ("Incomplete Crap Vol. 2", "Incomplete Crap, Volume 2"),
+            ("Analogue Bubblebath 3", "Analogue Bubblebath Vol. 3"),
+            ("Maximum Rock 'n' Roll", "Maximum Rocknroll"),
+        ] {
+            let value = album_title_similarity(local, remote);
+            assert!(
+                (0.95..1.0).contains(&value),
+                "{local:?} against {remote:?}: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_new_album_title_readings_keep_different_albums_apart() {
+        // Different volumes and different numbers stay different.
+        assert_eq!(
+            album_title_similarity("Hits Vol. 2", "Hits Vol. 3"),
+            local_similarity("Hits Vol. 2", "Hits Vol. 3")
+        );
+        assert!(album_title_similarity("Album 2", "Album 3") < 0.9);
+        // A decorated title keeps its core.
+        assert!(album_title_similarity("Another Pearl CDS2", "Other Pearl") < 0.9);
+        // Nothing is left to strip, or nothing would remain.
+        assert_eq!(reduce_album_title("CDS2"), None);
+        assert_eq!(reduce_album_title("Volume 2"), None);
+        // Versions are still never dropped.
+        assert!(album_title_similarity("Album", "Album Live 2") < 0.9);
+    }
+
+    #[test]
     fn release_type_words_and_a_leading_the_do_not_change_the_album() {
         for (local, remote) in [
             ("No Distance Left to Run EP", "No Distance Left To Run"),
@@ -3892,11 +3973,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v14"
+            "discogs-match-v15"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v13"
+            "musicbrainz-match-v14"
         );
     }
 
