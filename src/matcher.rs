@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v7";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v6";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v8";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v7";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -446,8 +446,152 @@ fn id3v1_prefix<'a>(local: &str, remote: &'a str) -> Option<&'a str> {
 /// comparison and, for a 30-character local value, a comparison with the
 /// remote's first 30 characters.
 pub fn local_similarity(local: &str, remote: &str) -> f64 {
-    let full = similarity(local, remote);
+    let mut full = similarity(local, remote);
+    if let Some(value) = suffix_tolerant_similarity(local, remote) {
+        full = full.max(value);
+    }
     id3v1_prefix(local, remote).map_or(full, |prefix| full.max(similarity(local, prefix)))
+}
+
+/// Taken off a comparison that needed a suffix removed, so it never scores as
+/// an exact match.
+const SUFFIX_PENALTY: f64 = 0.05;
+
+/// Words that make a bracketed suffix part of the recording or edition rather
+/// than a subtitle, so it is never removed for comparison.
+const VERSION_WORDS: &[&str] = &[
+    "acoustic",
+    "clean",
+    "cover",
+    "demo",
+    "deluxe",
+    "dub",
+    "edit",
+    "explicit",
+    "extended",
+    "instrumental",
+    "live",
+    "mix",
+    "mono",
+    "radio",
+    "remaster",
+    "remastered",
+    "remix",
+    "remixes",
+    "reprise",
+    "stereo",
+    "unplugged",
+    "uncensored",
+    "censored",
+    "version",
+];
+
+/// `text` without one trailing suffix that is a subtitle or credit: a bracketed
+/// group (`(I'll Be Anything)`, `[Ramones]`, or one cut off before it closed), a
+/// `feat.`/`ft.`/`featuring` tail, or a `part N` marker. `None` when there is
+/// no such suffix, it names a version, or nothing would be left.
+fn strip_title_suffix(text: &str) -> Option<String> {
+    let trimmed = text.trim_end();
+    let lower = trimmed.to_lowercase();
+
+    let mut cut = bracketed_suffix_start(trimmed)
+        .or_else(|| featured_suffix_start(&lower))
+        .or_else(|| part_suffix_start(&lower))?;
+    // Positions came from the lowercased text; lowercasing can change byte
+    // lengths for a few characters, so keep only a boundary of `trimmed`.
+    while cut > 0 && !trimmed.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let (base, suffix) = trimmed.split_at(cut);
+    let suffix_lower = suffix.to_lowercase();
+    if normalize_text(suffix)
+        .split_whitespace()
+        .any(|word| VERSION_WORDS.contains(&word))
+        || suffix_lower.contains("remaster")
+    {
+        return None;
+    }
+    // The separator before the suffix goes with it (`Song, Part II`).
+    let base = base.trim_end_matches(|ch: char| {
+        ch.is_whitespace() || matches!(ch, ',' | '-' | ':' | ';' | '\u{2013}' | '\u{2014}')
+    });
+    base.chars()
+        .any(char::is_alphanumeric)
+        .then(|| base.to_string())
+}
+
+/// Byte offset of a trailing `(...)` or `[...]` group, or of an opening bracket
+/// that was never closed (a tag cut off mid-subtitle).
+fn bracketed_suffix_start(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut open = None;
+    for (position, ch) in text.char_indices() {
+        match ch {
+            '(' | '[' => {
+                if depth == 0 {
+                    open = Some(position);
+                }
+                depth += 1;
+            }
+            ')' | ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && position + ch.len_utf8() < text.len() {
+                    // Closed with more text after it: not a trailing group.
+                    open = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    open
+}
+
+/// Byte offset of a trailing `feat.`, `ft.` or `featuring` credit.
+fn featured_suffix_start(lower: &str) -> Option<usize> {
+    ["featuring ", "feat. ", "feat ", "ft. ", "ft "]
+        .iter()
+        .filter_map(|marker| {
+            lower.rfind(marker).filter(|&at| {
+                at > 0
+                    && !lower[..at]
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_alphanumeric)
+            })
+        })
+        .min()
+}
+
+/// Byte offset of a trailing `part N` or `pt. N` marker, where `N` is a number
+/// or a roman numeral.
+fn part_suffix_start(lower: &str) -> Option<usize> {
+    let words: Vec<(usize, &str)> = lower
+        .split_whitespace()
+        .map(|word| (word.as_ptr() as usize - lower.as_ptr() as usize, word))
+        .collect();
+    let [.., (at, marker), (_, number)] = words.as_slice() else {
+        return None;
+    };
+    let marker = marker.trim_end_matches(['.', ',']);
+    let number = number.trim_matches(|ch: char| !ch.is_alphanumeric());
+    let numeric = !number.is_empty()
+        && (number.chars().all(|ch| ch.is_ascii_digit())
+            || number.chars().all(|ch| matches!(ch, 'i' | 'v' | 'x')));
+    (matches!(marker, "part" | "pt") && numeric && *at > 0).then_some(*at)
+}
+
+/// Comparison that ignores a suffix present on one side only, less
+/// [`SUFFIX_PENALTY`]. `None` when both or neither side has a removable suffix:
+/// two different subtitles are two different titles (`Intro (Part 1)` and
+/// `Intro (Part 2)`).
+fn suffix_tolerant_similarity(local: &str, remote: &str) -> Option<f64> {
+    let (local_base, remote_base) = (strip_title_suffix(local), strip_title_suffix(remote));
+    let value = match (local_base, remote_base) {
+        (Some(base), None) => similarity(&base, remote),
+        (None, Some(base)) => similarity(local, &base),
+        _ => return None,
+    };
+    Some((value - SUFFIX_PENALTY).max(0.0))
 }
 
 /// [`artist_similarity`] with the same allowance for a cut-off local artist.
@@ -1092,6 +1236,9 @@ impl<'a> TitleMatrix<'a> {
             remote_title,
             &self.remote_chars[remote_index],
         );
+        if let Some(suffixed) = suffix_tolerant_similarity(title, remote_title) {
+            value = value.max(suffixed);
+        }
         if let Some(prefix) = id3v1_prefix(title, remote_title) {
             value = value.max(comparison_similarity(
                 title,
@@ -2488,6 +2635,85 @@ mod tests {
     }
 
     #[test]
+    fn a_subtitle_present_on_one_side_costs_a_little_instead_of_blocking() {
+        for (local, remote) in [
+            (
+                "Tell Me What You Want",
+                "Tell Me What You Want (I'll Be Anything)",
+            ),
+            ("Pinhead [Ramones]", "Pinhead"),
+            ("Gypsy (bonus)", "Gypsy"),
+            ("Song", "Song feat. Someone"),
+            ("Song ft. Someone", "Song"),
+            ("Interlude", "Interlude, Part 2"),
+            ("Goop All Over My Phone (Pleasa", "Goop All Over My Phone"),
+        ] {
+            let value = local_similarity(local, remote);
+            assert!(
+                (0.9..1.0).contains(&value),
+                "{local:?} against {remote:?}: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn versions_and_different_subtitles_are_never_folded_away() {
+        // A version is part of the recording.
+        for (local, remote) in [
+            ("Song", "Song (live)"),
+            ("Song", "Song (Remix)"),
+            ("Song", "Song (Radio Edit)"),
+            ("Song", "Song (Instrumental)"),
+            ("Song", "Song (Clean)"),
+            ("Song", "Song (2009 Remastered)"),
+            ("Song", "Song [Acoustic]"),
+        ] {
+            assert!(
+                local_similarity(local, remote) < 0.9,
+                "{local:?} {remote:?}"
+            );
+        }
+        // Two different subtitles are two different titles.
+        assert!(suffix_tolerant_similarity("Intro (Part 1)", "Intro (Part 2)").is_none());
+        assert!(suffix_tolerant_similarity("Intro, Part 1", "Intro, Part 2").is_none());
+        // Neither side has a suffix to remove.
+        assert!(suffix_tolerant_similarity("One", "Two").is_none());
+        // A title that is only a suffix is left whole.
+        assert_eq!(strip_title_suffix("(Intro)"), None);
+        assert_eq!(strip_title_suffix("Song (live)"), None);
+        assert_eq!(strip_title_suffix("Song (Part 1) Reprise"), None);
+        assert_eq!(strip_title_suffix("Song (demo"), None);
+    }
+
+    #[test]
+    fn title_suffixes_are_found_where_beets_finds_them() {
+        assert_eq!(
+            strip_title_suffix("Song (Something)").as_deref(),
+            Some("Song")
+        );
+        assert_eq!(
+            strip_title_suffix("Song [Something]").as_deref(),
+            Some("Song")
+        );
+        assert_eq!(
+            strip_title_suffix("Song (Something").as_deref(),
+            Some("Song")
+        );
+        assert_eq!(
+            strip_title_suffix("Song feat. Someone").as_deref(),
+            Some("Song")
+        );
+        assert_eq!(
+            strip_title_suffix("Song (feat. Someone)").as_deref(),
+            Some("Song")
+        );
+        assert_eq!(strip_title_suffix("Song, Part II").as_deref(), Some("Song"));
+        assert_eq!(strip_title_suffix("Song Pt. 3").as_deref(), Some("Song"));
+        assert_eq!(strip_title_suffix("Perfect Song"), None);
+        assert_eq!(strip_title_suffix("Shift"), None);
+    }
+
+    #[test]
     fn a_cut_off_artist_matches_the_full_credit() {
         let remote = "Everything But The Girl & Tracey Thorn";
         let cut: String = remote.chars().take(ID3V1_FIELD_CHARS).collect();
@@ -3283,10 +3509,10 @@ mod tests {
 
     #[test]
     fn algorithm_versions_are_provider_specific() {
-        assert_eq!(algorithm_version(ProviderKind::Discogs), "discogs-match-v7");
+        assert_eq!(algorithm_version(ProviderKind::Discogs), "discogs-match-v8");
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v6"
+            "musicbrainz-match-v7"
         );
     }
 
