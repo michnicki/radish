@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v17";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v16";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v18";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v17";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -29,6 +29,15 @@ pub const CORROBORATED_TITLE_FLOOR: f64 = 0.70;
 pub const CORROBORATED_SCORE: f64 = 0.97;
 pub const CORROBORATED_DURATION_SECS: f64 = 1.5;
 pub const CORROBORATED_MEAN_TITLE: f64 = 0.97;
+
+/// The fewest local tracks the album-title rule accepts. Fewer tracks are too
+/// little evidence to outweigh a title that does not agree.
+pub const CORROBORATED_MIN_TRACKS: usize = 3;
+
+/// The fewest local tracks the album-title rule accepts for a Various Artists
+/// release. Its artist component is 1.0 by construction and so is no evidence,
+/// which the track count has to make up for.
+pub const CORROBORATED_MIN_VARIOUS_TRACKS: usize = 5;
 
 /// The lowest title score a single track may have, with a matching duration,
 /// and still not block an album-level match.
@@ -520,9 +529,19 @@ fn cut_off_similarity(local: &str, remote: &str) -> Option<f64> {
 /// 30-character local value, and the cut-off reading of
 /// [`cut_off_similarity`].
 pub fn local_similarity(local: &str, remote: &str) -> f64 {
+    local_similarity_with(local, remote, true)
+}
+
+/// [`local_similarity`] with the cut-off and ID3v1-prefix readings switched on
+/// or off. They only apply to text that is the raw tag: a title that was
+/// shortened for comparison says nothing about how long the tag was.
+fn local_similarity_with(local: &str, remote: &str, allow_cut_off: bool) -> f64 {
     let mut full = similarity(local, remote);
     if let Some(value) = suffix_tolerant_similarity(local, remote) {
         full = full.max(value);
+    }
+    if !allow_cut_off {
+        return full;
     }
     if let Some(value) = cut_off_similarity(local, remote) {
         full = full.max(value);
@@ -737,6 +756,19 @@ fn numbered_release_type(word: &str) -> bool {
     stem.len() < word.len() && RELEASE_TYPE_WORDS.contains(&stem)
 }
 
+/// The numbered release-type word (`CD1`, `CDS2`) a title ends with, compared
+/// as lowercase letters and digits.
+fn numbered_release_type_suffix(title: &str) -> Option<String> {
+    let last: String = title
+        .split_whitespace()
+        .next_back()?
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    numbered_release_type(&last).then_some(last)
+}
+
 /// Whether `word` is a volume number: digits or a roman numeral.
 fn is_volume_number(word: &str) -> bool {
     let word: String = word
@@ -798,14 +830,30 @@ fn compact_chars(text: &str) -> Vec<char> {
 /// the titles (`Iron Icon EP` against `The Iron Icon`, `Vol. 2` against
 /// `Volume 2`) and the titles with their spaces removed (`Rock 'n' Roll`
 /// against `Rocknroll`), each at a small cost.
+///
+/// Two different numbered release-type words (`CD1` against `CD2`) are
+/// different discs, so nothing is stripped from either title. A title that was
+/// shortened is not read as a cut-off tag.
 pub fn album_title_similarity(local: &str, remote: &str) -> f64 {
     let mut best = local_similarity(local, remote);
-    let (local_reduced, remote_reduced) = (reduce_album_title(local), reduce_album_title(remote));
+    let different_discs = matches!(
+        (
+            numbered_release_type_suffix(local),
+            numbered_release_type_suffix(remote)
+        ),
+        (Some(a), Some(b)) if a != b
+    );
+    let (local_reduced, remote_reduced) = if different_discs {
+        (None, None)
+    } else {
+        (reduce_album_title(local), reduce_album_title(remote))
+    };
     let local_album = local_reduced.as_deref().unwrap_or(local);
     let remote_album = remote_reduced.as_deref().unwrap_or(remote);
     if local_reduced.is_some() || remote_reduced.is_some() {
-        best =
-            best.max((local_similarity(local_album, remote_album) - ALBUM_TYPE_PENALTY).max(0.0));
+        // The cut-off readings only apply when the local text is the raw tag.
+        let reduced = local_similarity_with(local_album, remote_album, local_reduced.is_none());
+        best = best.max((reduced - ALBUM_TYPE_PENALTY).max(0.0));
     }
     let compact = similarity_chars(&compact_chars(local_album), &compact_chars(remote_album));
     best.max((compact - ALBUM_TYPE_PENALTY).max(0.0))
@@ -2190,9 +2238,10 @@ fn duration_gap(
 /// Whether `candidate` is the pressing the local files came from and `other`
 /// is not, judged by length alone: with at least [`DURATION_FIT_MIN_TRACKS`]
 /// local tracks, every mapped duration of `candidate` is known and within
-/// [`DURATION_TOLERANCE_SECS`], while `other` does not map the files one to one
-/// or has a known mapped duration beyond that. An alternative whose durations
-/// also agree is a retitled or re-credited edition and is not set aside.
+/// [`DURATION_TOLERANCE_SECS`], while `other` does not map every file or has a
+/// known mapped duration beyond that. An alternative whose durations also agree
+/// is a retitled or re-credited edition and is not set aside, and neither is
+/// one that only maps ambiguously: that mapping is still one to one.
 fn fits_durations_better(local: &LocalRelease, candidate: &Candidate, other: &Candidate) -> bool {
     if local.tracks.len() < DURATION_FIT_MIN_TRACKS
         || !candidate.mapping.complete
@@ -2209,7 +2258,7 @@ fn fits_durations_better(local: &LocalRelease, candidate: &Candidate, other: &Ca
     let other_misses = other.mapping.assigned_pairs().any(|(l, r)| {
         duration_gap(local, other, l, r).is_some_and(|gap| gap > DURATION_TOLERANCE_SECS)
     });
-    !other.mapping.complete || other.mapping.ambiguous || other_misses
+    !other.mapping.complete || other_misses
 }
 
 /// Whether two candidates are editions the provider files under one album: the
@@ -2307,10 +2356,18 @@ fn equivalent_audio(a: &Candidate, b: &Candidate) -> bool {
 /// [`CORROBORATED_TITLE_FLOOR`], the artist agrees, every local file maps one to
 /// one with every duration within [`CORROBORATED_DURATION_SECS`], and the track
 /// titles and the rest of the score are strong. The title then adds no
-/// evidence, so it no longer gates the album.
+/// evidence, so it no longer gates the album. The release needs at least
+/// [`CORROBORATED_MIN_TRACKS`] local tracks, or
+/// [`CORROBORATED_MIN_VARIOUS_TRACKS`] for Various Artists.
 fn corroborated_album(local: &LocalRelease, candidate: &Candidate) -> bool {
     let score = &candidate.score;
-    if score.album_title < CORROBORATED_TITLE_FLOOR
+    let min_tracks = if matches!(local.artist_kind, ArtistKind::VariousArtists) {
+        CORROBORATED_MIN_VARIOUS_TRACKS
+    } else {
+        CORROBORATED_MIN_TRACKS
+    };
+    if local.tracks.len() < min_tracks
+        || score.album_title < CORROBORATED_TITLE_FLOOR
         || score.album_title >= TITLE_SIMILARITY_THRESHOLD
         || score.album_artist < TITLE_SIMILARITY_THRESHOLD
         || score.track_titles < CORROBORATED_MEAN_TITLE
@@ -2404,7 +2461,7 @@ fn evaluate_at_scope(
 
     if corroborated_title {
         warnings.push(format!(
-            "album title scores {:.2} but every track and duration agrees",
+            "album title scores {:.3} but every track and duration agrees",
             candidate.score.album_title
         ));
     } else if match_scope == MatchScope::Album
@@ -2514,10 +2571,12 @@ fn evaluate_at_scope(
     // on a track whose length agrees closely, in an album of at least five where
     // every other track already agrees, is one mis-tagged or differently named
     // track of the same album: by elimination it is the remaining track. Only for
-    // an album-level match, and the total still has to clear the acceptance
-    // threshold.
+    // an album-level match. These exceptions do not stack with the weak album
+    // title rule: when that rule is in play, which replaces the acceptance score
+    // gate, any track title below the minimum blocks.
     let lone_weak_title = policy == AcceptancePolicy::Measured
         && match_scope == MatchScope::Album
+        && !corroborated_title
         && titles_below_minimum == 1;
     let near_miss_title = lone_weak_title
         && worst_title >= NEAR_MISS_TITLE_FLOOR
@@ -3023,11 +3082,14 @@ mod tests {
             "Detailed Instruction For The Self Involved",
             "Detailed Instructions For The",
         ] {
-            let value = local_similarity(cut, remote);
-            assert!(
-                value >= 1.0 || value < 0.96,
-                "{remote:?} read as a cut-off: {value}"
-            );
+            if remote == cut {
+                assert_eq!(local_similarity(cut, remote), 1.0);
+            } else {
+                assert!(
+                    cut_off_similarity(cut, remote).is_none(),
+                    "{remote:?} read as a cut-off"
+                );
+            }
         }
         // A 28-character value is complete as written, even when it is a prefix.
         let short = "The Mind Is A Terrible Thing";
@@ -3213,8 +3275,44 @@ mod tests {
     }
 
     #[test]
+    fn a_shortened_album_title_is_not_read_as_a_cut_off() {
+        let remote = "Detailed Instructions For The Self Involved";
+        for local in [
+            "Detailed Instructions For The EP",
+            "The Detailed Instructions For The",
+        ] {
+            let value = album_title_similarity(local, remote);
+            assert!(value < 0.90, "{local:?} scores {value}");
+        }
+        // The raw tag may still be a cut-off copy.
+        let cut = "Detailed Instructions For The";
+        assert!(album_title_similarity(cut, remote) >= 0.96);
+    }
+
+    #[test]
+    fn different_disc_numbers_are_never_stripped() {
+        for (local, remote) in [
+            ("Album CD1", "Album CD2"),
+            ("Greatest Hits CD1", "Greatest Hits CD2"),
+        ] {
+            let value = album_title_similarity(local, remote);
+            assert!(value < 0.95, "{local:?} against {remote:?}: {value}");
+            assert_eq!(value, local_similarity(local, remote));
+        }
+        let value = album_title_similarity("These Wooden Ideas CDS2", "These Wooden Ideas");
+        assert!((0.95..1.0).contains(&value), "{value}");
+        assert_eq!(album_title_similarity("Album CD1", "Album CD1"), 1.0);
+        assert_eq!(
+            numbered_release_type_suffix("Album CD1"),
+            Some("cd1".to_string())
+        );
+        assert_eq!(numbered_release_type_suffix("Album"), None);
+    }
+
+    #[test]
     fn the_new_album_title_readings_keep_different_albums_apart() {
-        // Different volumes and different numbers stay different.
+        // The new readings do not raise the score of a different volume, and
+        // different numbers stay different.
         assert_eq!(
             album_title_similarity("Hits Vol. 2", "Hits Vol. 3"),
             local_similarity("Hits Vol. 2", "Hits Vol. 3")
@@ -4078,11 +4176,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v17"
+            "discogs-match-v18"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v16"
+            "musicbrainz-match-v17"
         );
     }
 
@@ -4326,6 +4424,121 @@ mod tests {
         let mut artist = remote.clone();
         artist.artists = vec!["Another Band".to_string()];
         assert!(blocked(&local, &artist));
+    }
+
+    const TEN_TITLES: [&str; 10] = [
+        "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten",
+    ];
+
+    #[test]
+    fn a_weak_album_title_does_not_stack_with_a_weak_track_title() {
+        let mut local = local_release(&TEN_TITLES);
+        let mut remote = remote_release(&TEN_TITLES);
+        remote.title = "Exclusive Metal Radio Sampler".to_string();
+        // One short typo: 0.75 against "Four", mean still above 0.97.
+        local.tracks[3].title = Some("Fou".to_string());
+
+        // The setup is valid: with an exact album title the near-miss rule
+        // accepts the lone weak track.
+        let candidate = Candidate::new(&local, remote_release(&TEN_TITLES));
+        let evaluation =
+            evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default());
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+
+        // With the weak album title the weak track title blocks.
+        local.album_title = Some("Exclusive Metal Sampler".to_string());
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(
+            (0.70..0.90).contains(&candidate.score.album_title),
+            "{}",
+            candidate.score.album_title
+        );
+        assert!(
+            candidate.score.track_titles >= CORROBORATED_MEAN_TITLE,
+            "{}",
+            candidate.score.track_titles
+        );
+        let evaluation =
+            evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default());
+        assert!(!evaluation.auto_accept);
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|note| note.contains("only scores")),
+            "{:?}",
+            evaluation.blockers
+        );
+    }
+
+    #[test]
+    fn a_weak_album_title_needs_enough_tracks() {
+        let weak_title_blocks = |titles: &[&str], various: bool| {
+            let mut local = local_release(titles);
+            local.album_title = Some("Exclusive Metal Sampler".to_string());
+            let mut remote = remote_release(titles);
+            remote.title = "Exclusive Metal Radio Sampler".to_string();
+            if various {
+                local.artist_kind = ArtistKind::VariousArtists;
+                remote.artists = vec!["Various Artists".to_string()];
+            }
+            let candidate = Candidate::new(&local, remote);
+            if various {
+                assert_eq!(candidate.score.album_artist, 1.0);
+            }
+            let evaluation =
+                evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default());
+            if evaluation.auto_accept {
+                return false;
+            }
+            assert!(
+                evaluation
+                    .blockers
+                    .iter()
+                    .any(|note| note.contains("album title or artist does not agree")),
+                "{:?}",
+                evaluation.blockers
+            );
+            true
+        };
+        assert!(weak_title_blocks(&["One"], false));
+        assert!(weak_title_blocks(&["One", "Two"], false));
+        // Three tracks are enough for an ordinary artist.
+        assert!(!weak_title_blocks(&["One", "Two", "Three"], false));
+        // A Various Artists release has no artist evidence: it needs five.
+        assert!(weak_title_blocks(&["One", "Two", "Three", "Four"], true));
+        assert!(!weak_title_blocks(
+            &["One", "Two", "Three", "Four", "Five"],
+            true
+        ));
+    }
+
+    #[test]
+    fn an_ambiguous_alternative_is_not_set_aside_by_durations() {
+        let titles = ["One", "Two", "Three", "Four", "Five", "Six"];
+        let local = local_release(&titles);
+        let candidate = Candidate::new(&local, remote_release(&titles));
+        let mut other_release = remote_release(&titles);
+        other_release.id = ReleaseId::Discogs(46);
+        let mut other = Candidate::new(&local, other_release);
+        // Complete and within tolerance: nothing sets it aside.
+        assert!(!fits_durations_better(&local, &candidate, &other));
+        // Still one to one, only ambiguous: not set aside either.
+        other.mapping.ambiguous = true;
+        assert!(other.mapping.complete);
+        assert!(!fits_durations_better(&local, &candidate, &other));
+
+        // An incomplete mapping or a duration beyond tolerance still is.
+        let mut short_release = remote_release(&titles[..4]);
+        short_release.id = ReleaseId::Discogs(47);
+        let short = Candidate::new(&local, short_release);
+        assert!(!short.mapping.complete);
+        assert!(fits_durations_better(&local, &candidate, &short));
+        let mut off_release = remote_release(&titles);
+        off_release.id = ReleaseId::Discogs(48);
+        off_release.tracklist[0].duration_secs = Some(190.0);
+        let off = Candidate::new(&local, off_release);
+        assert!(fits_durations_better(&local, &candidate, &off));
     }
 
     #[test]
