@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v10";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v9";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v11";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v10";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -600,6 +600,102 @@ fn suffix_tolerant_similarity(local: &str, remote: &str) -> Option<f64> {
         _ => return None,
     };
     Some((value - SUFFIX_PENALTY).max(0.0))
+}
+
+/// Taken off an album-title comparison that needed a leading `The`, `O.S.T.`
+/// marker or trailing release-type word dropped.
+const ALBUM_TYPE_PENALTY: f64 = 0.03;
+
+/// Words a tag or a store appends to an album title to say what kind of release
+/// it is, not which album: `No Distance Left to Run EP`, `... OST`, `... Japan`.
+/// Versions (live, remix, remastered, and the rest of [`VERSION_WORDS`]) are not
+/// here, so they are never dropped.
+const RELEASE_TYPE_WORDS: &[&str] = &[
+    "bonus",
+    "cd",
+    "cdep",
+    "cdm",
+    "cds",
+    "digipack",
+    "digipak",
+    "disc",
+    "edition",
+    "ep",
+    "import",
+    "japan",
+    "japanese",
+    "limited",
+    "lp",
+    "maxi",
+    "mcd",
+    "ost",
+    "promo",
+    "retail",
+    "single",
+    "soundtrack",
+];
+
+/// `text` without a leading `O.S.T.`/`V.A.` marker (`O.S.T. Mary Reilly`,
+/// `v.a-smells like team spirit`).
+fn without_leading_marker(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    let lower = trimmed.to_lowercase();
+    for marker in ["o.s.t.", "o.s.t", "v.a.", "v.a", "ost"] {
+        let Some(rest) = lower.strip_prefix(marker) else {
+            continue;
+        };
+        let boundary = rest
+            .chars()
+            .next()
+            .is_none_or(|ch| ch.is_whitespace() || matches!(ch, '-' | ':' | '.' | '\u{2013}'));
+        if boundary {
+            // The marker is ASCII, so its length is the same in `trimmed`.
+            return trimmed[marker.len()..].trim_start_matches(|ch: char| {
+                ch.is_whitespace() || matches!(ch, '-' | ':' | '.' | '\u{2013}')
+            });
+        }
+    }
+    trimmed
+}
+
+/// An album title reduced to the album: no leading `The` or `O.S.T.`/`V.A.`
+/// marker and no trailing release-type words. `None` when nothing is removed or
+/// nothing would be left.
+fn reduce_album_title(text: &str) -> Option<String> {
+    let body = without_leading_marker(text);
+    let mut words: Vec<&str> = body.split_whitespace().collect();
+    if words.len() > 1 && words[0].eq_ignore_ascii_case("the") {
+        words.remove(0);
+    }
+    while words.len() > 1 {
+        let last: String = words[words.len() - 1]
+            .chars()
+            .filter(|ch| ch.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect();
+        if RELEASE_TYPE_WORDS.contains(&last.as_str()) {
+            words.pop();
+        } else {
+            break;
+        }
+    }
+    let reduced = words.join(" ");
+    (reduced != text.trim() && reduced.chars().any(char::is_alphanumeric)).then_some(reduced)
+}
+
+/// [`local_similarity`] for an album title, also comparing the albums behind
+/// the titles (`Iron Icon EP` against `The Iron Icon`) at a small cost.
+pub fn album_title_similarity(local: &str, remote: &str) -> f64 {
+    let base = local_similarity(local, remote);
+    let (local_reduced, remote_reduced) = (reduce_album_title(local), reduce_album_title(remote));
+    if local_reduced.is_none() && remote_reduced.is_none() {
+        return base;
+    }
+    let reduced = local_similarity(
+        local_reduced.as_deref().unwrap_or(local),
+        remote_reduced.as_deref().unwrap_or(remote),
+    );
+    base.max((reduced - ALBUM_TYPE_PENALTY).max(0.0))
 }
 
 /// [`artist_similarity`] with the same allowance for a cut-off local artist.
@@ -1411,7 +1507,7 @@ impl ScoreBreakdown {
 /// nothing is renormalized into false confidence.
 pub fn score(local: &LocalRelease, remote: &RemoteRelease, mapping: &Mapping) -> ScoreBreakdown {
     let album_title = match &local.album_title {
-        Some(title) if !title.trim().is_empty() => local_similarity(title, &remote.title),
+        Some(title) if !title.trim().is_empty() => album_title_similarity(title, &remote.title),
         _ => 0.0,
     };
 
@@ -1562,7 +1658,7 @@ pub fn rank_search_summary(local: &LocalRelease, summary: &SearchSummary) -> f64
     let mut rank = 0.0;
 
     if let Some(title) = &local.album_title {
-        rank += 0.5 * local_similarity(title, &summary.title);
+        rank += 0.5 * album_title_similarity(title, &summary.title);
     }
     if let Some(artist) = &local.album_artist {
         rank += 0.3 * summary_artist_hint(artist, summary);
@@ -2762,6 +2858,57 @@ mod tests {
     }
 
     #[test]
+    fn release_type_words_and_a_leading_the_do_not_change_the_album() {
+        for (local, remote) in [
+            ("No Distance Left to Run EP", "No Distance Left To Run"),
+            (
+                "Deuce Bigalow Male Gigolo OST",
+                "Deuce Bigalow, Male Gigolo",
+            ),
+            ("5150 Home 4 Tha Sick EP", "5150 Home 4 Tha Sick"),
+            ("donkey rhubarb e.p.", "Donkey Rhubarb"),
+            ("O.S.T. Mary Reilly", "Mary Reilly"),
+            ("v.a-smells like team spirit", "Smells Like Team Spirit"),
+            ("Iron Icon", "The Iron Icon"),
+            ("The May Queens", "May Queens"),
+            (
+                "The Fruit That Ate Itself Japanese",
+                "The Fruit That Ate Itself",
+            ),
+        ] {
+            let value = album_title_similarity(local, remote);
+            assert!(
+                (0.95..1.0).contains(&value),
+                "{local:?} against {remote:?}: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn album_title_reduction_never_drops_versions_or_the_whole_title() {
+        // A version stays part of the title.
+        for remote in [
+            "Album Live",
+            "Album Remix",
+            "Album Remastered",
+            "Album Demo",
+        ] {
+            assert!(album_title_similarity("Album", remote) < 0.9, "{remote}");
+        }
+        // Different albums stay different.
+        assert!(album_title_similarity("Ostrich", "Rich") < 0.6);
+        assert!(album_title_similarity("Some EP", "Other EP") < 0.7);
+        // Nothing is left to reduce, or nothing would remain.
+        assert_eq!(reduce_album_title("EP"), None);
+        assert_eq!(reduce_album_title("The"), None);
+        assert_eq!(reduce_album_title("Plain Title"), None);
+        assert_eq!(reduce_album_title("O.S.T."), None);
+        assert_eq!(reduce_album_title("Blue Single").as_deref(), Some("Blue"));
+        assert_eq!(reduce_album_title("Ostrich Eggs"), None);
+        assert_eq!(reduce_album_title("The Cure").as_deref(), Some("Cure"));
+    }
+
+    #[test]
     fn a_cut_off_artist_matches_the_full_credit() {
         let remote = "Everything But The Girl & Tracey Thorn";
         let cut: String = remote.chars().take(ID3V1_FIELD_CHARS).collect();
@@ -3559,11 +3706,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v10"
+            "discogs-match-v11"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v9"
+            "musicbrainz-match-v10"
         );
     }
 
