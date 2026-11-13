@@ -11,3 +11,6 @@ gemini-code-1787911410765.md
 .env
 .env.*
 !.env.example
+
+# local design specs and implementation plans
+docs/superpowers/
