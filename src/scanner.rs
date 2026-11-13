@@ -2,12 +2,12 @@ use crate::output::{Clean, clean_path};
 use crate::providers::Mbid;
 use anyhow::{Context, Result};
 use lofty::config::{ParseOptions, ParsingMode};
-use lofty::file::{AudioFile, TaggedFile, TaggedFileExt};
+use lofty::file::{AudioFile, FileType, TaggedFile, TaggedFileExt};
 use lofty::probe::Probe;
 use lofty::tag::{Accessor, ItemKey, ItemValue, Tag};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::ErrorKind;
+use std::io::{Cursor, ErrorKind, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -127,19 +127,132 @@ pub fn read_tags(path: &Path) -> Result<ScannedTrack> {
 ///
 /// One malformed frame, such as a year written `199x`, makes the default mode
 /// give up on the whole tag and so on every field in it. The relaxed mode
-/// drops only the fields it cannot parse. It runs only after the default read
-/// failed, so every file the default mode can read keeps exactly its values.
+/// drops only the fields it cannot parse. A tag whose header says ID3v2.3 over
+/// ID3v2.2 frames is read as the ID3v2.2 tag it is, see [`mislabeled_id3v22`].
+/// Both run only after the default read failed, so every file the default
+/// mode can read keeps exactly its values.
 fn read_file(path: &Path) -> Result<(TaggedFile, Option<anyhow::Error>)> {
     let strict = match Probe::open(path)?.read() {
         Ok(file) => return Ok((file, None)),
         Err(error) => anyhow::Error::from(error),
     };
+    let Some(bytes) = relabeled_id3v22(path) else {
+        return read_relaxed(Probe::open(path)?, strict);
+    };
+    let probe = || {
+        // The type the extension names, as `Probe::open` does.
+        let probe = Probe::new(Cursor::new(bytes.as_slice()));
+        match FileType::from_path(path) {
+            Some(file_type) => probe.set_file_type(file_type),
+            None => probe,
+        }
+    };
+    match probe().read() {
+        Ok(file) => Ok((file, None)),
+        Err(error) => read_relaxed(probe(), error.into()),
+    }
+}
+
+/// Reads `probe` in Lofty's relaxed mode, after the default mode failed with
+/// `strict`.
+fn read_relaxed<R: Read + Seek>(
+    probe: Probe<R>,
+    strict: anyhow::Error,
+) -> Result<(TaggedFile, Option<anyhow::Error>)> {
     let relaxed = ParseOptions::new().parsing_mode(ParsingMode::Relaxed);
-    match Probe::open(path)?.options(relaxed).read() {
+    match probe.options(relaxed).read() {
         Ok(file) => Ok((file, Some(strict))),
         // The default mode's error says more about the file.
         Err(_) => Err(strict),
     }
+}
+
+/// How an ID3v2.3 tag header starts: `ID3`, major version 3, revision 0 and
+/// no flags.
+///
+/// Flags would announce unsynchronisation, an extended header or (from v2.4)
+/// a footer, which change how the frames are stored; ID3v2.2 has none of
+/// them, so a tag with flags is never taken for one.
+const ID3V23_HEADER_START: &[u8] = b"ID3\x03\x00\x00";
+
+/// Length of an ID3v2 tag header: [`ID3V23_HEADER_START`] and the tag size.
+const ID3V2_HEADER_LEN: usize = 10;
+
+/// Where an ID3v2 tag header holds its major version, right after `ID3`.
+const ID3V2_VERSION_AT: usize = 3;
+
+/// Whether `bytes` begin with an ID3v2.3 header over ID3v2.2 frames.
+///
+/// Some taggers from around 2002 wrote ID3v2.2 frames, a three-character ID
+/// and a three-byte size with no flags, under a header that says ID3v2.3.
+/// Read as v2.3, every frame header runs four bytes into the frame, so
+/// sizes and flags come from the text: Lofty saw the "ar" of "Various
+/// Artists" as an encryption flag, or a frame size that swallowed the rest
+/// of the tag.
+///
+/// The frames must fill the tag exactly, up to zero padding. Real v2.3
+/// frames do not: read as a v2.2 size, the fourth character of a v2.3 frame
+/// ID makes the first frame at least three megabytes long.
+fn mislabeled_id3v22(bytes: &[u8]) -> bool {
+    let Some(header) = bytes.get(..ID3V2_HEADER_LEN) else {
+        return false;
+    };
+    if !header.starts_with(ID3V23_HEADER_START) {
+        return false;
+    }
+    // The tag size is synchsafe: seven bits per byte, the top bit clear.
+    let size = header[ID3V23_HEADER_START.len()..]
+        .iter()
+        .try_fold(0usize, |size, &byte| {
+            (byte < 0x80).then_some(size << 7 | usize::from(byte))
+        });
+    let Some(mut rest) = size.and_then(|size| bytes.get(ID3V2_HEADER_LEN..ID3V2_HEADER_LEN + size))
+    else {
+        return false;
+    };
+
+    let mut frames = 0;
+    loop {
+        rest = match rest {
+            // Padding, if any, fills the rest of the tag.
+            [] | [0, ..] => return frames > 0 && rest.iter().all(|&byte| byte == 0),
+            // A frame ID of three capitals or digits, then a big-endian size.
+            [a, b, c, s2, s1, s0, content @ ..]
+                if [a, b, c]
+                    .iter()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()) =>
+            {
+                let len = usize::from(*s2) << 16 | usize::from(*s1) << 8 | usize::from(*s0);
+                match content.get(len..) {
+                    Some(next) => next,
+                    None => return false,
+                }
+            }
+            _ => return false,
+        };
+        frames += 1;
+    }
+}
+
+/// The file's bytes, relabeled as the ID3v2.2 tag they hold when
+/// [`mislabeled_id3v22`].
+///
+/// Any I/O error also gives `None`: the caller then reports why Lofty could
+/// not read the file.
+fn relabeled_id3v22(path: &Path) -> Option<Vec<u8>> {
+    let mut file = std::fs::File::open(path).ok()?;
+    // Only a file that starts like an ID3v2.3 tag is read in full.
+    let mut bytes = vec![0; ID3V2_HEADER_LEN];
+    file.read_exact(&mut bytes).ok()?;
+    if !bytes.starts_with(ID3V23_HEADER_START) {
+        return None;
+    }
+    file.read_to_end(&mut bytes).ok()?;
+    if !mislabeled_id3v22(&bytes) {
+        return None;
+    }
+    bytes[ID3V2_VERSION_AT] = 2;
+    Some(bytes)
 }
 
 /// [`read_tags`], plus the error that made the read drop malformed fields,
@@ -577,6 +690,97 @@ mod tests {
             format!("{error:#}").contains("encrypted frame"),
             "{error:#}"
         );
+    }
+
+    /// Writes an MP3 whose tag header says ID3v2.3 but whose `frames` are
+    /// ID3v2.2 frames, followed by zero padding, as some taggers wrote them.
+    fn mislabeled_mp3(path: &Path, frames: &[(&str, &str)]) {
+        use crate::test_support::{id3v22_frames, id3v23_tag, write_mp3};
+        write_mp3(
+            path,
+            &id3v23_tag(&[id3v22_frames(frames), vec![0; 64]].concat()),
+        );
+    }
+
+    #[test]
+    fn a_v23_header_over_v22_frames_is_read_as_v22() {
+        let dir = crate::test_support::ScratchDir::new("mislabeled-v22");
+        let path = dir.path().join("song.mp3");
+        // As found in the wild. Read as v2.3, each frame header runs into the
+        // frame's text, and the "ar" of "Various Artists" sets the
+        // encryption flag.
+        mislabeled_mp3(
+            &path,
+            &[("TP1", "Various Artists"), ("TAL", "The Punk Rock Movie")],
+        );
+        let (track, dropped) = read_tags_noting(&path).unwrap();
+        assert_eq!(track.artist.as_deref(), Some("Various Artists"));
+        assert_eq!(track.album.as_deref(), Some("The Punk Rock Movie"));
+        assert!(track.duration_secs.is_some_and(|secs| secs > 0.9));
+        assert!(dropped.is_none(), "{dropped:?}");
+
+        // Read as v2.3, the first frame's size swallows the rest of the tag,
+        // so a relaxed read would keep no field at all.
+        mislabeled_mp3(
+            &path,
+            &[
+                ("TYE", "1999"),
+                ("TT2", "Song"),
+                ("TP1", "Artist"),
+                ("TAL", "Album"),
+                ("TRK", "3"),
+            ],
+        );
+        let (track, dropped) = read_tags_noting(&path).unwrap();
+        assert_eq!(track.title.as_deref(), Some("Song"));
+        assert_eq!(track.artist.as_deref(), Some("Artist"));
+        assert_eq!(track.album.as_deref(), Some("Album"));
+        assert_eq!(track.track_number, Some(3));
+        assert_eq!(track.year, Some(1999));
+        assert!(dropped.is_none(), "{dropped:?}");
+    }
+
+    #[test]
+    fn only_v22_frames_that_fill_a_v23_tag_count_as_mislabeled() {
+        use crate::test_support::{id3v22_frames, id3v23_frames, id3v23_tag};
+        let frames = id3v22_frames(&[("TT2", "Song"), ("TP1", "Artist")]);
+        let padded = |tail: &[u8]| id3v23_tag(&[&frames[..], tail].concat());
+
+        assert!(mislabeled_id3v22(&padded(&[])));
+        assert!(mislabeled_id3v22(&padded(&[0; 16])));
+        // Something other than padding after the frames.
+        assert!(!mislabeled_id3v22(&padded(&[0, 1])));
+        // A frame that runs past the end of the tag.
+        assert!(!mislabeled_id3v22(&id3v23_tag(&frames[..frames.len() - 1])));
+        // No frames at all.
+        assert!(!mislabeled_id3v22(&id3v23_tag(&[0; 16])));
+        // Real v2.3 frames, even one Lofty refuses.
+        let v23 = id3v23_frames(&[("TIT2", "Song", 0), ("TENC", "Encoder", 0x0040)]);
+        assert!(!mislabeled_id3v22(&id3v23_tag(&v23)));
+        // A header that already says v2.2, or one with flags, which would
+        // move or transform the frames.
+        let mut tag = padded(&[]);
+        tag[3] = 2;
+        assert!(!mislabeled_id3v22(&tag));
+        let mut tag = padded(&[]);
+        tag[5] = 0x40;
+        assert!(!mislabeled_id3v22(&tag));
+    }
+
+    #[test]
+    fn a_malformed_field_under_a_mislabeled_header_costs_only_that_field() {
+        let dir = crate::test_support::ScratchDir::new("mislabeled-v22-malformed");
+        let path = dir.path().join("song.mp3");
+        mislabeled_mp3(
+            &path,
+            &[("TT2", "Song"), ("TP1", "Artist"), ("TYE", "199x")],
+        );
+        let (track, dropped) = read_tags_noting(&path).unwrap();
+        assert_eq!(track.title.as_deref(), Some("Song"));
+        assert_eq!(track.artist.as_deref(), Some("Artist"));
+        assert_eq!(track.year, None);
+        let dropped = format!("{:#}", dropped.unwrap());
+        assert!(dropped.contains("unexpected character 'x'"), "{dropped}");
     }
 
     #[test]

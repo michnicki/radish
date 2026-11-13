@@ -81,14 +81,37 @@ pub(crate) fn write_mb_archive(dir: &Path, files: &[(&str, &str)]) -> PathBuf {
 /// Written by hand rather than through Lofty, so a test can store values
 /// (`199x` in a year frame) and flags (encryption) that Lofty would refuse.
 pub(crate) fn write_id3v23_mp3(path: &Path, frames: &[(&str, &str, u16)]) {
-    let mut body = Vec::new();
+    write_mp3(path, &id3v23_tag(&id3v23_frames(frames)));
+}
+
+/// ID3v2.3 frames holding `(frame ID, Latin-1 text, frame flags)`.
+pub(crate) fn id3v23_frames(frames: &[(&str, &str, u16)]) -> Vec<u8> {
+    let mut bytes = Vec::new();
     for (id, text, flags) in frames {
         let content = [&[0u8][..], text.as_bytes()].concat();
-        body.extend_from_slice(id.as_bytes());
-        body.extend_from_slice(&u32::try_from(content.len()).unwrap().to_be_bytes());
-        body.extend_from_slice(&flags.to_be_bytes());
-        body.extend_from_slice(&content);
+        bytes.extend_from_slice(id.as_bytes());
+        bytes.extend_from_slice(&u32::try_from(content.len()).unwrap().to_be_bytes());
+        bytes.extend_from_slice(&flags.to_be_bytes());
+        bytes.extend_from_slice(&content);
     }
+    bytes
+}
+
+/// ID3v2.2 frames holding `(frame ID, Latin-1 text)`: each a three-character
+/// ID, a three-byte size and the text, with no flags.
+pub(crate) fn id3v22_frames(frames: &[(&str, &str)]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for (id, text) in frames {
+        let content = [&[0u8][..], text.as_bytes()].concat();
+        bytes.extend_from_slice(id.as_bytes());
+        bytes.extend_from_slice(&u32::try_from(content.len()).unwrap().to_be_bytes()[1..]);
+        bytes.extend_from_slice(&content);
+    }
+    bytes
+}
+
+/// A tag header that says ID3v2.3, with no flags, followed by `body`.
+pub(crate) fn id3v23_tag(body: &[u8]) -> Vec<u8> {
     // The tag size is synchsafe: seven bits per byte.
     let size = u32::try_from(body.len()).unwrap();
     let mut bytes = b"ID3\x03\x00\x00".to_vec();
@@ -97,7 +120,13 @@ pub(crate) fn write_id3v23_mp3(path: &Path, frames: &[(&str, &str, u16)]) {
             .rev()
             .map(|shift| ((size >> (7 * shift)) & 0x7f) as u8),
     );
-    bytes.extend_from_slice(&body);
+    bytes.extend_from_slice(body);
+    bytes
+}
+
+/// Writes `tag` followed by about one second of silent MP3.
+pub(crate) fn write_mp3(path: &Path, tag: &[u8]) {
+    let mut bytes = tag.to_vec();
     // MPEG-1 Layer III at 128 kbit/s and 44.1 kHz: 417 bytes per frame, and
     // 40 frames last about a second.
     for _ in 0..40 {
