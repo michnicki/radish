@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v11";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v10";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v12";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v11";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -22,6 +22,12 @@ pub const DURATION_TOLERANCE_SECS: f64 = 3.0;
 /// The lowest title score a single track may have, with a matching duration,
 /// and still not block an album-level match.
 pub const NEAR_MISS_TITLE_FLOOR: f64 = 0.75;
+
+/// The tightest duration agreement that lets a single track of *any* title
+/// stand on its length alone, and the fewest tracks that may carry the album
+/// when it does.
+pub const LONE_TRACK_DURATION_GAP_SECS: f64 = 1.5;
+pub const LONE_TRACK_MIN_ALBUM_TRACKS: usize = 5;
 
 /// A primary candidate this close to the fallback is plausible evidence that
 /// both services describe the same edition, so discrepancies matter.
@@ -2288,17 +2294,24 @@ fn evaluate_at_scope(
         }
     }
 
-    // One title a little off, with the right length, is a spelling variant of
-    // the same recording rather than a different track. Only for an album-level
-    // match, where every other track already agrees and the total still has to
-    // clear the acceptance threshold.
-    let near_miss_title = policy == AcceptancePolicy::Measured
+    // One title off by a little, with the right length, is a spelling variant of
+    // the same recording rather than a different track. A title off by a lot,
+    // on a track whose length agrees closely, in an album of at least five where
+    // every other track already agrees, is one mis-tagged or differently named
+    // track of the same album: by elimination it is the remaining track. Only for
+    // an album-level match, and the total still has to clear the acceptance
+    // threshold.
+    let lone_weak_title = policy == AcceptancePolicy::Measured
         && match_scope == MatchScope::Album
-        && titles_below_minimum == 1
+        && titles_below_minimum == 1;
+    let near_miss_title = lone_weak_title
         && worst_title >= NEAR_MISS_TITLE_FLOOR
         && worst_title_duration_gap.is_some_and(|gap| gap <= DURATION_TOLERANCE_SECS);
+    let duration_confirmed_title = lone_weak_title
+        && local.tracks.len() >= LONE_TRACK_MIN_ALBUM_TRACKS
+        && worst_title_duration_gap.is_some_and(|gap| gap <= LONE_TRACK_DURATION_GAP_SECS);
     if worst_title < minimum_title_similarity {
-        if near_miss_title {
+        if near_miss_title || duration_confirmed_title {
             warnings.push(format!(
                 "track title '{worst_title_track}' scores {worst_title:.3} but its duration agrees"
             ));
@@ -3706,11 +3719,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v11"
+            "discogs-match-v12"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v10"
+            "musicbrainz-match-v11"
         );
     }
 
@@ -3852,7 +3865,7 @@ mod tests {
                 .auto_accept
         );
 
-        // Two weak titles, or one below the floor, still block.
+        // Two weak titles still block.
         let mut two = local.clone();
         two.tracks[4].title = Some("Fiv".to_string());
         let candidate = Candidate::new(&two, remote.clone());
@@ -3860,11 +3873,49 @@ mod tests {
             !evaluate_for_matching(&two, &candidate, &[], &DiscoveryEvidence::default())
                 .auto_accept
         );
-        let mut far = local;
-        far.tracks[2].title = Some("Tr".to_string());
-        let candidate = Candidate::new(&far, remote);
+    }
+
+    #[test]
+    fn one_track_of_any_title_passes_on_a_close_duration_in_a_larger_album() {
+        let titles = [
+            "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten",
+            "Eleven", "Twelve",
+        ];
+        let remote = remote_release(&titles);
+
+        // A wholly different title on a track whose length agrees.
+        let mut local = local_release(&titles);
+        local.tracks[2].title = Some("Something else entirely".to_string());
+        let candidate = Candidate::new(&local, remote.clone());
+        let evaluation =
+            evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default());
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+
+        // The length must agree closely: two seconds off is not enough.
+        let mut off = local.clone();
+        off.tracks[2].duration_secs = Some(off.tracks[2].duration_secs.unwrap() + 2.0);
+        let candidate = Candidate::new(&off, remote.clone());
         assert!(
-            !evaluate_for_matching(&far, &candidate, &[], &DiscoveryEvidence::default())
+            !evaluate_for_matching(&off, &candidate, &[], &DiscoveryEvidence::default())
+                .auto_accept
+        );
+
+        // Two different titles still block.
+        let mut two = local.clone();
+        two.tracks[4].title = Some("Another one entirely".to_string());
+        let candidate = Candidate::new(&two, remote.clone());
+        assert!(
+            !evaluate_for_matching(&two, &candidate, &[], &DiscoveryEvidence::default())
+                .auto_accept
+        );
+
+        // A short album cannot carry a track on its length alone.
+        let short_titles = ["One", "Two", "Three", "Four"];
+        let mut short = local_release(&short_titles);
+        short.tracks[2].title = Some("Something else entirely".to_string());
+        let candidate = Candidate::new(&short, remote_release(&short_titles));
+        assert!(
+            !evaluate_for_matching(&short, &candidate, &[], &DiscoveryEvidence::default())
                 .auto_accept
         );
     }

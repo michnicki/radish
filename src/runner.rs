@@ -1924,7 +1924,9 @@ mod tests {
 
     #[test]
     fn review_summary_uses_fallback_reasons_when_the_primary_failed() {
-        let (local, remote) = ai_album_fixture();
+        let (local, mut remote) = ai_album_fixture();
+        // One mismatched title is settled by its duration; two still need review.
+        remote.tracklist[1].title = "A different song".into();
         let primary = ProviderAttempt::failed(
             ProviderKind::MusicBrainz,
             ProviderError::Network {
