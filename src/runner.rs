@@ -951,6 +951,7 @@ where
             &primary.candidates,
             candidate,
             primary.embedded_release_resolved,
+            evaluation.relies_on_unlisted_lengths(),
         );
         if conflicts.is_empty() && direct.is_none() && !options.review {
             if let Some(error) = &primary.error {
@@ -1098,6 +1099,13 @@ async fn accept(
                     transcript,
                     "    album and tracks matched; exact edition unconfirmed"
                 );
+                for warning in evaluation
+                    .warnings
+                    .iter()
+                    .filter(|warning| warning.ends_with(matcher::UNCONFIRMED_LENGTHS_NOTE))
+                {
+                    outln_to!(transcript, "    {warning}");
+                }
             }
             Ok(Outcome::Accepted)
         }
@@ -2072,6 +2080,74 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_prints_that_a_text_only_album_match_has_unconfirmed_lengths() {
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let directory_id = store::upsert_directory(&pool, std::path::Path::new("/music"))
+            .await
+            .unwrap();
+        let files: Vec<_> = (1..=3)
+            .map(|number| scanned_track(&format!("/music/a/{number:02}.flac"), "Album", number))
+            .collect();
+        store::upsert_tracks(&pool, &files, directory_id)
+            .await
+            .unwrap();
+        store::rebuild_local_releases(&pool, None).await.unwrap();
+        let release = store::load_local_releases(&pool, None)
+            .await
+            .unwrap()
+            .remove(0);
+        let guard = store::load_match_guard(&pool, release.id).await.unwrap();
+
+        // The provider lists the same three titles and no length at all.
+        let (_, mut remote) = album_fixture();
+        remote.tracklist.truncate(3);
+        for track in &mut remote.tracklist {
+            track.duration_secs = None;
+        }
+        let candidate = Candidate::new(&release, remote);
+        let evaluation = matcher::evaluate_for_matching(
+            &release,
+            &candidate,
+            &[],
+            &matcher::DiscoveryEvidence::default(),
+        );
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+
+        let mut transcript = Transcript::held();
+        let outcome = accept(
+            &pool,
+            &release,
+            ProviderKind::Discogs,
+            &candidate,
+            &evaluation,
+            AcceptanceMethod::Automatic,
+            false,
+            &guard,
+            &mut transcript,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, Outcome::Accepted), "{outcome:?}");
+        let lines: Vec<&str> = transcript
+            .held
+            .iter()
+            .flatten()
+            .filter_map(|line| match line {
+                Line::Out(text) => Some(text.as_str()),
+                Line::Err(_) => None,
+            })
+            .collect();
+        let unconfirmed = lines
+            .iter()
+            .position(|line| line.contains("exact edition unconfirmed"))
+            .expect("the album scope note");
+        assert_eq!(
+            lines.get(unconfirmed + 1),
+            Some(&"    discogs lists no duration for 3 of 3 tracks; track lengths are unconfirmed")
         );
     }
 
