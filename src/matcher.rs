@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v5";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v4";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v6";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v5";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -1561,6 +1561,8 @@ pub fn evaluate_for_matching(
     for other in alternatives {
         if other.release.id != candidate.release.id
             && within_gap(candidate.score.album_score() - other.score.album_score())
+            && !(in_same_release_group(candidate, other)
+                && !conflicting_recordings(candidate, other))
             && !equivalent_audio(candidate, other)
         {
             album.blockers.push(format!(
@@ -1725,6 +1727,42 @@ fn album_track_qualifiers(title: &str) -> BTreeSet<&'static str> {
     qualifiers
 }
 
+/// Whether two candidates are editions the provider files under one album: the
+/// same MusicBrainz release group or Discogs master.
+///
+/// An album-level match asks which album a folder is, so another edition of the
+/// same album cannot contradict it, however many bonus tracks it adds or how it
+/// spells a title. Only a close alternative from a different album can.
+fn in_same_release_group(a: &Candidate, b: &Candidate) -> bool {
+    a.release.provider() == b.release.provider()
+        && matches!(
+            (&a.release.group_id, &b.release.group_id),
+            (Some(x), Some(y)) if x == y
+        )
+}
+
+/// Whether any local track maps to a different known recording in each
+/// candidate, as a remaster or re-recording would.
+///
+/// Those editions share an album but not the audio, so which one a folder holds
+/// cannot be settled from the album alone.
+fn conflicting_recordings(a: &Candidate, b: &Candidate) -> bool {
+    a.mapping
+        .assigned_pairs()
+        .any(|(local_index, remote_index)| {
+            let Some(other_index) = b.mapping.pairs.get(local_index).and_then(|pair| *pair) else {
+                return false;
+            };
+            matches!(
+                (
+                    a.release.tracklist[remote_index].recording_id,
+                    b.release.tracklist[other_index].recording_id,
+                ),
+                (Some(x), Some(y)) if x != y
+            )
+        })
+}
+
 fn equivalent_audio(a: &Candidate, b: &Candidate) -> bool {
     if !b.mapping.complete || b.mapping.ambiguous || b.release.has_unsupported_entries() {
         return false;
@@ -1765,9 +1803,14 @@ fn equivalent_audio(a: &Candidate, b: &Candidate) -> bool {
                     y.artist_display()
                 }
             });
+            // One shared recording is the same performance whatever an edition
+            // calls the artist (`Covenant` became `The Kovenant` on a reissue).
+            let same_recording =
+                matches!((x.recording_id, y.recording_id), (Some(x), Some(y)) if x == y);
             normalize_text(&x.title) == normalize_text(&y.title)
-                && normalize_artist_for(a.release.provider(), &x_artist)
-                    == normalize_artist_for(b.release.provider(), &y_artist)
+                && (same_recording
+                    || normalize_artist_for(a.release.provider(), &x_artist)
+                        == normalize_artist_for(b.release.provider(), &y_artist))
                 && matches!((x.duration_secs, y.duration_secs), (Some(x), Some(y))
                 if x.is_finite() && y.is_finite() && (x-y).abs() <= DURATION_TOLERANCE_SECS)
                 && !matches!((x.recording_id, y.recording_id), (Some(x), Some(y)) if x != y)
@@ -3147,10 +3190,10 @@ mod tests {
 
     #[test]
     fn algorithm_versions_are_provider_specific() {
-        assert_eq!(algorithm_version(ProviderKind::Discogs), "discogs-match-v5");
+        assert_eq!(algorithm_version(ProviderKind::Discogs), "discogs-match-v6");
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v4"
+            "musicbrainz-match-v5"
         );
     }
 
@@ -3183,6 +3226,85 @@ mod tests {
                 evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default());
             assert!(!evaluation.auto_accept, "accepted {problem}");
         }
+    }
+
+    #[test]
+    fn a_shared_recording_makes_editions_equivalent_despite_a_renamed_artist() {
+        let local = local_release(&["One", "Two"]);
+        let recordings = [
+            mbid("aaaaaaaa-1111-1111-1111-111111111111"),
+            mbid("bbbbbbbb-2222-2222-2222-222222222222"),
+        ];
+        let mut original = remote_release(&["One", "Two"]);
+        for (track, recording) in original.tracklist.iter_mut().zip(recordings) {
+            track.recording_id = Some(recording);
+        }
+        let mut reissue = original.clone();
+        reissue.id = ReleaseId::Discogs(43);
+        for track in &mut reissue.tracklist {
+            track.artist_credit = Some("Renamed Artist".to_string());
+        }
+        let first = Candidate::new(&local, original.clone());
+        let other = Candidate::new(&local, reissue.clone());
+        assert!(equivalent_audio(&first, &other));
+
+        // Without a shared recording the changed credit still separates them.
+        for track in &mut reissue.tracklist {
+            track.recording_id = None;
+        }
+        let unproven = Candidate::new(&local, reissue.clone());
+        assert!(!equivalent_audio(&first, &unproven));
+
+        // A different recording is never excused by anything else.
+        reissue.tracklist[0].recording_id = Some(mbid("cccccccc-3333-3333-3333-333333333333"));
+        reissue.tracklist[1].recording_id = original.tracklist[1].recording_id;
+        let conflicting = Candidate::new(&local, reissue);
+        assert!(!equivalent_audio(&first, &conflicting));
+    }
+
+    #[test]
+    fn another_edition_of_the_same_album_does_not_block_an_album_match() {
+        let local = local_release(&["One", "Two"]);
+        let group = Some(GroupId::DiscogsMaster(900));
+        let mut best = remote_release(&["One", "Two"]);
+        best.group_id = group.clone();
+        let first = Candidate::new(&local, best.clone());
+
+        // A bonus-track reissue in the same group is the same album.
+        let mut reissue = remote_release(&["One", "Two", "Bonus"]);
+        reissue.id = ReleaseId::Discogs(43);
+        reissue.group_id = group.clone();
+        let reissue = Candidate::new(&local, reissue);
+        let evaluation =
+            evaluate_for_matching(&local, &first, &[reissue], &DiscoveryEvidence::default());
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+
+        // The same tracklist filed under a different album still blocks.
+        let mut elsewhere = remote_release(&["One", "Two", "Bonus"]);
+        elsewhere.id = ReleaseId::Discogs(44);
+        elsewhere.group_id = Some(GroupId::DiscogsMaster(901));
+        let elsewhere = Candidate::new(&local, elsewhere);
+        let evaluation =
+            evaluate_for_matching(&local, &first, &[elsewhere], &DiscoveryEvidence::default());
+        assert!(!evaluation.auto_accept);
+
+        // Editions of one album whose mapped tracks are different recordings (a
+        // remaster) cannot be told apart from the album alone.
+        let mut remaster = remote_release(&["One", "Two"]);
+        remaster.id = ReleaseId::Discogs(45);
+        remaster.group_id = group;
+        let mut original = best.clone();
+        original.tracklist[0].recording_id = Some(mbid("aaaaaaaa-1111-1111-1111-111111111111"));
+        remaster.tracklist[0].recording_id = Some(mbid("bbbbbbbb-2222-2222-2222-222222222222"));
+        let first = Candidate::new(&local, original);
+        let remaster = Candidate::new(&local, remaster);
+        let evaluation =
+            evaluate_for_matching(&local, &first, &[remaster], &DiscoveryEvidence::default());
+        assert!(!evaluation.auto_accept);
+
+        // And with no group on either side there is nothing to rely on.
+        let ungrouped = Candidate::new(&local, remote_release(&["One", "Two"]));
+        assert!(!in_same_release_group(&ungrouped, &ungrouped));
     }
 
     #[test]
