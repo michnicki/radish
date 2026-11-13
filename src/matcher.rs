@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v15";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v14";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v16";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v15";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -37,6 +37,10 @@ pub const SOFT_DURATION_MAX_TRACKS: usize = 2;
 pub const SOFT_DURATION_MAX_SECS: f64 = 10.0;
 pub const SOFT_DURATION_TOTAL_RATIO: f64 = 0.02;
 pub const SOFT_DURATION_MIN_ALBUM_TRACKS: usize = 4;
+
+/// The fewest local tracks that let a candidate's agreeing durations set a
+/// close alternative aside: with fewer, a matching length is too common.
+pub const DURATION_FIT_MIN_TRACKS: usize = 3;
 
 /// A primary candidate this close to the fallback is plausible evidence that
 /// both services describe the same edition, so discrepancies matter.
@@ -1981,6 +1985,7 @@ pub fn evaluate_for_matching(
             && !(in_same_release_group(candidate, other)
                 && !conflicting_recordings(candidate, other))
             && !equivalent_audio(candidate, other)
+            && !fits_durations_better(local, candidate, other)
         {
             album.blockers.push(format!(
                 "close alternative {} does not establish the same album and recordings",
@@ -2142,6 +2147,48 @@ fn album_track_qualifiers(title: &str) -> BTreeSet<&'static str> {
     let mut qualifiers = edition_qualifiers(title);
     qualifiers.remove("remastered");
     qualifiers
+}
+
+/// The distance in seconds between a local track and the remote track it maps
+/// to, or `None` when either duration is unknown.
+fn duration_gap(
+    local: &LocalRelease,
+    candidate: &Candidate,
+    local_index: usize,
+    remote_index: usize,
+) -> Option<f64> {
+    let a = local.tracks.get(local_index)?.duration_secs?;
+    let b = candidate
+        .release
+        .tracklist
+        .get(remote_index)?
+        .duration_secs?;
+    (a.is_finite() && b.is_finite()).then(|| (a - b).abs())
+}
+
+/// Whether `candidate` is the pressing the local files came from and `other`
+/// is not, judged by length alone: with at least [`DURATION_FIT_MIN_TRACKS`]
+/// local tracks, every mapped duration of `candidate` is known and within
+/// [`DURATION_TOLERANCE_SECS`], while `other` does not map the files one to one
+/// or has a known mapped duration beyond that. An alternative whose durations
+/// also agree is a retitled or re-credited edition and is not set aside.
+fn fits_durations_better(local: &LocalRelease, candidate: &Candidate, other: &Candidate) -> bool {
+    if local.tracks.len() < DURATION_FIT_MIN_TRACKS
+        || !candidate.mapping.complete
+        || candidate.mapping.ambiguous
+    {
+        return false;
+    }
+    let candidate_fits = candidate.mapping.assigned_pairs().all(|(l, r)| {
+        duration_gap(local, candidate, l, r).is_some_and(|gap| gap <= DURATION_TOLERANCE_SECS)
+    });
+    if !candidate_fits {
+        return false;
+    }
+    let other_misses = other.mapping.assigned_pairs().any(|(l, r)| {
+        duration_gap(local, other, l, r).is_some_and(|gap| gap > DURATION_TOLERANCE_SECS)
+    });
+    !other.mapping.complete || other.mapping.ambiguous || other_misses
 }
 
 /// Whether two candidates are editions the provider files under one album: the
@@ -3973,11 +4020,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v15"
+            "discogs-match-v16"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v14"
+            "musicbrainz-match-v15"
         );
     }
 
@@ -4089,6 +4136,77 @@ mod tests {
         // And with no group on either side there is nothing to rely on.
         let ungrouped = Candidate::new(&local, remote_release(&["One", "Two"]));
         assert!(!in_same_release_group(&ungrouped, &ungrouped));
+    }
+
+    #[test]
+    fn an_alternative_that_misses_the_durations_does_not_block_the_candidate() {
+        let titles = ["One", "Two", "Three", "Four", "Five", "Six"];
+        let local = local_release(&titles);
+        let group = Some(GroupId::DiscogsMaster(900));
+        let mut best = remote_release(&titles);
+        best.group_id = group.clone();
+        best.tracklist[0].recording_id = Some(mbid("aaaaaaaa-1111-1111-1111-111111111111"));
+        let first = Candidate::new(&local, best);
+
+        // The same album in the same group, but another recording of the first
+        // track and a length that is ten seconds off: not what the folder holds.
+        let mut other = remote_release(&titles);
+        other.id = ReleaseId::Discogs(45);
+        other.group_id = group.clone();
+        other.tracklist[0].recording_id = Some(mbid("bbbbbbbb-2222-2222-2222-222222222222"));
+        other.tracklist[0].duration_secs = Some(190.0);
+        let other = Candidate::new(&local, other);
+        let evaluation =
+            evaluate_for_matching(&local, &first, &[other], &DiscoveryEvidence::default());
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+
+        // The same alternative with every duration agreeing cannot be told
+        // apart, so it still blocks.
+        let mut twin = remote_release(&titles);
+        twin.id = ReleaseId::Discogs(46);
+        twin.group_id = group.clone();
+        twin.tracklist[0].recording_id = Some(mbid("bbbbbbbb-2222-2222-2222-222222222222"));
+        let twin = Candidate::new(&local, twin);
+        let evaluation =
+            evaluate_for_matching(&local, &first, &[twin], &DiscoveryEvidence::default());
+        assert!(!evaluation.auto_accept);
+
+        // An unknown duration is no evidence either way.
+        let mut unknown = remote_release(&titles);
+        unknown.id = ReleaseId::Discogs(47);
+        unknown.group_id = group;
+        unknown.tracklist[0].recording_id = Some(mbid("bbbbbbbb-2222-2222-2222-222222222222"));
+        unknown.tracklist[0].duration_secs = None;
+        let unknown = Candidate::new(&local, unknown);
+        let evaluation =
+            evaluate_for_matching(&local, &first, &[unknown], &DiscoveryEvidence::default());
+        assert!(!evaluation.auto_accept);
+    }
+
+    #[test]
+    fn a_release_with_extra_tracks_in_another_group_does_not_block_a_fitting_candidate() {
+        let titles = ["One", "Two", "Three", "Four"];
+        let local = local_release(&titles);
+        let first = Candidate::new(&local, remote_release(&titles));
+
+        let mut longer = remote_release(&["One", "Two", "Three", "Four", "Bonus"]);
+        longer.id = ReleaseId::Discogs(48);
+        longer.group_id = Some(GroupId::DiscogsMaster(901));
+        let longer = Candidate::new(&local, longer);
+        let evaluation =
+            evaluate_for_matching(&local, &first, &[longer], &DiscoveryEvidence::default());
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+
+        // Two local tracks are too little evidence to set an alternative aside.
+        let local = local_release(&["One", "Two"]);
+        let first = Candidate::new(&local, remote_release(&["One", "Two"]));
+        let mut longer = remote_release(&["One", "Two", "Bonus"]);
+        longer.id = ReleaseId::Discogs(49);
+        longer.group_id = Some(GroupId::DiscogsMaster(902));
+        let longer = Candidate::new(&local, longer);
+        let evaluation =
+            evaluate_for_matching(&local, &first, &[longer], &DiscoveryEvidence::default());
+        assert!(!evaluation.auto_accept);
     }
 
     #[test]
