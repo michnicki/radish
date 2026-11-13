@@ -136,6 +136,26 @@ pub(crate) fn write_mp3(path: &Path, tag: &[u8]) {
     std::fs::write(path, bytes).unwrap();
 }
 
+/// Appends an ID3v1.1 tag holding `[title, artist, album, year]` and `track`.
+///
+/// Each field is padded with NUL bytes to its fixed width, as in the files
+/// found in the wild; a test can pass trailing spaces for taggers that pad
+/// with those.
+pub(crate) fn append_id3v1(path: &Path, fields: [&str; 4], track: u8) {
+    let [title, artist, album, year] = fields;
+    let mut tag = b"TAG".to_vec();
+    for (text, width) in [(title, 30), (artist, 30), (album, 30), (year, 4)] {
+        let start = tag.len();
+        tag.extend_from_slice(text.as_bytes());
+        tag.resize(start + width, 0);
+    }
+    // A 28-byte comment, the NUL that marks ID3v1.1, the track, no genre.
+    tag.resize(tag.len() + 29, 0);
+    tag.extend_from_slice(&[track, 0xff]);
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    file.write_all(&tag).unwrap();
+}
+
 /// Writes a WAV file whose tag holds `album` and the release `year`.
 pub(crate) fn write_tagged_wav(path: &Path, album: &str, year: u16) {
     use lofty::config::WriteOptions;

@@ -4,8 +4,9 @@ use anyhow::{Context, Result};
 use lofty::config::{ParseOptions, ParsingMode};
 use lofty::file::{AudioFile, FileType, TaggedFile, TaggedFileExt};
 use lofty::probe::Probe;
-use lofty::tag::{Accessor, ItemKey, ItemValue, Tag};
+use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagType};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Cursor, ErrorKind, Read, Seek};
 use std::path::{Path, PathBuf};
@@ -255,6 +256,23 @@ fn relabeled_id3v22(path: &Path) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Sets an absent or blank `field` to the ID3v1 `value`, if that has text.
+///
+/// ID3v1 pads each field to a fixed width, with NUL bytes or with spaces;
+/// Lofty drops only the NUL bytes, so the spaces are trimmed here.
+fn fill(field: &mut Option<String>, value: Option<Cow<'_, str>>) {
+    if !field.as_deref().is_none_or(|text| text.trim().is_empty()) {
+        return;
+    }
+    if let Some(text) = value
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        *field = Some(text.to_string());
+    }
+}
+
 /// [`read_tags`], plus the error that made the read drop malformed fields,
 /// when it had to.
 fn read_tags_noting(path: &Path) -> Result<(ScannedTrack, Option<anyhow::Error>)> {
@@ -263,7 +281,7 @@ fn read_tags_noting(path: &Path) -> Result<(ScannedTrack, Option<anyhow::Error>)
         .primary_tag()
         .or_else(|| tagged_file.first_tag());
 
-    let (title, artist, album, year, track_number) = match tag {
+    let (mut title, mut artist, mut album, mut year, mut track_number) = match tag {
         Some(tag) => (
             tag.title().map(|s| s.to_string()),
             tag.artist().map(|s| s.to_string()),
@@ -273,6 +291,15 @@ fn read_tags_noting(path: &Path) -> Result<(ScannedTrack, Option<anyhow::Error>)
         ),
         None => (None, None, None, None, None),
     };
+    // Old taggers often wrote a field only to the ID3v1 tag at the end of the
+    // file, so it fills what the primary tag lacks but never replaces a value.
+    if let Some(id3v1) = tagged_file.tag(TagType::Id3v1) {
+        fill(&mut title, id3v1.title());
+        fill(&mut artist, id3v1.artist());
+        fill(&mut album, id3v1.album());
+        year = year.or_else(|| id3v1.date().map(|ts| i64::from(ts.year)));
+        track_number = track_number.or_else(|| id3v1.track().map(i64::from));
+    }
 
     let album_artist = tag.and_then(|tag| {
         tag.get_string(ItemKey::AlbumArtist)
@@ -781,6 +808,57 @@ mod tests {
         assert_eq!(track.year, None);
         let dropped = format!("{:#}", dropped.unwrap());
         assert!(dropped.contains("unexpected character 'x'"), "{dropped}");
+    }
+
+    #[test]
+    fn fields_the_primary_tag_lacks_come_from_id3v1() {
+        use crate::test_support::{append_id3v1, write_id3v23_mp3};
+        let dir = crate::test_support::ScratchDir::new("id3v1-fill");
+        let path = dir.path().join("song.mp3");
+        // As found in the wild: the ID3v2 tag holds only the compilation's
+        // artist and album, the ID3v1 tag the track's own fields.
+        write_id3v23_mp3(
+            &path,
+            &[
+                ("TPE1", "Various Artists", 0),
+                ("TALB", "The Punk Rock Movie", 0),
+            ],
+        );
+        append_id3v1(
+            &path,
+            [
+                "God Save The Queen",
+                "Sex Pistols",
+                "Punk Rock Movie",
+                "1978",
+            ],
+            1,
+        );
+
+        let track = read_tags(&path).unwrap();
+        assert_eq!(track.title.as_deref(), Some("God Save The Queen"));
+        assert_eq!(track.year, Some(1978));
+        assert_eq!(track.track_number, Some(1));
+        // A value the primary tag holds is never replaced.
+        assert_eq!(track.artist.as_deref(), Some("Various Artists"));
+        assert_eq!(track.album.as_deref(), Some("The Punk Rock Movie"));
+    }
+
+    #[test]
+    fn a_blank_primary_field_comes_from_id3v1_without_its_padding() {
+        use crate::test_support::{append_id3v1, write_id3v23_mp3};
+        let dir = crate::test_support::ScratchDir::new("id3v1-blank");
+        let path = dir.path().join("song.mp3");
+        write_id3v23_mp3(&path, &[("TIT2", " ", 0), ("TPE1", "Artist", 0)]);
+        // Some taggers pad ID3v1 fields with spaces rather than NUL bytes.
+        append_id3v1(&path, ["Song      ", "", "Album   ", ""], 0);
+
+        let track = read_tags(&path).unwrap();
+        assert_eq!(track.title.as_deref(), Some("Song"));
+        assert_eq!(track.album.as_deref(), Some("Album"));
+        assert_eq!(track.artist.as_deref(), Some("Artist"));
+        assert_eq!(track.year, None);
+        assert_eq!(track.track_number, None);
     }
 
     #[test]
