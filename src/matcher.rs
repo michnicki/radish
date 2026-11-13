@@ -11,13 +11,24 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v16";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v15";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v17";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v16";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
 pub const TITLE_SIMILARITY_THRESHOLD: f64 = 0.90;
 pub const DURATION_TOLERANCE_SECS: f64 = 3.0;
+
+/// The album-title rule: an album title between this floor and
+/// [`TITLE_SIMILARITY_THRESHOLD`] may pass when everything else agrees tightly.
+/// The rest of the album, scored without the title, must reach
+/// `CORROBORATED_SCORE`, every mapped duration must be within
+/// `CORROBORATED_DURATION_SECS`, and the mean track-title score must reach
+/// `CORROBORATED_MEAN_TITLE`.
+pub const CORROBORATED_TITLE_FLOOR: f64 = 0.70;
+pub const CORROBORATED_SCORE: f64 = 0.97;
+pub const CORROBORATED_DURATION_SECS: f64 = 1.5;
+pub const CORROBORATED_MEAN_TITLE: f64 = 0.97;
 
 /// The lowest title score a single track may have, with a matching duration,
 /// and still not block an album-level match.
@@ -1599,6 +1610,16 @@ impl ScoreBreakdown {
             / (1.0 - WEIGHT_YEAR)
     }
 
+    /// The album score over the components other than the album title, scaled
+    /// so that a perfect rest scores 1.0. Used where the title carries no extra
+    /// evidence because every track already agrees.
+    pub fn album_score_without_title(&self) -> f64 {
+        (WEIGHT_ALBUM_ARTIST * self.album_artist
+            + WEIGHT_TRACK_TITLES * self.track_titles
+            + WEIGHT_DURATIONS * self.durations)
+            / (1.0 - WEIGHT_YEAR - WEIGHT_ALBUM_TITLE)
+    }
+
     /// Component values paired with their weights, for the review screen.
     pub fn components(&self) -> [(&'static str, f64, f64); 5] {
         [
@@ -2281,6 +2302,31 @@ fn equivalent_audio(a: &Candidate, b: &Candidate) -> bool {
         })
 }
 
+/// Whether an album title that falls short of [`TITLE_SIMILARITY_THRESHOLD`]
+/// is outweighed by the rest of the album: the title is at least
+/// [`CORROBORATED_TITLE_FLOOR`], the artist agrees, every local file maps one to
+/// one with every duration within [`CORROBORATED_DURATION_SECS`], and the track
+/// titles and the rest of the score are strong. The title then adds no
+/// evidence, so it no longer gates the album.
+fn corroborated_album(local: &LocalRelease, candidate: &Candidate) -> bool {
+    let score = &candidate.score;
+    if score.album_title < CORROBORATED_TITLE_FLOOR
+        || score.album_title >= TITLE_SIMILARITY_THRESHOLD
+        || score.album_artist < TITLE_SIMILARITY_THRESHOLD
+        || score.track_titles < CORROBORATED_MEAN_TITLE
+        || score.album_score_without_title() + 1e-9 < CORROBORATED_SCORE
+        || !candidate.mapping.complete
+        || candidate.mapping.ambiguous
+        || local.tracks.is_empty()
+        || candidate.mapping.assigned_count() != local.tracks.len()
+    {
+        return false;
+    }
+    candidate.mapping.assigned_pairs().all(|(l, r)| {
+        duration_gap(local, candidate, l, r).is_some_and(|gap| gap <= CORROBORATED_DURATION_SECS)
+    })
+}
+
 fn evaluate_at_scope(
     local: &LocalRelease,
     candidate: &Candidate,
@@ -2339,9 +2385,16 @@ fn evaluate_at_scope(
         blockers.push("track mapping has indistinguishable alternatives".to_string());
     }
 
+    // A weak album title outweighed by tracks and durations that all agree.
+    // Album scope and the measured policy only.
+    let corroborated_title = policy == AcceptancePolicy::Measured
+        && match_scope == MatchScope::Album
+        && corroborated_album(local, candidate);
+
     let acceptance_score = match_scope.score(&candidate.score);
-    if acceptance_score + 1e-9 < minimum_score
-        || (policy == AcceptancePolicy::Semantic && !acceptance_score.is_finite())
+    if !corroborated_title
+        && (acceptance_score + 1e-9 < minimum_score
+            || (policy == AcceptancePolicy::Semantic && !acceptance_score.is_finite()))
     {
         blockers.push(format!(
             "score {:.3} is below the {:.2} acceptance threshold",
@@ -2349,7 +2402,12 @@ fn evaluate_at_scope(
         ));
     }
 
-    if match_scope == MatchScope::Album
+    if corroborated_title {
+        warnings.push(format!(
+            "album title scores {:.2} but every track and duration agrees",
+            candidate.score.album_title
+        ));
+    } else if match_scope == MatchScope::Album
         && (candidate.score.album_title < minimum_title_similarity
             || candidate.score.album_artist < minimum_title_similarity)
     {
@@ -4020,11 +4078,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v16"
+            "discogs-match-v17"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v15"
+            "musicbrainz-match-v16"
         );
     }
 
@@ -4207,6 +4265,67 @@ mod tests {
         let evaluation =
             evaluate_for_matching(&local, &first, &[longer], &DiscoveryEvidence::default());
         assert!(!evaluation.auto_accept);
+    }
+
+    #[test]
+    fn a_weak_album_title_passes_when_every_track_and_duration_agrees() {
+        let titles = ["One", "Two", "Three", "Four", "Five", "Six"];
+        let mut local = local_release(&titles);
+        local.album_title = Some("Exclusive Metal Sampler".to_string());
+        let mut remote = remote_release(&titles);
+        remote.title = "Exclusive Metal Radio Sampler".to_string();
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(
+            (0.70..0.90).contains(&candidate.score.album_title),
+            "{}",
+            candidate.score.album_title
+        );
+        let evaluation =
+            evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default());
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert!(
+            evaluation
+                .warnings
+                .iter()
+                .any(|note| note.contains("album title")),
+            "{:?}",
+            evaluation.warnings
+        );
+    }
+
+    #[test]
+    fn a_weak_album_title_still_blocks_without_full_agreement() {
+        let titles = ["One", "Two", "Three", "Four", "Five", "Six"];
+        let mut local = local_release(&titles);
+        local.album_title = Some("Exclusive Metal Sampler".to_string());
+        let mut remote = remote_release(&titles);
+        remote.title = "Exclusive Metal Radio Sampler".to_string();
+        let blocked = |local: &LocalRelease, remote: &RemoteRelease| {
+            let candidate = Candidate::new(local, remote.clone());
+            !evaluate_for_matching(local, &candidate, &[], &DiscoveryEvidence::default())
+                .auto_accept
+        };
+
+        // One duration two seconds off: inside the three-second tolerance, but
+        // outside the one and a half seconds this rule needs.
+        let mut drifting = local.clone();
+        drifting.tracks[2].duration_secs = Some(drifting.tracks[2].duration_secs.unwrap() + 2.0);
+        assert!(blocked(&drifting, &remote));
+
+        // A track title that is only close: the mean falls under 0.97.
+        let mut spelled = local.clone();
+        spelled.tracks[3].title = Some("Fou".to_string());
+        assert!(blocked(&spelled, &remote));
+
+        // A title that is really different.
+        let mut other = remote.clone();
+        other.title = "Completely Different Thing".to_string();
+        assert!(blocked(&local, &other));
+
+        // A different artist.
+        let mut artist = remote.clone();
+        artist.artists = vec!["Another Band".to_string()];
+        assert!(blocked(&local, &artist));
     }
 
     #[test]

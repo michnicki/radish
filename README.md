@@ -231,7 +231,7 @@ Text uses normalized Levenshtein similarity. When comparing a local title or art
 
 A candidate can be accepted automatically as an **album match** when:
 
-- Its album score is at least `0.95`, with album title and artist similarity each at least `0.90`.
+- Its album score is at least `0.95`, with album title and artist similarity each at least `0.90`. One exception: when the artist is at least `0.90`, every local file maps one to one with every duration within 1.5 seconds, the mean track-title score is at least `0.97`, and the album score computed without the album title (artist, track titles and durations, scaled to 1.0) is at least `0.97`, an album title of at least `0.70` also passes, with a warning (`Exclusive Metal Sampler` against `Exclusive Metal Radio Sampler`). The tracks and lengths then carry the identity that the title would have.
 - Every local file maps uniquely, track counts agree, and no unsupported structures exist.
 - Every track has a local title and a positive, known duration on both sides. Each title scores at least `0.90`, and durations differ by at most three seconds, except that in an album of at least four tracks up to two tracks may differ by as much as ten seconds while the summed length of all mapped tracks is within 2% of the provider's (a different master or a trailing silence, not a different album). One title may score as low as `0.75` if it is the only one under `0.90` and its duration agrees (`Seek & Destroy` against `Seek And Destroy`): with every other track agreeing, a spelling variant on the one remaining track is the same recording. In an album of at least five tracks, one track of any title also passes when its duration is within 1.5 seconds, because by elimination it is the remaining track and the other files are tagged as that release says.
 - Observed identifiers and edition qualifiers do not contradict the candidate.
@@ -249,7 +249,7 @@ Radish prefers an **exact-edition match** when all of these hold:
 - Edition identity comes from a consistent embedded release ID or a fully resolved barcode/catalog search that uniquely identifies the release. A release group, a recording, or an explicitly entered ID never counts as edition evidence on its own.
 - Identifier discovery was not truncated or left unhydrated.
 
-Everything else is queued or reviewed. In review you may override score or identity uncertainty after seeing the warnings, but never an invalid, incomplete, or unsupported mapping. New decisions store `musicbrainz-match-v15` or `discogs-match-v16`; historical algorithm versions and accepted matches are preserved.
+Everything else is queued or reviewed. In review you may override score or identity uncertainty after seeing the warnings, but never an invalid, incomplete, or unsupported mapping. New decisions store `musicbrainz-match-v16` or `discogs-match-v17`; historical algorithm versions and accepted matches are preserved.
 
 ### Review
 
