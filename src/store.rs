@@ -1550,6 +1550,27 @@ impl LocalReleaseStatus {
     pub fn queued(&self) -> bool {
         !self.queued_providers.is_empty()
     }
+
+    /// The status with its qualifiers, as `releases` and the web UI show it:
+    /// `matched, album match; edition unconfirmed, stale, queued (musicbrainz)`.
+    pub fn status_label(&self) -> String {
+        let mut label = self.status.clone();
+        if self.match_scope.as_deref() == Some("album") {
+            label.push_str(", album match; edition unconfirmed");
+        }
+        if self.stale && self.status != STATUS_STALE {
+            label.push_str(", stale");
+        }
+        if self.queued() && self.status != STATUS_MATCHED {
+            let providers: Vec<&str> = self
+                .queued_providers
+                .iter()
+                .map(|provider| provider.as_str())
+                .collect();
+            label.push_str(&format!(", queued ({})", providers.join(", ")));
+        }
+        label
+    }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -1620,6 +1641,83 @@ pub async fn list_local_releases(
             queued_providers: queued_by_release.remove(&row.id).unwrap_or_default(),
         })
         .collect())
+}
+
+/// One imported root directory and how many tracks are stored under it.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct DirectorySummary {
+    pub path: String,
+    pub tracks: i64,
+}
+
+/// What the library holds right now, derived from the stored rows.
+///
+/// This is a snapshot, not a history: the database does not record when an
+/// import ran.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LibraryStatus {
+    pub directories: Vec<DirectorySummary>,
+    pub tracks: i64,
+    pub releases: i64,
+    pub matched: i64,
+    pub unmatched: i64,
+    pub stale: i64,
+    /// Releases with a queued review that are not already matched.
+    pub queued: i64,
+    /// The newest file modification time stored, in seconds since the epoch.
+    pub newest_modified: Option<i64>,
+}
+
+/// Reads the [`LibraryStatus`] without changing anything.
+pub async fn library_status(pool: &SqlitePool) -> Result<LibraryStatus> {
+    let directories = sqlx::query_as::<_, DirectorySummary>(
+        "SELECT d.path AS path, COUNT(t.id) AS tracks
+         FROM directories d
+         LEFT JOIN tracks t ON t.directory_id = d.id
+         GROUP BY d.id
+         ORDER BY d.path",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let (tracks, newest_modified): (i64, Option<i64>) =
+        sqlx::query_as("SELECT COUNT(*), MAX(modified_at) FROM tracks")
+            .fetch_one(pool)
+            .await?;
+
+    let by_status = sqlx::query_as::<_, (String, i64)>(
+        "SELECT status, COUNT(*) FROM local_releases GROUP BY status",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let queued: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT r.local_release_id)
+         FROM match_reviews r
+         JOIN local_releases lr ON lr.id = r.local_release_id
+         WHERE lr.status <> ?1",
+    )
+    .bind(STATUS_MATCHED)
+    .fetch_one(pool)
+    .await?;
+
+    let mut status = LibraryStatus {
+        directories,
+        tracks,
+        queued,
+        newest_modified,
+        ..LibraryStatus::default()
+    };
+    for (name, count) in by_status {
+        status.releases += count;
+        match name.as_str() {
+            STATUS_MATCHED => status.matched = count,
+            STATUS_UNMATCHED => status.unmatched = count,
+            STATUS_STALE => status.stale = count,
+            _ => {}
+        }
+    }
+    Ok(status)
 }
 
 // ---------------------------------------------------------------------------
@@ -2302,7 +2400,48 @@ pub struct TrackRow {
     pub stale: bool,
 }
 
+impl TrackRow {
+    /// The title, or the file name when the track has none.
+    pub fn display_title(&self) -> String {
+        match &self.title {
+            Some(title) => title.clone(),
+            None => Path::new(&self.path)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| self.path.clone()),
+        }
+    }
+}
+
 pub async fn list_tracks(pool: &SqlitePool) -> Result<Vec<TrackRow>> {
+    track_rows(pool, None, NO_LIMIT, 0).await
+}
+
+/// SQLite treats a negative `LIMIT` as no limit.
+const NO_LIMIT: i64 = -1;
+
+/// One page of the effective track listing, optionally filtered like
+/// [`search_tracks`]. Ask for `limit + 1` rows to learn whether a next page
+/// exists.
+pub async fn track_page(
+    pool: &SqlitePool,
+    query: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<TrackRow>> {
+    track_rows(pool, query.map(like_contains), limit, offset).await
+}
+
+/// The one query behind `list`, `search` and the web track page.
+///
+/// `pattern` is a `LIKE` pattern from [`like_contains`], or `None` for every
+/// track. The final `t.id` makes the order total, so pages never overlap.
+async fn track_rows(
+    pool: &SqlitePool,
+    pattern: Option<String>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<TrackRow>> {
     let rows = sqlx::query_as::<_, TrackRow>(
         "SELECT t.path AS path,
                 COALESCE(tm.remote_title, t.title) AS title,
@@ -2317,8 +2456,16 @@ pub async fn list_tracks(pool: &SqlitePool) -> Result<Vec<TrackRow>> {
          LEFT JOIN albums a ON a.id = t.album_id
          LEFT JOIN release_matches m ON m.local_release_id = t.local_release_id
          LEFT JOIN release_track_matches tm ON tm.track_id = t.id AND tm.match_id = m.id
-         ORDER BY album, disc_number, track_number, title",
+         WHERE ?1 IS NULL
+            OR COALESCE(tm.remote_title, t.title) LIKE ?1 COLLATE NOCASE ESCAPE '\\'
+            OR COALESCE(tm.remote_artist, t.artist) LIKE ?1 COLLATE NOCASE ESCAPE '\\'
+            OR COALESCE(m.title, a.title) LIKE ?1 COLLATE NOCASE ESCAPE '\\'
+         ORDER BY album, disc_number, track_number, title, t.id
+         LIMIT ?2 OFFSET ?3",
     )
+    .bind(pattern)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await?;
     Ok(rows)
@@ -2341,30 +2488,7 @@ fn like_contains(query: &str) -> String {
 }
 
 pub async fn search_tracks(pool: &SqlitePool, query: &str) -> Result<Vec<TrackRow>> {
-    let pattern = like_contains(query);
-    let rows = sqlx::query_as::<_, TrackRow>(
-        "SELECT t.path AS path,
-                COALESCE(tm.remote_title, t.title) AS title,
-                COALESCE(tm.remote_artist, t.artist) AS artist,
-                COALESCE(m.title, a.title) AS album,
-                CASE WHEN m.match_scope = 'album' THEN t.track_number
-                     ELSE COALESCE(tm.track_position, tm.remote_ordinal, t.track_number) END AS track_number,
-                COALESCE(tm.medium_position, t.disc_number) AS disc_number,
-                t.duration_secs AS duration_secs,
-                (m.stale = 1) AS stale
-         FROM tracks t
-         LEFT JOIN albums a ON a.id = t.album_id
-         LEFT JOIN release_matches m ON m.local_release_id = t.local_release_id
-         LEFT JOIN release_track_matches tm ON tm.track_id = t.id AND tm.match_id = m.id
-         WHERE COALESCE(tm.remote_title, t.title) LIKE ?1 COLLATE NOCASE ESCAPE '\\'
-            OR COALESCE(tm.remote_artist, t.artist) LIKE ?1 COLLATE NOCASE ESCAPE '\\'
-            OR COALESCE(m.title, a.title) LIKE ?1 COLLATE NOCASE ESCAPE '\\'
-         ORDER BY album, disc_number, track_number, title",
-    )
-    .bind(pattern)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
+    track_rows(pool, Some(like_contains(query)), NO_LIMIT, 0).await
 }
 
 #[cfg(test)]
@@ -3170,6 +3294,138 @@ mod tests {
         assert_eq!(review.candidates.len(), 1);
         assert_eq!(review.reasons, vec!["primary uncertain".to_string()]);
         assert_eq!(review.guard.source_revision, release.revision);
+    }
+
+    #[tokio::test]
+    async fn library_status_counts_what_is_stored() {
+        let pool = test_pool().await;
+        assert_eq!(
+            library_status(&pool).await.unwrap(),
+            LibraryStatus::default()
+        );
+
+        insert(
+            &pool,
+            "/music/a",
+            &[
+                scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1),
+                scanned("/music/a/02.flac", Some("Blue"), Some("Artist"), 2),
+            ],
+        )
+        .await;
+        insert(
+            &pool,
+            "/music/b",
+            &[scanned(
+                "/music/b/01.flac",
+                Some("Green"),
+                Some("Artist"),
+                1,
+            )],
+        )
+        .await;
+        insert(
+            &pool,
+            "/music/c",
+            &[scanned("/music/c/01.flac", Some("Red"), Some("Artist"), 1)],
+        )
+        .await;
+        accept_manually(&pool, "Green", &["Track 1"]).await;
+
+        let blue = load_local_releases(&pool, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|release| release.album_title.as_deref() == Some("Blue"))
+            .unwrap();
+        let candidate = Candidate::new(&blue, remote_release());
+        let stored = StoredCandidate {
+            release: candidate.release.clone(),
+            mapping: candidate.mapping.clone(),
+            score: candidate.score,
+            auto_accept: false,
+            match_scope: MatchScope::Edition,
+            blockers: vec!["review".to_string()],
+            warnings: Vec::new(),
+            evidence: Vec::new(),
+            ai_advice: None,
+        };
+        queue_review(
+            &pool,
+            blue.id,
+            ProviderKind::Discogs,
+            &blue.revision,
+            None,
+            std::slice::from_ref(&stored),
+            &candidate.mapping,
+            &["uncertain".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let status = library_status(&pool).await.unwrap();
+        let directories: Vec<(&str, i64)> = status
+            .directories
+            .iter()
+            .map(|dir| (dir.path.as_str(), dir.tracks))
+            .collect();
+        assert_eq!(
+            directories,
+            [("/music/a", 2), ("/music/b", 1), ("/music/c", 1)]
+        );
+        assert_eq!(status.tracks, 4);
+        assert_eq!(status.releases, 3);
+        assert_eq!(status.matched, 1);
+        assert_eq!(status.unmatched, 2);
+        assert_eq!(status.stale, 0);
+        assert_eq!(status.queued, 1);
+        assert_eq!(status.newest_modified, Some(1));
+    }
+
+    #[tokio::test]
+    async fn track_pages_do_not_overlap_and_filter_like_search() {
+        let pool = test_pool().await;
+        let tracks: Vec<ScannedTrack> = (1..=5)
+            .map(|n| {
+                scanned(
+                    &format!("/music/a/{n:02}.flac"),
+                    Some("Blue"),
+                    Some("Artist"),
+                    n,
+                )
+            })
+            .collect();
+        insert(&pool, "/music/a", &tracks).await;
+
+        let all: Vec<String> = list_tracks(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.path)
+            .collect();
+        let first = track_page(&pool, None, 3, 0).await.unwrap();
+        let second = track_page(&pool, None, 3, 3).await.unwrap();
+        assert_eq!((first.len(), second.len()), (3, 2));
+        let paged: Vec<String> = first
+            .into_iter()
+            .chain(second)
+            .map(|row| row.path)
+            .collect();
+        assert_eq!(paged, all);
+
+        let found = track_page(&pool, Some("track 2"), 10, 0).await.unwrap();
+        assert_eq!(found.len(), 1);
+        // `%` is a literal here, never a wildcard.
+        assert!(
+            track_page(&pool, Some("%"), 10, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            search_tracks(&pool, "track 2").await.unwrap().len(),
+            found.len()
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@
 //! - [`matcher`]: pure normalization, mapping, scoring, and acceptance rules.
 //! - [`store`]: grouping, revisions, review queue, and transactional overlay.
 //! - [`runner`]: CLI orchestration and the interactive review screen.
+//! - [`web`]: the read-only web interface behind `radish serve`.
 
 pub mod clef;
 pub mod db;
@@ -30,6 +31,7 @@ pub mod store;
 #[cfg(test)]
 mod test_support;
 pub mod watcher;
+pub mod web;
 
 /// Prints a line to stdout; a write failure ends the process.
 ///

@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
 bzip2 = "0.6.1"
 clap = { version = "4.6.6", features = ["derive"] }
 discogger = { git = "https://github.com/isabelgk/discogger.git", rev = "8e9bef2ac1c893cb4ea685e49334cc91ba8dbe5b" }

@@ -48,6 +48,9 @@ radish search "pierce the veil"
 
 # Import, then watch for file changes until Ctrl+C
 radish watch ~/Music
+
+# Browse the library in a web browser (read-only), at http://127.0.0.1:8787
+radish serve
 ```
 
 All commands accept `--db PATH`. It defaults to `./radish.db`, relative to the current working directory, and the database is created automatically. Use the same database path across commands to access the same library:
@@ -418,6 +421,24 @@ Current synchronization limits:
 - Changes made while the watcher is stopped are replayed by the initial import, which also removes rows for files that disappeared.
 - A change that only touches a file's modification time is not picked up until the next import, because metadata-only events are ignored.
 - If the database lives inside the watched tree, removing the whole tree with `rm -rf` may not raise a root-deleted event, because SQLite's open files pin the directory. Keep the database outside the watched directory if you need the watcher to notice that.
+
+## Web interface
+
+`radish serve` starts a small read-only web server over the library database and prints the address it listens on (default `http://127.0.0.1:8787`; change it with `--bind ADDR`, for example `--bind 127.0.0.1:0` for any free port). It uses the database given by `--db`, so it can run alongside `import`, `watch` and `match`. Stop it with `Ctrl+C`.
+
+| Page | Shows |
+| --- | --- |
+| `/` Status | Directory, track and local-release totals, releases by status (`matched`, `unmatched`, `stale`), how many unmatched releases have a queued review, the newest file modification time stored, and each imported directory with its track count. |
+| `/tracks` | The `list` columns. `?q=TEXT` searches title, artist and album exactly like `search`, and `?page=N` pages through the results, 100 per page. |
+| `/releases` | The `releases` data: ID, artist, album, track count, status, accepted match (linked when the provider URL is `http` or `https`) and folder, 100 per page. |
+
+Status is a snapshot of what the database holds, not a history: Radish does not record when an import ran, so the page cannot say when the last one was.
+
+The interface has no authentication and no way to change anything: every request is a `GET` and no JavaScript is served. Keep these defaults in mind:
+
+- It listens on loopback only. Binding any other address works but prints a warning, because the pages show the library's file paths to anyone who can connect.
+- Requests whose `Host` header is not `localhost`, a loopback address, or the bind address get `403`, which stops a web page from reaching the server through DNS rebinding. A wildcard bind (`0.0.0.0`) accepts any host.
+- Tags, paths and provider titles are untrusted. Control and bidirectional characters are escaped as in terminal output, then HTML escaping is applied. Every response carries a `Content-Security-Policy` that allows nothing but the page's own inline style.
 
 ## Storage and output
 

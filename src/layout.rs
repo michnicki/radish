@@ -1,4 +1,4 @@
-//! Plain-text layout helpers for CLI listings: pluralization and aligned tables.
+//! Plain-text layout helpers for listings: pluralization, track fields and aligned tables.
 //!
 //! Everything here is pure and returns strings, so callers decide how to write
 //! them (always through [`outln!`](crate::outln)). [`Table`] escapes every cell
@@ -34,6 +34,47 @@ const ELLIPSIS_WIDTH: usize = 1;
 pub fn plural(count: u64, singular: &str, plural: &str) -> String {
     let noun = if count == 1 { singular } else { plural };
     format!("{count} {noun}")
+}
+
+/// Formats a duration as `minutes:seconds`, or `?:??` when it is unknown.
+///
+/// # Examples
+///
+/// ```
+/// use radish::layout::format_duration;
+///
+/// assert_eq!(format_duration(Some(225.0)), "3:45");
+/// assert_eq!(format_duration(None), "?:??");
+/// ```
+pub fn format_duration(secs: Option<f64>) -> String {
+    match secs {
+        Some(secs) => {
+            let total = secs.round() as u64;
+            format!("{}:{:02}", total / 60, total % 60)
+        }
+        None => "?:??".to_string(),
+    }
+}
+
+/// Formats a track position as `track`, or `disc-track` above disc 1.
+///
+/// A missing track number shows as `-`.
+///
+/// # Examples
+///
+/// ```
+/// use radish::layout::track_number;
+///
+/// assert_eq!(track_number(Some(1), Some(3)), "3");
+/// assert_eq!(track_number(Some(2), Some(1)), "2-1");
+/// assert_eq!(track_number(None, None), "-");
+/// ```
+pub fn track_number(disc: Option<i64>, track: Option<i64>) -> String {
+    match (disc, track) {
+        (Some(disc), Some(track)) if disc > 1 => format!("{disc}-{track}"),
+        (_, Some(track)) => track.to_string(),
+        _ => "-".to_string(),
+    }
 }
 
 /// Returns how many terminal columns `text` occupies.

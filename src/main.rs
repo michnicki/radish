@@ -1,11 +1,12 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use radish::layout::{Column, Table, plural};
+use radish::layout::{Column, Table, format_duration, plural, track_number};
 use radish::output::{Clean, clean_path};
 use radish::progress::ImportProgress;
 use radish::providers::{ProviderKind, ReleaseId};
-use radish::{db, importer, index, outln, runner, store, watcher};
+use radish::{db, importer, index, outln, runner, store, watcher, web};
 use std::io::{self, IsTerminal};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -56,6 +57,13 @@ enum Command {
     },
     /// Watch a music directory and keep the library in sync in real time
     Watch { path: PathBuf },
+    /// Serve a read-only web interface: status, tracks (with search) and releases
+    Serve {
+        /// Address to listen on. Anything but a loopback address exposes the
+        /// library paths to the network without authentication.
+        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8787")]
+        bind: SocketAddr,
+    },
     /// List every track in the library
     List,
     /// Search the library by title, artist, or album
@@ -289,6 +297,7 @@ async fn run() -> Result<()> {
             }
         }
         Command::Watch { path } => watcher::watch_directory(pool, &path, &cli.db).await?,
+        Command::Serve { bind } => web::serve(pool, bind).await?,
         Command::Index { action } => match action {
             IndexAction::Build {
                 musicbrainz,
@@ -391,21 +400,7 @@ fn render_releases(rows: &[store::LocalReleaseStatus]) -> Vec<String> {
     for row in rows {
         let artist = row.album_artist.as_deref().unwrap_or("(unknown artist)");
         let title = row.album_title.as_deref().unwrap_or("(no album tag)");
-        let mut status = row.status.clone();
-        if row.match_scope.as_deref() == Some("album") {
-            status.push_str(", album match; edition unconfirmed");
-        }
-        if row.stale && row.status != store::STATUS_STALE {
-            status.push_str(", stale");
-        }
-        if row.queued() && row.status != store::STATUS_MATCHED {
-            let providers: Vec<&str> = row
-                .queued_providers
-                .iter()
-                .map(|provider| provider.as_str())
-                .collect();
-            status.push_str(&format!(", queued ({})", providers.join(", ")));
-        }
+        let status = row.status_label();
         let tracks = plural(row.track_count.max(0) as u64, "track", "tracks");
         lines.push(format!(
             "{:<id_width$}  {} — {}",
@@ -459,20 +454,11 @@ fn render_tracks(rows: &[store::TrackRow], truncate: bool) -> Vec<String> {
         Column::new(""),
     ]);
     for row in rows {
-        let filename = Path::new(&row.path)
-            .file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_else(|| row.path.clone());
-        let number = match (row.disc_number, row.track_number) {
-            (Some(disc), Some(number)) if disc > 1 => format!("{disc}-{number}"),
-            (_, Some(number)) => number.to_string(),
-            _ => "-".to_string(),
-        };
         table.push([
             row.artist.as_deref().unwrap_or("(unknown artist)"),
-            row.title.as_deref().unwrap_or(&filename),
+            &row.display_title(),
             row.album.as_deref().unwrap_or("-"),
-            &number,
+            &track_number(row.disc_number, row.track_number),
             &format_duration(row.duration_secs),
             if row.stale { "stale match" } else { "" },
         ]);
@@ -482,16 +468,6 @@ fn render_tracks(rows: &[store::TrackRow], truncate: bool) -> Vec<String> {
     lines.push(String::new());
     lines.push(format!("{}.", plural(rows.len() as u64, "track", "tracks")));
     lines
-}
-
-fn format_duration(secs: Option<f64>) -> String {
-    match secs {
-        Some(secs) => {
-            let total = secs.round() as u64;
-            format!("{}:{:02}", total / 60, total % 60)
-        }
-        None => "?:??".to_string(),
-    }
 }
 
 async fn run_import(
