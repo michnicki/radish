@@ -1,0 +1,10 @@
+[env]
+# The SQLite that libsqlite3-sys bundles is built with
+# SQLITE_ENABLE_MEMORY_MANAGEMENT, which makes every connection share one page
+# cache behind a single global mutex. Offline matching runs several index
+# queries at once (`match --offline --jobs`), and that mutex made more than four
+# at once slower than four. Radish never calls sqlite3_release_memory, the only
+# thing the option adds. Without it, offline matching of a 6,819-release library
+# finished 24% more releases in its first minute with one job, and 3.1 times as
+# many with 8 jobs, where it now keeps scaling up to 16.
+LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_MEMORY_MANAGEMENT"
