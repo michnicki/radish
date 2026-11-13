@@ -445,7 +445,7 @@ impl RemoteRelease {
 
         Self {
             id: ReleaseId::Discogs(release.id),
-            group_id: release.master_id.map(GroupId::DiscogsMaster),
+            group_id: release.master_id.and_then(GroupId::discogs_master),
             title: release.title.unwrap_or_default(),
             artists,
             year: release.year.map(i64::from),
@@ -695,6 +695,22 @@ mod tests {
         assert_eq!(release.tracklist[0].duration_secs, Some(180.0));
         assert!(release.has_unsupported_entries());
         assert_eq!(release.url, "https://www.discogs.com/release/42");
+    }
+
+    #[tokio::test]
+    async fn master_zero_and_no_master_mean_no_group() {
+        for (master, expected) in [
+            (r#""master_id": 0,"#, None),
+            ("", None),
+            (r#""master_id": 7,"#, Some(GroupId::DiscogsMaster(7))),
+        ] {
+            let body =
+                release_json().replacen(r#""id": 42,"#, &format!(r#""id": 42, {master}"#), 1);
+            let server = MockServer::start(move |_| (200, body.clone()));
+            let adapter = adapter(&server.url, fast_policy());
+            let release = adapter.fetch_discogs_release(42).await.unwrap();
+            assert_eq!(release.group_id, expected, "{master}");
+        }
     }
 
     #[tokio::test]

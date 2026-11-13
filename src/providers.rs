@@ -353,6 +353,13 @@ pub enum GroupId {
 }
 
 impl GroupId {
+    /// The Discogs master with this ID, or `None` for `0`, which is what Discogs
+    /// reports for a release that has no master. Treating `0` as a master would
+    /// make every masterless release one album.
+    pub fn discogs_master(id: u64) -> Option<Self> {
+        (id != 0).then_some(Self::DiscogsMaster(id))
+    }
+
     /// The provider-local identifier as stored in SQLite.
     pub fn storage_id(&self) -> String {
         match self {

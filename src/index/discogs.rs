@@ -449,7 +449,7 @@ fn convert(node: &Node) -> Result<RemoteRelease> {
         group_id: node
             .child("master_id")
             .and_then(|master| master.trimmed().parse::<u64>().ok())
-            .map(GroupId::DiscogsMaster),
+            .and_then(GroupId::discogs_master),
         title: title.to_string(),
         artists,
         year: node
@@ -607,6 +607,21 @@ mod tests {
             out.push(convert(&node));
         }
         out
+    }
+
+    #[test]
+    fn master_zero_and_no_master_both_mean_no_group() {
+        let xml = r#"<releases>
+  <release id="50"><title>Zero</title><master_id is_main_release="false">0</master_id></release>
+  <release id="51"><title>Absent</title></release>
+  <release id="52"><title>Real</title><master_id is_main_release="true">123</master_id></release>
+</releases>"#;
+        let releases = parse(xml);
+        let groups: Vec<_> = releases
+            .iter()
+            .map(|release| release.as_ref().unwrap().group_id.clone())
+            .collect();
+        assert_eq!(groups, [None, None, Some(GroupId::DiscogsMaster(123))]);
     }
 
     #[test]

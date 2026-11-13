@@ -10,6 +10,7 @@ use crate::matcher::{
     RemoteRelease, SearchSummary, normalize_barcode, normalize_identifier, normalize_text,
 };
 use crate::output::clean_path;
+use crate::providers::GroupId;
 use anyhow::{Context, Result};
 use flate2::Compression;
 use flate2::read::ZlibDecoder;
@@ -86,6 +87,10 @@ pub(crate) fn encode_document(release: &RemoteRelease) -> Result<Vec<u8>> {
 }
 
 /// Reads back what [`encode_document`] wrote.
+///
+/// Indexes built before a masterless Discogs release stopped carrying
+/// `DiscogsMaster(0)` still hold that group in their documents, so it is read
+/// as no group here and no rebuild is needed.
 pub(crate) fn decode_document(bytes: &[u8]) -> Result<RemoteRelease> {
     let mut json = Vec::new();
     ZlibDecoder::new(bytes)
@@ -96,7 +101,12 @@ pub(crate) fn decode_document(bytes: &[u8]) -> Result<RemoteRelease> {
         json.len() as u64 <= MAX_DOCUMENT_BYTES,
         "a release document exceeds {MAX_DOCUMENT_BYTES} bytes"
     );
-    serde_json::from_slice(&json).context("cannot decode a release document")
+    let mut release: RemoteRelease =
+        serde_json::from_slice(&json).context("cannot decode a release document")?;
+    if release.group_id == Some(GroupId::DiscogsMaster(0)) {
+        release.group_id = None;
+    }
+    Ok(release)
 }
 
 /// One release and the columns that answer searches for it.
@@ -388,6 +398,24 @@ mod tests {
         let bomb = encoder.finish().unwrap();
         let error = decode_document(&bomb).unwrap_err().to_string();
         assert!(error.contains("exceeds"), "{error}");
+    }
+
+    #[test]
+    fn a_stored_document_whose_group_is_master_zero_decodes_without_a_group() {
+        // Indexes built before the builder dropped master 0 hold it in their
+        // documents.
+        let mut stored = release();
+        stored.id = ReleaseId::Discogs(42);
+        stored.group_id = Some(GroupId::DiscogsMaster(0));
+        let bytes = encode_document(&stored).unwrap();
+        assert_eq!(decode_document(&bytes).unwrap().group_id, None);
+
+        stored.group_id = Some(GroupId::DiscogsMaster(7));
+        let bytes = encode_document(&stored).unwrap();
+        assert_eq!(
+            decode_document(&bytes).unwrap().group_id,
+            Some(GroupId::DiscogsMaster(7))
+        );
     }
 
     #[test]

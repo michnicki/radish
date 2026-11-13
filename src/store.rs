@@ -1844,7 +1844,7 @@ impl From<LegacyRemoteRelease> for RemoteRelease {
     fn from(legacy: LegacyRemoteRelease) -> Self {
         Self {
             id: ReleaseId::Discogs(legacy.id),
-            group_id: legacy.master_id.map(GroupId::DiscogsMaster),
+            group_id: legacy.master_id.and_then(GroupId::discogs_master),
             title: legacy.title,
             artists: legacy.artists,
             year: legacy.year,
