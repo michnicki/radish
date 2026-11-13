@@ -1379,21 +1379,7 @@ impl LocalTrackRow {
 /// case-insensitive path. Mapping pairs are positions in this order, so the
 /// loader and the accept transaction must agree on it.
 pub fn order_release_tracks(tracks: &mut [LocalTrack]) {
-    tracks.sort_by(|a, b| {
-        a.disc
-            .unwrap_or(1)
-            .cmp(&b.disc.unwrap_or(1))
-            .then(
-                a.track_number
-                    .unwrap_or(i64::MAX)
-                    .cmp(&b.track_number.unwrap_or(i64::MAX)),
-            )
-            .then_with(|| {
-                a.path
-                    .to_ascii_lowercase()
-                    .cmp(&b.path.to_ascii_lowercase())
-            })
-    });
+    tracks.sort_by(crate::matcher::local_track_order);
 }
 
 fn parse_musicbrainz_problems(raw: &str) -> Vec<String> {

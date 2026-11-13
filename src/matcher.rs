@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v21";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v20";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v22";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v21";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -58,6 +58,16 @@ pub const SOFT_DURATION_MAX_TRACKS: usize = 2;
 pub const SOFT_DURATION_MAX_SECS: f64 = 10.0;
 pub const SOFT_DURATION_TOTAL_RATIO: f64 = 0.02;
 pub const SOFT_DURATION_MIN_ALBUM_TRACKS: usize = 4;
+
+/// The duration-identity rule: when the album title and artist agree and every
+/// length of an album of at least `DURATION_IDENTITY_MIN_TRACKS` tracks is
+/// within `DURATION_IDENTITY_GAP_SECS` of the provider's, in track order, the
+/// lengths identify the tracks and any number of weak track titles stop
+/// blocking. The album score without the track titles must still reach
+/// `DURATION_IDENTITY_SCORE`.
+pub const DURATION_IDENTITY_MIN_TRACKS: usize = 5;
+pub const DURATION_IDENTITY_GAP_SECS: f64 = 1.5;
+pub const DURATION_IDENTITY_SCORE: f64 = 0.95;
 
 /// The fewest local tracks that let a candidate's agreeing durations set a
 /// close alternative aside: with fewer, a matching length is too common.
@@ -172,6 +182,28 @@ pub struct LocalRelease {
     /// In the order of `store::order_release_tracks`. `Mapping::pairs` is
     /// indexed by position in this list.
     pub tracks: Vec<LocalTrack>,
+}
+
+/// The order of a local release's tracks: disc (missing counts as 1), track
+/// number (missing sorts last), then case-insensitive path.
+///
+/// `store::order_release_tracks` sorts with this, and
+/// [`mapped_in_local_order`] checks the invariant against it. It lives here
+/// because `store` depends on this module and not the other way around.
+pub fn local_track_order(a: &LocalTrack, b: &LocalTrack) -> std::cmp::Ordering {
+    a.disc
+        .unwrap_or(1)
+        .cmp(&b.disc.unwrap_or(1))
+        .then(
+            a.track_number
+                .unwrap_or(i64::MAX)
+                .cmp(&b.track_number.unwrap_or(i64::MAX)),
+        )
+        .then_with(|| {
+            a.path
+                .to_ascii_lowercase()
+                .cmp(&b.path.to_ascii_lowercase())
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2223,6 +2255,16 @@ impl ScoreBreakdown {
             / (1.0 - WEIGHT_YEAR - WEIGHT_ALBUM_TITLE)
     }
 
+    /// The album score over the components other than the track titles, scaled
+    /// so that a perfect rest scores 1.0. Used where the lengths identify the
+    /// tracks, so the titles carry no extra evidence.
+    pub fn album_score_without_track_titles(&self) -> f64 {
+        (WEIGHT_ALBUM_TITLE * self.album_title
+            + WEIGHT_ALBUM_ARTIST * self.album_artist
+            + WEIGHT_DURATIONS * self.durations)
+            / (1.0 - WEIGHT_YEAR - WEIGHT_TRACK_TITLES)
+    }
+
     /// Component values paired with their weights, for the review screen.
     pub fn components(&self) -> [(&'static str, f64, f64); 5] {
         [
@@ -2665,6 +2707,93 @@ fn fits_durations_better(local: &LocalRelease, candidate: &Candidate, other: &Ca
     !other.mapping.complete || other_misses
 }
 
+/// Whether the mapping pairs every local track, in local track order, with the
+/// remote playable tracks in tracklist order: complete, unambiguous, as many
+/// local tracks as playable remote tracks, and local track `k` mapped to remote
+/// playable track `k`.
+///
+/// Two tracks of similar length cannot swap titles under such a mapping, which
+/// is what makes lengths a safe stand-in for junk local titles. `local.tracks`
+/// must be in the order of [`local_track_order`].
+fn mapped_in_local_order(local: &LocalRelease, candidate: &Candidate) -> bool {
+    debug_assert!(
+        local
+            .tracks
+            .is_sorted_by(|a, b| local_track_order(a, b).is_le()),
+        "local tracks must be in store::order_release_tracks order"
+    );
+    let mapping = &candidate.mapping;
+    if !mapping.complete || mapping.ambiguous {
+        return false;
+    }
+    let playable = candidate.release.playable_tracks();
+    local.tracks.len() == playable.len()
+        && mapping.pairs.len() == playable.len()
+        && mapping
+            .pairs
+            .iter()
+            .zip(&playable)
+            .all(|(pair, (remote_index, _))| *pair == Some(*remote_index))
+}
+
+/// Whether the lengths alone identify the tracks of an album-level match: at
+/// least [`DURATION_IDENTITY_MIN_TRACKS`] local tracks, album title and artist
+/// each at least [`TITLE_SIMILARITY_THRESHOLD`], a mapping that is
+/// [`mapped_in_local_order`], a local title and a known positive duration on
+/// both sides of every pair with each pair within [`DURATION_IDENTITY_GAP_SECS`],
+/// and an album score without the track titles of at least
+/// [`DURATION_IDENTITY_SCORE`].
+///
+/// The track titles then add no evidence, so weak ones no longer block. A weak
+/// title is junk only when it names nothing else: a local title that scores
+/// below [`TITLE_SIMILARITY_THRESHOLD`] against its mapped remote track but at
+/// least that against a different playable remote track is a contradiction
+/// (the edition orders its tracks differently), and the rule does not apply.
+fn durations_identify_tracks(local: &LocalRelease, candidate: &Candidate) -> bool {
+    let score = &candidate.score;
+    if local.tracks.len() < DURATION_IDENTITY_MIN_TRACKS
+        || score.album_title < TITLE_SIMILARITY_THRESHOLD
+        || score.album_artist < TITLE_SIMILARITY_THRESHOLD
+        || score.album_score_without_track_titles() + 1e-9 < DURATION_IDENTITY_SCORE
+        || !mapped_in_local_order(local, candidate)
+    {
+        return false;
+    }
+    let cleaned = cleaned_track_titles(local);
+    let playable = candidate.release.playable_tracks();
+    candidate.mapping.assigned_pairs().all(|(l, r)| {
+        let (Some(local_track), Some(remote_track)) =
+            (local.tracks.get(l), candidate.release.tracklist.get(r))
+        else {
+            return false;
+        };
+        let Some(title) = local_track
+            .title
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+        else {
+            return false;
+        };
+        let names_another_track = candidate
+            .mapping
+            .title_similarity(local, &cleaned, l, r, remote_track)
+            .is_some_and(|similarity| similarity < TITLE_SIMILARITY_THRESHOLD)
+            && playable.iter().any(|(other, track)| {
+                *other != r
+                    && track_title_similarity(
+                        title,
+                        cleaned.get(l).and_then(Option::as_ref),
+                        &track.title,
+                    ) >= TITLE_SIMILARITY_THRESHOLD
+            });
+        !names_another_track
+            && matches!((local_track.duration_secs, remote_track.duration_secs),
+                (Some(a), Some(b)) if a > 0.0 && b > 0.0)
+            && duration_gap(local, candidate, l, r)
+                .is_some_and(|gap| gap <= DURATION_IDENTITY_GAP_SECS)
+    })
+}
+
 /// Whether two candidates are editions the provider files under one album: the
 /// same MusicBrainz release group or Discogs master.
 ///
@@ -2830,8 +2959,16 @@ fn evaluate_at_scope(
     let corroborated_title =
         match_scope == MatchScope::Album && corroborated_album(local, candidate);
 
+    // Lengths that identify every track in track order stand in for the track
+    // titles, so the album score gate does not apply. Album scope only, and not
+    // together with the weak album title rule, which needs a title below the
+    // minimum that this rule requires.
+    let duration_identity = match_scope == MatchScope::Album
+        && !corroborated_title
+        && durations_identify_tracks(local, candidate);
+
     let acceptance_score = match_scope.score(&candidate.score);
-    if !corroborated_title && acceptance_score + 1e-9 < minimum_score {
+    if !corroborated_title && !duration_identity && acceptance_score + 1e-9 < minimum_score {
         blockers.push(format!(
             "score {:.3} is below the {:.2} acceptance threshold",
             acceptance_score, minimum_score
@@ -2956,7 +3093,8 @@ fn evaluate_at_scope(
     // track of the same album: by elimination it is the remaining track. Only for
     // an album-level match. These exceptions do not stack with the weak album
     // title rule: when that rule is in play, which replaces the acceptance score
-    // gate, any track title below the minimum blocks.
+    // gate, any track title below the minimum blocks. The duration-identity rule
+    // accepts any number of weak titles instead, as one warning.
     let lone_weak_title =
         match_scope == MatchScope::Album && !corroborated_title && titles_below_minimum == 1;
     let near_miss_title = lone_weak_title
@@ -2969,6 +3107,12 @@ fn evaluate_at_scope(
         if near_miss_title || duration_confirmed_title {
             warnings.push(format!(
                 "track title '{worst_title_track}' scores {worst_title:.3} but its duration agrees"
+            ));
+        } else if duration_identity {
+            // One weak title always takes the lone-title branch above, since the
+            // rule's own conditions imply it, so this is always plural.
+            warnings.push(format!(
+                "{titles_below_minimum} track titles score below {minimum_title_similarity:.2} (lowest '{worst_title_track}' {worst_title:.3}) but every duration agrees within {DURATION_IDENTITY_GAP_SECS}s in track order"
             ));
         } else {
             blockers.push(format!(
@@ -3174,7 +3318,11 @@ fn plausibility_score(local: &LocalRelease, primary: &Candidate) -> f64 {
 ///
 /// Scores, runner-up gaps, and mappings stay within one provider. This function
 /// only asks whether the fallback contradicts the local edition or a complete,
-/// plausible primary candidate.
+/// plausible primary candidate. A primary is plausible when its plausibility
+/// score reaches [`PLAUSIBLE_PRIMARY_SCORE`] or when its durations identify the
+/// tracks ([`durations_identify_tracks`]), so junk local titles do not hide the
+/// right primary. Against a primary that is plausible only through its
+/// durations, edition qualifiers and durations are compared but titles are not.
 pub fn fallback_conflicts(
     local: &LocalRelease,
     primary_candidates: &[Candidate],
@@ -3207,9 +3355,14 @@ pub fn fallback_conflicts(
     }
 
     for primary in primary_candidates {
-        if !primary.mapping.complete
-            || plausibility_score(local, primary) + 1e-9 < PLAUSIBLE_PRIMARY_SCORE
-        {
+        if !primary.mapping.complete {
+            continue;
+        }
+        // A primary that is plausible only because its durations identify the
+        // tracks has titles that carry no evidence, so they are not compared.
+        let plausible_by_score =
+            plausibility_score(local, primary) + 1e-9 >= PLAUSIBLE_PRIMARY_SCORE;
+        if !plausible_by_score && !durations_identify_tracks(local, primary) {
             continue;
         }
         let primary_qualifiers = remote_edition_qualifiers(&primary.release);
@@ -3223,7 +3376,7 @@ pub fn fallback_conflicts(
             let Some(primary_track) = primary.release.tracklist.get(remote_index) else {
                 continue;
             };
-            if let Some(fallback_title) = fallback_titles.get(&local_index) {
+            if plausible_by_score && let Some(fallback_title) = fallback_titles.get(&local_index) {
                 let similarity = similarity(&primary_track.title, fallback_title);
                 if similarity < TITLE_SIMILARITY_THRESHOLD {
                     conflicts.push(format!(
@@ -4994,11 +5147,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v21"
+            "discogs-match-v22"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v20"
+            "musicbrainz-match-v21"
         );
     }
 
@@ -5387,9 +5540,11 @@ mod tests {
                 .auto_accept
         );
 
-        // Two weak titles still block.
+        // Two weak titles still block, unless every length agrees closely, which
+        // is a different rule: here one other length is two seconds off.
         let mut two = local.clone();
         two.tracks[4].title = Some("Fiv".to_string());
+        two.tracks[0].duration_secs = Some(two.tracks[0].duration_secs.unwrap() + 2.0);
         let candidate = Candidate::new(&two, remote.clone());
         assert!(
             !evaluate_for_matching(&two, &candidate, &[], &DiscoveryEvidence::default())
@@ -5422,13 +5577,22 @@ mod tests {
                 .auto_accept
         );
 
-        // Two different titles still block.
+        // Two different titles still block, unless every length agrees closely,
+        // which is a different rule: here one other length is two seconds off.
         let mut two = local.clone();
         two.tracks[4].title = Some("Another one entirely".to_string());
+        two.tracks[0].duration_secs = Some(two.tracks[0].duration_secs.unwrap() + 2.0);
         let candidate = Candidate::new(&two, remote.clone());
+        let evaluation =
+            evaluate_for_matching(&two, &candidate, &[], &DiscoveryEvidence::default());
+        assert!(!evaluation.auto_accept);
         assert!(
-            !evaluate_for_matching(&two, &candidate, &[], &DiscoveryEvidence::default())
-                .auto_accept
+            evaluation
+                .blockers
+                .iter()
+                .any(|note| note.contains("only scores")),
+            "{:?}",
+            evaluation.blockers
         );
 
         // A short album cannot carry a track on its length alone.
@@ -5440,6 +5604,517 @@ mod tests {
             !evaluate_for_matching(&short, &candidate, &[], &DiscoveryEvidence::default())
                 .auto_accept
         );
+    }
+
+    /// A local release and a remote release over the same tracks whose lengths
+    /// are 31 seconds apart, so that no two tracks can be mistaken for each
+    /// other by length. `remote_titles` are what the provider calls the tracks
+    /// and `local_titles` what the files say.
+    fn spaced_pair(local_titles: &[&str], remote_titles: &[&str]) -> (LocalRelease, RemoteRelease) {
+        let mut local = local_release(local_titles);
+        let mut remote = remote_release(remote_titles);
+        for (index, track) in local.tracks.iter_mut().enumerate() {
+            track.duration_secs = Some(150.0 + 31.0 * index as f64);
+        }
+        for (index, track) in remote.tracklist.iter_mut().enumerate() {
+            track.duration_secs = Some(150.0 + 31.0 * index as f64);
+        }
+        (local, remote)
+    }
+
+    fn album_evaluation(
+        local: &LocalRelease,
+        remote: &RemoteRelease,
+        alternatives: &[Candidate],
+    ) -> Evaluation {
+        let candidate = Candidate::new(local, remote.clone());
+        evaluate_for_matching(
+            local,
+            &candidate,
+            alternatives,
+            &DiscoveryEvidence::default(),
+        )
+    }
+
+    /// Asserts the album is accepted on the lengths alone, with one warning
+    /// naming `weak` titles.
+    fn assert_accepted_on_durations(local: &LocalRelease, remote: &RemoteRelease, weak: usize) {
+        let candidate = Candidate::new(local, remote.clone());
+        assert!(
+            durations_identify_tracks(local, &candidate),
+            "{:?}",
+            candidate.score
+        );
+        let evaluation = album_evaluation(local, remote, &[]);
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        let expected = format!("{weak} track titles score below 0.90 (lowest ");
+        let warnings: Vec<_> = evaluation
+            .warnings
+            .iter()
+            .filter(|note| note.contains("every duration agrees within 1.5s in track order"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{:?}", evaluation.warnings);
+        assert!(warnings[0].starts_with(&expected), "{}", warnings[0]);
+    }
+
+    #[test]
+    fn placeholder_track_titles_pass_on_exact_lengths() {
+        let remote_titles = [
+            "Opening",
+            "Second Wind",
+            "Hollow",
+            "Undertow",
+            "Lantern",
+            "Closing",
+        ];
+        let local_titles = [
+            "Track01", "Track02", "Track03", "Track04", "Track05", "Track06",
+        ];
+        let (local, remote) = spaced_pair(&local_titles, &remote_titles);
+        assert_accepted_on_durations(&local, &remote, 6);
+    }
+
+    #[test]
+    fn misspelled_titles_pass_on_exact_lengths() {
+        // Meathook Seed, Embedded.
+        let remote_titles = [
+            "Embedded",
+            "A Fumed Grave",
+            "A Wilted Remnant",
+            "Focal Point Blur",
+            "Dead Reckoning",
+            "Fracture Lines",
+        ];
+        let local_titles = [
+            "Embedded",
+            "A Fumed Game",
+            "A Melted Remnant",
+            "Jocal Point Bliss",
+            "Dead Reckoning",
+            "Fracture Lines",
+        ];
+        let (local, remote) = spaced_pair(&local_titles, &remote_titles);
+        assert_accepted_on_durations(&local, &remote, 3);
+
+        // Beheaded.
+        let remote_titles = [
+            "Transcendental Iniquity",
+            "Subconscious Deliverance",
+            "Cadaveric Offering",
+            "Rotting Throne",
+            "Funeral Mist",
+        ];
+        let local_titles = [
+            "transdental inquiry",
+            "subconscious delivery",
+            "Cadaveric Offering",
+            "Rotting Throne",
+            "Funeral Mist",
+        ];
+        let (local, remote) = spaced_pair(&local_titles, &remote_titles);
+        assert_accepted_on_durations(&local, &remote, 2);
+    }
+
+    #[test]
+    fn two_shortened_titles_in_a_long_album_pass_on_exact_lengths() {
+        // Alice Cooper, Dragontown.
+        let remote_titles = [
+            "Triumph of the Will",
+            "Sex, Death and Money",
+            "Somewhere in the Jungle",
+            "Sentinel Rising",
+            "I Just Wanna Be God",
+            "Deeper",
+            "The Sentinel",
+            "Fantasy Man",
+            "It's Me",
+            "Disgraceland",
+            "Every Woman Has a Name",
+            "Dragontown",
+        ];
+        let mut local_titles = remote_titles;
+        local_titles[2] = "Somewhere";
+        local_titles[6] = "I Am the Sentinel";
+        let (local, remote) = spaced_pair(&local_titles, &remote_titles);
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(candidate.score.track_titles < 0.95);
+        assert_accepted_on_durations(&local, &remote, 2);
+    }
+
+    #[test]
+    fn remote_titles_with_an_artist_prefix_pass_on_exact_lengths() {
+        let local_titles = [
+            "Declare Guerre Nucleaire",
+            "Hate to Say I Told You So",
+            "Main Offender",
+            "Veni Vidi Vicious",
+            "Die, All Right!",
+            "Supply and Demand",
+        ];
+        let prefixed: Vec<String> = local_titles
+            .iter()
+            .map(|title| format!("The Hives - {title}"))
+            .collect();
+        let remote_titles: Vec<&str> = prefixed.iter().map(String::as_str).collect();
+        let (local, remote) = spaced_pair(&local_titles, &remote_titles);
+        assert_accepted_on_durations(&local, &remote, 6);
+    }
+
+    /// Six placeholder files over a six-track release with spaced lengths.
+    fn placeholder_pair() -> (LocalRelease, RemoteRelease) {
+        spaced_pair(
+            &[
+                "Track01", "Track02", "Track03", "Track04", "Track05", "Track06",
+            ],
+            &[
+                "Opening",
+                "Second Wind",
+                "Hollow",
+                "Undertow",
+                "Lantern",
+                "Closing",
+            ],
+        )
+    }
+
+    fn assert_blocked_without_duration_identity(local: &LocalRelease, remote: &RemoteRelease) {
+        let candidate = Candidate::new(local, remote.clone());
+        assert!(!durations_identify_tracks(local, &candidate));
+        let evaluation = album_evaluation(local, remote, &[]);
+        assert!(!evaluation.auto_accept);
+        assert!(
+            !evaluation
+                .warnings
+                .iter()
+                .any(|note| note.contains("every duration agrees")),
+            "{:?}",
+            evaluation.warnings
+        );
+    }
+
+    #[test]
+    fn one_length_two_seconds_off_blocks_duration_identity() {
+        let (mut local, remote) = placeholder_pair();
+        local.tracks[3].duration_secs = Some(local.tracks[3].duration_secs.unwrap() + 2.0);
+        assert_blocked_without_duration_identity(&local, &remote);
+    }
+
+    #[test]
+    fn tracks_mapped_out_of_local_order_block_duration_identity() {
+        // Adjacent remote lengths are one second apart, so every gap stays within
+        // 1.5 s after a swap and only the order check can tell.
+        let titles = [
+            "Opening",
+            "Second Wind",
+            "Hollow",
+            "Undertow",
+            "Lantern",
+            "Closing",
+        ];
+        let local = local_release(&[
+            "Track01", "Track02", "Track03", "Track04", "Track05", "Track06",
+        ]);
+        let remote = remote_release(&titles);
+        let mut candidate = Candidate::new(&local, remote.clone());
+        assert!(mapped_in_local_order(&local, &candidate));
+        assert!(durations_identify_tracks(&local, &candidate));
+
+        candidate.mapping.pairs.swap(1, 2);
+        let gaps_agree = candidate
+            .mapping
+            .assigned_pairs()
+            .all(|(l, r)| duration_gap(&local, &candidate, l, r).is_some_and(|gap| gap <= 1.5));
+        assert!(gaps_agree);
+        assert!(candidate.mapping.complete && !candidate.mapping.ambiguous);
+        assert!(!mapped_in_local_order(&local, &candidate));
+        assert!(!durations_identify_tracks(&local, &candidate));
+
+        let evaluation = evaluate_at_scope(
+            &local,
+            &candidate,
+            None,
+            &DiscoveryEvidence::default(),
+            MatchScope::Album,
+        );
+        assert!(!evaluation.auto_accept);
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|note| note.contains("only scores")),
+            "{:?}",
+            evaluation.blockers
+        );
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|note| note.contains("acceptance threshold")),
+            "{:?}",
+            evaluation.blockers
+        );
+    }
+
+    #[test]
+    fn a_mapping_in_local_order_needs_matching_counts_and_no_ambiguity() {
+        let (local, remote) = placeholder_pair();
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(mapped_in_local_order(&local, &candidate));
+
+        let mut ambiguous = candidate.clone();
+        ambiguous.mapping.ambiguous = true;
+        assert!(!mapped_in_local_order(&local, &ambiguous));
+
+        let mut incomplete = candidate.clone();
+        incomplete.mapping.complete = false;
+        assert!(!mapped_in_local_order(&local, &incomplete));
+
+        let mut longer = remote;
+        let extra = longer.tracklist[0].clone();
+        longer.tracklist.push(extra);
+        let longer = Candidate::new(&local, longer);
+        assert!(!mapped_in_local_order(&local, &longer));
+    }
+
+    #[test]
+    fn four_tracks_block_duration_identity() {
+        let (local, remote) = spaced_pair(
+            &["Track01", "Track02", "Track03", "Track04"],
+            &["Opening", "Second Wind", "Hollow", "Undertow"],
+        );
+        assert_blocked_without_duration_identity(&local, &remote);
+    }
+
+    #[test]
+    fn a_weak_album_title_or_artist_blocks_duration_identity() {
+        let (mut local, mut remote) = placeholder_pair();
+        local.album_title = Some("Exclusive Metal Sampler".to_string());
+        remote.title = "Exclusive Metal Radio Sampler".to_string();
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!((0.70..0.90).contains(&candidate.score.album_title));
+        assert_blocked_without_duration_identity(&local, &remote);
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|note| note.contains("album title or artist does not agree")),
+            "{:?}",
+            evaluation.blockers
+        );
+
+        let (mut local, remote) = placeholder_pair();
+        local.album_artist = Some("Another Band".to_string());
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(candidate.score.album_artist < 0.90);
+        assert_blocked_without_duration_identity(&local, &remote);
+    }
+
+    #[test]
+    fn a_title_and_artist_at_the_minimum_leave_too_little_score_for_duration_identity() {
+        let (mut local, mut remote) = placeholder_pair();
+        local.album_title = Some("Test Album".to_string());
+        remote.title = "Test Albun".to_string();
+        local.album_artist = Some("Artist Nam".to_string());
+        remote.artists = vec!["Artist Nan".to_string()];
+        for (l, r) in local.tracks.iter_mut().zip(&remote.tracklist) {
+            l.duration_secs = r.duration_secs;
+        }
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!((candidate.score.album_title - 0.90).abs() < 1e-9);
+        assert!((candidate.score.album_artist - 0.90).abs() < 1e-9);
+        assert!(candidate.score.album_score_without_track_titles() < DURATION_IDENTITY_SCORE);
+        assert_blocked_without_duration_identity(&local, &remote);
+    }
+
+    #[test]
+    fn a_track_version_qualifier_still_blocks_duration_identity() {
+        let (local, mut remote) = placeholder_pair();
+        for track in &mut remote.tracklist {
+            track.title = format!("{} (Live)", track.title);
+        }
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(durations_identify_tracks(&local, &candidate));
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(!evaluation.auto_accept);
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|note| note.contains("track version qualifiers differ")),
+            "{:?}",
+            evaluation.blockers
+        );
+    }
+
+    #[test]
+    fn a_missing_title_or_length_blocks_duration_identity() {
+        let (mut local, remote) = placeholder_pair();
+        local.tracks[2].title = None;
+        assert_blocked_without_duration_identity(&local, &remote);
+
+        let (local, mut remote) = placeholder_pair();
+        remote.tracklist[4].duration_secs = None;
+        assert_blocked_without_duration_identity(&local, &remote);
+
+        let (mut local, remote) = placeholder_pair();
+        local.tracks[1].duration_secs = None;
+        assert_blocked_without_duration_identity(&local, &remote);
+    }
+
+    #[test]
+    fn titles_that_name_other_tracks_block_duration_identity() {
+        // The files are tagged correctly, but the edition orders tracks 2 and 3
+        // the other way round and the two lengths are a second apart: each file
+        // would take the other's title.
+        let titles = [
+            "Opening",
+            "Second Wind",
+            "Hollow",
+            "Undertow",
+            "Lantern",
+            "Closing",
+        ];
+        let (mut local, mut remote) = spaced_pair(&titles, &titles);
+        local.tracks[1].duration_secs = Some(200.0);
+        local.tracks[2].duration_secs = Some(201.0);
+        remote.tracklist[1].duration_secs = Some(200.0);
+        remote.tracklist[2].duration_secs = Some(201.0);
+        let control = Candidate::new(&local, remote.clone());
+        assert!(!control.mapping.ambiguous && control.mapping.complete);
+        assert_eq!(control.score.track_titles, 1.0);
+
+        remote.tracklist.swap(1, 2);
+        for (index, track) in remote.tracklist.iter_mut().enumerate() {
+            track.position = Some((index + 1).to_string());
+        }
+        remote.tracklist[1].duration_secs = Some(200.0);
+        remote.tracklist[2].duration_secs = Some(201.0);
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(mapped_in_local_order(&local, &candidate));
+        assert!(candidate.score.track_titles < 0.9);
+        assert!(candidate.mapping.assigned_pairs().all(|(l, r)| {
+            duration_gap(&local, &candidate, l, r).is_some_and(|gap| gap <= 1.5)
+        }));
+        assert!(!durations_identify_tracks(&local, &candidate));
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(!evaluation.auto_accept);
+        assert!(
+            !evaluation
+                .warnings
+                .iter()
+                .any(|note| note.contains("every duration agrees")),
+            "{:?}",
+            evaluation.warnings
+        );
+    }
+
+    #[test]
+    fn a_close_alternative_of_another_album_still_blocks_duration_identity() {
+        let (local, mut remote) = placeholder_pair();
+        remote.group_id = Some(GroupId::DiscogsMaster(900));
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+
+        // The same lengths and titles filed under another album are not
+        // equivalent audio, and the lengths cannot tell the two apart.
+        let mut other = remote.clone();
+        other.id = ReleaseId::Discogs(43);
+        other.group_id = Some(GroupId::DiscogsMaster(901));
+        let other = Candidate::new(&local, other);
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(!equivalent_audio(&candidate, &other));
+        let evaluation = album_evaluation(&local, &remote, &[other]);
+        assert!(!evaluation.auto_accept);
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|note| note.contains("close alternative")),
+            "{:?}",
+            evaluation.blockers
+        );
+    }
+
+    #[test]
+    fn the_fallback_check_ignores_titles_of_a_primary_plausible_only_by_durations() {
+        // Romanized local titles, a Discogs fallback that agrees with them, and
+        // a MusicBrainz primary titled in Japanese.
+        let romanized = [
+            "Aoi Sora",
+            "Yoru no Uta",
+            "Kaze no Machi",
+            "Tsuki no Hikari",
+            "Hana Fubuki",
+            "Owari no Hi",
+        ];
+        let japanese = [
+            "\u{9752}\u{3044}\u{7a7a}",
+            "\u{591c}\u{306e}\u{6b4c}",
+            "\u{98a8}\u{306e}\u{8857}",
+            "\u{6708}\u{306e}\u{5149}",
+            "\u{82b1}\u{5439}\u{96ea}",
+            "\u{7d42}\u{308f}\u{308a}\u{306e}\u{65e5}",
+        ];
+        let (local, primary_release) = spaced_pair(&romanized, &japanese);
+        let mut primary_release = primary_release;
+        primary_release.id = ReleaseId::MusicBrainz(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"));
+        let primary = Candidate::new(&local, primary_release);
+        assert!(plausibility_score(&local, &primary) < PLAUSIBLE_PRIMARY_SCORE);
+        assert!(durations_identify_tracks(&local, &primary));
+
+        let (_, fallback_release) = spaced_pair(&romanized, &romanized);
+        let fallback = Candidate::new(&local, fallback_release);
+        let conflicts = fallback_conflicts(&local, std::slice::from_ref(&primary), &fallback, true);
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+
+        // Edition qualifiers are still compared against such a primary.
+        let mut live = primary.release.clone();
+        live.edition_notes = vec!["Live".to_string()];
+        let live = Candidate::new(&local, live);
+        let conflicts = fallback_conflicts(&local, &[live], &fallback, true);
+        assert!(
+            conflicts
+                .iter()
+                .any(|conflict| conflict.contains("primary candidates describe")),
+            "{conflicts:?}"
+        );
+        assert!(
+            !conflicts
+                .iter()
+                .any(|conflict| conflict.contains("track titles differ")),
+            "{conflicts:?}"
+        );
+    }
+
+    #[test]
+    fn the_fallback_check_trusts_a_primary_whose_durations_identify_the_tracks() {
+        let (local, remote) = placeholder_pair();
+        let mut primary_release = remote.clone();
+        primary_release.id = ReleaseId::MusicBrainz(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"));
+        primary_release.edition_notes = vec!["Live".to_string()];
+        let primary = Candidate::new(&local, primary_release);
+        assert!(plausibility_score(&local, &primary) < PLAUSIBLE_PRIMARY_SCORE);
+        assert!(durations_identify_tracks(&local, &primary));
+
+        let fallback = Candidate::new(&local, remote.clone());
+        let conflicts = fallback_conflicts(&local, std::slice::from_ref(&primary), &fallback, true);
+        assert!(
+            conflicts
+                .iter()
+                .any(|conflict| conflict.contains("primary candidates describe")),
+            "{conflicts:?}"
+        );
+
+        // A length that is off leaves the primary implausible, so it is ignored.
+        let mut off = local.clone();
+        off.tracks[3].duration_secs = Some(off.tracks[3].duration_secs.unwrap() + 2.0);
+        let primary = Candidate::new(&off, primary.release.clone());
+        assert!(plausibility_score(&off, &primary) < PLAUSIBLE_PRIMARY_SCORE);
+        assert!(!durations_identify_tracks(&off, &primary));
+        let fallback = Candidate::new(&off, remote);
+        let conflicts = fallback_conflicts(&off, &[primary], &fallback, true);
+        assert!(conflicts.is_empty(), "{conflicts:?}");
     }
 
     #[test]

@@ -1820,8 +1820,10 @@ mod tests {
     #[test]
     fn review_summary_uses_fallback_reasons_when_the_primary_failed() {
         let (local, mut remote) = album_fixture();
-        // One mismatched title is settled by its duration; two still need review.
+        // One mismatched title is settled by its duration; two still need review,
+        // unless every length agrees within 1.5 s, so one other length is 2 s off.
         remote.tracklist[1].title = "A different song".into();
+        remote.tracklist[5].duration_secs = Some(188.0);
         let primary = ProviderAttempt::failed(
             ProviderKind::MusicBrainz,
             ProviderError::Network {
