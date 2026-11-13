@@ -75,6 +75,38 @@ pub(crate) fn write_mb_archive(dir: &Path, files: &[(&str, &str)]) -> PathBuf {
     path
 }
 
+/// Writes about one second of silent MP3 under an ID3v2.3 tag that holds
+/// `frames` exactly as given: `(frame ID, Latin-1 text, frame flags)`.
+///
+/// Written by hand rather than through Lofty, so a test can store values
+/// (`199x` in a year frame) and flags (encryption) that Lofty would refuse.
+pub(crate) fn write_id3v23_mp3(path: &Path, frames: &[(&str, &str, u16)]) {
+    let mut body = Vec::new();
+    for (id, text, flags) in frames {
+        let content = [&[0u8][..], text.as_bytes()].concat();
+        body.extend_from_slice(id.as_bytes());
+        body.extend_from_slice(&u32::try_from(content.len()).unwrap().to_be_bytes());
+        body.extend_from_slice(&flags.to_be_bytes());
+        body.extend_from_slice(&content);
+    }
+    // The tag size is synchsafe: seven bits per byte.
+    let size = u32::try_from(body.len()).unwrap();
+    let mut bytes = b"ID3\x03\x00\x00".to_vec();
+    bytes.extend(
+        (0..4)
+            .rev()
+            .map(|shift| ((size >> (7 * shift)) & 0x7f) as u8),
+    );
+    bytes.extend_from_slice(&body);
+    // MPEG-1 Layer III at 128 kbit/s and 44.1 kHz: 417 bytes per frame, and
+    // 40 frames last about a second.
+    for _ in 0..40 {
+        bytes.extend_from_slice(&[0xff, 0xfb, 0x90, 0x00]);
+        bytes.extend_from_slice(&[0u8; 413]);
+    }
+    std::fs::write(path, bytes).unwrap();
+}
+
 /// Writes a WAV file whose tag holds `album` and the release `year`.
 pub(crate) fn write_tagged_wav(path: &Path, album: &str, year: u16) {
     use lofty::config::WriteOptions;

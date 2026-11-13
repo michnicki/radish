@@ -1,7 +1,8 @@
 use crate::output::{Clean, clean_path};
 use crate::providers::Mbid;
 use anyhow::{Context, Result};
-use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::config::{ParseOptions, ParsingMode};
+use lofty::file::{AudioFile, TaggedFile, TaggedFileExt};
 use lofty::probe::Probe;
 use lofty::tag::{Accessor, ItemKey, ItemValue, Tag};
 use serde::{Deserialize, Serialize};
@@ -118,7 +119,33 @@ fn modified_at(metadata: &std::fs::Metadata) -> Result<i64> {
 }
 
 pub fn read_tags(path: &Path) -> Result<ScannedTrack> {
-    let tagged_file = Probe::open(path)?.read()?;
+    read_tags_noting(path).map(|(track, _)| track)
+}
+
+/// Reads a file's tags with Lofty's default parsing, or leniently when that
+/// fails.
+///
+/// One malformed frame, such as a year written `199x`, makes the default mode
+/// give up on the whole tag and so on every field in it. The relaxed mode
+/// drops only the fields it cannot parse. It runs only after the default read
+/// failed, so every file the default mode can read keeps exactly its values.
+fn read_file(path: &Path) -> Result<(TaggedFile, Option<anyhow::Error>)> {
+    let strict = match Probe::open(path)?.read() {
+        Ok(file) => return Ok((file, None)),
+        Err(error) => anyhow::Error::from(error),
+    };
+    let relaxed = ParseOptions::new().parsing_mode(ParsingMode::Relaxed);
+    match Probe::open(path)?.options(relaxed).read() {
+        Ok(file) => Ok((file, Some(strict))),
+        // The default mode's error says more about the file.
+        Err(_) => Err(strict),
+    }
+}
+
+/// [`read_tags`], plus the error that made the read drop malformed fields,
+/// when it had to.
+fn read_tags_noting(path: &Path) -> Result<(ScannedTrack, Option<anyhow::Error>)> {
+    let (tagged_file, dropped) = read_file(path)?;
     let tag = tagged_file
         .primary_tag()
         .or_else(|| tagged_file.first_tag());
@@ -162,7 +189,7 @@ pub fn read_tags(path: &Path) -> Result<ScannedTrack> {
     let duration_secs = Some(tagged_file.properties().duration().as_secs_f64());
     let modified_at = modified_at(&std::fs::metadata(path)?)?;
 
-    Ok(ScannedTrack {
+    let track = ScannedTrack {
         path: path.to_path_buf(),
         title,
         artist,
@@ -177,7 +204,8 @@ pub fn read_tags(path: &Path) -> Result<ScannedTrack> {
         musicbrainz,
         duration_secs,
         modified_at,
-    })
+    };
+    Ok((track, dropped))
 }
 
 /// Progress notifications, delivered synchronously by the collecting task.
@@ -318,12 +346,17 @@ pub async fn scan_directory_incremental(
     run_bounded(
         to_read,
         read_limit(),
-        |path| read_tags(path).with_context(|| clean_path(path)),
+        |path| read_tags_noting(path).with_context(|| clean_path(path)),
         |path, outcome| {
             let warning = match outcome {
-                Ok(Ok(track)) => {
+                Ok(Ok((track, dropped))) => {
                     result.tracks.push(track);
-                    None
+                    dropped.map(|error| {
+                        format!(
+                            "note: dropped malformed tag fields from {}: {error:#}",
+                            clean_path(path)
+                        )
+                    })
                 }
                 Ok(Err(err)) => {
                     result.unreadable.push(path.to_path_buf());
@@ -456,6 +489,94 @@ mod tests {
 
         assert_eq!(finished, 24);
         assert_eq!(peak.load(Ordering::SeqCst), 3);
+    }
+
+    fn tagged_mp3(path: &Path, year: &str) {
+        crate::test_support::write_id3v23_mp3(
+            path,
+            &[
+                ("TIT2", "Song", 0),
+                ("TPE1", "Artist", 0),
+                ("TALB", "Album", 0),
+                ("TRCK", "3", 0),
+                ("TYER", year, 0),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_malformed_year_costs_only_the_year() {
+        let dir = crate::test_support::ScratchDir::new("malformed-year");
+        // As found in the wild: a placeholder digit, a stray dash, only spaces.
+        for year in ["199x", "-1999", "    "] {
+            let path = dir.path().join("song.mp3");
+            tagged_mp3(&path, year);
+
+            let track = read_tags(&path).unwrap_or_else(|error| panic!("{year:?}: {error:#}"));
+            assert_eq!(track.title.as_deref(), Some("Song"), "{year:?}");
+            assert_eq!(track.artist.as_deref(), Some("Artist"), "{year:?}");
+            assert_eq!(track.album.as_deref(), Some("Album"), "{year:?}");
+            assert_eq!(track.track_number, Some(3), "{year:?}");
+            assert_eq!(track.year, None, "{year:?}");
+            assert!(
+                track.duration_secs.is_some_and(|secs| secs > 0.9),
+                "{year:?}"
+            );
+        }
+
+        let path = dir.path().join("song.mp3");
+        tagged_mp3(&path, "1999");
+        assert_eq!(read_tags(&path).unwrap().year, Some(1999));
+    }
+
+    #[tokio::test]
+    async fn an_import_notes_the_tag_fields_it_dropped() {
+        let dir = crate::test_support::ScratchDir::new("malformed-year-scan");
+        tagged_mp3(&dir.path().join("song.mp3"), "199x");
+
+        let mut warnings = Vec::new();
+        let result = scan_directory_incremental(
+            dir.path(),
+            |_, _| false,
+            |event| {
+                if let ScanEvent::FileFinished {
+                    warning: Some(warning),
+                    ..
+                } = event
+                {
+                    warnings.push(warning);
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.tracks.len(), 1);
+        assert!(result.unreadable.is_empty(), "{:?}", result.unreadable);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("note: dropped malformed tag fields from ")
+                && warnings[0].contains("song.mp3")
+                && warnings[0].contains("unexpected character 'x'"),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn an_encrypted_frame_without_its_length_still_fails_the_read() {
+        let dir = crate::test_support::ScratchDir::new("encrypted-frame");
+        let path = dir.path().join("song.mp3");
+        crate::test_support::write_id3v23_mp3(
+            &path,
+            &[("TIT2", "Song", 0), ("TENC", "Encoder", 0x0040)],
+        );
+        // Lofty refuses this in every parsing mode, so the file stays
+        // unreadable and its stored row, if any, is kept.
+        let error = read_tags(&path).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("encrypted frame"),
+            "{error:#}"
+        );
     }
 
     #[test]
