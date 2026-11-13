@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v13";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v12";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v14";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v13";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -465,12 +465,51 @@ fn id3v1_prefix<'a>(local: &str, remote: &'a str) -> Option<&'a str> {
     Some(&remote[..end])
 }
 
+/// Taken off a comparison that read a local value as a cut-off copy, so it
+/// never scores as an exact match.
+const CUT_OFF_PENALTY: f64 = 0.03;
+
+/// The fewest comparison characters a cut-off copy may have. Shorter text is a
+/// prefix of too many unrelated titles to say anything.
+const CUT_OFF_MIN_CHARS: usize = 20;
+
+/// `1 - CUT_OFF_PENALTY` when `local` may be `remote` cut to an ID3v1 field.
+///
+/// A value of 29 or 30 characters whose comparison text (punctuation dropped,
+/// apostrophes joined) is a strict prefix of the remote's is read as cut off.
+/// At 29 the remote must continue with a space: the lost 30th character was
+/// that space, and the writers that cut text to fit drop a trailing space. At
+/// 30 the cut may fall inside a word. Comparing normalized text, not the
+/// remote's first 30 raw characters, also covers a local copy that lost its
+/// punctuation, which shifts the cut.
+fn cut_off_similarity(local: &str, remote: &str) -> Option<f64> {
+    let width = local.chars().count();
+    if width != ID3V1_FIELD_CHARS && width != ID3V1_FIELD_CHARS - 1 {
+        return None;
+    }
+    let (local_chars, remote_chars) = (normalized_chars(local), normalized_chars(remote));
+    if local_chars.len() < CUT_OFF_MIN_CHARS
+        || remote_chars.len() <= local_chars.len()
+        || !remote_chars.starts_with(&local_chars)
+    {
+        return None;
+    }
+    if width == ID3V1_FIELD_CHARS - 1 && remote_chars[local_chars.len()] != ' ' {
+        return None;
+    }
+    Some(1.0 - CUT_OFF_PENALTY)
+}
+
 /// [`similarity`] for a value read from a local file: the better of the full
-/// comparison and, for a 30-character local value, a comparison with the
-/// remote's first 30 characters.
+/// comparison, a comparison with the remote's first 30 characters for a
+/// 30-character local value, and the cut-off reading of
+/// [`cut_off_similarity`].
 pub fn local_similarity(local: &str, remote: &str) -> f64 {
     let mut full = similarity(local, remote);
     if let Some(value) = suffix_tolerant_similarity(local, remote) {
+        full = full.max(value);
+    }
+    if let Some(value) = cut_off_similarity(local, remote) {
         full = full.max(value);
     }
     id3v1_prefix(local, remote).map_or(full, |prefix| full.max(similarity(local, prefix)))
@@ -715,7 +754,10 @@ pub fn album_title_similarity(local: &str, remote: &str) -> f64 {
 
 /// [`artist_similarity`] with the same allowance for a cut-off local artist.
 pub fn local_artist_similarity(local: &str, remote: &str) -> f64 {
-    let full = artist_similarity(local, remote).max(folded_artist_similarity(local, remote));
+    let mut full = artist_similarity(local, remote).max(folded_artist_similarity(local, remote));
+    if let Some(value) = cut_off_similarity(local, remote) {
+        full = full.max(value);
+    }
     id3v1_prefix(local, remote).map_or(full, |prefix| {
         full.max(artist_similarity(local, prefix))
             .max(folded_artist_similarity(local, prefix))
@@ -1358,6 +1400,9 @@ impl<'a> TitleMatrix<'a> {
         if let Some(suffixed) = suffix_tolerant_similarity(title, remote_title) {
             value = value.max(suffixed);
         }
+        if let Some(cut_off) = cut_off_similarity(title, remote_title) {
+            value = value.max(cut_off);
+        }
         if let Some(prefix) = id3v1_prefix(title, remote_title) {
             value = value.max(comparison_similarity(
                 title,
@@ -1654,6 +1699,9 @@ fn album_artist_score(local: &LocalRelease, remote: &RemoteRelease) -> f64 {
                 prefix,
                 &prefix_chars,
             ));
+        }
+        if let Some(cut_off) = cut_off_similarity(artist, original) {
+            value = value.max(cut_off);
         }
         value
     };
@@ -2792,6 +2840,97 @@ mod tests {
     }
 
     #[test]
+    fn a_title_cut_after_a_word_matches_its_full_form() {
+        // 29 characters: the trailing space of the 30-character field was lost.
+        let cut = "Detailed Instructions For The";
+        assert_eq!(cut.chars().count(), 29);
+        let value = local_similarity(cut, "Detailed Instructions For The Self Involved");
+        assert!((0.96..1.0).contains(&value), "{value}");
+
+        let cut = "Three Years Two Months Eleven";
+        assert_eq!(cut.chars().count(), 29);
+        let value = album_title_similarity(cut, "Three Years Two Months Eleven Days");
+        assert!((0.96..1.0).contains(&value), "{value}");
+    }
+
+    #[test]
+    fn a_cut_off_title_that_lost_its_punctuation_still_matches() {
+        // Exactly 30 characters, but the provider's first 30 characters include
+        // the punctuation the local copy lost, so the raw prefix is misaligned.
+        let cut = "Schools Out Surfs Up Lets Fall";
+        assert_eq!(cut.chars().count(), 30);
+        let remote = "School's Out, Surf's Up, Let's Fall in Love";
+        let value = album_title_similarity(cut, remote);
+        assert!((0.96..1.0).contains(&value), "{value}");
+    }
+
+    #[test]
+    fn a_cut_off_reading_needs_a_real_prefix() {
+        let cut = "Detailed Instructions For The";
+        // A different word, a different spelling, or a cut inside a word at 29
+        // characters are not the same text continued.
+        for remote in [
+            "Detailed Instructions For Them All And More",
+            "Detailed Instruction For The Self Involved",
+            "Detailed Instructions For The",
+        ] {
+            let value = local_similarity(cut, remote);
+            assert!(
+                value >= 1.0 || value < 0.96,
+                "{remote:?} read as a cut-off: {value}"
+            );
+        }
+        // A 28-character value is complete as written, even when it is a prefix.
+        let short = "The Mind Is A Terrible Thing";
+        assert_eq!(short.chars().count(), 28);
+        let remote = "The Mind Is A Terrible Thing To Taste";
+        assert_eq!(local_similarity(short, remote), similarity(short, remote));
+        // A padded short value has too little text to be a cut-off.
+        let padded = format!("{:<29}", "Intro");
+        assert_eq!(
+            cut_off_similarity(&padded, "Intro And A Much Longer Title"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_cut_off_track_title_matches_in_the_mapping() {
+        let cut = "Alpha Bravo Charlie Delta Fox";
+        assert_eq!(cut.chars().count(), 29);
+        let titles = ["One", "Two", "Three", "Four", "Five", cut];
+        let local = local_release(&titles);
+        let remote = remote_release(&[
+            "One",
+            "Two",
+            "Three",
+            "Four",
+            "Five",
+            "Alpha Bravo Charlie Delta Fox Trot Band",
+        ]);
+        let candidate = Candidate::new(&local, remote.clone());
+        let value = candidate
+            .mapping
+            .title_similarity(5, 5, &local.tracks[5], &remote.tracklist[5])
+            .unwrap();
+        assert!((0.96..1.0).contains(&value), "{value}");
+    }
+
+    #[test]
+    fn a_cut_off_artist_matches_its_full_credit() {
+        let cut = "Alpha Bravo Charlie Delta Fox";
+        assert_eq!(cut.chars().count(), 29);
+        let mut local = local_release(&["One"]);
+        local.album_artist = Some(cut.to_string());
+        let mut remote = remote_release(&["One"]);
+        remote.artists = vec!["Alpha Bravo Charlie Delta Fox Trot Band".to_string()];
+        let value = album_artist_score(&local, &remote);
+        assert!((0.96..1.0).contains(&value), "{value}");
+
+        remote.artists = vec!["Alpha Bravo Charlie Delta Foxes Band".to_string()];
+        assert!(album_artist_score(&local, &remote) < 0.96);
+    }
+
+    #[test]
     fn a_leading_the_and_an_ampersand_fold_away_at_a_small_cost() {
         for (local, remote) in [
             ("Sisters Of Mercy", "The Sisters of Mercy"),
@@ -3753,11 +3892,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v13"
+            "discogs-match-v14"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v12"
+            "musicbrainz-match-v13"
         );
     }
 
