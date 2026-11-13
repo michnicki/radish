@@ -14,7 +14,8 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
 
-const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "m4a", "ogg", "opus", "wav", "aac", "wma"];
+pub(crate) const AUDIO_EXTENSIONS: &[&str] =
+    &["mp3", "flac", "m4a", "ogg", "opus", "wav", "aac", "wma"];
 
 /// Observed MusicBrainz identifiers, kept as raw strings so malformed and
 /// conflicting values survive for diagnostics instead of being dropped.

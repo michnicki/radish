@@ -7,12 +7,13 @@
 //! Provider SDK types never reach this module.
 
 use crate::providers::{GroupId, Mbid, ProviderKind, ReleaseId};
+use crate::scanner::AUDIO_EXTENSIONS;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v18";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v17";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v19";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v18";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -507,7 +508,13 @@ const CUT_OFF_MIN_CHARS: usize = 20;
 /// remote's first 30 raw characters, also covers a local copy that lost its
 /// punctuation, which shifts the cut.
 fn cut_off_similarity(local: &str, remote: &str) -> Option<f64> {
-    let width = local.chars().count();
+    cut_off_similarity_at(local.chars().count(), local, remote)
+}
+
+/// [`cut_off_similarity`] for a `local` text that came from a tag `width`
+/// characters wide. A title read after its track number was removed is shorter
+/// than the field it was cut to, so the width is the raw tag's, not its own.
+fn cut_off_similarity_at(width: usize, local: &str, remote: &str) -> Option<f64> {
     if width != ID3V1_FIELD_CHARS && width != ID3V1_FIELD_CHARS - 1 {
         return None;
     }
@@ -566,6 +573,7 @@ const VERSION_WORDS: &[&str] = &[
     "explicit",
     "extended",
     "instrumental",
+    "instrumentals",
     "live",
     "mix",
     "mono",
@@ -688,6 +696,256 @@ fn suffix_tolerant_similarity(local: &str, remote: &str) -> Option<f64> {
         _ => return None,
     };
     Some((value - SUFFIX_PENALTY).max(0.0))
+}
+
+/// Taken off a track-title reading that needed junk removed (an audio
+/// extension, a shared release tag or a track number), so a cleaned title never
+/// scores as an exact match.
+const TRACK_TITLE_CLEANUP_PENALTY: f64 = 0.02;
+
+/// The fewest titles that must end in the whole token to show it is a release
+/// tag. On fewer, titles that end alike are a coincidence.
+const SHARED_TOKEN_MIN_TRACKS: usize = 3;
+
+/// The shortest and longest release tag (`SYN`, `amrc`, `1up`), in characters.
+/// A single character is too often part of the title, and a longer word is
+/// more likely a subtitle than a scene group.
+const SHARED_TOKEN_MIN_CHARS: usize = 2;
+const SHARED_TOKEN_MAX_CHARS: usize = 8;
+
+/// The most digits a track number prefix has. A longer run is a number that
+/// belongs to the title (`1000 Ways`, `1979`).
+const NUMBER_PREFIX_MAX_DIGITS: usize = 3;
+
+/// A local track title read for comparison only, with the junk a tagger left
+/// in it removed. Stored tags never change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CleanedTitle {
+    text: String,
+    /// The width of the raw tag, when the cut-off reading may be applied to
+    /// `text`: only a track number was removed, so the tag was cut to its field
+    /// width with the number still in it. `None` once an extension or release
+    /// tag was removed as well, because those say nothing about where the cut
+    /// fell.
+    cut_width: Option<usize>,
+}
+
+/// `title` without a trailing audio extension (`Cheap_Wine-SYN.mp3`). `None`
+/// when it has none or nothing but punctuation would be left.
+fn strip_audio_extension(title: &str) -> Option<&str> {
+    let (stem, extension) = title.rsplit_once('.')?;
+    let known = AUDIO_EXTENSIONS
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(extension));
+    (known && stem.chars().any(char::is_alphanumeric)).then_some(stem)
+}
+
+/// `title` split at its last `-` or `_` into the text before and after it, when
+/// no space comes before the separator (`Song - Seattle` is a subtitle) and the
+/// text before it holds a letter or digit.
+fn split_trailing_token(title: &str) -> Option<(&str, &str)> {
+    let at = title.rfind(['-', '_'])?;
+    let (base, token) = (&title[..at], &title[at + 1..]);
+    (!base.ends_with(char::is_whitespace) && base.chars().any(char::is_alphanumeric))
+        .then_some((base, token))
+}
+
+/// Abbreviations and loose words for a version of the recording, which are
+/// never a release tag even though [`VERSION_WORDS`] does not spell them. A
+/// vocal release whose every title ends `-Inst` is not tagged by a group: the
+/// files are a different version, and reading the suffix as junk would score
+/// them as the vocal tracks. Compared without case and without trailing digits
+/// (`take2`, `rmx2`, `inst2`), and no entry is longer than a tag can be.
+const NON_TAG_WORDS: &[&str] = &[
+    "inst", "instr", "instru", "karaoke", "acapella", "acapela", "tv", "acap", "offvocal", "rmx",
+    "remixed", "mixed", "vip", "vocal", "club", "dirty", "ext", "orig", "original", "alt", "take",
+    "session", "outtake", "bonus", "ver", "vers",
+];
+
+/// Whether `token` is written in Title Case: an uppercase first letter and at
+/// least one more letter, all of them lowercase (`Inst`, `Hop`). Scene group
+/// tags are lowercase (`amrc`), uppercase (`SYN`) or mixed (`ViLE`, `iTS`), so a
+/// Title Case word at the end of every title is an English word.
+fn is_title_case(token: &str) -> bool {
+    let mut letters = token.chars().filter(char::is_ascii_alphabetic);
+    letters
+        .next()
+        .is_some_and(|first| first.is_ascii_uppercase())
+        && {
+            let rest: Vec<char> = letters.collect();
+            !rest.is_empty() && rest.iter().all(char::is_ascii_lowercase)
+        }
+}
+
+/// Whether `token` has the shape of a release tag: 2 to 8 ASCII letters and
+/// digits with at least one letter, and not a version word or version
+/// abbreviation ([`VERSION_WORDS`], [`NON_TAG_WORDS`] with any trailing digits
+/// dropped, or `v` and digits alone such as `v2`), which say something about
+/// the recording. How the titles spell it is checked by
+/// [`shared_trailing_token`].
+fn is_release_tag(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    let word = lower.trim_end_matches(|ch: char| ch.is_ascii_digit());
+    let version_marker = lower
+        .strip_prefix('v')
+        .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()));
+    (SHARED_TOKEN_MIN_CHARS..=SHARED_TOKEN_MAX_CHARS).contains(&token.len())
+        && token.chars().all(|ch| ch.is_ascii_alphanumeric())
+        && token.chars().any(|ch| ch.is_ascii_alphabetic())
+        && !version_marker
+        && !VERSION_WORDS.contains(&word)
+        && !NON_TAG_WORDS.contains(&word)
+}
+
+/// Whether a title of this many characters may have been cut to an ID3v1
+/// field, which loses the end of a release tag or all of it.
+fn may_be_cut_to_field(title: &str) -> bool {
+    let width = title.chars().count();
+    width == ID3V1_FIELD_CHARS || width == ID3V1_FIELD_CHARS - 1
+}
+
+/// The release tag the titles share (`-amrc`, `_SYN`), compared without case.
+///
+/// At least [`SHARED_TOKEN_MIN_TRACKS`] titles must end in the whole token, and
+/// no title may contradict it. None may spell it in Title Case (see
+/// [`is_title_case`]), whichever title comes first. A title of 29 or 30 characters may have been
+/// cut to an ID3v1 field, so it may end in the whole token, in the start of it,
+/// or lack it. Every other title, shorter or longer, must end in the whole
+/// token: a longer one cannot have been cut, and a shorter one has room for it.
+/// The token is read from the first title that is not of 29 or 30 characters.
+fn shared_trailing_token<'a>(titles: &[&'a str]) -> Option<&'a str> {
+    let first = titles.iter().find(|title| !may_be_cut_to_field(title))?;
+    let (_, token) = split_trailing_token(first)?;
+    if !is_release_tag(token) {
+        return None;
+    }
+    let mut ending_in_token = 0;
+    for title in titles {
+        let tail = split_trailing_token(title).map(|(_, tail)| tail);
+        if let Some(tail) = tail.filter(|tail| tail.eq_ignore_ascii_case(token)) {
+            if is_title_case(tail) {
+                return None;
+            }
+            ending_in_token += 1;
+        } else if !may_be_cut_to_field(title) {
+            return None;
+        }
+    }
+    (ending_in_token >= SHARED_TOKEN_MIN_TRACKS).then_some(token)
+}
+
+/// `title` without the trailing `-token` or `_token` that
+/// [`shared_trailing_token`] found. A title of 29 or 30 characters may end in
+/// the start of the token instead (`...sky-am` for `-amrc`), which goes too.
+fn strip_shared_token<'a>(title: &'a str, token: &str) -> Option<&'a str> {
+    let (base, tail) = split_trailing_token(title)?;
+    let partial = may_be_cut_to_field(title)
+        && !tail.is_empty()
+        && tail.len() < token.len()
+        && token.as_bytes()[..tail.len()].eq_ignore_ascii_case(tail.as_bytes());
+    (tail.eq_ignore_ascii_case(token) || partial).then_some(base)
+}
+
+/// Characters that may follow a track number prefix.
+fn is_number_separator(ch: char) -> bool {
+    matches!(ch, ' ' | '-' | '.' | '_' | ')' | ']' | ':')
+}
+
+/// `title` without a leading track number that equals `number`: an optional
+/// `(` or `[`, 1 to [`NUMBER_PREFIX_MAX_DIGITS`] digits, at least one separator
+/// and then text with a letter or digit in it. The digit run is maximal, so
+/// `1000 Ways` does not start with 10 and `1979` is not a prefix at all.
+fn strip_track_number_prefix(title: &str, number: i64) -> Option<&str> {
+    let body = title.strip_prefix(['(', '[']).unwrap_or(title);
+    let digits = body.bytes().take_while(u8::is_ascii_digit).count();
+    if !(1..=NUMBER_PREFIX_MAX_DIGITS).contains(&digits) || body[..digits].parse() != Ok(number) {
+        return None;
+    }
+    let after_digits = &body[digits..];
+    let rest = after_digits.trim_start_matches(is_number_separator);
+    (rest.len() < after_digits.len() && rest.chars().any(char::is_alphanumeric)).then_some(rest)
+}
+
+/// The track number a title's prefix has to equal: the tagged one, or for an
+/// untagged track its 1-based position on its disc, counted in local order. A
+/// track with no disc is on disc 1, as in `store::order_release_tracks`.
+fn expected_track_number(local: &LocalRelease, index: usize) -> Option<i64> {
+    let track = local.tracks.get(index)?;
+    track.track_number.or_else(|| {
+        let earlier = local.tracks[..index]
+            .iter()
+            .filter(|other| other.disc.unwrap_or(1) == track.disc.unwrap_or(1))
+            .count();
+        i64::try_from(earlier + 1).ok()
+    })
+}
+
+/// One extra reading of each local track title for comparison, or `None` for a
+/// track with no title or nothing to remove. In this order, on the title with
+/// its trailing spaces removed (ID3v1 pads with them):
+///
+/// 1. a trailing audio extension (`02-Cheap_Wine-SYN.mp3`);
+/// 2. the release tag every title of the release ends with
+///    ([`shared_trailing_token`]);
+/// 3. a leading number equal to the track number ([`strip_track_number_prefix`]).
+///
+/// Only comparison reads this. Stored tags, version qualifiers and everything
+/// else keep the raw title.
+fn cleaned_track_titles(local: &LocalRelease) -> Vec<Option<CleanedTitle>> {
+    let stems: Vec<Option<(&str, bool)>> = local
+        .tracks
+        .iter()
+        .map(|track| {
+            let title = track.title.as_deref()?.trim_end_matches(' ');
+            Some(strip_audio_extension(title).map_or((title, false), |stem| (stem, true)))
+        })
+        .collect();
+    let titles: Vec<&str> = stems.iter().flatten().map(|(stem, _)| *stem).collect();
+    let token = shared_trailing_token(&titles);
+
+    stems
+        .iter()
+        .enumerate()
+        .map(|(index, stem)| {
+            let (stem, extension_removed) = (*stem)?;
+            let untagged = token.and_then(|token| strip_shared_token(stem, token));
+            let number_free = untagged.unwrap_or(stem);
+            let number_removed = expected_track_number(local, index)
+                .and_then(|number| strip_track_number_prefix(number_free, number));
+            if !extension_removed && untagged.is_none() && number_removed.is_none() {
+                return None;
+            }
+            let only_number = !extension_removed && untagged.is_none();
+            let raw_width = local.tracks[index].title.as_deref()?.chars().count();
+            Some(CleanedTitle {
+                text: number_removed.unwrap_or(number_free).to_string(),
+                cut_width: only_number.then_some(raw_width),
+            })
+        })
+        .collect()
+}
+
+/// The best reading of a cleaned title, less [`TRACK_TITLE_CLEANUP_PENALTY`]:
+/// the full comparison, and the cut-off reading at the raw tag's width when
+/// [`CleanedTitle::cut_width`] allows it.
+fn cleaned_title_similarity(cleaned: &CleanedTitle, remote: &str) -> f64 {
+    let mut value = local_similarity_with(&cleaned.text, remote, false);
+    if let Some(cut_off) = cleaned
+        .cut_width
+        .and_then(|width| cut_off_similarity_at(width, &cleaned.text, remote))
+    {
+        value = value.max(cut_off);
+    }
+    (value - TRACK_TITLE_CLEANUP_PENALTY).max(0.0)
+}
+
+/// [`local_similarity`] for a track title: the better of the raw reading and
+/// the `cleaned` one, when the title has one.
+fn track_title_similarity(raw: &str, cleaned: Option<&CleanedTitle>, remote: &str) -> f64 {
+    let value = local_similarity(raw, remote);
+    cleaned.map_or(value, |cleaned| {
+        value.max(cleaned_title_similarity(cleaned, remote))
+    })
 }
 
 /// Taken off an album-title comparison that needed a leading `The`, `O.S.T.`
@@ -1139,22 +1397,31 @@ impl Mapping {
     /// Title similarity between a local track and the remote track it is being
     /// scored against, or `None` when the local file has no title. Reuses the
     /// recorded value only when it was measured for this same remote track, so
-    /// edited pairs are recomputed.
+    /// edited pairs are recomputed. A recomputed value reads the title the way
+    /// [`TitleMatrix`] does, including its cleaned reading, so a mapping decoded
+    /// from JSON scores exactly like a fresh one. `cleaned` is
+    /// [`cleaned_track_titles`] of `local`, which the caller works out once for
+    /// all its pairs.
     fn title_similarity(
         &self,
+        local: &LocalRelease,
+        cleaned: &[Option<CleanedTitle>],
         local_index: usize,
         remote_index: usize,
-        local_track: &LocalTrack,
         remote_track: &RemoteTrack,
     ) -> Option<f64> {
-        let title = local_track.title.as_deref()?;
+        let title = local.tracks.get(local_index)?.title.as_deref()?;
         if let Some(Some((recorded_remote, recorded))) = self.pair_similarity.get(local_index)
             && *recorded_remote == remote_index
             && (0.0..=1.0).contains(recorded)
         {
             return Some(*recorded);
         }
-        Some(local_similarity(title, &remote_track.title))
+        Some(track_title_similarity(
+            title,
+            cleaned.get(local_index).and_then(Option::as_ref),
+            &remote_track.title,
+        ))
     }
 
     pub fn assigned_pairs(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
@@ -1462,13 +1729,17 @@ pub fn map_tracks(local: &LocalRelease, remote: &RemoteRelease) -> Mapping {
     }
 }
 
-/// Title similarities for one `map_tracks` call. Each title is normalized once
-/// and each pair is compared at most once, however many passes ask for it.
+/// Title similarities for one `map_tracks` call. Each title is normalized and
+/// cleaned once and each pair is compared at most once, however many passes ask
+/// for it. A pair scores the better of the raw and the cleaned reading, as
+/// [`track_title_similarity`] does.
 struct TitleMatrix<'a> {
     local: &'a LocalRelease,
     remote: &'a RemoteRelease,
     local_chars: Vec<Vec<char>>,
     remote_chars: Vec<Vec<char>>,
+    /// The cleaned reading of each local title, worked out once per release.
+    cleaned: Vec<Option<CleanedTitle>>,
     cache: Vec<Vec<Option<f64>>>,
 }
 
@@ -1487,6 +1758,7 @@ impl<'a> TitleMatrix<'a> {
                 .iter()
                 .map(|track| normalized_chars(&track.title))
                 .collect(),
+            cleaned: cleaned_track_titles(local),
             cache: vec![vec![None; remote.tracklist.len()]; local.tracks.len()],
         }
     }
@@ -1517,6 +1789,9 @@ impl<'a> TitleMatrix<'a> {
                 prefix,
                 &normalized_chars(prefix),
             ));
+        }
+        if let Some(cleaned) = &self.cleaned[local_index] {
+            value = value.max(cleaned_title_similarity(cleaned, remote_title));
         }
         self.cache[local_index][remote_index] = Some(value);
         Some(value)
@@ -1693,8 +1968,9 @@ pub fn score(local: &LocalRelease, remote: &RemoteRelease, mapping: &Mapping) ->
     let track_titles = if local.tracks.is_empty() {
         0.0
     } else {
+        let cleaned = cleaned_track_titles(local);
         let mut total = 0.0;
-        for (index, track) in local.tracks.iter().enumerate() {
+        for index in 0..local.tracks.len() {
             let Some(remote_index) = mapping.pairs.get(index).and_then(|pair| *pair) else {
                 continue;
             };
@@ -1702,7 +1978,7 @@ pub fn score(local: &LocalRelease, remote: &RemoteRelease, mapping: &Mapping) ->
                 continue;
             };
             if let Some(similarity) =
-                mapping.title_similarity(index, remote_index, track, remote_track)
+                mapping.title_similarity(local, &cleaned, index, remote_index, remote_track)
             {
                 total += similarity;
             }
@@ -2302,6 +2578,7 @@ fn evaluate_at_scope(
     }
 
     // Per-track evidence.
+    let cleaned = cleaned_track_titles(local);
     let mut worst_title = 1.0f64;
     let mut worst_title_track = String::new();
     let mut worst_title_duration_gap: Option<f64> = None;
@@ -2351,11 +2628,13 @@ fn evaluate_at_scope(
             }
         }
 
-        if let Some(score) =
-            candidate
-                .mapping
-                .title_similarity(local_index, remote_index, local_track, remote_track)
-        {
+        if let Some(score) = candidate.mapping.title_similarity(
+            local,
+            &cleaned,
+            local_index,
+            remote_index,
+            remote_track,
+        ) {
             if score < minimum_title_similarity {
                 titles_below_minimum += 1;
             }
@@ -2938,7 +3217,13 @@ mod tests {
         let candidate = Candidate::new(&local, remote.clone());
         let value = candidate
             .mapping
-            .title_similarity(5, 5, &local.tracks[5], &remote.tracklist[5])
+            .title_similarity(
+                &local,
+                &cleaned_track_titles(&local),
+                5,
+                5,
+                &remote.tracklist[5],
+            )
             .unwrap();
         assert!((0.96..1.0).contains(&value), "{value}");
     }
@@ -3993,11 +4278,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v18"
+            "discogs-match-v19"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v17"
+            "musicbrainz-match-v18"
         );
     }
 
@@ -4556,5 +4841,623 @@ mod tests {
             "{:?}",
             result.blockers
         );
+    }
+
+    /// A local release whose titles are `titles`, tagged with track numbers.
+    fn local_titled(titles: &[String]) -> LocalRelease {
+        let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+        local_release(&refs)
+    }
+
+    /// `titles` with `NN - ` in front of each, as scene tags often have them.
+    fn numbered(titles: &[&str]) -> Vec<String> {
+        titles
+            .iter()
+            .enumerate()
+            .map(|(index, title)| format!("{:02} - {title}", index + 1))
+            .collect()
+    }
+
+    fn album_scope_evaluation(local: &LocalRelease, remote: &RemoteRelease) -> Evaluation {
+        let candidate = Candidate::new(local, remote.clone());
+        evaluate_at_scope(
+            local,
+            &candidate,
+            None,
+            &DiscoveryEvidence::default(),
+            MatchScope::Album,
+        )
+    }
+
+    /// The similarity the mapping records or computes for local track `index`
+    /// against the remote track at the same index.
+    fn pair_similarity_at(local: &LocalRelease, remote: &RemoteRelease, index: usize) -> f64 {
+        let candidate = Candidate::new(local, remote.clone());
+        candidate
+            .mapping
+            .title_similarity(
+                local,
+                &cleaned_track_titles(local),
+                index,
+                index,
+                &remote.tracklist[index],
+            )
+            .unwrap()
+    }
+
+    const CLEAN_TITLES: [&str; 6] = [
+        "Soul Pilgrim",
+        "Far From Home",
+        "Parallax",
+        "Cheap Wine",
+        "Temptress Luna",
+        "Night Shift",
+    ];
+
+    #[test]
+    fn a_number_prefix_equal_to_the_track_number_is_dropped_for_comparison() {
+        let local = local_titled(&numbered(&CLEAN_TITLES));
+        let remote = remote_release(&CLEAN_TITLES);
+        assert!(local_similarity("01 - Soul Pilgrim", "Soul Pilgrim") < 0.9);
+        for index in 0..CLEAN_TITLES.len() {
+            let value = pair_similarity_at(&local, &remote, index);
+            assert!((value - 0.98).abs() < 1e-9, "track {index}: {value}");
+        }
+        let evaluation = album_scope_evaluation(&local, &remote);
+        assert!(
+            evaluation.auto_accept,
+            "{:?} {:?}",
+            evaluation.blockers, evaluation.evidence
+        );
+    }
+
+    #[test]
+    fn a_cleaned_near_miss_title_passes_through_the_near_miss_exception() {
+        // Four tracks with distinct titles: the single-wrong-track exception
+        // needs five, so only the near-miss rule can pass the misspelt title.
+        let remote = remote_release(&["Far From Home", "Soul Pilgrim", "Parallax", "Cheap Wine"]);
+        let with_title = |first: &str| {
+            local_titled(&[
+                first.to_string(),
+                "Soul Pilgrim".to_string(),
+                "Parallax".to_string(),
+                "Cheap Wine".to_string(),
+            ])
+        };
+
+        let local = with_title("01-Far form Home");
+        let raw = local_similarity("01-Far form Home", "Far From Home");
+        assert!(raw < NEAR_MISS_TITLE_FLOOR, "{raw}");
+        let cleaned = pair_similarity_at(&local, &remote, 0);
+        assert!(
+            (NEAR_MISS_TITLE_FLOOR..TITLE_SIMILARITY_THRESHOLD).contains(&cleaned),
+            "{cleaned}"
+        );
+        let evaluation = album_scope_evaluation(&local, &remote);
+        assert!(
+            evaluation.auto_accept,
+            "{:?} {:?}",
+            evaluation.blockers, evaluation.evidence
+        );
+        assert!(
+            evaluation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("its duration agrees")),
+            "{:?}",
+            evaluation.warnings
+        );
+
+        // The number does not match track 1, so nothing is cleaned and the raw
+        // reading alone blocks.
+        let local = with_title("09-Far form Home");
+        assert!(cleaned_track_titles(&local)[0].is_none());
+        let evaluation = album_scope_evaluation(&local, &remote);
+        assert!(!evaluation.auto_accept);
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|reason| reason.contains("only scores")),
+            "{:?}",
+            evaluation.blockers
+        );
+    }
+
+    #[test]
+    fn a_release_tag_and_extension_are_dropped_along_with_the_number() {
+        let junk = [
+            "01-Soul_Pilgrim-SYN.mp3",
+            "02-Far_From_Home-SYN.mp3",
+            "03-Parallax-SYN.mp3",
+            "04-Cheap_Wine-SYN.mp3",
+        ];
+        let local = local_titled(&junk.map(str::to_string));
+        let remote = remote_release(&CLEAN_TITLES[..4]);
+        for index in 0..junk.len() {
+            let value = pair_similarity_at(&local, &remote, index);
+            assert!((value - 0.98).abs() < 1e-9, "track {index}: {value}");
+        }
+        assert!(album_scope_evaluation(&local, &remote).auto_accept);
+    }
+
+    #[test]
+    fn a_release_tag_shared_by_every_title_is_dropped_even_when_one_is_cut_off() {
+        let cut = "Under The Midnight Sky Dive-am";
+        assert_eq!(cut.chars().count(), 30);
+        let titles = [
+            "Soul Pilgrim-amrc",
+            "Far From Home-amrc",
+            "Parallax-amrc",
+            cut,
+            "Temptress Luna-amrc",
+        ];
+        let local = local_release(&titles);
+        let remote = remote_release(&[
+            "Soul Pilgrim",
+            "Far From Home",
+            "Parallax",
+            "Under The Midnight Sky Dive",
+            "Temptress Luna",
+        ]);
+        assert!(local_similarity("Soul Pilgrim-amrc", "Soul Pilgrim") < 0.8);
+        for index in 0..titles.len() {
+            let value = pair_similarity_at(&local, &remote, index);
+            assert!((value - 0.98).abs() < 1e-9, "track {index}: {value}");
+        }
+        assert!(album_scope_evaluation(&local, &remote).auto_accept);
+    }
+
+    #[test]
+    fn a_tag_title_that_lost_the_shared_token_entirely_does_not_block_it() {
+        let lost = "Alpha Bravo Charlie Delta Echo";
+        assert_eq!(lost.chars().count(), 30);
+        let local = local_release(&["One-amrc", "Two-amrc", "Three-amrc", lost]);
+        let cleaned = cleaned_track_titles(&local);
+        assert_eq!(cleaned[0].as_ref().unwrap().text, "One");
+        assert_eq!(cleaned[2].as_ref().unwrap().text, "Three");
+        assert!(cleaned[3].is_none());
+
+        // A title under 29 characters without it does.
+        let local = local_release(&["One-amrc", "Two-amrc", "Three-amrc", "Four"]);
+        assert!(cleaned_track_titles(&local).iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn an_untagged_track_takes_its_number_from_its_position() {
+        let titles = numbered(&CLEAN_TITLES);
+        let mut local = local_titled(&titles);
+        for track in &mut local.tracks {
+            track.track_number = None;
+        }
+        let remote = remote_release(&CLEAN_TITLES);
+        for index in 0..CLEAN_TITLES.len() {
+            let value = pair_similarity_at(&local, &remote, index);
+            assert!((value - 0.98).abs() < 1e-9, "track {index}: {value}");
+        }
+    }
+
+    #[test]
+    fn an_untagged_track_counts_only_the_earlier_tracks_on_its_own_disc() {
+        let mut local = local_release(&["01 - Alpha", "02 - Bravo", "01 - Charlie", "02 - Delta"]);
+        for (track, disc) in local.tracks.iter_mut().zip([1, 1, 2, 2]) {
+            track.track_number = None;
+            track.disc = Some(disc);
+        }
+        let texts: Vec<_> = cleaned_track_titles(&local)
+            .into_iter()
+            .map(|cleaned| cleaned.unwrap().text)
+            .collect();
+        assert_eq!(texts, ["Alpha", "Bravo", "Charlie", "Delta"]);
+
+        // The position on the disc, not in the release.
+        local.tracks[2].title = Some("03 - Charlie".to_string());
+        assert!(cleaned_track_titles(&local)[2].is_none());
+    }
+
+    #[test]
+    fn a_cut_off_title_keeps_its_cut_off_reading_after_the_number_is_dropped() {
+        let cut = "05 - Tonight Can't Come Too So";
+        assert_eq!(cut.chars().count(), 30);
+        let local = local_release(&["One", "Two", "Three", "Four", cut]);
+        let remote =
+            remote_release(&["One", "Two", "Three", "Four", "Tonight Can't Come Too Soon"]);
+        assert!(local_similarity(cut, "Tonight Can't Come Too Soon") < 0.9);
+        let value = pair_similarity_at(&local, &remote, 4);
+        assert!((value - 0.95).abs() < 1e-9, "{value}");
+    }
+
+    #[test]
+    fn the_cut_off_reading_is_not_allowed_once_a_tag_or_extension_was_removed() {
+        let cleaned = |width| CleanedTitle {
+            text: "Tonight Can't Come Too So".to_string(),
+            cut_width: width,
+        };
+        let remote = "Tonight Can't Come Too Soon Tomorrow";
+        let with = track_title_similarity("junk", Some(&cleaned(Some(30))), remote);
+        let without = track_title_similarity("junk", Some(&cleaned(None)), remote);
+        assert!((with - 0.95).abs() < 1e-9, "{with}");
+        assert!(without < 0.9, "{without}");
+
+        let local = local_release(&["One-amrc", "Two-amrc", "Three-amrc"]);
+        assert_eq!(
+            cleaned_track_titles(&local)[0].as_ref().unwrap().cut_width,
+            None
+        );
+        let local = local_release(&["01 - One", "Two"]);
+        assert_eq!(
+            cleaned_track_titles(&local)[0].as_ref().unwrap().cut_width,
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn a_number_prefix_must_match_the_track_and_end_in_a_separator() {
+        for (title, number, expected) in [
+            ("01 - Soul Pilgrim", 1, Some("Soul Pilgrim")),
+            ("03. Parallax", 3, Some("Parallax")),
+            ("(02) Foo", 2, Some("Foo")),
+            ("[03] Foo", 3, Some("Foo")),
+            ("7_Seven Nation", 7, Some("Seven Nation")),
+            ("12: Twelve", 12, Some("Twelve")),
+            ("007 - Bond", 7, Some("Bond")),
+            ("07 - Song", 3, None),
+            ("1000 Ways", 10, None),
+            ("100 Percent", 10, None),
+            ("1979", 19, None),
+            ("1979", 1979, None),
+            ("19 79", 1, None),
+            ("13", 13, None),
+            ("13 -", 13, None),
+            ("13 - ", 13, None),
+            ("(13", 13, None),
+            ("Song 13 - X", 13, None),
+        ] {
+            assert_eq!(
+                strip_track_number_prefix(title, number),
+                expected,
+                "{title}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrong_or_bare_number_is_left_alone_in_a_release() {
+        // Four tracks: the lone-track exception needs five.
+        let mut titles = numbered(&CLEAN_TITLES[..4]);
+        titles[2] = "07 - Song".to_string();
+        let local = local_titled(&titles);
+        assert!(cleaned_track_titles(&local)[2].is_none());
+        let mut remote_titles = CLEAN_TITLES[..4].to_vec();
+        remote_titles[2] = "Song";
+        let remote = remote_release(&remote_titles);
+        assert!(pair_similarity_at(&local, &remote, 2) < 0.75);
+        assert!(!album_scope_evaluation(&local, &remote).auto_accept);
+
+        let mut ten: Vec<&str> = vec!["One", "Two", "Three", "Four", "Five"];
+        ten.extend(["Six", "Seven", "Eight", "Nine", "1000 Ways"]);
+        let local = local_release(&ten);
+        assert!(cleaned_track_titles(&local)[9].is_none());
+        ten[9] = "100 Percent";
+        let local = local_release(&ten);
+        assert!(cleaned_track_titles(&local)[9].is_none());
+        ten[9] = "1979";
+        let local = local_release(&ten);
+        assert!(cleaned_track_titles(&local)[9].is_none());
+    }
+
+    #[test]
+    fn a_title_that_starts_like_its_own_number_keeps_its_raw_score() {
+        let titles = ["a", "b", "c", "d", "e", "f", "7 Seconds"];
+        let local = local_release(&titles);
+        let remote = remote_release(&titles);
+        assert_eq!(
+            cleaned_track_titles(&local)[6].as_ref().unwrap().text,
+            "Seconds"
+        );
+        assert_eq!(pair_similarity_at(&local, &remote, 6), 1.0);
+    }
+
+    #[test]
+    fn a_trailing_token_needs_three_tracks_that_all_share_it() {
+        let none = |titles: &[&str]| cleaned_track_titles(&local_release(titles));
+
+        // Only two of three end with it.
+        assert!(
+            none(&["A Song-amrc", "B Song-amrc", "C Song"])
+                .iter()
+                .all(Option::is_none)
+        );
+        // Two tracks are too few.
+        assert!(
+            none(&["A Song-amrc", "B Song-amrc"])
+                .iter()
+                .all(Option::is_none)
+        );
+        // A different token on one track.
+        assert!(
+            none(&["A Song-amrc", "B Song-amrc", "C Song-xyz"])
+                .iter()
+                .all(Option::is_none)
+        );
+        // A space before the separator is a subtitle, not a tag.
+        assert!(
+            none(&["One - Seattle", "Two - Seattle", "Three - Seattle"])
+                .iter()
+                .all(Option::is_none)
+        );
+
+        let cleaned = none(&["A Song-AMRC", "B Song_amrc", "C Song-amrc"]);
+        let texts: Vec<_> = cleaned
+            .iter()
+            .map(|c| c.as_ref().unwrap().text.as_str())
+            .collect();
+        assert_eq!(texts, ["A Song", "B Song", "C Song"]);
+    }
+
+    #[test]
+    fn a_trailing_token_has_the_shape_of_a_release_tag() {
+        let shared = |token: &str| {
+            let titles = [
+                format!("One-{token}"),
+                format!("Two-{token}"),
+                format!("Three-{token}"),
+            ];
+            let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+            shared_trailing_token(&refs).map(str::to_string)
+        };
+        assert_eq!(shared("SYN").as_deref(), Some("SYN"));
+        assert_eq!(shared("1up").as_deref(), Some("1up"));
+        assert_eq!(shared("ab").as_deref(), Some("ab"));
+        assert_eq!(shared("abcdefgh").as_deref(), Some("abcdefgh"));
+        assert_eq!(shared("a"), None);
+        assert_eq!(shared("abcdefghi"), None);
+        // At least one letter.
+        assert_eq!(shared("2000"), None);
+        // Not ASCII alphanumerics.
+        assert_eq!(shared("caf\u{e9}"), None);
+        // Version and edition words are meaningful.
+        for word in [
+            "live",
+            "demo",
+            "remix",
+            "remastered",
+            "Instrumental",
+            "deluxe",
+            "edit",
+            "acoustic",
+        ] {
+            assert_eq!(shared(word), None, "{word}");
+        }
+    }
+
+    #[test]
+    fn a_trailing_audio_extension_is_dropped() {
+        assert_eq!(strip_audio_extension("Song.mp3"), Some("Song"));
+        assert_eq!(strip_audio_extension("Song.FLAC"), Some("Song"));
+        assert_eq!(strip_audio_extension("A.B.ogg"), Some("A.B"));
+        assert_eq!(strip_audio_extension("Song.txt"), None);
+        assert_eq!(strip_audio_extension("Song"), None);
+        assert_eq!(strip_audio_extension("Song.mp3x"), None);
+        assert_eq!(strip_audio_extension(".mp3"), None);
+        assert_eq!(strip_audio_extension("Mr. Mp3"), None);
+
+        let local = local_release(&["Alpha.mp3 ", "Bravo.flac"]);
+        let cleaned = cleaned_track_titles(&local);
+        assert_eq!(cleaned[0].as_ref().unwrap().text, "Alpha");
+        assert_eq!(cleaned[1].as_ref().unwrap().text, "Bravo");
+    }
+
+    #[test]
+    fn trailing_padding_is_ignored_before_cleaning() {
+        let local = local_release(&["01 - Alpha            ", "Bravo"]);
+        let cleaned = cleaned_track_titles(&local);
+        assert_eq!(cleaned[0].as_ref().unwrap().text, "Alpha");
+    }
+
+    #[test]
+    fn version_words_are_never_stripped_as_a_release_tag() {
+        for word in ["live", "demo"] {
+            let titles: Vec<String> = ["Yesterday", "Michelle", "Girl"]
+                .iter()
+                .map(|title| format!("{title}-{word}"))
+                .collect();
+            let local = local_titled(&titles);
+            assert!(
+                cleaned_track_titles(&local).iter().all(Option::is_none),
+                "{word}"
+            );
+            let remote = remote_release(&["Yesterday", "Michelle", "Girl"]);
+            let evaluation = album_scope_evaluation(&local, &remote);
+            assert!(!evaluation.auto_accept, "{word}");
+            assert!(
+                evaluation
+                    .blockers
+                    .iter()
+                    .any(|reason| reason.contains("track version qualifiers")),
+                "{word}: {:?}",
+                evaluation.blockers
+            );
+        }
+    }
+
+    #[test]
+    fn a_decoded_mapping_scores_junk_titles_like_the_fresh_one() {
+        let junk = [
+            "01-Soul_Pilgrim-SYN.mp3",
+            "02-Far_From_Home-SYN.mp3",
+            "03-Parallax-SYN.mp3",
+            "04-Cheap_Wine-SYN.mp3",
+        ];
+        let local = local_release(&junk);
+        let remote = remote_release(&CLEAN_TITLES[..4]);
+        let candidate = Candidate::new(&local, remote.clone());
+
+        let json = serde_json::to_value(&candidate.mapping).unwrap();
+        let decoded: Mapping = serde_json::from_value(json).unwrap();
+        assert!(decoded.pair_similarity.is_empty());
+        let rescored = score(&local, &remote, &decoded);
+        assert_eq!(rescored, candidate.score);
+        assert!((rescored.track_titles - 0.98).abs() < 1e-9, "{rescored:?}");
+        let cleaned = cleaned_track_titles(&local);
+        for index in 0..junk.len() {
+            assert_eq!(
+                decoded.title_similarity(&local, &cleaned, index, index, &remote.tracklist[index]),
+                candidate.mapping.title_similarity(
+                    &local,
+                    &cleaned,
+                    index,
+                    index,
+                    &remote.tracklist[index]
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn version_abbreviations_are_never_a_release_tag() {
+        let shared = |token: &str| {
+            let titles = [
+                format!("One-{token}"),
+                format!("Two-{token}"),
+                format!("Three-{token}"),
+            ];
+            let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+            shared_trailing_token(&refs).map(str::to_string)
+        };
+        for word in NON_TAG_WORDS {
+            for token in [
+                word.to_string(),
+                word.to_uppercase(),
+                format!("{}{}", word[..1].to_uppercase(), &word[1..]),
+            ] {
+                if (SHARED_TOKEN_MIN_CHARS..=SHARED_TOKEN_MAX_CHARS).contains(&token.len()) {
+                    assert_eq!(shared(&token), None, "{token}");
+                }
+            }
+        }
+        for token in ["Rmx", "Karaoke", "Inst", "Vocal", "Hop", "Ab"] {
+            assert_eq!(shared(token), None, "{token}");
+        }
+        // Scene tags: lowercase, uppercase and mixed case.
+        for token in ["amrc", "SYN", "LATW", "ViLE", "iTS", "rH", "1up"] {
+            assert_eq!(shared(token).as_deref(), Some(token), "{token}");
+        }
+        assert!(VERSION_WORDS.contains(&"instrumentals"));
+        // Digits after a version word, `v` and digits, and further spellings.
+        for token in [
+            "inst2", "Inst2", "rmx2", "take2", "ver2", "v2", "V10", "acapela", "tv", "TV",
+        ] {
+            assert_eq!(shared(token), None, "{token}");
+        }
+        // Words that merely start with `v`, or are digits after a tag.
+        for token in ["vile", "amrc2", "vx"] {
+            assert_eq!(shared(token).as_deref(), Some(token), "{token}");
+        }
+        for word in NON_TAG_WORDS {
+            assert!(word.len() <= SHARED_TOKEN_MAX_CHARS, "{word}");
+        }
+    }
+
+    #[test]
+    fn a_title_case_spelling_anywhere_rules_the_token_out() {
+        for titles in [
+            ["One-Hop", "Two-HOP", "Three-HOP"],
+            ["One-HOP", "Two-Hop", "Three-Hop"],
+            ["One-HOP", "Two-HOP", "Three-Hop"],
+        ] {
+            assert_eq!(shared_trailing_token(&titles), None, "{titles:?}");
+        }
+        assert_eq!(
+            shared_trailing_token(&["One-HOP", "Two-HOP", "Three-hop"]),
+            Some("HOP")
+        );
+    }
+
+    #[test]
+    fn an_instrumental_release_tagged_inst_stays_blocked_against_the_vocal_release() {
+        let vocal = ["Yesterday", "Michelle", "Girl", "Help"];
+        let remote = remote_release(&vocal);
+        for suffix in ["Inst", "inst", "INST", "Rmx", "Karaoke", "Vocal"] {
+            let titles: Vec<String> = vocal
+                .iter()
+                .map(|title| format!("{title}-{suffix}"))
+                .collect();
+            let local = local_titled(&titles);
+            assert!(
+                cleaned_track_titles(&local).iter().all(Option::is_none),
+                "{suffix}"
+            );
+            let evaluation = album_scope_evaluation(&local, &remote);
+            assert!(
+                !evaluation.auto_accept,
+                "{suffix}: {:?}",
+                evaluation.evidence
+            );
+            assert!(!evaluation.blockers.is_empty(), "{suffix}");
+        }
+    }
+
+    #[test]
+    fn one_title_cannot_establish_a_shared_token() {
+        let long_one = "A Rather Long Title That Goes On And On";
+        let long_two = "Another Rather Long Title That Goes On And On";
+        assert!(long_one.chars().count() > ID3V1_FIELD_CHARS);
+        assert!(long_two.chars().count() > ID3V1_FIELD_CHARS);
+        // Only one title ends in `hop`; the long ones cannot have lost it.
+        let local = local_release(&["Hip-hop", long_one, long_two]);
+        assert!(cleaned_track_titles(&local).iter().all(Option::is_none));
+        let local = local_release(&["Hip-Hop", long_one, long_two]);
+        assert!(cleaned_track_titles(&local).iter().all(Option::is_none));
+
+        // Two of three, the third a 30-character title without it.
+        let lost = "Alpha Bravo Charlie Delta Echo";
+        assert_eq!(lost.chars().count(), 30);
+        let local = local_release(&["One-amrc", "Two-amrc", lost]);
+        assert!(cleaned_track_titles(&local).iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn a_title_too_long_to_have_been_cut_must_end_in_the_token() {
+        let long = "Alpha Bravo Charlie Delta Echo Foxtrot";
+        assert!(long.chars().count() > 30);
+        let local = local_release(&["One-amrc", "Two-amrc", "Three-amrc", long]);
+        assert!(cleaned_track_titles(&local).iter().all(Option::is_none));
+
+        let tagged = format!("{long}-amrc");
+        let local = local_release(&["One-amrc", "Two-amrc", "Three-amrc", &tagged]);
+        let cleaned = cleaned_track_titles(&local);
+        assert_eq!(cleaned[3].as_ref().unwrap().text, long);
+    }
+
+    #[test]
+    fn three_full_token_titles_and_a_cut_off_one_without_it_still_strip() {
+        let lost = "Alpha Bravo Charlie Delta Echo";
+        assert_eq!(lost.chars().count(), 30);
+        let local = local_release(&["One-amrc", "Two-amrc", "Three-amrc", lost]);
+        let cleaned = cleaned_track_titles(&local);
+        assert_eq!(cleaned[0].as_ref().unwrap().text, "One");
+        assert!(cleaned[3].is_none());
+
+        // A 30-character title with the whole token counts as one of the three.
+        let full = "Alpha Bravo Charlie Delta-amrc";
+        assert_eq!(full.chars().count(), 30);
+        let local = local_release(&["One-amrc", "Two-amrc", full]);
+        let cleaned = cleaned_track_titles(&local);
+        assert_eq!(
+            cleaned[2].as_ref().unwrap().text,
+            "Alpha Bravo Charlie Delta"
+        );
+    }
+
+    #[test]
+    fn a_track_with_no_disc_counts_as_disc_one_when_numbering_by_position() {
+        let mut local = local_release(&["01 - Alpha", "02 - Bravo", "03 - Charlie"]);
+        for (track, disc) in local.tracks.iter_mut().zip([Some(1), Some(1), None]) {
+            track.track_number = None;
+            track.disc = disc;
+        }
+        let cleaned = cleaned_track_titles(&local);
+        assert_eq!(cleaned[2].as_ref().unwrap().text, "Charlie");
     }
 }
