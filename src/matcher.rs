@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v30";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v29";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v31";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v30";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -90,9 +90,33 @@ pub const UNCONFIRMED_LENGTHS_NOTE: &str = "track lengths are unconfirmed";
 /// can print it next to the unconfirmed-edition note.
 pub const LABEL_DIFFERENCE_NOTE: &str = "read as a labelling difference";
 
+/// The odd-length rule: when album title, artist and every track title agree in
+/// track order and every length of an album of at least
+/// `ODD_LENGTH_MIN_TRACKS` tracks agrees within [`DURATION_TOLERANCE_SECS`]
+/// but exactly one (a hidden track, a vinyl typo, another mix), that track does
+/// not block. The album score with the odd pair counted at the tolerance edge
+/// (see [`odd_length_edge_score`]) must still reach [`SCORE_THRESHOLD`].
+pub const ODD_LENGTH_MIN_TRACKS: usize = 5;
+
+/// The fewest local tracks the odd-length rule accepts for a Various Artists
+/// release. Its artist component is 1.0 by construction and track artists are
+/// not compared, so the artist is no evidence and the track count has to make
+/// up for it. The leading-tracks rule uses the same minimum for the same
+/// reason.
+pub const ODD_LENGTH_MIN_VARIOUS_TRACKS: usize = 8;
+
+/// What the warning of an accept under the odd-length rule ends with (see
+/// [`one_length_differs`]), so that the runner can print it next to the
+/// unconfirmed-edition note.
+pub const ODD_LENGTH_NOTE: &str = "every title and every other length agrees";
+
 /// The endings that mark a warning as the note of an acceptance rule, which the
 /// runner prints under the accept (see [`Evaluation::rule_notes`]).
-const RULE_NOTES: &[&str] = &[UNCONFIRMED_LENGTHS_NOTE, LABEL_DIFFERENCE_NOTE];
+const RULE_NOTES: &[&str] = &[
+    UNCONFIRMED_LENGTHS_NOTE,
+    LABEL_DIFFERENCE_NOTE,
+    ODD_LENGTH_NOTE,
+];
 
 /// The edition qualifiers that a release may carry on one side only without
 /// being a different recording, when every length agrees: a provider's `Live`
@@ -2940,10 +2964,16 @@ pub struct ScoreBreakdown {
 impl ScoreBreakdown {
     /// Album identity does not depend on a particular pressing's year.
     pub fn album_score(&self) -> f64 {
+        self.album_score_with_durations(self.durations)
+    }
+
+    /// [`ScoreBreakdown::album_score`] with `durations` in place of the stored
+    /// duration component. Used where one track's length is set aside.
+    pub fn album_score_with_durations(&self, durations: f64) -> f64 {
         (WEIGHT_ALBUM_TITLE * self.album_title
             + WEIGHT_ALBUM_ARTIST * self.album_artist
             + WEIGHT_TRACK_TITLES * self.track_titles
-            + WEIGHT_DURATIONS * self.durations)
+            + WEIGHT_DURATIONS * durations)
             / (1.0 - WEIGHT_YEAR)
     }
 
@@ -3427,14 +3457,9 @@ impl Evaluation {
 struct RuleGuards {
     /// The text-only rule ([`titles_identify_tracks`]) may apply.
     text_identity: bool,
-    /// Why the odd-length rule must not apply, naming the alternative release.
-    /// `None` lets the rule apply. The rule pushes the text as a blocker, and
-    /// only when it would otherwise have applied. Reserved for the odd-length
-    /// rule, which is not implemented yet.
-    #[expect(
-        dead_code,
-        reason = "read by the odd-length rule, added in a later step"
-    )]
+    /// Why the odd-length rule ([`one_length_differs`]) must not apply, naming
+    /// the alternative release. `None` lets the rule apply. The rule pushes the
+    /// text as a blocker, and only when it would otherwise have applied.
     odd_length_blocker: Option<String>,
     /// Why the leading-tracks rule must not apply, naming the alternative
     /// release. `None` lets the rule apply. The rule pushes the text as a
@@ -3491,6 +3516,26 @@ pub fn evaluate_for_matching(
             && other.release.provider() == candidate.release.provider()
             && text_agrees_but_lengths_do_not(local, other, &cleaned, SOFT_DURATION_MAX_SECS)
     });
+    // Another album of the same provider that fits every length is the likelier
+    // source of the files than this one with a length that does not fit.
+    let odd_length_blocker = if local.tracks.len() >= ODD_LENGTH_MIN_TRACKS {
+        alternatives
+            .iter()
+            .find(|other| {
+                other.release.id != candidate.release.id
+                    && other.release.provider() == candidate.release.provider()
+                    && !in_same_release_group(candidate, other)
+                    && fits_every_length(local, other)
+            })
+            .map(|other| {
+                format!(
+                    "release {} outside this release group fits every length",
+                    other.release.id
+                )
+            })
+    } else {
+        None
+    };
     let mut album = evaluate_with(
         local,
         candidate,
@@ -3499,6 +3544,7 @@ pub fn evaluate_for_matching(
         MatchScope::Album,
         RuleGuards {
             text_identity,
+            odd_length_blocker,
             ..RuleGuards::default()
         },
     );
@@ -3575,6 +3621,165 @@ fn fits_durations_better(local: &LocalRelease, candidate: &Candidate, other: &Ca
         duration_gap(local, other, l, r).is_some_and(|gap| gap > DURATION_TOLERANCE_SECS)
     });
     !other.mapping.complete || other_misses
+}
+
+/// Whether `candidate` maps every local track and every mapped length is known
+/// and within [`DURATION_TOLERANCE_SECS`]: the mapping is complete and
+/// unambiguous and no length is missing or off. Says nothing about titles.
+fn fits_every_length(local: &LocalRelease, candidate: &Candidate) -> bool {
+    candidate.mapping.complete
+        && !candidate.mapping.ambiguous
+        && candidate.mapping.assigned_count() > 0
+        && candidate.mapping.assigned_pairs().all(|(l, r)| {
+            duration_gap(local, candidate, l, r).is_some_and(|gap| gap <= DURATION_TOLERANCE_SECS)
+        })
+}
+
+/// Whether a few tracks drift from the provider's durations while the album
+/// still agrees as a whole (see [`SOFT_DURATION_MAX_TRACKS`]): at least
+/// [`SOFT_DURATION_MIN_ALBUM_TRACKS`] local tracks, at most
+/// [`SOFT_DURATION_MAX_TRACKS`] of them beyond [`DURATION_TOLERANCE_SECS`], the
+/// worst within [`SOFT_DURATION_MAX_SECS`], and the summed lengths within
+/// [`SOFT_DURATION_TOTAL_RATIO`] of the provider's. `worst` is the largest
+/// difference and the totals are over the pairs with both lengths known.
+fn is_length_drift(
+    local_tracks: usize,
+    over_tolerance: usize,
+    worst: f64,
+    local_total: f64,
+    remote_total: f64,
+) -> bool {
+    local_tracks >= SOFT_DURATION_MIN_ALBUM_TRACKS
+        && over_tolerance <= SOFT_DURATION_MAX_TRACKS
+        && worst <= SOFT_DURATION_MAX_SECS
+        && remote_total > 0.0
+        && (local_total - remote_total).abs() / remote_total <= SOFT_DURATION_TOTAL_RATIO
+}
+
+/// Whether a title names a version of a song: any of its normalized words is in
+/// [`VERSION_WORDS`] or contains `remaster`. A title that does is another
+/// recording as easily as the same one, so its length is no odd one out.
+fn names_a_version(title: &str) -> bool {
+    normalize_text(title)
+        .split_whitespace()
+        .any(|word| VERSION_WORDS.contains(&word) || word.contains("remaster"))
+}
+
+/// Whether a title names an alternate take, outtake, rehearsal or session in a
+/// trailing bracketed group or after a dash ([`names_take_words`]). `cleaned`
+/// is the cleaned reading of a local title, which drops a tag the raw reading
+/// hides the group behind. Unlike [`local_title_is_another_take`] it does not
+/// care whether the other side has a group too.
+fn title_names_a_take(title: &str, cleaned: Option<&CleanedTitle>) -> bool {
+    let names_take = |text: &str| {
+        let text = text.trim_end();
+        bracketed_suffix_start(text).is_some_and(|start| names_take_words(&text[start..]))
+            || text
+                .rsplit_once(" - ")
+                .is_some_and(|(_, tail)| names_take_words(tail))
+    };
+    names_take(title) || cleaned.is_some_and(|cleaned| names_take(&cleaned.text))
+}
+
+/// The local index of the one track whose length differs, when `candidate` is
+/// the album in every other respect: at least [`ODD_LENGTH_MIN_TRACKS`] local
+/// tracks ([`ODD_LENGTH_MIN_VARIOUS_TRACKS`] for Various Artists, whose artist
+/// is no evidence), album title and artist that [`album_text_agrees`], a
+/// mapping that is [`mapped_in_local_order`], every title at least
+/// [`TITLE_SIMILARITY_THRESHOLD`] ([`track_titles_agree`]) and preferring its
+/// own track ([`titles_prefer_own_tracks`]), every local and remote length
+/// known, finite and positive, and exactly one pair more than
+/// [`DURATION_TOLERANCE_SECS`] apart.
+///
+/// On that pair the titles must agree strictly: at least
+/// [`TITLE_SIMILARITY_THRESHOLD`] by [`strict_track_title_similarity`], so a
+/// subtitle that only one side has is not forgiven. Neither the local nor the
+/// remote title may name a version ([`names_a_version`]) or another take
+/// ([`title_names_a_take`]), because a label or take on either side is another
+/// recording as easily as the same one. A gap that the drift allowance already
+/// covers ([`is_length_drift`]) is not an odd length: it keeps its own warning.
+/// `cleaned` is [`cleaned_track_titles`] of `local`.
+///
+/// One hidden track, a typo on a vinyl side or another mix does not change the
+/// album that every title and every other length identify, but a length alone
+/// cannot say which of those it is, so the rule leaves the call to the score
+/// ([`odd_length_edge_score`]) and to the alternatives (see
+/// [`RuleGuards::odd_length_blocker`]).
+fn one_length_differs(
+    local: &LocalRelease,
+    candidate: &Candidate,
+    cleaned: &[Option<CleanedTitle>],
+) -> Option<usize> {
+    let min_tracks = if matches!(local.artist_kind, ArtistKind::VariousArtists) {
+        ODD_LENGTH_MIN_VARIOUS_TRACKS
+    } else {
+        ODD_LENGTH_MIN_TRACKS
+    };
+    if local.tracks.len() < min_tracks
+        || !album_text_agrees(candidate)
+        || !mapped_in_local_order(local, candidate)
+        || !track_titles_agree(local, candidate, cleaned)
+        || !titles_prefer_own_tracks(local, candidate, cleaned)
+    {
+        return None;
+    }
+    let known = |duration: Option<f64>| duration.filter(|secs| secs.is_finite() && *secs > 0.0);
+    let mut odd: Option<(usize, usize, f64)> = None;
+    let (mut local_total, mut remote_total) = (0.0f64, 0.0f64);
+    for (l, r) in candidate.mapping.assigned_pairs() {
+        let a = known(local.tracks.get(l)?.duration_secs)?;
+        let b = known(candidate.release.tracklist.get(r)?.duration_secs)?;
+        local_total += a;
+        remote_total += b;
+        let gap = (a - b).abs();
+        if gap > DURATION_TOLERANCE_SECS && odd.replace((l, r, gap)).is_some() {
+            return None;
+        }
+    }
+    let (l, r, gap) = odd?;
+    if is_length_drift(local.tracks.len(), 1, gap, local_total, remote_total) {
+        return None;
+    }
+    let local_title = local.tracks.get(l)?.title.as_deref()?;
+    let remote_title = &candidate.release.tracklist.get(r)?.title;
+    let cleaned_title = cleaned.get(l).and_then(Option::as_ref);
+    let strictly_the_same = strict_track_title_similarity(local_title, cleaned_title, remote_title)
+        >= TITLE_SIMILARITY_THRESHOLD;
+    let another_recording = names_a_version(local_title)
+        || names_a_version(remote_title)
+        || title_names_a_take(local_title, cleaned_title)
+        || title_names_a_take(remote_title, None);
+    (strictly_the_same && !another_recording).then_some(l)
+}
+
+/// The album score of an odd-length match (see [`one_length_differs`]), which
+/// replaces the album score gate for that rule: the album score with the odd
+/// pair's duration similarity replaced by the one the scorer gives a pair
+/// exactly [`DURATION_TOLERANCE_SECS`] apart, the edge of what agrees. The odd
+/// pair counts as a pair at the edge, not as a perfect one and not as one left
+/// out, so a length that is hundreds of seconds off is no worse than one just
+/// beyond the tolerance. `odd` is the local index `one_length_differs` returned.
+fn odd_length_edge_score(local: &LocalRelease, candidate: &Candidate, odd: usize) -> f64 {
+    let tracks = local.tracks.len();
+    debug_assert!(
+        tracks >= ODD_LENGTH_MIN_TRACKS,
+        "the odd-length rule needs at least {ODD_LENGTH_MIN_TRACKS} tracks"
+    );
+    let odd_similarity = candidate
+        .mapping
+        .pairs
+        .get(odd)
+        .copied()
+        .flatten()
+        .and_then(|r| {
+            let a = local.tracks.get(odd)?.duration_secs?;
+            let b = candidate.release.tracklist.get(r)?.duration_secs?;
+            Some(duration_similarity(a, b))
+        })
+        .unwrap_or(0.0);
+    let edge_similarity = duration_similarity(0.0, DURATION_TOLERANCE_SECS);
+    let durations = candidate.score.durations + (edge_similarity - odd_similarity) / tracks as f64;
+    candidate.score.album_score_with_durations(durations)
 }
 
 /// Whether the mapping pairs every local track, in local track order, with the
@@ -4389,6 +4594,25 @@ fn evaluate_with(
         && !corroborated_title
         && titles_identify_tracks(local, candidate);
 
+    // Every title and every length but one agrees: the odd track does not block
+    // when the score over the other lengths reaches the gate, which replaces the
+    // album score gate. Album scope only. It needs a length above the tolerance,
+    // which the duration-identity rule rules out, and every length known, which
+    // the text-identity rule rules out, so the three never overlap; and every
+    // title at least 0.90, which the weak album title rule rules out. Another
+    // album that fits every length switches it off with a blocker.
+    let odd_length = if match_scope == MatchScope::Album
+        && !corroborated_title
+        && !duration_identity
+        && !text_identity
+    {
+        one_length_differs(local, candidate, &cleaned)
+            .filter(|odd| odd_length_edge_score(local, candidate, *odd) + 1e-9 >= minimum_score)
+    } else {
+        None
+    };
+    let odd_length_rule = odd_length.filter(|_| guards.odd_length_blocker.is_none());
+
     // A label on one side only is a labelling difference, not another recording,
     // when the lengths identify the tracks and every other title agrees. The
     // gate holds with an empty list when no track carries a label.
@@ -4405,6 +4629,7 @@ fn evaluate_with(
     if !corroborated_title
         && !duration_identity
         && !text_identity
+        && odd_length_rule.is_none()
         && acceptance_score + 1e-9 < minimum_score
     {
         blockers.push(format!(
@@ -4619,16 +4844,43 @@ fn evaluate_with(
         // seconds without changing the album, which shows in the summed length.
         // Only for an album-level match, never for an exact edition.
         let drifted_album = match_scope == MatchScope::Album
-            && local.tracks.len() >= SOFT_DURATION_MIN_ALBUM_TRACKS
-            && tracks_over_tolerance <= SOFT_DURATION_MAX_TRACKS
-            && difference <= SOFT_DURATION_MAX_SECS
-            && remote_total > 0.0
-            && (local_total - remote_total).abs() / remote_total <= SOFT_DURATION_TOTAL_RATIO;
+            && is_length_drift(
+                local.tracks.len(),
+                tracks_over_tolerance,
+                difference,
+                local_total,
+                remote_total,
+            );
         if drifted_album {
             warnings.push(format!(
                 "track '{worst_duration_track}' differs by {difference:.1}s from the {provider} duration but the album length agrees"
             ));
+        } else if let Some(odd) = odd_length_rule {
+            let longer = candidate
+                .mapping
+                .pairs
+                .get(odd)
+                .copied()
+                .flatten()
+                .and_then(|r| {
+                    Some(
+                        local.tracks.get(odd)?.duration_secs?
+                            > remote.tracklist.get(r)?.duration_secs?,
+                    )
+                })
+                .unwrap_or(false);
+            let direction = if longer { "longer" } else { "shorter" };
+            warnings.push(format!(
+                "track '{worst_duration_track}' is {difference:.1}s {direction} in the files than the {provider} duration; {ODD_LENGTH_NOTE}"
+            ));
         } else {
+            // The rule would have applied but for another album that fits every
+            // length, which says why.
+            if odd_length.is_some()
+                && let Some(blocker) = &guards.odd_length_blocker
+            {
+                blockers.push(blocker.clone());
+            }
             blockers.push(format!(
                 "track '{worst_duration_track}' differs by {difference:.1}s from the {provider} duration"
             ));
@@ -6840,11 +7092,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v30"
+            "discogs-match-v31"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v29"
+            "musicbrainz-match-v30"
         );
     }
 
@@ -9198,10 +9450,60 @@ mod tests {
         three.tracks[9].duration_secs = Some(three.tracks[9].duration_secs.unwrap() + 5.0);
         assert!(!accepts(&three, &remote));
 
-        // A track more than ten seconds off is not drift.
+        // A track more than ten seconds off is not drift. It is the one odd
+        // length of an album whose titles and other lengths all agree, which
+        // passes with the warning of that rule, and drift's warning is absent.
         let mut far = local_release(&titles);
         far.tracks[3].duration_secs = Some(far.tracks[3].duration_secs.unwrap() + 11.0);
-        assert!(!accepts(&far, &remote));
+        assert!(accepts(&far, &remote));
+        let far_evaluation = album_evaluation(&far, &remote, &[]);
+        assert!(
+            far_evaluation
+                .warnings
+                .iter()
+                .any(|warning| warning.ends_with(ODD_LENGTH_NOTE)),
+            "{:?}",
+            far_evaluation.warnings
+        );
+        assert!(
+            !far_evaluation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("but the album length agrees")),
+            "{:?}",
+            far_evaluation.warnings
+        );
+
+        // Six seconds is drift, and keeps drift's warning, not the odd length's.
+        let mut near = local_release(&titles);
+        near.tracks[3].duration_secs = Some(near.tracks[3].duration_secs.unwrap() + 6.0);
+        let near_evaluation = album_evaluation(&near, &remote, &[]);
+        assert!(
+            near_evaluation.auto_accept,
+            "{:?}",
+            near_evaluation.blockers
+        );
+        assert!(
+            near_evaluation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("but the album length agrees")),
+            "{:?}",
+            near_evaluation.warnings
+        );
+        assert!(
+            !near_evaluation
+                .warnings
+                .iter()
+                .any(|warning| warning.ends_with(ODD_LENGTH_NOTE)),
+            "{:?}",
+            near_evaluation.warnings
+        );
+
+        // A second track beyond the tolerance makes two odd lengths, not one.
+        let mut two = far.clone();
+        two.tracks[8].duration_secs = Some(two.tracks[8].duration_secs.unwrap() + 4.0);
+        assert!(!accepts(&two, &remote));
 
         // On a short album the same drift is too much of the whole.
         let short_titles = ["One", "Two", "Three", "Four"];
@@ -11704,5 +12006,582 @@ mod tests {
         assert!(!bases_agree(remote_titles[2], remote_titles[4]));
         assert!(bases_agree(local_titles[2], local_titles[4]));
         assert_not_read_as_label(&local, &remote);
+    }
+
+    // -----------------------------------------------------------------------
+    // The odd-length rule
+    // -----------------------------------------------------------------------
+
+    /// A local release and a remote release over the first `count` titles of
+    /// [`TITLES_12`], with the files' track `index` (0-based) `delta` seconds
+    /// longer than the provider's.
+    fn odd_length_pair(count: usize, index: usize, delta: f64) -> (LocalRelease, RemoteRelease) {
+        let mut local = local_release(&TITLES_12[..count]);
+        let remote = remote_release(&TITLES_12[..count]);
+        local.tracks[index].duration_secs =
+            Some(local.tracks[index].duration_secs.unwrap() + delta);
+        (local, remote)
+    }
+
+    /// The odd-length warning of an evaluation, if it has one.
+    fn odd_length_warning(evaluation: &Evaluation) -> Option<&str> {
+        evaluation
+            .warnings
+            .iter()
+            .map(String::as_str)
+            .find(|warning| warning.ends_with(ODD_LENGTH_NOTE))
+    }
+
+    fn assert_blocked_not_odd(local: &LocalRelease, remote: &RemoteRelease) {
+        let evaluation = album_evaluation(local, remote, &[]);
+        assert!(!evaluation.auto_accept, "{:?}", evaluation.warnings);
+        assert_eq!(odd_length_warning(&evaluation), None);
+    }
+
+    #[test]
+    fn the_last_track_hundreds_of_seconds_long_passes_with_a_warning() {
+        let (local, remote) = odd_length_pair(10, 9, 312.0);
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert_eq!(
+            odd_length_warning(&evaluation),
+            Some(
+                "track 'Iron Garden' is 312.0s longer in the files than the discogs duration; every title and every other length agrees"
+            )
+        );
+        assert_eq!(
+            evaluation.rule_notes().collect::<Vec<_>>(),
+            [odd_length_warning(&evaluation).unwrap()]
+        );
+    }
+
+    #[test]
+    fn a_middle_track_that_is_shorter_in_the_files_passes() {
+        let (local, remote) = odd_length_pair(6, 2, -95.0);
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert_eq!(
+            odd_length_warning(&evaluation),
+            Some(
+                "track 'Hollow' is 95.0s shorter in the files than the discogs duration; every title and every other length agrees"
+            )
+        );
+    }
+
+    #[test]
+    fn a_remote_length_that_is_longer_reads_as_shorter_in_the_files() {
+        let (local, mut remote) = odd_length_pair(8, 4, 0.0);
+        remote.tracklist[4].duration_secs = Some(remote.tracklist[4].duration_secs.unwrap() + 50.0);
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert_eq!(
+            odd_length_warning(&evaluation),
+            Some(
+                "track 'Lantern' is 50.0s shorter in the files than the discogs duration; every title and every other length agrees"
+            )
+        );
+    }
+
+    #[test]
+    fn the_odd_length_rule_applies_to_musicbrainz() {
+        let (local, mut remote) = odd_length_pair(10, 9, 312.0);
+        remote.id = ReleaseId::MusicBrainz(mbid(MUSICBRAINZ_PRIMARY_ID));
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert_eq!(
+            odd_length_warning(&evaluation),
+            Some(
+                "track 'Iron Garden' is 312.0s longer in the files than the musicbrainz duration; every title and every other length agrees"
+            )
+        );
+    }
+
+    #[test]
+    fn the_odd_length_rule_applies_to_a_disc_folder() {
+        let mut local = disc_folder("/music/Set-2CD/CD2", 2, 12);
+        local.tracks[11].duration_secs = Some(local.tracks[11].duration_secs.unwrap() + 120.0);
+        let remote = disc_set(&[12, 12]);
+        let candidate = Candidate::new(&local, remote.clone());
+        assert_eq!(candidate.mapping.medium, Some(2));
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert!(odd_length_warning(&evaluation).is_some());
+    }
+
+    #[test]
+    fn a_short_gap_beyond_the_album_length_allowance_is_an_odd_length() {
+        // Five tracks of half a minute: five seconds is a sixth of the album, so
+        // it is not drift, but it is one odd length among agreeing ones.
+        let (mut local, mut remote) = odd_length_pair(5, 4, 0.0);
+        for (index, track) in local.tracks.iter_mut().enumerate() {
+            track.duration_secs = Some(30.0 + index as f64);
+        }
+        for (index, track) in remote.tracklist.iter_mut().enumerate() {
+            track.duration_secs = Some(30.0 + index as f64);
+        }
+        local.tracks[4].duration_secs = Some(local.tracks[4].duration_secs.unwrap() + 5.0);
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert!(odd_length_warning(&evaluation).is_some());
+    }
+
+    #[test]
+    fn the_odd_pair_counts_at_the_tolerance_edge_in_the_odd_length_score() {
+        // The edge value is what the scorer gives a pair exactly the tolerance
+        // apart, and the rule's score is the album score with the odd pair's
+        // similarity replaced by it.
+        let edge = duration_similarity(0.0, DURATION_TOLERANCE_SECS);
+        let (local, remote) = odd_length_pair(10, 9, 312.0);
+        let mut candidate = Candidate::new(&local, remote);
+        candidate.score.album_title = 0.90;
+        candidate.score.album_artist = 0.92;
+        let plain = candidate.score.album_score();
+        let replaced = odd_length_edge_score(&local, &candidate, 9);
+        let by_hand = candidate
+            .score
+            .album_score_with_durations(candidate.score.durations + edge / 10.0);
+        assert!((replaced - by_hand).abs() < 1e-9, "{replaced} {by_hand}");
+        // The plain score counts the odd pair as zero, so it is below the gate
+        // while the replacement is what reaches it.
+        assert!(plain < SCORE_THRESHOLD, "{plain}");
+        assert!(replaced >= SCORE_THRESHOLD, "{replaced}");
+        let evaluation =
+            evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default());
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert!(odd_length_warning(&evaluation).is_some());
+
+        // A title mean just under one takes the replacement below the gate.
+        candidate.score.track_titles = 0.99;
+        assert!(odd_length_edge_score(&local, &candidate, 9) < SCORE_THRESHOLD);
+        let evaluation =
+            evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default());
+        assert!(!evaluation.auto_accept);
+        assert_eq!(odd_length_warning(&evaluation), None);
+    }
+
+    #[test]
+    fn an_odd_pair_counts_as_an_edge_pair_not_a_perfect_one() {
+        // Perfect text passes with ten tracks and with five.
+        for count in [10, 5] {
+            let (local, remote) = odd_length_pair(count, count - 1, 312.0);
+            let evaluation = album_evaluation(&local, &remote, &[]);
+            assert!(evaluation.auto_accept, "{count}: {:?}", evaluation.blockers);
+            assert!(odd_length_warning(&evaluation).is_some());
+        }
+
+        // Album title and artist at the minimum used to pass, with the odd
+        // pair dropped from the durations. Counted at the edge it scores
+        // 0.948, under the gate.
+        let (local, remote) = odd_length_pair(10, 9, 11.0);
+        let mut candidate = Candidate::new(&local, remote);
+        candidate.score.album_title = 0.90;
+        candidate.score.album_artist = 0.90;
+        assert!(odd_length_edge_score(&local, &candidate, 9) < SCORE_THRESHOLD);
+        let evaluation =
+            evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default());
+        assert!(!evaluation.auto_accept);
+        assert_eq!(odd_length_warning(&evaluation), None);
+    }
+
+    #[test]
+    fn two_odd_lengths_are_not_one() {
+        let (mut local, remote) = odd_length_pair(10, 9, 312.0);
+        local.tracks[3].duration_secs = Some(local.tracks[3].duration_secs.unwrap() + 20.0);
+        assert_blocked_not_odd(&local, &remote);
+    }
+
+    #[test]
+    fn four_tracks_are_too_few_for_an_odd_length() {
+        let (local, remote) = odd_length_pair(4, 3, 312.0);
+        assert_blocked_not_odd(&local, &remote);
+    }
+
+    #[test]
+    fn an_odd_length_does_not_excuse_a_weak_title() {
+        // On another track.
+        let (mut local, remote) = odd_length_pair(10, 9, 312.0);
+        local.tracks[2].title = Some("Something else entirely".to_string());
+        assert_blocked_not_odd(&local, &remote);
+
+        // On the odd track itself.
+        let (mut local, remote) = odd_length_pair(10, 9, 312.0);
+        local.tracks[9].title = Some("Something else entirely".to_string());
+        assert_blocked_not_odd(&local, &remote);
+    }
+
+    #[test]
+    fn an_odd_length_on_a_version_of_a_song_is_another_recording() {
+        // Both name a mix.
+        let (mut local, mut remote) = odd_length_pair(10, 2, 200.0);
+        local.tracks[2].title = Some("Hollow (Extended Mix)".to_string());
+        remote.tracklist[2].title = "Hollow (Extended Mix)".to_string();
+        assert_blocked_not_odd(&local, &remote);
+
+        // Only the provider does, and the files' title agrees with its song.
+        let (local, mut remote) = odd_length_pair(10, 2, 200.0);
+        remote.tracklist[2].title = "Hollow (Remastered 2011)".to_string();
+        assert_blocked_not_odd(&local, &remote);
+
+        // The same mix on an unrelated track does not matter.
+        let (mut local, mut remote) = odd_length_pair(10, 9, 200.0);
+        local.tracks[2].title = Some("Hollow (Extended Mix)".to_string());
+        remote.tracklist[2].title = "Hollow (Extended Mix)".to_string();
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+    }
+
+    #[test]
+    fn an_odd_length_on_another_take_is_another_recording() {
+        let (mut local, remote) = odd_length_pair(10, 2, 200.0);
+        local.tracks[2].title = Some("Hollow (Peel Session)".to_string());
+        assert_blocked_not_odd(&local, &remote);
+
+        let (mut local, remote) = odd_length_pair(10, 2, 200.0);
+        local.tracks[2].title = Some("Hollow - Take 2".to_string());
+        assert_blocked_not_odd(&local, &remote);
+    }
+
+    #[test]
+    fn an_odd_track_without_a_remote_length_is_not_an_odd_length() {
+        // The odd track has no remote length to differ from. The titles then
+        // carry the match as they always did (the text-identity rule), and the
+        // odd-length rule has nothing to say.
+        let (local, mut remote) = odd_length_pair(10, 9, 312.0);
+        remote.tracklist[9].duration_secs = None;
+        let candidate = Candidate::new(&local, remote.clone());
+        let cleaned = cleaned_track_titles(&local);
+        assert_eq!(one_length_differs(&local, &candidate, &cleaned), None);
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert_eq!(odd_length_warning(&evaluation), None);
+        assert!(evaluation.relies_on_unlisted_lengths());
+
+        // Another track without a remote length leaves an odd one that no rule
+        // accepts.
+
+        let (local, mut remote) = odd_length_pair(10, 9, 312.0);
+        remote.tracklist[4].duration_secs = None;
+        assert_blocked_not_odd(&local, &remote);
+    }
+
+    #[test]
+    fn a_local_length_that_is_unknown_is_not_an_odd_length() {
+        let (mut local, remote) = odd_length_pair(10, 9, 312.0);
+        local.tracks[4].duration_secs = None;
+        assert_blocked_not_odd(&local, &remote);
+    }
+
+    #[test]
+    fn another_album_that_fits_every_length_blocks_the_odd_length_rule() {
+        let (local, remote) = odd_length_pair(10, 9, 312.0);
+        let mut other = remote.clone();
+        other.id = ReleaseId::Discogs(43);
+        other.tracklist[9].duration_secs = local.tracks[9].duration_secs;
+        let fits = Candidate::new(&local, other.clone());
+        assert!(fits.mapping.complete);
+
+        // No group on either side: another album.
+        let evaluation = album_evaluation(&local, &remote, std::slice::from_ref(&fits));
+        assert!(!evaluation.auto_accept);
+        assert!(
+            evaluation.blockers.contains(
+                &"release discogs 43 outside this release group fits every length".to_string()
+            ),
+            "{:?}",
+            evaluation.blockers
+        );
+        assert_eq!(odd_length_warning(&evaluation), None);
+
+        // A different master on the alternative.
+        let mut first = remote.clone();
+        first.group_id = Some(GroupId::DiscogsMaster(7));
+        other.group_id = Some(GroupId::DiscogsMaster(8));
+        let fits = Candidate::new(&local, other.clone());
+        let evaluation = album_evaluation(&local, &first, std::slice::from_ref(&fits));
+        assert!(!evaluation.auto_accept);
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("outside this release group fits every length")),
+            "{:?}",
+            evaluation.blockers
+        );
+
+        // The same master is another edition of this album, which does not
+        // contradict the files.
+        other.group_id = Some(GroupId::DiscogsMaster(7));
+        let fits = Candidate::new(&local, other);
+        let evaluation = album_evaluation(&local, &first, std::slice::from_ref(&fits));
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert!(odd_length_warning(&evaluation).is_some());
+    }
+
+    #[test]
+    fn another_album_that_does_not_fit_every_length_leaves_the_rule_alone() {
+        let (local, remote) = odd_length_pair(10, 9, 312.0);
+        // It has the same odd length, so it fits no better.
+        let mut other = remote.clone();
+        other.id = ReleaseId::Discogs(43);
+        other.title = "A Different Album".to_string();
+        let alternative = Candidate::new(&local, other);
+        let evaluation = album_evaluation(&local, &remote, std::slice::from_ref(&alternative));
+        assert!(
+            !evaluation
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("fits every length")),
+            "{:?}",
+            evaluation.blockers
+        );
+    }
+
+    #[test]
+    fn a_remote_album_title_that_names_another_album_blocks_the_odd_length_rule() {
+        let (mut local, mut remote) = odd_length_pair(10, 9, 312.0);
+        local.album_title = Some("Exclusive Metal Sampler".to_string());
+        remote.title = "Exclusive Radio Sampler".to_string();
+        assert_blocked_not_odd(&local, &remote);
+    }
+
+    #[test]
+    fn swapped_part_titles_do_not_pass_with_an_odd_length() {
+        let mut titles = TITLES_12[..6].to_vec();
+        titles[0] = "Intro (Part 1)";
+        titles[1] = "Intro (Part 2)";
+        let mut local = local_release(&titles);
+        titles[0] = "Intro (Part 2)";
+        titles[1] = "Intro (Part 1)";
+        let remote = remote_release(&titles);
+        local.tracks[5].duration_secs = Some(local.tracks[5].duration_secs.unwrap() + 200.0);
+        assert_blocked_not_odd(&local, &remote);
+    }
+
+    #[test]
+    fn the_odd_length_rule_is_for_album_scope_only() {
+        let (local, remote) = odd_length_pair(10, 9, 312.0);
+        let candidate = Candidate::new(&local, remote);
+        let evaluation = evaluate(&local, &candidate, None, &DiscoveryEvidence::default());
+        assert!(!evaluation.auto_accept);
+        assert_eq!(odd_length_warning(&evaluation), None);
+    }
+
+    /// Asserts that the odd-length rule does not read the pair as one odd
+    /// length, however the rest of the evaluation goes.
+    fn assert_no_odd_length(local: &LocalRelease, remote: &RemoteRelease, context: &str) {
+        let candidate = Candidate::new(local, remote.clone());
+        let cleaned = cleaned_track_titles(local);
+        assert_eq!(
+            one_length_differs(local, &candidate, &cleaned),
+            None,
+            "{context}"
+        );
+        let evaluation = album_evaluation(local, remote, &[]);
+        assert!(
+            !evaluation.auto_accept,
+            "{context}: {:?}",
+            evaluation.warnings
+        );
+        assert_eq!(odd_length_warning(&evaluation), None, "{context}");
+    }
+
+    #[test]
+    fn an_odd_pair_whose_remote_title_adds_a_label_or_take_is_another_recording() {
+        for remote_title in [
+            "Hollow (Alternate Take)",
+            "Hollow (Take 2)",
+            "Hollow (Outtake)",
+            "Hollow (Rehearsal)",
+            "Hollow (BBC Session)",
+            "Hollow (Re-Recorded)",
+            "Hollow (Single)",
+            "Hollow (Remixed)",
+            "Hollow (Acapella)",
+            "Hollow - Alternate Take",
+            "Hollow [Take 3]",
+        ] {
+            let (local, mut remote) = odd_length_pair(10, 2, 60.0);
+            remote.tracklist[2].title = remote_title.to_string();
+            assert_no_odd_length(&local, &remote, remote_title);
+        }
+    }
+
+    #[test]
+    fn an_odd_pair_whose_local_title_adds_a_label_or_take_is_another_recording() {
+        for local_title in [
+            "Hollow (Remixed)",
+            "Hollow (Re-Recorded)",
+            "Hollow (Single)",
+            "Hollow - Take 2",
+            "Hollow (Peel Session)",
+        ] {
+            let (mut local, remote) = odd_length_pair(10, 2, 60.0);
+            local.tracks[2].title = Some(local_title.to_string());
+            assert_no_odd_length(&local, &remote, local_title);
+        }
+    }
+
+    #[test]
+    fn the_odd_pair_titles_must_agree_strictly() {
+        // A subtitle that only one side has is forgiven in the album score but
+        // not for the pair that carries the odd length.
+        let titles = {
+            let mut titles = TITLES_12[..10].to_vec();
+            titles[2] = "I Sold Myself In";
+            titles
+        };
+        let mut local = local_release(&titles);
+        local.tracks[2].duration_secs = Some(local.tracks[2].duration_secs.unwrap() + 60.0);
+        let mut remote = remote_release(&titles);
+        remote.tracklist[2].title = "I Sold Myself In / [unknown]".to_string();
+        assert!(
+            strict_track_title_similarity("I Sold Myself In", None, &remote.tracklist[2].title)
+                < TITLE_SIMILARITY_THRESHOLD
+        );
+        assert_no_odd_length(&local, &remote, "one-sided subtitle");
+
+        // The same subtitle on another track is not the odd pair's business.
+        let (mut local, mut remote) = odd_length_pair(10, 9, 60.0);
+        local.tracks[2].title = Some("I Sold Myself In".to_string());
+        remote.tracklist[2].title = "I Sold Myself In / [unknown]".to_string();
+        let candidate = Candidate::new(&local, remote);
+        let cleaned = cleaned_track_titles(&local);
+        assert_eq!(one_length_differs(&local, &candidate, &cleaned), Some(9));
+    }
+
+    #[test]
+    fn a_take_word_on_one_side_of_the_odd_pair_is_another_recording() {
+        // The titles score at least 0.90 against each other, one letter apart,
+        // so only the take word on one side separates them.
+        for (take, other) in [
+            ("Harbor Lights (Outtake)", "Harbor Lights (Outtaker)"),
+            ("Harbor Lights - Outtake", "Harbor Lights - Outtaker"),
+            ("Harbor Lights [Rehearsal]", "Harbor Lights [Rehearsel]"),
+        ] {
+            assert!(
+                strict_track_title_similarity(take, None, other) >= TITLE_SIMILARITY_THRESHOLD
+                    && strict_track_title_similarity(other, None, take)
+                        >= TITLE_SIMILARITY_THRESHOLD,
+                "{take} {other}"
+            );
+            let (mut local, mut remote) = odd_length_pair(10, 2, 200.0);
+            local.tracks[2].title = Some(take.to_string());
+            remote.tracklist[2].title = other.to_string();
+            assert_no_odd_length(&local, &remote, "take word only locally");
+
+            let (mut local, mut remote) = odd_length_pair(10, 2, 200.0);
+            local.tracks[2].title = Some(other.to_string());
+            remote.tracklist[2].title = take.to_string();
+            assert_no_odd_length(&local, &remote, "take word only remotely");
+        }
+    }
+
+    /// An odd pair on a Various Artists release of `count` tracks.
+    fn various_odd_pair(count: usize) -> (LocalRelease, RemoteRelease) {
+        let (mut local, mut remote) = odd_length_pair(count, count - 1, 312.0);
+        local.artist_kind = ArtistKind::VariousArtists;
+        local.album_artist = Some("Various Artists".to_string());
+        remote.artists = vec!["Various Artists".to_string()];
+        (local, remote)
+    }
+
+    #[test]
+    fn a_various_artists_release_needs_eight_tracks_for_an_odd_length() {
+        let (local, remote) = various_odd_pair(ODD_LENGTH_MIN_VARIOUS_TRACKS - 1);
+        assert_no_odd_length(&local, &remote, "seven tracks");
+
+        let (local, remote) = various_odd_pair(ODD_LENGTH_MIN_VARIOUS_TRACKS);
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert!(odd_length_warning(&evaluation).is_some());
+    }
+
+    #[test]
+    fn a_length_gap_that_the_drift_allowance_covers_is_not_an_odd_length() {
+        // Nine seconds on one of ten tracks is drift. Counted at the edge the
+        // odd-length score would reach the gate where the drift score does not,
+        // so only the exclusion keeps the odd-length rule from taking it.
+        let (local, remote) = odd_length_pair(10, 4, 9.0);
+        let mut candidate = Candidate::new(&local, remote);
+        candidate.score.album_title = 0.90;
+        candidate.score.album_artist = 0.92;
+        assert!(odd_length_edge_score(&local, &candidate, 4) >= SCORE_THRESHOLD);
+        let cleaned = cleaned_track_titles(&local);
+        assert_eq!(one_length_differs(&local, &candidate, &cleaned), None);
+        let evaluation =
+            evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default());
+        assert!(!evaluation.auto_accept, "{:?}", evaluation.warnings);
+        assert_eq!(odd_length_warning(&evaluation), None);
+    }
+
+    #[test]
+    fn a_version_word_on_one_side_of_the_odd_pair_is_another_recording() {
+        // The titles score at least 0.90 against each other, one letter apart,
+        // so only the version word separates them.
+        let (mut local, mut remote) = odd_length_pair(10, 2, 200.0);
+        local.tracks[2].title = Some("Harbor Lights Mix".to_string());
+        remote.tracklist[2].title = "Harbor Lights Mic".to_string();
+        let local_side = remote.clone();
+        let local_titles = local.clone();
+        assert!(
+            strict_track_title_similarity("Harbor Lights Mix", None, "Harbor Lights Mic")
+                >= TITLE_SIMILARITY_THRESHOLD
+        );
+        assert_no_odd_length(&local_titles, &local_side, "version word only locally");
+
+        let (mut local, mut remote) = odd_length_pair(10, 2, 200.0);
+        local.tracks[2].title = Some("Harbor Lights Mic".to_string());
+        remote.tracklist[2].title = "Harbor Lights Mix".to_string();
+        assert_no_odd_length(&local, &remote, "version word only remotely");
+    }
+
+    #[test]
+    fn the_odd_length_rule_needs_the_mapping_in_local_order() {
+        // The provider lists the first two tracks the other way round, with
+        // their lengths: titles and lengths still pair up one to one, but the
+        // mapping is not in local order.
+        let (local, mut remote) = odd_length_pair(10, 5, 200.0);
+        remote.tracklist.swap(0, 1);
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(candidate.mapping.complete && !candidate.mapping.ambiguous);
+        assert!(!mapped_in_local_order(&local, &candidate));
+        assert_no_odd_length(&local, &remote, "swapped order");
+    }
+
+    #[test]
+    fn an_alternative_with_an_ambiguous_mapping_does_not_block_the_odd_length_rule() {
+        let (local, remote) = odd_length_pair(10, 9, 312.0);
+        let mut other = remote.clone();
+        other.id = ReleaseId::Discogs(43);
+        other.tracklist[9].duration_secs = local.tracks[9].duration_secs;
+        let mut fits = Candidate::new(&local, other);
+        assert!(fits_every_length(&local, &fits));
+        fits.mapping.ambiguous = true;
+        assert!(!fits_every_length(&local, &fits));
+        let evaluation = album_evaluation(&local, &remote, std::slice::from_ref(&fits));
+        assert!(
+            !evaluation
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("fits every length")),
+            "{:?}",
+            evaluation.blockers
+        );
+    }
+
+    #[test]
+    fn a_title_that_names_a_version_is_found_in_any_word() {
+        for title in [
+            "Hollow (Extended Mix)",
+            "Hollow - Live",
+            "Hollow (2011 Remastered)",
+            "Hollow Remaster",
+            "Hollow (Radio Edit)",
+            "Hollow Version",
+        ] {
+            assert!(names_a_version(title), "{title}");
+        }
+        for title in ["Hollow", "Second Wind", "Paper Crowns"] {
+            assert!(!names_a_version(title), "{title}");
+        }
     }
 }
