@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v28";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v27";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v29";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v28";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -85,9 +85,26 @@ pub const TEXT_IDENTITY_SCORE: f64 = 0.95;
 /// that the runner can print it next to the unconfirmed-edition note.
 pub const UNCONFIRMED_LENGTHS_NOTE: &str = "track lengths are unconfirmed";
 
+/// What the warning of an accept that reads a one-sided version label as a
+/// labelling difference ends with (see [`one_sided_labels`]), so that the runner
+/// can print it next to the unconfirmed-edition note.
+pub const LABEL_DIFFERENCE_NOTE: &str = "read as a labelling difference";
+
 /// The endings that mark a warning as the note of an acceptance rule, which the
 /// runner prints under the accept (see [`Evaluation::rule_notes`]).
-const RULE_NOTES: &[&str] = &[UNCONFIRMED_LENGTHS_NOTE];
+const RULE_NOTES: &[&str] = &[UNCONFIRMED_LENGTHS_NOTE, LABEL_DIFFERENCE_NOTE];
+
+/// The edition qualifiers that a release may carry on one side only without
+/// being a different recording, when every length agrees: a provider's `Live`
+/// edition note or a `Remastered` format that the files' tags never mention. The
+/// other qualifiers never count: `instrumental`, `mono` and `remix` name audio
+/// that really differs, and `stereo` is already ignored by [`qualifiers_agree`].
+const RELEASE_LABEL_QUALIFIERS: &[&str] = &["acoustic", "deluxe", "demo", "live", "remastered"];
+
+/// [`RELEASE_LABEL_QUALIFIERS`] for a single track title. Narrower, since
+/// `deluxe` names an edition and a track's `remastered` never counts (see
+/// [`album_track_qualifiers`]).
+const TRACK_LABEL_QUALIFIERS: &[&str] = &["acoustic", "demo", "live"];
 
 /// The fewest local tracks that let a candidate's agreeing durations set a
 /// close alternative aside: with fewer, a matching length is too common.
@@ -2093,6 +2110,23 @@ fn significant_qualifiers(set: &BTreeSet<&'static str>) -> BTreeSet<&'static str
         .collect()
 }
 
+/// Whether two qualifier sets differ only by version labels: after the stereo
+/// rule of [`qualifiers_agree`], one set is a proper subset of the other (an
+/// empty set counts) and every word that tells them apart is in `labels`.
+/// `{}` and `{live}` pass, as do `{live}` and `{live, remastered}` for
+/// [`RELEASE_LABEL_QUALIFIERS`]; `{demo}` and `{live}` do not, nor does `{}`
+/// against `{mono}`.
+fn one_sided_labels(
+    a: &BTreeSet<&'static str>,
+    b: &BTreeSet<&'static str>,
+    labels: &[&str],
+) -> bool {
+    let (a, b) = (significant_qualifiers(a), significant_qualifiers(b));
+    a != b
+        && (a.is_subset(&b) || b.is_subset(&a))
+        && a.symmetric_difference(&b).all(|word| labels.contains(word))
+}
+
 // ---------------------------------------------------------------------------
 // Track mapping
 // ---------------------------------------------------------------------------
@@ -3645,6 +3679,194 @@ fn durations_identify_tracks(local: &LocalRelease, candidate: &Candidate) -> boo
     })
 }
 
+/// A track title split into its base and the version label it ends with: a
+/// final `(...)` or `[...]` group, or a ` - ` or en dash tail, whose words
+/// include an edition qualifier (see [`edition_qualifiers`]). `Clean Slate
+/// (live)` gives `("Clean Slate", "live")`; `Live Wire` and `Live Forever` have
+/// no group to lose, and `Song (Live) [Bonus Track]` ends with a group that
+/// names no qualifier, so none of them splits. A title whose base would be empty
+/// does not split either.
+fn split_version_label(title: &str) -> Option<(&str, &str)> {
+    let title = title.trim();
+    let open = match title.chars().next_back() {
+        Some(')') => Some('('),
+        Some(']') => Some('['),
+        _ => None,
+    };
+    let (cut, label) = if let Some(open) = open {
+        let start = title.rfind(open)?;
+        (start, &title[start + 1..title.len() - 1])
+    } else {
+        let (start, width) = [" - ", " \u{2013} "]
+            .iter()
+            .filter_map(|separator| title.rfind(separator).map(|at| (at, separator.len())))
+            .max_by_key(|(at, _)| *at)?;
+        (start, &title[start + width..])
+    };
+    let base = title[..cut].trim_end();
+    (!base.is_empty() && !edition_qualifiers(label).is_empty()).then_some((base, label))
+}
+
+/// A track title without the version label it ends with
+/// ([`split_version_label`]), or the trimmed title when it has none.
+fn without_version_label(title: &str) -> &str {
+    split_version_label(title).map_or_else(|| title.trim(), |(base, _)| base)
+}
+
+/// Whether `a` and `b` are the same title once each loses its trailing version
+/// label ([`without_version_label`]), at least [`TITLE_SIMILARITY_THRESHOLD`].
+fn bases_agree(a: &str, b: &str) -> bool {
+    track_title_similarity(without_version_label(a), None, without_version_label(b))
+        >= TITLE_SIMILARITY_THRESHOLD
+}
+
+/// The readings of a local title that [`without_version_label`] may strip: the
+/// raw tag and, when there is one, the cleaned reading
+/// ([`cleaned_track_titles`]), which has the extension and the track number off
+/// (`05 - Clean Slate (Live).mp3`).
+fn local_title_readings<'a>(title: &'a str, cleaned: Option<&'a CleanedTitle>) -> Vec<&'a str> {
+    let mut readings = vec![title];
+    readings.extend(cleaned.map(|cleaned| cleaned.text.as_str()));
+    readings
+}
+
+/// A mapped pair whose titles differ only by a version label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LabelPair {
+    local_index: usize,
+    remote_index: usize,
+    /// The title that carries the extra label, as the files or the provider
+    /// spell it.
+    labelled_title: String,
+}
+
+/// Whether `labelled` is `plain` plus a real version label: it ends in one
+/// ([`split_version_label`]) that names no take, session or rehearsal, and its
+/// base reads as `plain` once the label (if any) is off, without the
+/// forgiveness of a subtitle that only one side has
+/// ([`strict_track_title_similarity`]). `Song (Live)` is `Song` plus a label,
+/// but neither `Song (Part 2)` nor `Song [Bonus Track]` is, and a title that
+/// ends in a bare word (`... Many Words Live`) has no group to lose.
+fn is_plain_plus_label(labelled: &str, plain: &str) -> bool {
+    let Some((base, label)) = split_version_label(labelled) else {
+        return false;
+    };
+    !names_take_words(label)
+        && !split_version_label(plain).is_some_and(|(_, label)| names_take_words(label))
+        && strict_track_title_similarity(base, None, without_version_label(plain))
+            >= TITLE_SIMILARITY_THRESHOLD
+}
+
+/// The local tracks of a candidate that differ from their remote track only by a
+/// version label, when every pair of the mapping is either that or agrees
+/// outright; `None` when some pair is neither. `Some` of an empty list means
+/// every pair agrees outright. `cleaned` is [`cleaned_track_titles`] of `local`.
+///
+/// A pair agrees outright when its title scores at least
+/// [`TITLE_SIMILARITY_THRESHOLD`] and the track qualifiers agree. It is a label
+/// pair when the track qualifiers differ by [`TRACK_LABEL_QUALIFIERS`] on one
+/// side only ([`one_sided_labels`]), the side with the extra label really ends
+/// in one ([`is_plain_plus_label`]), and no twin exists: no other local track,
+/// and no other playable track of the mapped medium, has a title agreeing with
+/// this pair's once its label is off. A twin would make the label the one thing
+/// that tells two recordings apart.
+fn label_only_pairs(
+    local: &LocalRelease,
+    candidate: &Candidate,
+    cleaned: &[Option<CleanedTitle>],
+) -> Option<Vec<LabelPair>> {
+    let mapping = &candidate.mapping;
+    let playable = candidate.release.playable_tracks_in(mapping.medium);
+    let mut label_pairs = Vec::new();
+    for (l, r) in mapping.assigned_pairs() {
+        let local_track = local.tracks.get(l)?;
+        let remote_track = candidate.release.tracklist.get(r)?;
+        let title = local_track.title.as_deref()?;
+        let local_qualifiers = album_track_qualifiers(title);
+        let remote_qualifiers = album_track_qualifiers(&remote_track.title);
+        let similarity = mapping.title_similarity(local, cleaned, l, r, remote_track)?;
+        if similarity >= TITLE_SIMILARITY_THRESHOLD
+            && qualifiers_agree(&local_qualifiers, &remote_qualifiers)
+        {
+            continue;
+        }
+        if !one_sided_labels(
+            &local_qualifiers,
+            &remote_qualifiers,
+            TRACK_LABEL_QUALIFIERS,
+        ) {
+            return None;
+        }
+        let local_carries = significant_qualifiers(&local_qualifiers).len()
+            > significant_qualifiers(&remote_qualifiers).len();
+        let readings = local_title_readings(title, cleaned.get(l).and_then(Option::as_ref));
+        let agreeing_reading = readings.iter().copied().find(|reading| {
+            if local_carries {
+                is_plain_plus_label(reading, &remote_track.title)
+            } else {
+                is_plain_plus_label(&remote_track.title, reading)
+            }
+        })?;
+        let twin_among_local = local.tracks.iter().enumerate().any(|(other, track)| {
+            other != l
+                && track.title.as_deref().is_some_and(|other_title| {
+                    local_title_readings(other_title, cleaned.get(other).and_then(Option::as_ref))
+                        .iter()
+                        .any(|reading| bases_agree(reading, agreeing_reading))
+                })
+        });
+        let twin_among_remote = playable
+            .iter()
+            .any(|(other, track)| *other != r && bases_agree(&track.title, &remote_track.title));
+        if twin_among_local || twin_among_remote {
+            return None;
+        }
+        label_pairs.push(LabelPair {
+            local_index: l,
+            remote_index: r,
+            labelled_title: if local_carries {
+                title.to_string()
+            } else {
+                remote_track.title.clone()
+            },
+        });
+    }
+    Some(label_pairs)
+}
+
+/// Whether the labels of every level say one thing: the release's edition
+/// qualifiers, alone and then with the track qualifiers of every label pair, on
+/// each side, agree or differ by [`RELEASE_LABEL_QUALIFIERS`] on one side only. Demo tracks
+/// against a release noted as live, or a live track against a remastered
+/// release, are two different claims and never a single labelling difference.
+fn labels_agree_across_levels(
+    local: &LocalRelease,
+    candidate: &Candidate,
+    label_pairs: &[LabelPair],
+) -> bool {
+    let mut local_set = match &local.album_title {
+        Some(title) if tag_identity(local).title.is_some() => edition_qualifiers(title),
+        _ => BTreeSet::new(),
+    };
+    let mut remote_set = remote_edition_qualifiers(&candidate.release);
+    let at_release_level = qualifiers_agree(&local_set, &remote_set)
+        || one_sided_labels(&local_set, &remote_set, RELEASE_LABEL_QUALIFIERS);
+    for pair in label_pairs {
+        let local_title = local
+            .tracks
+            .get(pair.local_index)
+            .and_then(|track| track.title.as_deref())
+            .unwrap_or_default();
+        local_set.extend(album_track_qualifiers(local_title));
+        if let Some(remote_track) = candidate.release.tracklist.get(pair.remote_index) {
+            remote_set.extend(album_track_qualifiers(&remote_track.title));
+        }
+    }
+    at_release_level
+        && (qualifiers_agree(&local_set, &remote_set)
+            || one_sided_labels(&local_set, &remote_set, RELEASE_LABEL_QUALIFIERS))
+}
+
 /// Whether a candidate is marked unofficial: a Discogs format that says
 /// `Unofficial Release`, or a MusicBrainz release with status `Bootleg`. Such a
 /// release is not the edition a library's files come from often enough to take
@@ -3874,9 +4096,6 @@ fn local_title_is_another_take(
 }
 
 fn names_another_take(local_title: &str, remote_title: &str) -> bool {
-    const NUMBER_WORDS: &[&str] = &[
-        "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
-    ];
     let local_title = local_title.trim_end();
     let Some(start) = bracketed_suffix_start(local_title) else {
         return false;
@@ -3884,7 +4103,17 @@ fn names_another_take(local_title: &str, remote_title: &str) -> bool {
     if bracketed_suffix_start(remote_title.trim_end()).is_some() {
         return false;
     }
-    let suffix = normalize_text(&local_title[start..]);
+    names_take_words(&local_title[start..])
+}
+
+/// Whether `text` (the inside or the whole of a bracketed group, or a dash
+/// tail) names an alternate take, outtake, rehearsal or session, or `take`
+/// followed by a number.
+fn names_take_words(text: &str) -> bool {
+    const NUMBER_WORDS: &[&str] = &[
+        "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    ];
+    let suffix = normalize_text(text);
     let words: Vec<&str> = suffix.split_whitespace().collect();
     words.iter().any(|word| {
         matches!(
@@ -3957,6 +4186,15 @@ fn conflicting_recordings(a: &Candidate, b: &Candidate) -> bool {
         })
 }
 
+/// Whether `b` is the same audio as `a` under another edition's name: the same
+/// group when both have one, the same title and artist, every mapped track with
+/// the same title, artist and a length within [`DURATION_TOLERANCE_SECS`], and
+/// no contradicting recording. Release qualifiers must agree, except that a
+/// release label on one side only ([`one_sided_labels`] over
+/// [`RELEASE_LABEL_QUALIFIERS`]) is allowed when there are at least
+/// [`DURATION_IDENTITY_MIN_TRACKS`] pairs and every pair is within
+/// [`DURATION_IDENTITY_GAP_SECS`]. A label in a track title never makes two
+/// releases equivalent, since the titles must normalize equal.
 fn equivalent_audio(a: &Candidate, b: &Candidate) -> bool {
     if !b.mapping.complete || b.mapping.ambiguous || b.release.has_unsupported_entries() {
         return false;
@@ -3970,14 +4208,23 @@ fn equivalent_audio(a: &Candidate, b: &Candidate) -> bool {
     if normalize_text(&a.release.title) != normalize_text(&b.release.title)
         || normalize_artist_for(a.release.provider(), &a.release.artist_display())
             != normalize_artist_for(b.release.provider(), &b.release.artist_display())
-        || !qualifiers_agree(
-            &remote_edition_qualifiers(&a.release),
-            &remote_edition_qualifiers(&b.release),
-        )
         || a.mapping.pairs.len() != b.mapping.pairs.len()
     {
         return false;
     }
+    let (a_qualifiers, b_qualifiers) = (
+        remote_edition_qualifiers(&a.release),
+        remote_edition_qualifiers(&b.release),
+    );
+    let labelled = if qualifiers_agree(&a_qualifiers, &b_qualifiers) {
+        false
+    } else if one_sided_labels(&a_qualifiers, &b_qualifiers, RELEASE_LABEL_QUALIFIERS)
+        && a.mapping.assigned_count() >= DURATION_IDENTITY_MIN_TRACKS
+    {
+        true
+    } else {
+        return false;
+    };
     a.mapping
         .assigned_pairs()
         .all(|(local_index, remote_index)| {
@@ -4010,6 +4257,9 @@ fn equivalent_audio(a: &Candidate, b: &Candidate) -> bool {
                         == normalize_artist_for(b.release.provider(), &y_artist))
                 && matches!((x.duration_secs, y.duration_secs), (Some(x), Some(y))
                 if x.is_finite() && y.is_finite() && (x-y).abs() <= DURATION_TOLERANCE_SECS)
+                && (!labelled
+                    || matches!((x.duration_secs, y.duration_secs), (Some(x), Some(y))
+                    if (x-y).abs() <= DURATION_IDENTITY_GAP_SECS))
                 && !matches!((x.recording_id, y.recording_id), (Some(x), Some(y)) if x != y)
         })
 }
@@ -4139,6 +4389,18 @@ fn evaluate_with(
         && !corroborated_title
         && titles_identify_tracks(local, candidate);
 
+    // A label on one side only is a labelling difference, not another recording,
+    // when the lengths identify the tracks and every other title agrees. The
+    // gate holds with an empty list when no track carries a label.
+    let label_pairs = if duration_identity {
+        label_only_pairs(local, candidate, &cleaned)
+            .filter(|pairs| labels_agree_across_levels(local, candidate, pairs))
+    } else {
+        None
+    };
+    let label_gate = label_pairs.is_some();
+    let label_pairs = label_pairs.unwrap_or_default();
+
     let acceptance_score = match_scope.score(&candidate.score);
     if !corroborated_title
         && !duration_identity
@@ -4212,6 +4474,10 @@ fn evaluate_with(
             continue;
         };
 
+        let label_pair = label_pairs
+            .iter()
+            .any(|pair| pair.local_index == local_index);
+
         if match_scope == MatchScope::Album {
             let known =
                 |duration: Option<f64>| duration.is_some_and(|secs| secs.is_finite() && secs > 0.0);
@@ -4226,10 +4492,12 @@ fn evaluate_with(
             if !known(remote_track.duration_secs) {
                 missing_remote += 1;
             }
-            if !qualifiers_agree(
-                &album_track_qualifiers(local_track.title.as_deref().unwrap_or_default()),
-                &album_track_qualifiers(&remote_track.title),
-            ) {
+            if !label_pair
+                && !qualifiers_agree(
+                    &album_track_qualifiers(local_track.title.as_deref().unwrap_or_default()),
+                    &album_track_qualifiers(&remote_track.title),
+                )
+            {
                 blockers.push(format!(
                     "track version qualifiers differ for '{}'",
                     remote_track.title
@@ -4246,13 +4514,15 @@ fn evaluate_with(
             }
         }
 
-        if let Some(score) = candidate.mapping.title_similarity(
-            local,
-            &cleaned,
-            local_index,
-            remote_index,
-            remote_track,
-        ) {
+        if !label_pair
+            && let Some(score) = candidate.mapping.title_similarity(
+                local,
+                &cleaned,
+                local_index,
+                remote_index,
+                remote_track,
+            )
+        {
             if score < minimum_title_similarity {
                 titles_below_minimum += 1;
             }
@@ -4291,6 +4561,19 @@ fn evaluate_with(
         warnings.push(format!(
             "{provider} lists no duration for {missing_remote} of {} tracks; {UNCONFIRMED_LENGTHS_NOTE}",
             local.tracks.len()
+        ));
+    }
+
+    if let Some(first) = label_pairs.first() {
+        let count = label_pairs.len();
+        let (noun, verb) = if count == 1 {
+            ("title", "differs")
+        } else {
+            ("titles", "differ")
+        };
+        let first = &first.labelled_title;
+        warnings.push(format!(
+            "{count} track {noun} {verb} from {provider} only by a version label (first '{first}') and every duration agrees within {DURATION_IDENTITY_GAP_SECS}s in track order; {LABEL_DIFFERENCE_NOTE}"
         ));
     }
 
@@ -4452,10 +4735,32 @@ fn evaluate_with(
         let local_qualifiers = edition_qualifiers(local_title);
         let remote_qualifiers = remote_edition_qualifiers(remote);
         if !qualifiers_agree(&local_qualifiers, &remote_qualifiers) {
-            blockers.push(format!(
-                "edition qualifiers differ: local {:?} versus {provider} {:?}",
-                local_qualifiers, remote_qualifiers
-            ));
+            if label_gate
+                && one_sided_labels(
+                    &local_qualifiers,
+                    &remote_qualifiers,
+                    RELEASE_LABEL_QUALIFIERS,
+                )
+            {
+                let agreement = if label_pairs.is_empty() {
+                    format!(
+                        "every title and every duration within {DURATION_IDENTITY_GAP_SECS}s agree in track order"
+                    )
+                } else {
+                    format!(
+                        "every duration within {DURATION_IDENTITY_GAP_SECS}s agrees in track order and the titles agree apart from their version labels"
+                    )
+                };
+                warnings.push(format!(
+                    "edition qualifiers differ (local {:?} versus {provider} {:?}) but {agreement}; {LABEL_DIFFERENCE_NOTE}",
+                    local_qualifiers, remote_qualifiers
+                ));
+            } else {
+                blockers.push(format!(
+                    "edition qualifiers differ: local {:?} versus {provider} {:?}",
+                    local_qualifiers, remote_qualifiers
+                ));
+            }
         }
     }
 
@@ -6511,11 +6816,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v28"
+            "discogs-match-v29"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v27"
+            "musicbrainz-match-v28"
         );
     }
 
@@ -10590,5 +10895,657 @@ mod tests {
             Some("Test Album"),
             "Test Album (Remastered)"
         ));
+    }
+
+    // ---- R2a: a label on one side only, when every length agrees ----
+
+    const LABEL_TITLES: [&str; 6] = [
+        "Opening",
+        "Second Wind",
+        "Hollow",
+        "Undertow",
+        "Lantern",
+        "Closing",
+    ];
+
+    fn qualifier_set(words: &[&'static str]) -> BTreeSet<&'static str> {
+        words.iter().copied().collect()
+    }
+
+    /// Asserts the album is accepted with exactly one warning that ends with
+    /// the label note, and returns that warning.
+    fn assert_read_as_label(local: &LocalRelease, remote: &RemoteRelease) -> String {
+        let evaluation = album_evaluation(local, remote, &[]);
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        let notes: Vec<_> = evaluation.rule_notes().collect();
+        assert_eq!(notes.len(), 1, "{:?}", evaluation.warnings);
+        assert!(notes[0].ends_with(LABEL_DIFFERENCE_NOTE));
+        notes[0].to_string()
+    }
+
+    /// Asserts the album is accepted and that at least one warning is read as a
+    /// labelling difference.
+    fn assert_labelled_accept(local: &LocalRelease, remote: &RemoteRelease) {
+        let evaluation = album_evaluation(local, remote, &[]);
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert!(
+            evaluation.rule_notes().count() >= 1,
+            "{:?}",
+            evaluation.warnings
+        );
+    }
+
+    fn assert_not_read_as_label(local: &LocalRelease, remote: &RemoteRelease) -> Evaluation {
+        let evaluation = album_evaluation(local, remote, &[]);
+        assert!(!evaluation.auto_accept, "{:?}", evaluation.warnings);
+        assert!(
+            !evaluation
+                .warnings
+                .iter()
+                .any(|note| note.ends_with(LABEL_DIFFERENCE_NOTE)),
+            "{:?}",
+            evaluation.warnings
+        );
+        evaluation
+    }
+
+    #[test]
+    fn one_sided_labels_need_a_label_on_one_side_only() {
+        let release = RELEASE_LABEL_QUALIFIERS;
+        for (a, b) in [
+            (&[][..], &["live"][..]),
+            (&["live"], &["live", "remastered"]),
+            (&["acoustic", "live"], &["live"]),
+            (&[], &["deluxe"]),
+            (&["live"], &["stereo"]),
+            (&[], &["remastered", "stereo"]),
+        ] {
+            let (a, b) = (qualifier_set(a), qualifier_set(b));
+            assert!(one_sided_labels(&a, &b, release), "{a:?} versus {b:?}");
+            assert!(one_sided_labels(&b, &a, release), "{b:?} versus {a:?}");
+        }
+        for (a, b) in [
+            (&["demo"][..], &["live"][..]),
+            (&[], &["mono"]),
+            (&[], &["instrumental"]),
+            (&[], &["remix"]),
+            (&[], &["remixes"]),
+            (&["live"], &["live", "mono"]),
+            (&[], &[]),
+            (&[], &["stereo"]),
+            (&["live"], &["live"]),
+        ] {
+            let (a, b) = (qualifier_set(a), qualifier_set(b));
+            assert!(!one_sided_labels(&a, &b, release), "{a:?} versus {b:?}");
+            assert!(!one_sided_labels(&b, &a, release), "{b:?} versus {a:?}");
+        }
+        // A track's labels are narrower than a release's.
+        let (empty, deluxe) = (qualifier_set(&[]), qualifier_set(&["deluxe"]));
+        assert!(!one_sided_labels(&empty, &deluxe, TRACK_LABEL_QUALIFIERS));
+        let live = qualifier_set(&["live"]);
+        assert!(one_sided_labels(&empty, &live, TRACK_LABEL_QUALIFIERS));
+    }
+
+    #[test]
+    fn a_version_label_is_stripped_only_from_the_end() {
+        for (title, base) in [
+            ("Clean Slate (live)", "Clean Slate"),
+            ("Song - Live", "Song"),
+            ("Song \u{2013} Demo", "Song"),
+            ("Song [Demo Version]", "Song"),
+            ("  Song (Acoustic)  ", "Song"),
+            ("Live Wire", "Live Wire"),
+            ("Live Forever", "Live Forever"),
+            ("Song (Live) [Bonus Track]", "Song (Live) [Bonus Track]"),
+            ("Song (Part 2)", "Song (Part 2)"),
+            ("(Live)", "(Live)"),
+            ("Song - Part 2", "Song - Part 2"),
+        ] {
+            assert_eq!(without_version_label(title), base, "{title}");
+        }
+    }
+
+    #[test]
+    fn a_release_label_on_the_remote_side_alone_is_read_as_a_labelling_difference() {
+        for (setup, expected) in [
+            ("notes", "Live"),
+            ("notes", "Demo"),
+            ("format", "CD (Album, Remastered)"),
+            ("format", "Vinyl (LP, Album, Remastered, Stereo)"),
+        ] {
+            let (mut local, mut remote) = spaced_pair(&LABEL_TITLES, &LABEL_TITLES);
+            local.album_title = Some("Tokyo Tales".to_string());
+            remote.title = "Tokyo Tales".to_string();
+            if setup == "notes" {
+                remote.edition_notes = vec![expected.to_string()];
+            } else {
+                remote.formats = vec![expected.to_string()];
+            }
+            let note = assert_read_as_label(&local, &remote);
+            assert!(
+                note.starts_with("edition qualifiers differ (local {} versus discogs {"),
+                "{note}"
+            );
+            assert!(
+                note.ends_with(
+                    "but every title and every duration within 1.5s agree in track order; read as a labelling difference"
+                ),
+                "{note}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_label_in_the_local_album_title_against_a_silent_remote_is_read_as_a_labelling_difference()
+    {
+        // The provider's title is the files' title without the word `Live`.
+        let (mut local, mut remote) = spaced_pair(&LABEL_TITLES, &LABEL_TITLES);
+        local.album_title =
+            Some("An Evening with Test Artist Recorded Live at the Royal Albert Hall".to_string());
+        remote.title = "An Evening with Test Artist Recorded at the Royal Albert Hall".to_string();
+        let note = assert_read_as_label(&local, &remote);
+        assert!(
+            note.contains("(local {\"live\"} versus discogs {})"),
+            "{note}"
+        );
+
+        // A short album title cannot lose a word and still agree.
+        let (mut local, remote) = spaced_pair(&LABEL_TITLES, &LABEL_TITLES);
+        local.album_title = Some("Test Album (Live)".to_string());
+        let evaluation = assert_not_read_as_label(&local, &remote);
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("album title or artist")),
+            "{:?}",
+            evaluation.blockers
+        );
+    }
+
+    #[test]
+    fn a_track_label_on_one_side_is_read_as_a_labelling_difference() {
+        // Quicksand, `Clean Slate`.
+        let mut local_titles = LABEL_TITLES;
+        local_titles[1] = "Clean Slate (live)";
+        local_titles[3] = "Backdraft (live)";
+        let mut remote_titles = LABEL_TITLES;
+        remote_titles[1] = "Clean Slate";
+        remote_titles[3] = "Backdraft";
+        let (local, remote) = spaced_pair(&local_titles, &remote_titles);
+        let note = assert_read_as_label(&local, &remote);
+        assert_eq!(
+            note,
+            "2 track titles differ from discogs only by a version label (first 'Clean Slate (live)') and every duration agrees within 1.5s in track order; read as a labelling difference"
+        );
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(
+            !evaluation.warnings.iter().any(|warning| {
+                warning.contains("track title") && !warning.ends_with(LABEL_DIFFERENCE_NOTE)
+            }),
+            "no weak-title warning for a label pair: {:?}",
+            evaluation.warnings
+        );
+        assert!(
+            !evaluation
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("version qualifiers")),
+            "{:?}",
+            evaluation.blockers
+        );
+
+        // One label pair reads in the singular, and the label may be the remote's.
+        let mut local_titles = LABEL_TITLES;
+        local_titles[2] = "Hollow";
+        let mut remote_titles = LABEL_TITLES;
+        remote_titles[2] = "Hollow (Live)";
+        let (local, remote) = spaced_pair(&local_titles, &remote_titles);
+        let note = assert_read_as_label(&local, &remote);
+        assert!(
+            note.starts_with(
+                "1 track title differs from discogs only by a version label (first 'Hollow (Live)')"
+            ),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn several_live_tracks_of_a_studio_album_are_read_as_labelling_differences() {
+        // Klasse Kriminale.
+        let local_titles = [
+            "Opening (Live)",
+            "Second Wind (Live)",
+            "Hollow",
+            "Undertow (Live)",
+            "Lantern (Live)",
+            "Closing",
+        ];
+        let (local, remote) = spaced_pair(&local_titles, &LABEL_TITLES);
+        let note = assert_read_as_label(&local, &remote);
+        assert!(
+            note.starts_with("4 track titles differ from discogs"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn dash_tails_and_file_name_titles_are_read_as_labelling_differences() {
+        let mut remote_titles = LABEL_TITLES;
+        remote_titles[2] = "Song - Live";
+        let mut local_titles = LABEL_TITLES;
+        local_titles[2] = "Song";
+        let (local, remote) = spaced_pair(&local_titles, &remote_titles);
+        assert_read_as_label(&local, &remote);
+
+        let mut local_titles = LABEL_TITLES;
+        local_titles[2] = "Song (Live)";
+        let mut remote_titles = LABEL_TITLES;
+        remote_titles[2] = "Song";
+        let (local, remote) = spaced_pair(&local_titles, &remote_titles);
+        assert_read_as_label(&local, &remote);
+
+        let mut local_titles = LABEL_TITLES;
+        local_titles[4] = "05 - Clean Slate (Live).mp3";
+        let mut remote_titles = LABEL_TITLES;
+        remote_titles[4] = "Clean Slate";
+        let (local, remote) = spaced_pair(&local_titles, &remote_titles);
+        assert_read_as_label(&local, &remote);
+    }
+
+    #[test]
+    fn mono_instrumental_and_remix_notes_are_not_labels() {
+        for note in ["Mono", "Instrumental", "Remix"] {
+            let (local, mut remote) = spaced_pair(&LABEL_TITLES, &LABEL_TITLES);
+            remote.edition_notes = vec![note.to_string()];
+            let evaluation = assert_not_read_as_label(&local, &remote);
+            assert!(
+                evaluation
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.contains("edition qualifiers differ")),
+                "{note}: {:?}",
+                evaluation.blockers
+            );
+        }
+    }
+
+    #[test]
+    fn a_demo_does_not_stand_for_a_live_release() {
+        // The album titles agree (the provider's has no `Demo`), so only the
+        // demo-versus-live subset rule can block.
+        let (mut local, mut remote) = spaced_pair(&LABEL_TITLES, &LABEL_TITLES);
+        local.album_title =
+            Some("An Evening with Test Artist Recorded Demo at the Royal Albert Hall".to_string());
+        remote.title = "An Evening with Test Artist Recorded at the Royal Albert Hall".to_string();
+        let silent = assert_read_as_label(&local, &remote);
+        assert!(
+            silent.contains("(local {\"demo\"} versus discogs {})"),
+            "{silent}"
+        );
+        remote.edition_notes = vec!["Live".to_string()];
+        let evaluation = assert_not_read_as_label(&local, &remote);
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("edition qualifiers differ")),
+            "{:?}",
+            evaluation.blockers
+        );
+    }
+
+    #[test]
+    fn a_label_pair_needs_every_other_title_to_agree() {
+        let live_remote = |mut remote: RemoteRelease| {
+            remote.edition_notes = vec!["Live".to_string()];
+            remote
+        };
+        // Another title at 0.7x scores below the minimum.
+        let mut local_titles = LABEL_TITLES;
+        local_titles[3] = "Undertone Rising";
+        let (local, remote) = spaced_pair(&local_titles, &LABEL_TITLES);
+        let remote = live_remote(remote);
+        assert_not_read_as_label(&local, &remote);
+
+        // A label is no excuse for a weak album title (0.70 to 0.90).
+        let (mut local, remote) = spaced_pair(&LABEL_TITLES, &LABEL_TITLES);
+        local.album_title = Some("A Test Album".to_string());
+        let remote = live_remote(remote);
+        let score = Candidate::new(&local, remote.clone()).score.album_title;
+        assert!((0.70..0.90).contains(&score), "{score}");
+        assert_not_read_as_label(&local, &remote);
+
+        // Four tracks are too few to identify anything by length.
+        let (local, remote) = spaced_pair(&LABEL_TITLES[..4], &LABEL_TITLES[..4]);
+        let remote = live_remote(remote);
+        assert_not_read_as_label(&local, &remote);
+
+        // A remote that lists no length cannot confirm any.
+        let (local, mut remote) = spaced_pair(&LABEL_TITLES, &LABEL_TITLES);
+        for track in &mut remote.tracklist {
+            track.duration_secs = None;
+        }
+        let remote = live_remote(remote);
+        assert_not_read_as_label(&local, &remote);
+
+        // A placeholder title is not a label pair.
+        let mut local_titles = LABEL_TITLES;
+        local_titles[2] = "Track03";
+        let mut remote_titles = LABEL_TITLES;
+        remote_titles[2] = "Live Wire";
+        let (local, remote) = spaced_pair(&local_titles, &remote_titles);
+        assert_not_read_as_label(&local, &remote);
+    }
+
+    #[test]
+    fn a_label_pair_two_seconds_off_is_not_read_as_a_labelling_difference() {
+        let mut local_titles = LABEL_TITLES;
+        local_titles[2] = "Hollow (Live)";
+        let (mut local, remote) = spaced_pair(&local_titles, &LABEL_TITLES);
+        local.tracks[2].duration_secs = Some(local.tracks[2].duration_secs.unwrap() + 2.0);
+        let evaluation = assert_not_read_as_label(&local, &remote);
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("version qualifiers differ")),
+            "{:?}",
+            evaluation.blockers
+        );
+
+        let (mut local, mut remote) = spaced_pair(&LABEL_TITLES, &LABEL_TITLES);
+        remote.edition_notes = vec!["Live".to_string()];
+        local.tracks[2].duration_secs = Some(local.tracks[2].duration_secs.unwrap() + 2.0);
+        assert_not_read_as_label(&local, &remote);
+    }
+
+    #[test]
+    fn a_twin_title_keeps_a_label_pair_apart() {
+        // A twin among the other files.
+        let mut local_titles = LABEL_TITLES;
+        local_titles[1] = "Hollow (Live)";
+        local_titles[2] = "Hollow";
+        let mut remote_titles = LABEL_TITLES;
+        remote_titles[1] = "Hollow";
+        remote_titles[2] = "Hollow";
+        let (local, remote) = spaced_pair(&local_titles, &remote_titles);
+        assert_not_read_as_label(&local, &remote);
+
+        // A twin among the other tracks of the release.
+        let mut local_titles = LABEL_TITLES;
+        local_titles[2] = "Song (Live)";
+        let mut remote_titles = LABEL_TITLES;
+        remote_titles[2] = "Song";
+        remote_titles[4] = "Song (Live)";
+        let (local, remote) = spaced_pair(&local_titles, &remote_titles);
+        assert_not_read_as_label(&local, &remote);
+
+        // A remix is not a label, so `Song` and `Song (Remix)` stay apart.
+        let mut local_titles = LABEL_TITLES;
+        local_titles[2] = "Song";
+        let mut remote_titles = LABEL_TITLES;
+        remote_titles[2] = "Song (Remix)";
+        let (local, remote) = spaced_pair(&local_titles, &remote_titles);
+        assert_not_read_as_label(&local, &remote);
+    }
+
+    #[test]
+    fn a_label_is_not_read_as_a_labelling_difference_at_edition_scope() {
+        let (local, mut remote) = spaced_pair(&LABEL_TITLES, &LABEL_TITLES);
+        remote.edition_notes = vec!["Live".to_string()];
+        let candidate = Candidate::new(&local, remote);
+        let evaluation = evaluate(&local, &candidate, None, &DiscoveryEvidence::default());
+        assert!(!evaluation.auto_accept);
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("edition qualifiers differ")),
+            "{:?}",
+            evaluation.blockers
+        );
+        assert!(
+            !evaluation
+                .warnings
+                .iter()
+                .any(|warning| warning.ends_with(LABEL_DIFFERENCE_NOTE))
+        );
+    }
+
+    #[test]
+    fn an_alternative_that_differs_only_by_a_release_label_is_equivalent_audio() {
+        let (local, remote) = spaced_pair(&LABEL_TITLES, &LABEL_TITLES);
+        let first = Candidate::new(&local, remote.clone());
+        let alternative = |notes: &str, shift: f64| {
+            let mut other = remote.clone();
+            other.id = ReleaseId::Discogs(43);
+            other.formats = vec![notes.to_string()];
+            other.tracklist[2].duration_secs = other.tracklist[2].duration_secs.map(|d| d + shift);
+            Candidate::new(&local, other)
+        };
+        assert!(equivalent_audio(
+            &first,
+            &alternative("CD (Album, Remastered)", 0.0)
+        ));
+        assert!(equivalent_audio(
+            &first,
+            &alternative("CD (Album, Remastered)", 1.0)
+        ));
+        assert!(!equivalent_audio(
+            &first,
+            &alternative("CD (Album, Remastered)", 2.0)
+        ));
+        assert!(!equivalent_audio(
+            &first,
+            &alternative("CD (Album, Mono)", 0.0)
+        ));
+        assert!(!equivalent_audio(
+            &first,
+            &alternative("CD (Album, Instrumental)", 0.0)
+        ));
+        // Without a label, two seconds are still within the pressing tolerance.
+        assert!(equivalent_audio(&first, &alternative("CD (Album)", 2.0)));
+
+        // Fewer than five pairs: too little to call it one recording.
+        let (short_local, short_remote) = spaced_pair(&LABEL_TITLES[..4], &LABEL_TITLES[..4]);
+        let short_first = Candidate::new(&short_local, short_remote.clone());
+        let mut short_other = short_remote;
+        short_other.id = ReleaseId::Discogs(43);
+        short_other.formats = vec!["CD (Album, Remastered)".to_string()];
+        let short_other = Candidate::new(&short_local, short_other);
+        assert!(!equivalent_audio(&short_first, &short_other));
+
+        // A label in a track title never makes two releases equivalent.
+        let mut live_titles = LABEL_TITLES;
+        live_titles[2] = "Hollow (Live)";
+        let mut live = remote.clone();
+        live.id = ReleaseId::Discogs(44);
+        live.tracklist[2].title = live_titles[2].to_string();
+        assert!(!equivalent_audio(&first, &Candidate::new(&local, live)));
+    }
+
+    #[test]
+    fn the_labels_of_every_level_must_agree_with_the_release_label() {
+        // Demo tracks against a live release are two different claims.
+        let local_titles = [
+            "Opening",
+            "Second Wind (Demo)",
+            "Hollow",
+            "Undertow (Demo)",
+            "Lantern",
+            "Closing",
+        ];
+        let (local, mut remote) = spaced_pair(&local_titles, &LABEL_TITLES);
+        let silent = assert_read_as_label(&local, &remote);
+        assert!(silent.starts_with("2 track titles differ"), "{silent}");
+        remote.edition_notes = vec!["Live".to_string()];
+        let evaluation = assert_not_read_as_label(&local, &remote);
+        assert!(!evaluation.blockers.is_empty());
+
+        // The same label on both levels agrees, and so does a subset of the
+        // release's labels.
+        let live_titles = [
+            "Opening",
+            "Second Wind (Live)",
+            "Hollow",
+            "Undertow (Live)",
+            "Lantern",
+            "Closing",
+        ];
+        let (local, mut remote) = spaced_pair(&live_titles, &LABEL_TITLES);
+        remote.edition_notes = vec!["Live".to_string()];
+        assert_labelled_accept(&local, &remote);
+        remote.formats = vec!["CD (Album, Remastered)".to_string()];
+        assert_labelled_accept(&local, &remote);
+
+        // A track label against a release that names another label.
+        let (local, mut remote) = spaced_pair(&live_titles, &LABEL_TITLES);
+        remote.edition_notes = vec!["Demo".to_string()];
+        assert_not_read_as_label(&local, &remote);
+
+        // Labels on the files' side at both levels add up against a silent
+        // release; a release that says `Live` contradicts the album's `Demo`.
+        let (mut local, mut remote) = spaced_pair(&live_titles, &LABEL_TITLES);
+        local.album_title =
+            Some("An Evening with Test Artist Recorded Demo at the Royal Albert Hall".to_string());
+        remote.title = "An Evening with Test Artist Recorded at the Royal Albert Hall".to_string();
+        assert_labelled_accept(&local, &remote);
+        remote.edition_notes = vec!["Live".to_string()];
+        assert_not_read_as_label(&local, &remote);
+        remote.edition_notes = vec!["Remix".to_string()];
+        assert_not_read_as_label(&local, &remote);
+    }
+
+    #[test]
+    fn a_label_pair_must_really_be_a_label() {
+        for (local_title, remote_title) in [
+            ("Song (Live)", "Song (Part 2)"),
+            ("Song (Live)", "Song [Bonus Track]"),
+            (
+                "Some Extremely Long Song Title With Many Words Live",
+                "Some Extremely Long Song Title With Many Words",
+            ),
+            (
+                "Some Extremely Long Song Title With Many Words",
+                "Some Extremely Long Song Title With Many Words Live",
+            ),
+            ("Song (Live Rehearsal)", "Song"),
+            ("Song (Demo, Take 2)", "Song"),
+            ("Song - Live Session", "Song"),
+            ("Song", "Song (Demo, Take 2)"),
+            ("Song", "Song [Live Outtake]"),
+        ] {
+            let mut local_titles = LABEL_TITLES;
+            local_titles[2] = local_title;
+            let mut remote_titles = LABEL_TITLES;
+            remote_titles[2] = remote_title;
+            let (local, remote) = spaced_pair(&local_titles, &remote_titles);
+            let evaluation = assert_not_read_as_label(&local, &remote);
+            assert!(
+                !evaluation.blockers.is_empty(),
+                "{local_title} versus {remote_title}"
+            );
+        }
+        // Real labels around the same shapes still pass.
+        for (local_title, remote_title) in [
+            ("Song (Live)", "Song"),
+            ("Song", "Song (Live)"),
+            ("Song - Live", "Song"),
+            ("Song [Demo Version]", "Song"),
+        ] {
+            let mut local_titles = LABEL_TITLES;
+            local_titles[2] = local_title;
+            let mut remote_titles = LABEL_TITLES;
+            remote_titles[2] = remote_title;
+            let (local, remote) = spaced_pair(&local_titles, &remote_titles);
+            assert_read_as_label(&local, &remote);
+        }
+    }
+
+    #[test]
+    fn a_deluxe_track_title_is_not_a_track_label() {
+        let mut local_titles = LABEL_TITLES;
+        local_titles[2] = "Hollow (Deluxe)";
+        let (local, remote) = spaced_pair(&local_titles, &LABEL_TITLES);
+        let evaluation = assert_not_read_as_label(&local, &remote);
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("version qualifiers differ")),
+            "{:?}",
+            evaluation.blockers
+        );
+    }
+
+    #[test]
+    fn the_title_that_carries_the_extra_label_is_the_one_named() {
+        let mut local_titles = LABEL_TITLES;
+        local_titles[2] = "Hollow (Acoustic Live)";
+        let mut remote_titles = LABEL_TITLES;
+        remote_titles[2] = "Hollow (Live)";
+        let (local, remote) = spaced_pair(&local_titles, &remote_titles);
+        let note = assert_read_as_label(&local, &remote);
+        assert!(note.contains("(first 'Hollow (Acoustic Live)')"), "{note}");
+
+        let (local, remote) = spaced_pair(&remote_titles_swapped(), &local_titles);
+        let note = assert_read_as_label(&local, &remote);
+        assert!(note.contains("(first 'Hollow (Acoustic Live)')"), "{note}");
+    }
+
+    fn remote_titles_swapped() -> [&'static str; 6] {
+        let mut titles = LABEL_TITLES;
+        titles[2] = "Hollow (Live)";
+        titles
+    }
+
+    #[test]
+    fn a_release_warning_does_not_claim_every_title_agrees_beside_label_pairs() {
+        let mut local_titles = LABEL_TITLES;
+        local_titles[2] = "Hollow (Live)";
+        let (mut local, mut remote) = spaced_pair(&local_titles, &LABEL_TITLES);
+        local.album_title =
+            Some("An Evening with Test Artist Recorded Live at the Royal Albert Hall".to_string());
+        remote.title = "An Evening with Test Artist Recorded at the Royal Albert Hall".to_string();
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        let notes: Vec<_> = evaluation.rule_notes().collect();
+        assert_eq!(notes.len(), 2, "{:?}", evaluation.warnings);
+        let edition = notes
+            .iter()
+            .find(|note| note.starts_with("edition qualifiers differ"))
+            .expect("the release warning");
+        assert!(!edition.contains("every title"), "{edition}");
+        assert!(edition.ends_with(LABEL_DIFFERENCE_NOTE), "{edition}");
+    }
+
+    #[test]
+    fn a_remote_twin_alone_keeps_a_label_pair_apart() {
+        let mut local_titles = LABEL_TITLES;
+        local_titles[2] = "Song (Live)";
+        local_titles[4] = "Song (Acoustic) [Bonus]";
+        let mut remote_titles = LABEL_TITLES;
+        remote_titles[2] = "Song";
+        remote_titles[4] = "Song (Acoustic)";
+        let (local, remote) = spaced_pair(&local_titles, &remote_titles);
+        assert_not_read_as_label(&local, &remote);
+    }
+
+    #[test]
+    fn a_local_twin_alone_keeps_a_label_pair_apart() {
+        // One letter apart is 0.96, three letters 0.88: the files' two titles
+        // agree once the label is off, while the provider's two titles, which
+        // took one different step each, do not.
+        let mut local_titles = LABEL_TITLES;
+        local_titles[2] = "Midnight Caravan Of Dreamz (Live)";
+        local_titles[4] = "Mxdnight Caravan Of Dreamz";
+        let mut remote_titles = LABEL_TITLES;
+        remote_titles[2] = "Midnight Caravan Of Dreams";
+        remote_titles[4] = "Mxdnight Karavan Of Dreamz";
+        let (local, remote) = spaced_pair(&local_titles, &remote_titles);
+        assert!(!bases_agree(remote_titles[2], remote_titles[4]));
+        assert!(bases_agree(local_titles[2], local_titles[4]));
+        assert_not_read_as_label(&local, &remote);
     }
 }
