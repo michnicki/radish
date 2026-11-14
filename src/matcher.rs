@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v26";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v25";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v27";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v26";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -294,6 +294,18 @@ impl RemoteTrack {
         parsed.track.and(parsed.disc)
     }
 
+    /// Whether the position is a bare track number (`15`): no medium or side,
+    /// and no explicit medium position.
+    fn is_bare_number(&self) -> bool {
+        if self.medium_position.is_some() && self.track_position.is_some() {
+            return false;
+        }
+        self.position.as_deref().is_some_and(|raw| {
+            let parsed = parse_position(raw);
+            parsed.side.is_none() && parsed.track.is_some() && parsed.disc.is_none()
+        })
+    }
+
     /// Explicit medium/track position, then a Discogs-style position string.
     pub fn position_key(&self) -> Option<(u32, u32)> {
         if let (Some(medium), Some(position)) = (self.medium_position, self.track_position) {
@@ -375,13 +387,44 @@ impl RemoteRelease {
         self.playable_tracks_in(None)
     }
 
+    /// The medium of every tracklist entry, by index. An entry whose position
+    /// names its medium ([`RemoteTrack::medium`]) has it. On Discogs, a bare
+    /// number (`15`) inherits the medium of the nearest explicit `N-M` entry
+    /// before it, since some releases leave the `N-` off a few tracks
+    /// (`1-14`, `15`, `16`, `2-1`); a bare number with no explicit entry before
+    /// it, and every other entry, has none. Everything that asks which medium a
+    /// track is on goes through this, so they agree.
+    pub fn track_media(&self) -> Vec<Option<u32>> {
+        let discogs = matches!(self.id, ReleaseId::Discogs(_));
+        let mut current = None;
+        self.tracklist
+            .iter()
+            .map(|track| {
+                if let Some(medium) = track.medium() {
+                    current = Some(medium);
+                    Some(medium)
+                } else if discogs && track.is_bare_number() {
+                    current
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// The medium of the tracklist entry at `index` ([`Self::track_media`]).
+    pub fn medium_of(&self, index: usize) -> Option<u32> {
+        self.track_media().get(index).copied().flatten()
+    }
+
     /// [`Self::playable_tracks`], limited to one medium when `medium` is given.
     pub fn playable_tracks_in(&self, medium: Option<u32>) -> Vec<(usize, &RemoteTrack)> {
+        let media = self.track_media();
         self.tracklist
             .iter()
             .enumerate()
-            .filter(|(_, track)| {
-                track.is_playable() && medium.is_none_or(|medium| track.medium() == Some(medium))
+            .filter(|(index, track)| {
+                track.is_playable() && medium.is_none_or(|medium| media[*index] == Some(medium))
             })
             .collect()
     }
@@ -1311,6 +1354,161 @@ fn is_volume_number(word: &str) -> bool {
             || word.chars().all(|ch| matches!(ch, 'i' | 'v' | 'x')))
 }
 
+/// The words after which a roman numeral is read as a number.
+const NUMBERING_WORDS: &[&str] = &["vol", "vols", "volume", "volumes", "part", "pt", "chapter"];
+
+/// The value of a roman numeral written with `i`, `v` and `x` (1 to 39), or
+/// `None` for any other text, including spellings that are not canonical
+/// (`iiii`, `vx`).
+fn roman_value(letters: &str) -> Option<u32> {
+    let value_of = |ch: char| match ch {
+        'i' => Some(1i32),
+        'v' => Some(5),
+        'x' => Some(10),
+        _ => None,
+    };
+    let values: Vec<i32> = letters.chars().map(value_of).collect::<Option<_>>()?;
+    let mut total = 0i32;
+    for (index, value) in values.iter().enumerate() {
+        if values.get(index + 1).is_some_and(|next| next > value) {
+            total -= value;
+        } else {
+            total += value;
+        }
+    }
+    let total = u32::try_from(total).ok().filter(|total| *total >= 1)?;
+    let (tens, ones) = (total / 10, total % 10);
+    let digit = ["", "i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix"][ones as usize];
+    (format!("{}{digit}", "x".repeat(tens as usize)) == letters).then_some(total)
+}
+
+/// The disc and format words that a number in front of makes decoration
+/// (`2CD`, `2 CD`, `(3 LP)`) in [`title_numbers`].
+const COUNTED_FORMAT_WORDS: &[&str] = &["cd", "cds", "lp", "dvd"];
+
+/// The tokens of `text`, with a volume word that is joined to its number by a
+/// dot (`Vol.II`, `Pt.2`) split in two.
+fn numbering_tokens(text: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    for token in text.split_whitespace() {
+        if let Some((word, number)) = token.split_once('.')
+            && number.chars().any(char::is_alphanumeric)
+            && NUMBERING_WORDS.contains(&alphanumeric_lowercase(word).as_str())
+        {
+            tokens.push(&token[..=word.len()]);
+            tokens.push(number);
+        } else {
+            tokens.push(token);
+        }
+    }
+    tokens
+}
+
+/// The numbers an album title carries, in order, as decimal text without
+/// leading zeros (`02` and `2` are the same): its digit runs, and a roman
+/// numeral after a volume word ([`NUMBERING_WORDS`], also `Vol.II`), read after
+/// the decoration is dropped (`Fools Gold 7"` and `Album CD2` have none). A
+/// number in front of a disc or format word (`2CD`, `2 CD`;
+/// [`COUNTED_FORMAT_WORDS`]) is decoration too.
+fn title_numbers(text: &str) -> Vec<String> {
+    let tokens = numbering_tokens(text);
+    let spelled: Vec<String> = tokens
+        .iter()
+        .enumerate()
+        .map(|(index, token)| {
+            let numeral = index
+                .checked_sub(1)
+                .filter(|before| {
+                    NUMBERING_WORDS.contains(&alphanumeric_lowercase(tokens[*before]).as_str())
+                })
+                .and_then(|_| roman_value(&alphanumeric_lowercase(token)));
+            numeral.map_or_else(|| (*token).to_string(), |value| value.to_string())
+        })
+        .collect();
+    let spelled = without_counted_formats(&spelled.join(" "));
+    let reduced = reduce_album_title(&spelled);
+    let mut numbers = Vec::new();
+    let mut run = String::new();
+    for ch in reduced
+        .as_deref()
+        .unwrap_or(&spelled)
+        .chars()
+        .chain(std::iter::once(' '))
+    {
+        if ch.is_ascii_digit() {
+            run.push(ch);
+        } else if !run.is_empty() {
+            let trimmed = run.trim_start_matches('0');
+            numbers.push(if trimmed.is_empty() { "0" } else { trimmed }.to_string());
+            run.clear();
+        }
+    }
+    numbers
+}
+
+/// `text` without the digit runs that stand in front of a disc or format word
+/// ([`COUNTED_FORMAT_WORDS`]), as one token (`2CD`) or two (`2 CD`).
+fn without_counted_formats(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut kept = String::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if !chars[index].is_ascii_digit() {
+            kept.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < chars.len() && chars[index].is_ascii_digit() {
+            index += 1;
+        }
+        let mut ahead = index;
+        while ahead < chars.len() && chars[ahead].is_whitespace() {
+            ahead += 1;
+        }
+        let word_start = ahead;
+        while ahead < chars.len() && chars[ahead].is_alphabetic() {
+            ahead += 1;
+        }
+        let word: String = chars[word_start..ahead]
+            .iter()
+            .flat_map(|ch| ch.to_lowercase())
+            .collect();
+        let counted = COUNTED_FORMAT_WORDS.contains(&word.as_str())
+            && !chars.get(ahead).is_some_and(|ch| ch.is_alphanumeric());
+        if !counted {
+            kept.extend(&chars[start..index]);
+        }
+    }
+    kept
+}
+
+/// Whether `short` is `long` with some numbers left out, in order.
+fn is_subsequence(short: &[String], long: &[String]) -> bool {
+    let mut rest = long.iter();
+    short.iter().all(|number| rest.any(|other| other == number))
+}
+
+/// Whether the numbers in the album titles of a text-only match agree (see
+/// [`title_numbers`]). They contradict only when each title has a number the
+/// other lacks, that is, neither sequence is the other with some numbers left
+/// out: a number on one side only (`Album (1999)` against `Album`, `Album Vol. 2
+/// (1999)` against `Album Vol. 2`) is no evidence of another release. A `local` title that fills an
+/// ID3v1 field and reads as a cut-off copy of `remote` may also lack the numbers
+/// at the end of it, as long as the numbers it has are the start of the
+/// remote's.
+fn album_numbers_agree(local: &str, remote: &str) -> bool {
+    let (local_numbers, remote_numbers) = (title_numbers(local), title_numbers(remote));
+    if is_subsequence(&local_numbers, &remote_numbers)
+        || is_subsequence(&remote_numbers, &local_numbers)
+    {
+        return true;
+    }
+    may_be_cut_to_field(local)
+        && (cut_off_similarity(local, remote).is_some() || id3v1_prefix(local, remote).is_some())
+        && remote_numbers.starts_with(&local_numbers)
+}
+
 /// Words that are no album title on their own: kept text that is only one of
 /// them (`The` from `The-Bootleg`) means the decoration was the title.
 const BARE_ARTICLES: &[&str] = &["a", "an", "the"];
@@ -2043,7 +2241,9 @@ pub fn title_disc_suffix(title: &str) -> Option<(String, u32)> {
         .then(|| (album.to_string(), number))
 }
 
-/// The disc every file's tag names, when they all name the same one.
+/// The disc every file's tag names, when they all name the same one and it is
+/// disc 2 or later. A uniform tag of disc 1 is what a missing tag means and what
+/// per-disc rips carry on every disc, so it is no evidence either way.
 fn disc_tag_number(local: &LocalRelease) -> Option<u32> {
     let first = local.tracks.first()?.disc?;
     local
@@ -2052,13 +2252,15 @@ fn disc_tag_number(local: &LocalRelease) -> Option<u32> {
         .all(|track| track.disc == Some(first))
         .then(|| u32::try_from(first).ok())
         .flatten()
-        .filter(|number| *number >= 1)
+        .filter(|number| *number >= 2)
 }
 
 /// The disc a local release says it is, from its folder name, its album title
 /// and its disc tags. The sources that say anything must agree, or there is no
-/// hint. Disc tags alone only count from disc 2 on, because a missing tag already
-/// reads as disc 1; mixed or partly tagged files give no tag hint at all.
+/// hint. Disc tags only count from disc 2 on, because a missing tag already
+/// reads as disc 1, so a uniform tag of 1 neither gives a hint nor conflicts with
+/// a folder or title that names a disc; mixed or partly tagged files give no tag
+/// hint at all.
 pub fn local_disc_hint(local: &LocalRelease) -> Option<DiscHint> {
     let sources: Vec<DiscHint> = [
         folder_disc_number(&local.directory).map(|number| (number, DiscHintSource::Folder)),
@@ -2075,9 +2277,6 @@ pub fn local_disc_hint(local: &LocalRelease) -> Option<DiscHint> {
     .collect();
     let first = *sources.first()?;
     if sources.iter().any(|hint| hint.number != first.number) {
-        return None;
-    }
-    if first.source == DiscHintSource::DiscTags && first.number < 2 {
         return None;
     }
     Some(first)
@@ -2109,14 +2308,17 @@ pub fn disc_label(remote: &RemoteRelease, medium: u32) -> String {
 }
 
 /// The playable tracks on each medium of a release, when it has several and
-/// every playable track names its medium explicitly (see
-/// [`RemoteTrack::medium`]). Vinyl sides (`A1`), positions such as `CD1-1`, and
-/// bare Discogs positions (`1`, `10`) name no medium, so a release with any of
-/// them gives `None`: one stray `10-68` entry does not make a single CD a set.
+/// every playable track has a medium (see [`RemoteRelease::track_media`]).
+/// Vinyl sides (`A1`) and positions such as `CD1-1` name no medium, and a bare
+/// Discogs position (`1`, `10`) has one only after an explicit `N-M` entry, so a
+/// release with any such track gives `None`: one stray `10-68` entry after plain
+/// positions does not make a single CD a set, while `1-14`, `15`, `16`, `2-1`
+/// is two discs.
 pub fn remote_media(remote: &RemoteRelease) -> Option<BTreeMap<u32, usize>> {
+    let track_media = remote.track_media();
     let mut media = BTreeMap::new();
-    for (_, track) in remote.playable_tracks() {
-        *media.entry(track.medium()?).or_insert(0usize) += 1;
+    for (index, _) in remote.playable_tracks() {
+        *media.entry(track_media[index]?).or_insert(0usize) += 1;
     }
     (media.len() >= 2).then_some(media)
 }
@@ -2163,6 +2365,16 @@ pub fn map_tracks(local: &LocalRelease, remote: &RemoteRelease) -> Mapping {
 /// files are.
 fn map_tracks_within(local: &LocalRelease, remote: &RemoteRelease, medium: Option<u32>) -> Mapping {
     let playable = remote.playable_tracks_in(medium);
+    // A bare Discogs number sits on the medium it inherits, not on disc 1.
+    let track_media = remote.track_media();
+    let remote_key = |index: usize| -> Option<(u32, u32)> {
+        let track = &remote.tracklist[index];
+        let (disc, number) = track.position_key()?;
+        match track_media[index] {
+            Some(inherited) if track.medium().is_none() => Some((inherited, number)),
+            _ => Some((disc, number)),
+        }
+    };
     let key_of = |track: &LocalTrack, number: i64| -> (u32, u32) {
         (
             medium.unwrap_or_else(|| track.disc.unwrap_or(1).max(0) as u32),
@@ -2286,7 +2498,7 @@ fn map_tracks_within(local: &LocalRelease, remote: &RemoteRelease, medium: Optio
             track.track_number.is_some()
         }) && remaining_remote
             .iter()
-            .all(|index| remote.tracklist[*index].position_key().is_some());
+            .all(|index| remote_key(*index).is_some());
 
         if all_keyed {
             let mut local_by_key: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
@@ -2298,7 +2510,7 @@ fn map_tracks_within(local: &LocalRelease, remote: &RemoteRelease, medium: Optio
 
             let mut remote_by_key: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
             for index in &remaining_remote {
-                if let Some(key) = remote.tracklist[*index].position_key() {
+                if let Some(key) = remote_key(*index) {
                     remote_by_key.entry(key).or_default().push(*index);
                 }
             }
@@ -2333,21 +2545,21 @@ fn map_tracks_within(local: &LocalRelease, remote: &RemoteRelease, medium: Optio
     {
         let local_track = &local.tracks[local_index];
         let remote_track = &remote.tracklist[remote_index];
-        let Some(remote_key) = remote_track.position_key() else {
+        let Some(found_key) = remote_key(remote_index) else {
             continue;
         };
         let Some(local_number) = local_track.track_number else {
             continue;
         };
         let local_key = key_of(local_track, local_number);
-        if local_key != remote_key {
+        if local_key != found_key {
             notes.push(format!(
                 "identifier for '{}' points to remote {} but its tags say {}-{}",
                 local_track.title.as_deref().unwrap_or(&local_track.path),
                 remote_track
                     .position
                     .clone()
-                    .unwrap_or_else(|| format!("{}-{}", remote_key.0, remote_key.1)),
+                    .unwrap_or_else(|| format!("{}-{}", found_key.0, found_key.1)),
                 local_key.0,
                 local_key.1
             ));
@@ -2940,13 +3152,17 @@ impl RankIdentity {
 ///
 /// A self-titled placeholder ranks as the better of the artist's name and the
 /// tag as written, and junk tags rank as nothing (see [`tag_identity`]).
+///
+/// A test helper: discovery builds a [`rank_identity`] once per release and ranks
+/// every hit with it.
+#[cfg(test)]
 pub fn rank_search_summary(local: &LocalRelease, summary: &SearchSummary) -> f64 {
     rank_identity(local).rank(local, summary)
 }
 
 /// [`rank_search_summary`] for the given album title and artist, which may
 /// differ from the tags.
-pub(crate) fn rank_search_summary_with(
+fn rank_search_summary_with(
     local: &LocalRelease,
     title: Option<&str>,
     artist: Option<&str>,
@@ -3383,11 +3599,52 @@ fn text_agrees_in_order(local: &LocalRelease, candidate: &Candidate) -> bool {
     })
 }
 
+/// Whether the album titles of a text-only match rule out a different release
+/// that is named alike. The local title must not call itself a bootleg (the
+/// reduction that makes `Album (Bootleg)` match `Album` would otherwise let an
+/// official release stand for it), and the numbers in both titles must agree
+/// ([`album_numbers_agree`]): `Live in Berlin 1994` is not `Live in Berlin 1995`,
+/// and with no lengths to tell them apart nothing else would say so. A
+/// placeholder title (`Self Titled`) names no number and is not compared.
+fn album_titles_identify(local: &LocalRelease, candidate: &Candidate) -> bool {
+    let Some(title) = local.album_title.as_deref() else {
+        return false;
+    };
+    if decoration_names_bootleg(title) {
+        return false;
+    }
+    if is_self_titled(title) {
+        return true;
+    }
+    // A disc marker on the title of the matched disc is not part of the name.
+    let disc_album = candidate.mapping.medium.and_then(|medium| {
+        title_disc_suffix(title)
+            .filter(|(_, number)| *number == medium)
+            .map(|(album, _)| album)
+    });
+    album_numbers_agree(
+        disc_album.as_deref().unwrap_or(title),
+        &candidate.release.title,
+    )
+}
+
+/// Whether the decoration run at the end of an album title names a bootleg.
+fn decoration_names_bootleg(title: &str) -> bool {
+    decoration_run(title).is_some_and(|run| {
+        run.units.first().is_some_and(|first| {
+            decoration_tokens(&title[first.start..])
+                .iter()
+                .any(|(_, token)| alphanumeric_lowercase(token) == "bootleg")
+        })
+    })
+}
+
 /// Whether the titles alone identify the tracks of an album-level match whose
 /// provider lists no length for some of them: at least
 /// [`TEXT_IDENTITY_MIN_TRACKS`] local tracks ([`TEXT_IDENTITY_MIN_VARIOUS_TRACKS`]
 /// for Various Artists), a candidate not marked unofficial ([`is_unofficial`]),
-/// text that [`text_agrees_in_order`], no local file that is another take than
+/// text that [`text_agrees_in_order`], album titles that [`album_titles_identify`],
+/// no local file that is another take than
 /// its remote track ([`local_title_is_another_take`]), no local title that scores strictly
 /// higher against another playable remote track than against its own, a known
 /// positive local length on every track, at least one length the provider does
@@ -3409,6 +3666,7 @@ fn titles_identify_tracks(local: &LocalRelease, candidate: &Candidate) -> bool {
     if local.tracks.len() < min_tracks
         || is_unofficial(&candidate.release)
         || candidate.score.album_score_without_durations() + 1e-9 < TEXT_IDENTITY_SCORE
+        || !album_titles_identify(local, candidate)
     {
         return false;
     }
@@ -4053,7 +4311,10 @@ fn evaluate_with(
     }
 
     // Edition qualifiers must agree; they change what the release is.
-    if let Some(local_title) = &local.album_title {
+    // A missing or junk title says nothing about the edition.
+    if tag_identity(local).title.is_some()
+        && let Some(local_title) = &local.album_title
+    {
         let local_qualifiers = edition_qualifiers(local_title);
         let remote_qualifiers = remote_edition_qualifiers(remote);
         if !qualifiers_agree(&local_qualifiers, &remote_qualifiers) {
@@ -4139,6 +4400,11 @@ fn plausibility_score(local: &LocalRelease, primary: &Candidate) -> f64 {
 /// tracks ([`durations_identify_tracks`]), so junk local titles do not hide the
 /// right primary. Against a primary that is plausible only through its
 /// durations, edition qualifiers and durations are compared but titles are not.
+///
+/// A fallback accepted on its text alone (`text_only_fallback`, because its
+/// provider lists no length for some tracks) is also checked against every
+/// primary whose text agrees with the files: that primary's lengths must not
+/// contradict them.
 pub fn fallback_conflicts(
     local: &LocalRelease,
     primary_candidates: &[Candidate],
@@ -5984,11 +6250,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v26"
+            "discogs-match-v27"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v25"
+            "musicbrainz-match-v26"
         );
     }
 
@@ -8574,8 +8840,17 @@ mod tests {
         assert_eq!(hint("/music/Set", "Set", &[Some(1), Some(2)]), None);
         assert_eq!(hint("/music/Set", "Set", &[Some(2), None]), None);
         assert_eq!(hint("/music/Set", "Set", &[Some(0), Some(0)]), None);
-        // The sources must agree.
-        assert_eq!(hint("/music/Set/CD2", "Set", &[Some(1), Some(1)]), None);
+        // The sources must agree, but a uniform tag of disc 1 is what per-disc
+        // rips carry on every disc, so it never vetoes a folder or title.
+        assert_eq!(
+            hint("/music/Set/CD2", "Set", &[Some(1), Some(1)]),
+            folder(2)
+        );
+        assert_eq!(
+            hint("/music/Set", "Set CD2", &[Some(1), Some(1)]),
+            Some((2, DiscHintSource::AlbumTitle))
+        );
+        assert_eq!(hint("/music/Set/CD2", "Set", &[Some(3), Some(3)]), None);
         assert_eq!(
             hint("/music/Set/CD1", "Set", &[Some(1), Some(1)]),
             folder(1)
@@ -9327,5 +9602,244 @@ mod tests {
         assert_eq!(mapping.medium, None);
         assert_eq!(mapping.assigned_count(), 10);
         assert_eq!(mapping.pairs[9], Some(9));
+    }
+
+    /// Discogs 21454897 shape: `1-1`..`1-14`, bare `15` and `16`, then `2-1`..`2-17`.
+    fn precious_funk() -> RemoteRelease {
+        let mut remote = remote_release(&[]);
+        let positions: Vec<(u32, u32, String)> = (1..=14)
+            .map(|k| (1, k, format!("1-{k}")))
+            .chain((15..=16).map(|k| (1, k, k.to_string())))
+            .chain((1..=17).map(|k| (2, k, format!("2-{k}"))))
+            .collect();
+        for (medium, k, position) in positions {
+            let mut track = remote_release(&["Song"]).tracklist.remove(0);
+            track.position = Some(position);
+            track.title = format!("Song {medium}-{k}");
+            track.duration_secs = Some(f64::from(200 + 10 * medium + k));
+            remote.tracklist.push(track);
+        }
+        remote
+    }
+
+    #[test]
+    fn a_bare_discogs_position_inherits_the_medium_before_it() {
+        let remote = precious_funk();
+        assert_eq!(
+            remote_media(&remote),
+            Some(BTreeMap::from([(1, 16), (2, 17)]))
+        );
+        assert_eq!(remote.medium_of(14), Some(1));
+        assert_eq!(remote.medium_of(15), Some(1));
+        assert_eq!(remote.medium_of(16), Some(2));
+        assert_eq!(disc_label(&remote, 2), "disc 2 of 2");
+        assert_eq!(remote.playable_tracks_in(Some(1)).len(), 16);
+        assert_eq!(remote.playable_tracks_in(Some(2)).len(), 17);
+
+        for (medium, count) in [(1, 16), (2, 17)] {
+            let local = disc_folder(&format!("/music/Set/CD{medium}"), medium, count);
+            let mapping = map_tracks(&local, &remote);
+            assert_eq!(mapping.medium, Some(medium));
+            assert!(mapping.complete, "{:?}", mapping.notes);
+            assert!(!mapping.ambiguous, "{:?}", mapping.notes);
+            assert_eq!(mapping.assigned_count(), count);
+            for (_, remote_index) in mapping.assigned_pairs() {
+                assert_eq!(remote.medium_of(remote_index), Some(medium));
+            }
+        }
+
+        // Inheritance is for Discogs; a bare number on another provider stays
+        // medium-less, and a fully explicit release is unchanged.
+        let mut musicbrainz = precious_funk();
+        musicbrainz.id = ReleaseId::MusicBrainz(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"));
+        assert_eq!(remote_media(&musicbrainz), None);
+        assert_eq!(
+            remote_media(&disc_set(&[2, 2])),
+            Some(BTreeMap::from([(1, 2), (2, 2)]))
+        );
+    }
+
+    #[test]
+    fn a_bare_position_before_any_explicit_one_stays_medium_less() {
+        let mut remote = precious_funk();
+        // The bare tracks now come first, as in the Undertow shape.
+        remote.tracklist.swap(0, 14);
+        assert_eq!(remote_media(&remote), None);
+    }
+
+    /// A text-only pair whose album titles are `local_title` and `remote_title`.
+    fn titled_unlisted_pair(
+        local_title: &str,
+        remote_title: &str,
+    ) -> (LocalRelease, RemoteRelease) {
+        let (mut local, mut remote) = unlisted_pair(&TITLES_6);
+        local.album_title = Some(local_title.to_string());
+        remote.title = remote_title.to_string();
+        (local, remote)
+    }
+
+    #[test]
+    fn numbers_in_the_album_titles_must_agree_for_text_identity() {
+        for (local, remote) in [
+            ("Live in Berlin 1994", "Live in Berlin 1995"),
+            ("Live at the BBC 1994", "Live at the BBC 1995"),
+            ("Tour Edition 2", "Tour Edition 3"),
+            ("Hits Vol. II", "Hits Vol. III"),
+            ("Hits Part 1", "Hits Part 2"),
+            ("Now Music 4", "Now Music 45"),
+            ("Live 1994 Vol. 2", "Live 1994 Vol. 1"),
+            ("Album 2CD Vol. 3", "Album Vol. 2"),
+        ] {
+            let (local, remote) = titled_unlisted_pair(local, remote);
+            assert_blocked_without_text_identity(&local, &remote);
+        }
+        for (local, remote) in [
+            ("Live in Berlin 1994", "Live in Berlin 1994"),
+            ("Hits Vol. 2", "Hits Volume 2"),
+            ("Fools Gold 12 Inch", "Fools Gold"),
+            ("Fools Gold 7\"", "Fools Gold"),
+            ("Fools Gold CD2", "Fools Gold"),
+            ("Test Album", "Test Album"),
+            // A number on one side only is no contradiction.
+            ("Test Album (1999)", "Test Album"),
+            ("Test Album [2004]", "Test Album"),
+            ("Test Album (2CD)", "Test Album"),
+            ("Test Album (Disc 1)", "Test Album"),
+            ("Test Album II", "Test Album Vol. II"),
+            ("Test Album Vol. 2 (1999)", "Test Album Vol. 2"),
+            ("Test Hits 1 (1999)", "Test Hits 1"),
+        ] {
+            let (local, remote) = titled_unlisted_pair(local, remote);
+            assert_accepted_on_text(&local, &remote, 6);
+        }
+    }
+
+    #[test]
+    fn title_numbers_contradict_only_when_each_title_has_a_number_the_other_lacks() {
+        for (local, remote) in [
+            ("Album Vol. 2 (1999)", "Album Vol. 2"),
+            ("Hits 1 (1999)", "Hits 1"),
+            ("Top 40 Hits Vol. 3 (2001)", "Top 40 Hits, Volume 3"),
+            ("Album (Disc 1) 2004", "Album 2004"),
+            ("Album (1999)", "Album"),
+            ("Album", "Album 1999"),
+        ] {
+            assert!(album_numbers_agree(local, remote), "{local} / {remote}");
+        }
+        for (local, remote) in [
+            ("Live in Berlin 1994", "Live in Berlin 1995"),
+            ("Now Music 4", "Now Music 45"),
+            ("Live 1994 Vol. 2", "Live 1994 Vol. 1"),
+            ("Album 2CD Vol. 3", "Album Vol. 2"),
+            ("Album 2 1999", "Album 1999 2"),
+        ] {
+            assert!(!album_numbers_agree(local, remote), "{local} / {remote}");
+        }
+    }
+
+    #[test]
+    fn title_numbers_read_digits_and_roman_numerals_after_a_volume_word() {
+        assert_eq!(title_numbers("Live in Berlin 1994"), ["1994"]);
+        assert_eq!(title_numbers("Album 02 Part 007"), ["2", "7"]);
+        assert_eq!(title_numbers("Hits Vol. II"), ["2"]);
+        assert_eq!(title_numbers("Hits Volume III"), ["3"]);
+        assert_eq!(
+            title_numbers("Hits Vol. 2"),
+            title_numbers("Hits Volume II")
+        );
+        assert_eq!(title_numbers("Chapter IV: Part ix"), ["4", "9"]);
+        // No space after the dot of the volume word.
+        assert_eq!(title_numbers("Hits Vol.II"), ["2"]);
+        assert_eq!(title_numbers("Hits Pt.II"), ["2"]);
+        assert_eq!(title_numbers("Hits Vol.2"), ["2"]);
+        // A number in front of a disc or format word is decoration.
+        for title in [
+            "Album (2CD)",
+            "Album 2CD",
+            "Album 2 CD",
+            "Album [3 LP]",
+            "Album 2 DVD",
+            "Album 2cds",
+        ] {
+            assert!(title_numbers(title).is_empty(), "{title}");
+        }
+        assert_eq!(title_numbers("Album 2 CDs Live 1994"), ["1994"]);
+        // A roman numeral counts only after a volume word.
+        assert!(title_numbers("Mix I Love").is_empty());
+        assert!(title_numbers("Part Civic").is_empty());
+        // Decoration is not part of the title.
+        assert!(title_numbers("Fools Gold 7\"").is_empty());
+        assert!(title_numbers("Fools Gold 12 Inch").is_empty());
+        assert!(title_numbers("Fools Gold CD2").is_empty());
+        assert!(title_numbers("No Numbers Here").is_empty());
+    }
+
+    #[test]
+    fn a_cut_off_local_title_may_lack_trailing_numbers() {
+        let cut = "Live at the Hammersmith Odeon";
+        assert_eq!(cut.chars().count(), 29);
+        let (local, remote) = titled_unlisted_pair(cut, "Live at the Hammersmith Odeon 1994");
+        assert_accepted_on_text(&local, &remote, 6);
+
+        // A title that is not 29 or 30 characters is complete as written.
+        let (local, remote) = titled_unlisted_pair(
+            "Live at the Hammersmith Odeo",
+            "Live at the Hammersmith Odeo 1994",
+        );
+        assert_blocked_without_text_identity(&local, &remote);
+
+        // The numbers a cut-off title does have must still be the start of the
+        // remote's sequence.
+        let cut = "Live at Hammersmith Odeon 1994";
+        assert_eq!(cut.chars().count(), 30);
+        let (local, remote) = titled_unlisted_pair(cut, "Live at Hammersmith Odeon 1994 Vol 2");
+        assert_accepted_on_text(&local, &remote, 6);
+        let (local, remote) = titled_unlisted_pair(
+            "Live at Hammersmith Odeon 1995",
+            "Live at Hammersmith Odeon 1994 Vol 2",
+        );
+        assert_blocked_without_text_identity(&local, &remote);
+    }
+
+    #[test]
+    fn a_local_bootleg_decoration_blocks_text_identity_only() {
+        let (local, remote) = titled_unlisted_pair("Test Album (Bootleg)", "Test Album");
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(candidate.score.album_title >= 0.96);
+        assert_blocked_without_text_identity(&local, &remote);
+        let (local, remote) = titled_unlisted_pair("Test Album-BOOTLEG", "Test Album");
+        assert_blocked_without_text_identity(&local, &remote);
+
+        // With lengths the normal gates decide, as before.
+        let mut local = local_release(&TITLES_6);
+        local.album_title = Some("Test Album (Bootleg)".to_string());
+        let remote = remote_release(&TITLES_6);
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+    }
+
+    #[test]
+    fn a_junk_or_missing_local_title_is_no_edition_evidence() {
+        let edition_blocked = |local_title: Option<&str>, remote_title: &str| {
+            let mut local = local_release(&TITLES_6);
+            local.album_title = local_title.map(str::to_string);
+            let mut remote = remote_release(&TITLES_6);
+            remote.title = remote_title.to_string();
+            album_evaluation(&local, &remote, &[])
+                .blockers
+                .iter()
+                .any(|note| note.contains("edition qualifiers differ"))
+        };
+        assert!(!edition_blocked(None, "Test Album (Remastered)"));
+        assert!(!edition_blocked(
+            Some("Unknown Album"),
+            "Test Album (Remastered)"
+        ));
+        assert!(!edition_blocked(Some("Unknown Album"), "Test Album Live"));
+        // A real title that names no qualifier still conflicts.
+        assert!(edition_blocked(
+            Some("Test Album"),
+            "Test Album (Remastered)"
+        ));
     }
 }

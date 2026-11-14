@@ -1107,7 +1107,7 @@ async fn accept(
                     .iter()
                     .filter(|warning| warning.ends_with(matcher::UNCONFIRMED_LENGTHS_NOTE))
                 {
-                    outln_to!(transcript, "    {warning}");
+                    outln_to!(transcript, "    {}", Clean(warning));
                 }
             }
             Ok(Outcome::Accepted)

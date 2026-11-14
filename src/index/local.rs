@@ -3,7 +3,7 @@
 //! The trait is the only seam: discovery, scoring, acceptance, review, and
 //! overlays never learn whether a candidate came from HTTP or a dump. Search
 //! only decides which candidates reach detail lookups, and
-//! `matcher::rank_search_summary` re-scores every hit anyway.
+//! `matcher::RankIdentity::rank` re-scores every hit anyway.
 
 use crate::index::writer::decode_document;
 use crate::index::{IndexKind, IndexPaths, open_read_only};

@@ -92,6 +92,7 @@ const TITLE_TAIL_WORDS: &[&str] = &[
     "retail",
     "advance",
     "bootleg",
+    "split",
     "vinyl",
     "7inch",
     "10inch",
@@ -100,6 +101,13 @@ const TITLE_TAIL_WORDS: &[&str] = &[
     "soundtrack",
     "trackfix",
     "dirfix",
+];
+
+/// Words that, with nothing else, name a kind of release and no album: a title
+/// made only of them is no title (`Fazed-EP-VLS-DE-2000-GRP`). `Demo` and `Live`
+/// are not here, since releases are called that (`DdF-Demo-2001-PMS`).
+const TYPE_ONLY_WORDS: &[&str] = &[
+    "ep", "split", "vls", "single", "cds", "cdm", "cdep", "mcd", "maxi", "promo",
 ];
 
 /// Disc and format words that a number in front of makes a tail word (`2cd`,
@@ -191,6 +199,10 @@ struct Field {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SceneName {
     fields: Vec<Field>,
+    /// Whether the name marks a split release (a `Split` or `Split EP` tag, or
+    /// a title that ends in `Split`), which names several artists and so has no
+    /// reading.
+    split_release: bool,
 }
 
 /// An artist and album title read from a directory name.
@@ -198,7 +210,9 @@ pub struct SceneName {
 pub struct SceneSplit {
     /// `None` for a Various Artists release.
     pub artist: Option<String>,
-    pub title: String,
+    /// `None` when what the name leaves is only release-type words (`EP`,
+    /// `VLS`, `Single`): they say what kind of release it is, not which album.
+    pub title: Option<String>,
     pub various: bool,
 }
 
@@ -216,7 +230,7 @@ pub struct SceneSplit {
 /// let name = parse_release_directory("/mp3/Hidrology-Asleep-2002-AMRC").unwrap();
 /// let split = name.split().unwrap();
 /// assert_eq!(split.artist.as_deref(), Some("Hidrology"));
-/// assert_eq!(split.title, "Asleep");
+/// assert_eq!(split.title.as_deref(), Some("Asleep"));
 /// ```
 pub fn parse_release_directory(directory: &str) -> Option<SceneName> {
     let name = release_leaf(directory)?;
@@ -230,9 +244,10 @@ pub fn parse_release_directory(directory: &str) -> Option<SceneName> {
     }
     fields.pop();
 
-    let mut year_seen = strip_trailing_fields(&mut fields, true);
+    let mut split_release = false;
+    let mut year_seen = strip_trailing_fields(&mut fields, true, &mut split_release);
     merge_markers(&mut fields);
-    year_seen |= strip_trailing_fields(&mut fields, false);
+    year_seen |= strip_trailing_fields(&mut fields, false, &mut split_release);
 
     if fields.len() < 2 {
         return None;
@@ -241,9 +256,12 @@ pub fn parse_release_directory(directory: &str) -> Option<SceneName> {
         return None;
     }
     if let Some(last) = fields.last_mut() {
-        last.text = strip_title_tail(&last.text, year_seen);
+        last.text = strip_title_tail(&last.text, year_seen, &mut split_release);
     }
-    Some(SceneName { fields })
+    Some(SceneName {
+        fields,
+        split_release,
+    })
 }
 
 /// The path component that names the release.
@@ -336,8 +354,9 @@ fn clean_text(raw: &str, dotted: bool) -> String {
 }
 
 /// Drops year and tag fields from the end while more than two fields remain
-/// (and years too when `years` is set). Returns whether a year was dropped.
-fn strip_trailing_fields(fields: &mut Vec<Field>, years: bool) -> bool {
+/// (and years too when `years` is set). Returns whether a year was dropped, and
+/// sets `split_release` when a dropped tag field says `Split`.
+fn strip_trailing_fields(fields: &mut Vec<Field>, years: bool, split_release: &mut bool) -> bool {
     let mut year_dropped = false;
     while fields.len() > 2 {
         let Some(last) = fields.last() else { break };
@@ -345,6 +364,8 @@ fn strip_trailing_fields(fields: &mut Vec<Field>, years: bool) -> bool {
             year_dropped = true;
         } else if !is_tag_field(&last.text) {
             break;
+        } else if has_word(&last.text, "split") {
+            *split_release = true;
         }
         fields.pop();
     }
@@ -410,6 +431,12 @@ fn strip_wrapping_brackets(text: &str) -> &str {
     text
 }
 
+/// Whether `word` is one of the words of `text`, without case.
+fn has_word(text: &str, word: &str) -> bool {
+    text.split(|ch: char| !ch.is_alphanumeric())
+        .any(|candidate| candidate.eq_ignore_ascii_case(word))
+}
+
 /// A field made only of tag words, country codes, numbered tags and numbers,
 /// with at least one word that is not a number.
 fn is_tag_field(text: &str) -> bool {
@@ -455,14 +482,20 @@ fn is_tag_word(word: &str) -> bool {
 /// Drops decoration from the end of the title field, never the whole title:
 /// bracket groups that are tags or years, trailing format words, and a bare
 /// trailing year when the name had no year field.
-fn strip_title_tail(title: &str, year_seen: bool) -> String {
+fn strip_title_tail(title: &str, year_seen: bool, split_release: &mut bool) -> String {
     let mut title = title.trim().to_string();
     loop {
         let shorter = strip_bracket_group(&title)
             .or_else(|| strip_tail_word(&title, year_seen))
             .map(|rest| rest.trim().to_string());
         match shorter {
-            Some(rest) if rest.chars().any(char::is_alphanumeric) => title = rest,
+            Some(rest) if rest.chars().any(char::is_alphanumeric) => {
+                let dropped = title[rest.len()..].trim();
+                if has_word(dropped, "split") {
+                    *split_release = true;
+                }
+                title = rest;
+            }
             _ => return title,
         }
     }
@@ -549,9 +582,25 @@ impl SceneName {
         various: bool,
     ) -> Option<SceneSplit> {
         let has_text = |text: &str| text.chars().any(char::is_alphanumeric);
-        (has_text(&title) && artist.as_deref().is_none_or(has_text)).then_some(SceneSplit {
+        if self.split_release || !has_text(&title) || !artist.as_deref().is_none_or(has_text) {
+            return None;
+        }
+        let type_only = title
+            .split(|ch: char| !ch.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .all(|word| TYPE_ONLY_WORDS.contains(&word.to_ascii_lowercase().as_str()));
+        // A title that is only `Split` marks a split release too.
+        if type_only && has_word(&title, "split") {
+            return None;
+        }
+        // The artist alone is still a reading, but not for Various Artists,
+        // which then says nothing at all.
+        if type_only && artist.is_none() {
+            return None;
+        }
+        Some(SceneSplit {
             artist,
-            title,
+            title: (!type_only).then_some(title),
             various,
         })
     }
@@ -604,9 +653,8 @@ mod tests {
     use crate::matcher::local_artist_similarity;
 
     fn read(directory: &str) -> Option<(Option<String>, String, bool)> {
-        parse_release_directory(directory)?
-            .split()
-            .map(|split| (split.artist, split.title, split.various))
+        let split = parse_release_directory(directory)?.split()?;
+        Some((split.artist, split.title?, split.various))
     }
 
     fn pair(artist: &str, title: &str) -> Option<(Option<String>, String, bool)> {
@@ -755,7 +803,7 @@ mod tests {
     fn matching(directory: &str, hint: &str) -> Option<(Option<String>, String)> {
         parse_release_directory(directory)?
             .split_matching(|part| local_artist_similarity(hint, part) >= 0.90)
-            .map(|split| (split.artist, split.title))
+            .and_then(|split| Some((split.artist, split.title?)))
     }
 
     #[test]
@@ -850,7 +898,7 @@ mod tests {
         ];
         for (directory, title) in cases {
             let split = parse_release_directory(directory).unwrap().split().unwrap();
-            assert_eq!(split.title, title, "{directory}");
+            assert_eq!(split.title.as_deref(), Some(title), "{directory}");
         }
         // Never the whole title, and a word that is a title stays one.
         assert_eq!(read("Foo-OST-2001-GRP"), pair("Foo", "OST"));
@@ -902,7 +950,7 @@ mod tests {
         assert_eq!(read("Foo-Bar_EP-GRP"), pair("Foo", "Bar"));
         assert_eq!(read("Foo-Bar_(Demo)_(1993)-GRP"), pair("Foo", "Bar"));
         assert_eq!(read("Foo-Bar_1996-GRP"), pair("Foo", "Bar"));
-        assert_eq!(read("Foo-EP_(Demo)_1996-GRP"), pair("Foo", "EP"));
+        assert_eq!(read("Foo-EP_(Demo)_1996-GRP"), None);
         // A year in the title stays when the name had a year field.
         assert_eq!(read("Foo-Bar_1996-1996-GRP"), pair("Foo", "Bar 1996"));
         // A bracket that does not close keeps the dash inside it.
@@ -926,5 +974,51 @@ mod tests {
         // Text without a letter or digit names nothing.
         assert_eq!(read("Foo-___-GRP"), None);
         assert_eq!(read("-_--Foo-Bar-GRP"), pair("Foo", "Bar"));
+    }
+
+    fn split_of(directory: &str) -> Option<SceneSplit> {
+        parse_release_directory(directory)?.split()
+    }
+
+    #[test]
+    fn a_release_type_word_is_never_read_as_the_album() {
+        // The artist is still read; the title is not.
+        for (directory, artist) in [
+            ("Fazed-EP-VLS-DE-2000-GRP", "Fazed"),
+            ("hybrid_soul-EP-2001-GRP", "hybrid soul"),
+            ("Foo-Single-2001-GRP", "Foo"),
+            ("Foo-Maxi_Single-2001-GRP", "Foo"),
+            ("Foo-CDS-2001-GRP", "Foo"),
+            ("Foo-Promo-2001-GRP", "Foo"),
+        ] {
+            let split = split_of(directory).unwrap_or_else(|| panic!("{directory}"));
+            assert_eq!(split.artist.as_deref(), Some(artist), "{directory}");
+            assert_eq!(split.title, None, "{directory}");
+        }
+        // Words that are real titles stay titles.
+        assert_eq!(read("DdF-Demo-2001-PMS"), pair("DdF", "Demo"));
+        assert_eq!(read("Foo-Live-2001-GRP"), pair("Foo", "Live"));
+        assert_eq!(read("Foo-EP_Two-2001-GRP"), pair("Foo", "EP Two"));
+    }
+
+    #[test]
+    fn a_split_release_is_not_read() {
+        // Which band is the artist and what the title is cannot be told.
+        for directory in [
+            "Rambo_and_Crucial_Unit-Split-EP-2000-GRP",
+            "Samael_-_Tiamat-Live_March_Split-2001-GRP",
+            "VA-Jane._Vs_Shaft-Chorus_of_Doom-Split_EP-2001-GRP",
+            "Foo-Bar-Split-2001-GRP",
+            "Foo-Bar_Split_EP-2001-GRP",
+            "Foo-Split_EP-VLS-2001-GRP",
+        ] {
+            assert_eq!(split_of(directory), None, "{directory}");
+            let name = parse_release_directory(directory);
+            assert_eq!(
+                name.and_then(|name| name.split_matching(|_| true)),
+                None,
+                "{directory}"
+            );
+        }
     }
 }

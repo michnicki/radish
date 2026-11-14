@@ -16,7 +16,7 @@ use crate::scene;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
-/// Lowest [`matcher::rank_search_summary`] score that earns a detailed lookup
+/// Lowest [`matcher::rank_identity`] rank that earns a detailed lookup
 /// for a title or artist search hit.
 ///
 /// The rank adds up to 0.5 for the title, 0.3 for the artist, 0.1 for the year
@@ -114,9 +114,12 @@ fn search_view(local: &LocalRelease) -> (Cow<'_, LocalRelease>, Option<String>) 
     let mut title_read = None;
     let mut artist_read = None;
     // Filler in the directory is as little use as filler in the tag.
-    if identity.title.is_none() && !matcher::is_junk_title(&split.title) {
-        title_read = Some(split.title.clone());
-        view.album_title = Some(split.title);
+    if identity.title.is_none()
+        && let Some(title) = split.title
+        && !matcher::is_junk_title(&title)
+    {
+        title_read = Some(title.clone());
+        view.album_title = Some(title);
     }
     if artist_unusable {
         if split.various {
@@ -144,6 +147,10 @@ fn search_view(local: &LocalRelease) -> (Cow<'_, LocalRelease>, Option<String>) 
 ///
 /// A release whose album title or artist is missing or junk is searched with
 /// what its directory name says instead, when the name is a scene release name.
+///
+/// A test helper: production builds the view once with `search_view`, which it
+/// also needs for ranking, and calls `strategies_for_view` with it.
+#[cfg(test)]
 pub fn strategies_for(
     provider: ProviderKind,
     local: &LocalRelease,
@@ -413,12 +420,17 @@ pub async fn discover<P: MetadataProvider>(
     let (view, directory_note) = search_view(local);
     // Ranking, the weak-result floor and the searches all use the same identity.
     let searched: &LocalRelease = &view;
-    notes.extend(directory_note);
-
-    for (index, (label, strategy)) in strategies_for_view(provider_kind, searched)
-        .into_iter()
-        .enumerate()
+    let strategies = strategies_for_view(provider_kind, searched);
+    // The note says what the searches used, so it needs a search that uses it:
+    // an identifier search does not.
+    if strategies
+        .iter()
+        .any(|(_, strategy)| matches!(strategy, SearchStrategy::TitleArtist { .. }))
     {
+        notes.extend(directory_note);
+    }
+
+    for (index, (label, strategy)) in strategies.into_iter().enumerate() {
         if index >= budget.max_strategies {
             notes.push(format!(
                 "omitted strategies after the first {}",
@@ -1418,6 +1430,49 @@ mod tests {
     }
 
     #[test]
+    fn a_release_type_word_in_the_directory_is_never_searched_as_the_title() {
+        let mut local = untagged();
+        for (directory, artist) in [
+            ("Fazed-EP-VLS-DE-2000-GRP", "Fazed"),
+            ("hybrid_soul-EP-2001-GRP", "hybrid soul"),
+        ] {
+            local.directory = format!("/mp3/{directory}");
+            let (view, note) = search_view(&local);
+            assert_eq!(view.album_title, None, "{directory}");
+            assert_eq!(view.album_artist.as_deref(), Some(artist), "{directory}");
+            assert_eq!(
+                note,
+                Some(format!(
+                    "searched with artist '{artist}' read from the directory name"
+                )),
+                "{directory}"
+            );
+            for kind in [ProviderKind::MusicBrainz, ProviderKind::Discogs] {
+                assert!(title_and_artist(kind, &local).is_empty(), "{directory}");
+            }
+        }
+        // A split release names several artists: nothing is read from it.
+        for directory in [
+            "Rambo_and_Crucial_Unit-Split-EP-2000-GRP",
+            "Samael_-_Tiamat-Live_March_Split-2001-GRP",
+            "VA-Jane._Vs_Shaft-Chorus_of_Doom-Split_EP-2001-GRP",
+        ] {
+            local.directory = format!("/mp3/{directory}");
+            let (view, note) = search_view(&local);
+            assert_eq!(note, None, "{directory}");
+            assert_eq!(view.album_title, None, "{directory}");
+            assert_eq!(view.album_artist, None, "{directory}");
+            assert!(strategies_for(ProviderKind::Discogs, &local).is_empty());
+        }
+        // A real title in the same shape of name is still read.
+        local.directory = "/mp3/DdF-Demo-2001-PMS".to_string();
+        assert_eq!(
+            title_and_artist(ProviderKind::Discogs, &local),
+            vec![search("title", "Demo", Some("DdF"))]
+        );
+    }
+
+    #[test]
     fn a_various_artists_directory_searches_the_title_as_a_compilation() {
         let mut local = untagged();
         local.directory = "/mp3/VA-Thirteen_Days_OST-2000-RNS".to_string();
@@ -1474,6 +1529,24 @@ mod tests {
         let calls = provider.calls.lock().unwrap().clone();
         assert!(calls[0].contains("title: \"Broken\""), "{calls:?}");
         assert!(calls[0].contains("Straight Faced"), "{calls:?}");
+
+        // A directory that fills only the artist runs no title search, so it
+        // records no note; an identifier search does not use it either.
+        let mut artist_only = untagged();
+        artist_only.directory = "/mp3/Fazed-EP-VLS-DE-2000-GRP".to_string();
+        for barcode in [None, Some("0123456789012".to_string())] {
+            artist_only.barcode = barcode.clone();
+            let provider = FakeProvider::new(ProviderKind::MusicBrainz, Vec::new(), Vec::new());
+            let result = discover(&provider, &artist_only, None).await.unwrap();
+            assert!(
+                result
+                    .notes
+                    .iter()
+                    .all(|note| !note.contains("directory name")),
+                "{barcode:?} {:?}",
+                result.notes
+            );
+        }
 
         // A tagged release records no such note.
         let provider = FakeProvider::new(ProviderKind::MusicBrainz, Vec::new(), Vec::new());

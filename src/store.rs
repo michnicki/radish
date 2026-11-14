@@ -1900,6 +1900,15 @@ struct LegacyStoredCandidate {
     evidence: Vec<String>,
 }
 
+/// Reads a stored Discogs master `0`, which Discogs reports for a release that
+/// has no master, as no group (the rule of [`GroupId::discogs_master`]), so an
+/// old snapshot never makes every masterless release one album.
+fn normalize_stored_group(release: &mut RemoteRelease) {
+    if release.group_id == Some(GroupId::DiscogsMaster(0)) {
+        release.group_id = None;
+    }
+}
+
 /// Decodes a stored release snapshot. Version 1 is the historical numeric
 /// Discogs shape; version 2 is provider-qualified.
 pub fn decode_release_snapshot(
@@ -1916,7 +1925,8 @@ pub fn decode_release_snapshot(
             Ok(legacy.into())
         }
         2 => {
-            let release: RemoteRelease = serde_json::from_str(json)?;
+            let mut release: RemoteRelease = serde_json::from_str(json)?;
+            normalize_stored_group(&mut release);
             if release.provider() != provider {
                 bail!(
                     "snapshot says {} but the row is {}",
@@ -1956,7 +1966,13 @@ pub fn decode_stored_candidates(
                 })
                 .collect())
         }
-        2 => Ok(serde_json::from_str(json)?),
+        2 => {
+            let mut candidates: Vec<StoredCandidate> = serde_json::from_str(json)?;
+            for candidate in &mut candidates {
+                normalize_stored_group(&mut candidate.release);
+            }
+            Ok(candidates)
+        }
         other => bail!("unknown review snapshot version {other}"),
     }
 }
@@ -2012,13 +2028,9 @@ pub async fn accept_match(
     // The files are one disc of the release. Every track they map to must be on
     // it; checked before the write lock is taken.
     if let Some(medium) = candidate.mapping.medium {
+        let track_media = candidate.release.track_media();
         for (_, remote_index) in candidate.mapping.assigned_pairs() {
-            if candidate
-                .release
-                .tracklist
-                .get(remote_index)
-                .is_none_or(|track| track.medium() != Some(medium))
-            {
+            if track_media.get(remote_index).copied().flatten() != Some(medium) {
                 bail!("refusing to accept a mapping with a track outside disc {medium}");
             }
         }
@@ -3471,6 +3483,44 @@ mod tests {
         assert!(release.tracklist[0].release_track_id.is_none());
         assert_eq!(release.provider_metadata, serde_json::Value::Null);
         assert!(decode_release_snapshot(1, ProviderKind::MusicBrainz, legacy).is_err());
+    }
+
+    #[tokio::test]
+    async fn version_two_snapshots_read_discogs_master_zero_as_no_group() {
+        let pool = test_pool().await;
+        insert(
+            &pool,
+            "/music/a",
+            &[scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1)],
+        )
+        .await;
+        let local = load_local_releases(&pool, None).await.unwrap().remove(0);
+        let mut remote = remote_release();
+        remote.group_id = Some(GroupId::DiscogsMaster(0));
+
+        let json = serde_json::to_string(&remote).unwrap();
+        let decoded = decode_release_snapshot(2, ProviderKind::Discogs, &json).unwrap();
+        assert_eq!(decoded.group_id, None);
+
+        let candidate = Candidate::new(&local, remote.clone());
+        let stored = StoredCandidate {
+            release: remote.clone(),
+            mapping: candidate.mapping.clone(),
+            score: candidate.score,
+            auto_accept: false,
+            match_scope: MatchScope::Edition,
+            blockers: Vec::new(),
+            warnings: Vec::new(),
+            evidence: Vec::new(),
+        };
+        let json = serde_json::to_string(&vec![stored]).unwrap();
+        let decoded = decode_stored_candidates(2, ProviderKind::Discogs, &json).unwrap();
+        assert_eq!(decoded[0].release.group_id, None);
+
+        remote.group_id = Some(GroupId::DiscogsMaster(7));
+        let json = serde_json::to_string(&remote).unwrap();
+        let decoded = decode_release_snapshot(2, ProviderKind::Discogs, &json).unwrap();
+        assert_eq!(decoded.group_id, Some(GroupId::DiscogsMaster(7)));
     }
 
     #[test]
