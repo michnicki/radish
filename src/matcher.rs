@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v33";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v32";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v34";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v33";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -4585,6 +4585,23 @@ fn in_same_release_group(a: &Candidate, b: &Candidate) -> bool {
         )
 }
 
+/// Whether `other` lists exactly the files where `first`, ranked ahead of it,
+/// does not.
+///
+/// `other` must be a different release whose mapping is complete, unambiguous
+/// and free of unsupported entries, and either an edition of `first`'s release
+/// group or an album whose score is within [`RUNNER_UP_GAP`] of `first`'s. Scores
+/// average over the local tracks, so an edition with bonus tracks ties with the
+/// one that lists exactly the files, and only the second can be applied.
+pub(crate) fn lists_exactly_the_files(first: &Candidate, other: &Candidate) -> bool {
+    other.release.id != first.release.id
+        && other.mapping.complete
+        && !other.mapping.ambiguous
+        && !other.release.has_unsupported_entries()
+        && (in_same_release_group(first, other)
+            || within_gap(first.score.album_score() - other.score.album_score()))
+}
+
 /// Whether any local track maps to a different known recording in each
 /// candidate, as a remaster or re-recording would.
 ///
@@ -7354,11 +7371,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v33"
+            "discogs-match-v34"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v32"
+            "musicbrainz-match-v33"
         );
     }
 

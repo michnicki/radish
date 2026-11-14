@@ -237,6 +237,16 @@ pub struct ProviderAttempt {
     /// Failures discovery worked around because other results arrived.
     pub partial_failures: Vec<ProviderError>,
     pub embedded_release_resolved: bool,
+    /// The candidate [`prefer_complete`] moved to the front, and the one it
+    /// displaced. Printed with the release's other progress lines.
+    promotion: Option<Promotion>,
+}
+
+/// A complete edition ranked before the incomplete one that sorted first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Promotion {
+    promoted: ReleaseId,
+    previous: ReleaseId,
 }
 
 impl ProviderAttempt {
@@ -249,6 +259,7 @@ impl ProviderAttempt {
             error: Some(error),
             partial_failures: Vec::new(),
             embedded_release_resolved: false,
+            promotion: None,
         }
     }
 
@@ -294,7 +305,9 @@ impl ProviderAttempt {
                     .then_with(|| b.release.id.cmp(&a.release.id))
             })
             .map(|candidate| candidate.release.id.clone());
-        candidates.sort_by(|a, b| candidate_order(exact_id.as_ref(), a, b));
+        // Evaluations are computed after the final order, so each stays paired
+        // with its candidate whatever moved it.
+        let promotion = rank_candidates(&mut candidates, exact_id.as_ref());
 
         let evaluations = candidates
             .iter()
@@ -322,6 +335,7 @@ impl ProviderAttempt {
             error,
             partial_failures: result.failures,
             embedded_release_resolved,
+            promotion,
         }
     }
 
@@ -874,6 +888,7 @@ where
     }
 
     for attempt in &attempts {
+        print_promotion(attempt, transcript);
         for note in &attempt.notes {
             eprintln_to!(transcript, "  note ({}): {}", attempt.provider, Clean(note));
         }
@@ -1406,6 +1421,48 @@ fn print_candidate(
     );
 }
 
+/// Sorts `candidates` into the order they are judged in, then lets
+/// [`prefer_complete`] correct it unless an exact edition was selected.
+fn rank_candidates(
+    candidates: &mut [Candidate],
+    exact_id: Option<&ReleaseId>,
+) -> Option<Promotion> {
+    candidates.sort_by(|a, b| candidate_order(exact_id, a, b));
+    if exact_id.is_some() {
+        return None;
+    }
+    prefer_complete(candidates)
+}
+
+/// Moves the first candidate that lists exactly the files to the front when the
+/// first candidate's mapping is incomplete.
+///
+/// Scores average over the local tracks, so an edition with bonus tracks ties
+/// with the one that lists exactly the files and can sort first, yet its mapping
+/// is incomplete and can never be applied. Only the first candidate decides, so
+/// the complete edition is ranked ahead of it. This is a pass over the sorted
+/// list rather than part of [`candidate_order`], because "within the score gap"
+/// is not transitive and a comparator built on it is not a total order. The
+/// others keep their order, and the promoted candidate still has to pass every
+/// gate.
+fn prefer_complete(candidates: &mut [Candidate]) -> Option<Promotion> {
+    let first = candidates.first()?;
+    if first.mapping.complete {
+        return None;
+    }
+    let index = candidates
+        .iter()
+        .skip(1)
+        .position(|other| matcher::lists_exactly_the_files(first, other))?
+        + 1;
+    let previous = first.release.id.clone();
+    candidates[..=index].rotate_right(1);
+    Some(Promotion {
+        promoted: candidates[0].release.id.clone(),
+        previous,
+    })
+}
+
 /// The order candidates are shown and judged in: the proven edition first, then
 /// album score, then total score. On a full tie a release the files make up whole
 /// comes before one of whose discs they are only one, then the release ID.
@@ -1682,6 +1739,19 @@ where
     }
 }
 
+/// Says that a complete edition was ranked before the incomplete one that
+/// sorted first, so an audit can find the releases this changed.
+fn print_promotion(attempt: &ProviderAttempt, transcript: &mut Transcript) {
+    if let Some(Promotion { promoted, previous }) = &attempt.promotion {
+        outln_to!(
+            transcript,
+            "  ranked {} before {}: it lists exactly the files",
+            Clean(&promoted.to_string()),
+            Clean(&previous.to_string())
+        );
+    }
+}
+
 fn print_decision(attempt: &ProviderAttempt, transcript: &mut Transcript) {
     for (index, (candidate, evaluation)) in attempt
         .candidates
@@ -1743,6 +1813,7 @@ fn print_decision_for(
             error: None,
             partial_failures: Vec::new(),
             embedded_release_resolved: false,
+            promotion: None,
         },
         transcript,
     );
@@ -2658,5 +2729,209 @@ mod tests {
         candidates.reverse();
         candidates.sort_by(|a, b| candidate_order(None, a, b));
         assert_eq!(candidates[0].release.id, ReleaseId::Discogs(9));
+    }
+
+    /// An edition of the fixture album with `count` tracks of 180 seconds, in
+    /// the release group `group`.
+    fn edition(id: u64, count: usize, group: Option<u64>) -> RemoteRelease {
+        let (_, mut remote) = album_fixture();
+        remote.id = ReleaseId::Discogs(id);
+        remote.group_id = group.map(crate::providers::GroupId::DiscogsMaster);
+        remote.tracklist.truncate(count);
+        for (index, track) in remote.tracklist.iter_mut().enumerate() {
+            track.title = format!("Track {}", index + 1);
+            track.duration_secs = Some(180.0);
+        }
+        remote
+    }
+
+    /// The fixture album's first ten files, all 180 seconds long.
+    fn ten_files() -> LocalRelease {
+        let (mut local, _) = album_fixture();
+        local.tracks.truncate(10);
+        for track in &mut local.tracks {
+            track.duration_secs = Some(180.0);
+        }
+        local
+    }
+
+    fn attempt_over(local: &LocalRelease, releases: Vec<RemoteRelease>) -> ProviderAttempt {
+        ProviderAttempt::from_discovery(
+            ProviderKind::Discogs,
+            local,
+            DiscoveryResult {
+                releases,
+                ..Default::default()
+            },
+            None,
+            false,
+        )
+    }
+
+    fn ids(attempt: &ProviderAttempt) -> Vec<u64> {
+        attempt
+            .candidates
+            .iter()
+            .map(|candidate| match candidate.release.id {
+                ReleaseId::Discogs(id) => id,
+                ReleaseId::MusicBrainz(_) => unreachable!("a discogs test"),
+            })
+            .collect()
+    }
+
+    fn out_lines(transcript: &Transcript) -> Vec<&str> {
+        transcript
+            .held
+            .iter()
+            .flatten()
+            .filter_map(|line| match line {
+                Line::Out(text) => Some(text.as_str()),
+                Line::Err(_) => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_exact_count_edition_goes_first_and_is_accepted() {
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let directory_id = store::upsert_directory(&pool, std::path::Path::new("/music"))
+            .await
+            .unwrap();
+        let files: Vec<_> = (1..=10)
+            .map(|number| scanned_track(&format!("/music/a/{number:02}.flac"), "Album", number))
+            .collect();
+        store::upsert_tracks(&pool, &files, directory_id)
+            .await
+            .unwrap();
+        store::rebuild_local_releases(&pool, None).await.unwrap();
+        let release = store::load_local_releases(&pool, None)
+            .await
+            .unwrap()
+            .remove(0);
+        let guard = store::load_match_guard(&pool, release.id).await.unwrap();
+
+        // The twelve-track edition ties with the ten-track one of its group and
+        // has the lower release ID, so the sort alone puts it first.
+        let attempt = attempt_over(
+            &release,
+            vec![edition(10, 12, Some(1)), edition(11, 10, Some(1))],
+        );
+        assert!(attempt.candidates[0].mapping.complete && !attempt.candidates[1].mapping.complete);
+        assert_eq!(ids(&attempt), vec![11, 10]);
+        assert!(
+            attempt.settled(false),
+            "{:?}",
+            attempt.evaluations[0].blockers
+        );
+        assert_eq!(
+            attempt.evaluations[0].blockers,
+            Vec::<String>::new(),
+            "the evaluation is the one computed for the promoted candidate"
+        );
+
+        let mut transcript = Transcript::held();
+        print_promotion(&attempt, &mut transcript);
+        let outcome = accept(
+            &pool,
+            &release,
+            ProviderKind::Discogs,
+            &attempt.candidates[0],
+            &attempt.evaluations[0],
+            AcceptanceMethod::Automatic,
+            false,
+            &guard,
+            &mut transcript,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, Outcome::Accepted), "{outcome:?}");
+        assert!(
+            out_lines(&transcript)
+                .contains(&"  ranked discogs 11 before discogs 10: it lists exactly the files"),
+            "{:?}",
+            out_lines(&transcript)
+        );
+    }
+
+    #[test]
+    fn a_first_candidate_with_a_complete_mapping_is_left_alone() {
+        let local = ten_files();
+        let attempt = attempt_over(
+            &local,
+            vec![edition(10, 10, Some(1)), edition(11, 10, Some(1))],
+        );
+        assert!(attempt.candidates[0].mapping.complete);
+        assert_eq!(ids(&attempt), vec![10, 11]);
+        assert_eq!(attempt.promotion, None);
+        let mut transcript = Transcript::held();
+        print_promotion(&attempt, &mut transcript);
+        assert!(out_lines(&transcript).is_empty());
+    }
+
+    #[test]
+    fn an_exact_edition_selection_is_never_reordered() {
+        let local = ten_files();
+        let mut candidates: Vec<Candidate> = [edition(10, 12, Some(1)), edition(11, 10, Some(1))]
+            .into_iter()
+            .map(|release| Candidate::new(&local, release))
+            .collect();
+        assert!(!candidates[0].mapping.complete && candidates[1].mapping.complete);
+        let selected = ReleaseId::Discogs(10);
+        assert_eq!(rank_candidates(&mut candidates, Some(&selected)), None);
+        assert_eq!(candidates[0].release.id, selected);
+
+        // Without the selection the same candidates are reordered.
+        let promotion = rank_candidates(&mut candidates, None).expect("a promotion");
+        assert_eq!(promotion.promoted, ReleaseId::Discogs(11));
+        assert_eq!(promotion.previous, ReleaseId::Discogs(10));
+    }
+
+    #[test]
+    fn a_complete_candidate_of_another_group_outside_the_gap_is_not_promoted() {
+        let local = ten_files();
+        let mut other_album = edition(11, 10, Some(2));
+        for track in &mut other_album.tracklist {
+            track.title = "Something else entirely".into();
+        }
+        let attempt = attempt_over(&local, vec![edition(10, 12, Some(1)), other_album]);
+        let first = &attempt.candidates[0];
+        let second = &attempt.candidates[1];
+        assert_eq!(first.release.id, ReleaseId::Discogs(10));
+        assert!(!first.mapping.complete);
+        assert!(second.mapping.complete);
+        assert!(!matcher::within_gap(
+            first.score.album_score() - second.score.album_score()
+        ));
+        assert_eq!(ids(&attempt), vec![10, 11]);
+        assert_eq!(attempt.promotion, None);
+    }
+
+    #[test]
+    fn the_first_qualifying_candidate_is_promoted_and_the_rest_keep_their_order() {
+        let local = ten_files();
+        // The second candidate is incomplete too and the third is of another
+        // album outside the gap; the fourth and fifth both qualify.
+        let mut other_album = edition(12, 10, Some(2));
+        for track in &mut other_album.tracklist {
+            track.title = "Something else entirely".into();
+        }
+        let attempt = attempt_over(
+            &local,
+            vec![
+                edition(10, 12, Some(1)),
+                edition(11, 11, Some(1)),
+                other_album,
+                edition(13, 10, Some(1)),
+                edition(14, 10, Some(1)),
+            ],
+        );
+        assert_eq!(ids(&attempt), vec![13, 10, 11, 14, 12]);
+        assert_eq!(
+            attempt.promotion,
+            Some(Promotion {
+                promoted: ReleaseId::Discogs(13),
+                previous: ReleaseId::Discogs(10),
+            })
+        );
     }
 }

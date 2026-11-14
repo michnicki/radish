@@ -37,7 +37,7 @@ text of an acceptance rule, which the database does not store:
     odd-length        "every title and every other length agrees"
     tracklist         "track titles and lengths agree in track order"
     leading           "after the files' last"
-    complete-first    no note: see complete_first below
+    complete-first    "it lists exactly the files"
 
 With --log the audit sheet gets these extra columns, filled where the slice has
 the data: note (the matched log line), gap_secs, last_track and local_vs_remote
@@ -324,19 +324,14 @@ def leading(r):
 
 
 def complete_first(r):
-    """New accepts whose remote release lists exactly as many tracks as the files.
+    """Accepts after a complete edition was ranked before an incomplete one.
 
-    The log does not say which candidate ranked first before a complete edition was
-    promoted, so the promotion itself cannot be read from it. Every new accept is
-    one the BASE run did not accept, so this selects the new accepts that a complete
-    edition could have rescued: the remote track count equals the local track count.
-    The audit then compares each with the review the BASE run queued.
+    The runner prints `ranked X before Y: it lists exactly the files` when it moves
+    a release that lists exactly the files ahead of the first candidate, whose
+    mapping was incomplete. The note carries both release ids.
     """
-    counts = track_counts(r)
-    if counts["present"] != counts["listed"]:
-        return None
-    accepted = [line for line in r["log"] if line.startswith("accepted ")]
-    return {"note": " | ".join(accepted), **counts}
+    extra = noted("it lists exactly the files")(r)
+    return None if extra is None else {**extra, **track_counts(r)}
 
 
 # Slices that read the log; they need --log.
