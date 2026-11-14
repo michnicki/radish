@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v37";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v36";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v38";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v37";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -3948,6 +3948,16 @@ fn title_names_a_take(title: &str, cleaned: Option<&CleanedTitle>) -> bool {
 /// covers ([`is_length_drift`]) is not an odd length: it keeps its own warning.
 /// `cleaned` is [`cleaned_track_titles`] of `local`.
 ///
+/// The rule also does not apply in two cases where the odd file may be another
+/// recording that no label on the odd pair shows. Another playable track on any
+/// medium may share the odd pair's remote base title, the title without its
+/// trailing version or take group ([`bases_agree`]): the file may be that
+/// sibling's recording (`Darts of Pleasure` against `Darts of Pleasure [home
+/// Demo]`, where the file is the demo). And a local title of 29 or 30
+/// characters ([`may_be_cut_to_field`]) that ends inside an unclosed `(` or `[`
+/// group ([`ends_inside_open_group`]) was cut by an ID3v1 field, and the cut
+/// group may have named a version or take that the rule cannot see.
+///
 /// One hidden track, a typo on a vinyl side or another mix does not change the
 /// album that every title and every other length identify, but a length alone
 /// cannot say which of those it is, so the rule leaves the call to the score
@@ -3997,7 +4007,25 @@ fn one_length_differs(
         || names_a_version(remote_title)
         || title_names_a_take(local_title, cleaned_title)
         || title_names_a_take(remote_title, None);
-    (strictly_the_same && !another_recording).then_some(l)
+    let may_be_a_sibling_recording = candidate
+        .release
+        .playable_tracks()
+        .into_iter()
+        .any(|(index, track)| index != r && bases_agree(&track.title, remote_title));
+    let cut_inside_a_group =
+        may_be_cut_to_field(local_title) && ends_inside_open_group(local_title);
+    (strictly_the_same && !another_recording && !may_be_a_sibling_recording && !cut_inside_a_group)
+        .then_some(l)
+}
+
+/// Whether `title` ends inside a `(` or `[` group that it never closes, as a
+/// title cut to an ID3v1 field does (`Desperate Mother With A Gun (B`).
+fn ends_inside_open_group(title: &str) -> bool {
+    [('(', ')'), ('[', ']')].into_iter().any(|(open, close)| {
+        title
+            .rfind(open)
+            .is_some_and(|start| !title[start..].contains(close))
+    })
 }
 
 /// The album score of an odd-length match (see [`one_length_differs`]), which
@@ -7702,11 +7730,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v37"
+            "discogs-match-v38"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v36"
+            "musicbrainz-match-v37"
         );
     }
 
@@ -13286,6 +13314,103 @@ mod tests {
             local.tracks[2].title = Some(other.to_string());
             remote.tracklist[2].title = take.to_string();
             assert_no_odd_length(&local, &remote, "take word only remotely");
+        }
+    }
+
+    /// The *Darts of Pleasure* EP: the studio recording and, at the end, the
+    /// home demo of the same song. The files' first track is 207.4 seconds, the
+    /// demo's length, against the studio track's 182. `last` is the title of
+    /// the fifth track on both sides.
+    fn darts_pair(last: &str) -> (LocalRelease, RemoteRelease) {
+        let titles = [
+            "Darts of Pleasure",
+            "Van Tango",
+            "Shopping for Blood",
+            "Love and Destroy",
+            last,
+        ];
+        let lengths = [182.0, 180.0, 165.0, 200.0, 206.0];
+        let mut local = local_release(&titles);
+        let mut remote = remote_release(&titles);
+        for (index, length) in lengths.iter().enumerate() {
+            local.tracks[index].duration_secs = Some(*length);
+            remote.tracklist[index].duration_secs = Some(*length);
+        }
+        local.tracks[0].duration_secs = Some(207.4);
+        (local, remote)
+    }
+
+    fn odd_length_index(local: &LocalRelease, remote: &RemoteRelease) -> Option<usize> {
+        let candidate = Candidate::new(local, remote.clone());
+        let cleaned = cleaned_track_titles(local);
+        one_length_differs(local, &candidate, &cleaned)
+    }
+
+    #[test]
+    fn an_odd_file_that_may_be_a_same_titled_sibling_recording_is_not_an_odd_length() {
+        // The odd file is the home demo, which the release lists last: the
+        // studio track's length is not the file's.
+        let (local, remote) = darts_pair("Darts of Pleasure [home Demo]");
+        assert_no_odd_length(&local, &remote, "same base title sibling");
+
+        // A sibling on another disc counts as well.
+        let (local, mut remote) = darts_pair("Darts of Pleasure [home Demo]");
+        for (index, track) in remote.tracklist.iter_mut().enumerate() {
+            track.medium_position = Some(if index == 4 { 2 } else { 1 });
+        }
+        assert_eq!(odd_length_index(&local, &remote), None);
+    }
+
+    #[test]
+    fn a_sibling_with_another_base_title_does_not_block_an_odd_length() {
+        let (local, remote) = darts_pair("Home Tapes [home Demo]");
+        assert_eq!(odd_length_index(&local, &remote), Some(0));
+
+        // The same song without a version group on the odd pair is untouched
+        // by a sibling that has another song's title.
+        let (local, remote) = darts_pair("Home Tapes");
+        assert_eq!(odd_length_index(&local, &remote), Some(0));
+    }
+
+    /// An odd pair on the fourth of five tracks, whose files' title is `title`
+    /// on both sides.
+    fn titled_odd_pair(title: &str) -> (LocalRelease, RemoteRelease) {
+        let (mut local, mut remote) = darts_pair("Home Tapes");
+        local.tracks[0].duration_secs = Some(182.0);
+        local.tracks[3].duration_secs = Some(200.0 + 40.0);
+        local.tracks[3].title = Some(title.to_string());
+        remote.tracklist[3].title = title.to_string();
+        (local, remote)
+    }
+
+    #[test]
+    fn a_title_cut_inside_a_bracket_group_is_not_an_odd_length() {
+        for title in [
+            "Desperate Mother With A Gun (B",
+            "Desperate Mother With A Gun [B",
+            "Desperate Mother With A Gun (",
+            "Desperate Mother With A Gun[B",
+        ] {
+            assert!(may_be_cut_to_field(title), "{title}");
+            let (local, remote) = titled_odd_pair(title);
+            assert_eq!(odd_length_index(&local, &remote), None, "{title}");
+        }
+    }
+
+    #[test]
+    fn a_closed_or_shorter_bracket_title_keeps_the_odd_length_rule() {
+        for title in [
+            // Closed.
+            "Desperate Mother With A Gun (Bonus)",
+            // Not the width of an ID3v1 field.
+            "Desperate Mother Gun (B",
+            // At the width but the group is closed and no longer open.
+            "Desperate Mother With A (Gun)",
+            // At the width, no group at all.
+            "Desperate Mother With A Gunny",
+        ] {
+            let (local, remote) = titled_odd_pair(title);
+            assert_eq!(odd_length_index(&local, &remote), Some(3), "{title}");
         }
     }
 
