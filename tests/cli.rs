@@ -37,14 +37,34 @@ async fn seed_directory(db: &Path, directory: &str, year: i64) -> i64 {
 }
 
 async fn seed_album(db: &Path, directory: &str, album: &str, year: i64) -> i64 {
+    seed_tracks(
+        db,
+        directory,
+        album,
+        year,
+        &["Track 1", "Track 2"],
+        &[181.0, 182.0],
+    )
+    .await
+}
+
+async fn seed_tracks(
+    db: &Path,
+    directory: &str,
+    album: &str,
+    year: i64,
+    titles: &[&str],
+    durations: &[f64],
+) -> i64 {
     let pool = radish::db::connect(db).await.unwrap();
     let directory = Path::new(directory);
     let directory_id = store::upsert_directory(&pool, directory).await.unwrap();
 
-    for number in 1..=2i64 {
+    for (index, (title, duration)) in titles.iter().zip(durations).enumerate() {
+        let number = index as i64 + 1;
         let track = ScannedTrack {
             path: directory.join(format!("0{number}.flac")),
-            title: Some(format!("Track {number}")),
+            title: Some((*title).to_string()),
             artist: Some("Test Artist".to_string()),
             album: Some(album.to_string()),
             album_artist: Some("Test Artist".to_string()),
@@ -55,7 +75,7 @@ async fn seed_album(db: &Path, directory: &str, album: &str, year: i64) -> i64 {
             catalog_number: None,
             discogs_release_id: None,
             musicbrainz: ObservedMusicBrainzIds::default(),
-            duration_secs: Some(180.0 + number as f64),
+            duration_secs: Some(*duration),
             modified_at: 1,
         };
         store::upsert_track(&pool, &track, directory_id)
@@ -169,6 +189,147 @@ async fn dry_run_reports_an_automatic_fallback_album_match() {
     assert!(text.contains("edition unconfirmed"), "{text}");
     assert_eq!(row_count(&db, "release_matches").await, 0);
     assert_eq!(row_count(&db, "match_reviews").await, 0);
+}
+
+const SETTLE_TITLES: [&str; 6] = [
+    "Opening",
+    "Second Wind",
+    "Hollow",
+    "Undertow",
+    "Lantern",
+    "Closing",
+];
+const SETTLE_DURATIONS: [f64; 6] = [181.0, 212.0, 243.0, 274.0, 305.0, 336.0];
+
+/// Six files, Discogs release 42 titled like them, and MusicBrainz releases
+/// of different release groups that all fit the files, so MusicBrainz settles
+/// none of them on its own. One lists a placeholder subtitle on track 3 that the
+/// files and Discogs do not have, so that release and Discogs disagree on the
+/// title; the files side with Discogs. With `live_primary`, another lists track
+/// 3 as a live recording, which the files do not rule out.
+async fn seed_settling_scenario(db: &Path, live_primary: bool) -> MockServer {
+    let titles = SETTLE_TITLES;
+    let durations = SETTLE_DURATIONS;
+    seed_tracks(db, "/music/blue", "Blue", 2001, &titles, &durations).await;
+    let exact = "11111111-1111-1111-1111-111111111111";
+    let placeholder_id = "22222222-2222-2222-2222-222222222222";
+    let live_id = "33333333-3333-3333-3333-333333333333";
+    let mut placeholder = titles;
+    placeholder[2] = "Hollow / [unknown]";
+    let mut live = titles;
+    live[2] = "Hollow (Live)";
+    let tracklist: Vec<_> = titles
+        .iter()
+        .zip(durations)
+        .enumerate()
+        .map(|(index, (title, duration))| {
+            serde_json::json!({
+                "position": (index + 1).to_string(),
+                "title": title,
+                "duration": format!("{}:{:02}", duration as u64 / 60, duration as u64 % 60),
+                "type_": "track"
+            })
+        })
+        .collect();
+    let discogs_release = serde_json::json!({
+        "id": 42, "title": "Blue", "year": 2001, "country": "US",
+        "artists": [{"id": 1, "name": "Test Artist"}],
+        "labels": [{"id": 2, "name": "Label", "catno": "CAT-1"}],
+        "formats": [{"name": "CD", "descriptions": ["Album"]}],
+        "identifiers": [],
+        "tracklist": tracklist
+    })
+    .to_string();
+    let mut ids = vec![exact, placeholder_id];
+    if live_primary {
+        ids.push(live_id);
+    }
+    MockServer::start(move |target| {
+        let other_group = |id: &str, tracks: &[&str], group: &str| {
+            musicbrainz_release_json(id, tracks, &durations)
+                .replace("4642ee19-7790-3c8d-ab5e-d133de942db6", group)
+        };
+        if target.contains(&format!("/ws/2/release/{exact}")) {
+            return (200, musicbrainz_release_json(exact, &titles, &durations));
+        }
+        if target.contains(&format!("/ws/2/release/{placeholder_id}")) {
+            let group = "5753ff2a-8801-4d9e-bc6f-e244ef053ec7";
+            return (200, other_group(placeholder_id, &placeholder, group));
+        }
+        if target.contains(&format!("/ws/2/release/{live_id}")) {
+            let group = "6864ab3b-9912-4eaf-8d70-f355f0164fd8";
+            return (200, other_group(live_id, &live, group));
+        }
+        if target.contains("/ws/2/release") {
+            let releases: Vec<_> = ids
+                .iter()
+                .map(|id| {
+                    serde_json::json!({
+                        "id": id, "title": "Blue", "date": "2001-05-01",
+                        "artist-credit": [{"name": "Test Artist", "joinphrase": ""}]
+                    })
+                })
+                .collect();
+            return (
+                200,
+                serde_json::json!({
+                    "count": releases.len(), "offset": 0, "releases": releases
+                })
+                .to_string(),
+            );
+        }
+        if target.contains("/releases/42") {
+            return (200, discogs_release.clone());
+        }
+        handler(target)
+    })
+}
+
+const SETTLED_TITLE_LINE: &str = "fallback conflict settled by the files: primary and fallback track titles differ for local track 3 ('Hollow / [unknown]' versus 'Hollow'); the file 'Hollow' agrees with the fallback";
+
+#[tokio::test]
+async fn the_files_settle_a_placeholder_title_conflict_between_the_providers() {
+    let db = db_path("dry-run-fallback-settled");
+    let server = seed_settling_scenario(&db, false).await;
+
+    let output = run(&db, &server, &["match", "--dry-run"], Some("test-token"));
+    let text = stdout(&output);
+    assert!(output.status.success(), "{output:?}\n{text}");
+    assert!(text.contains("would accept discogs"), "{text}");
+    assert!(text.contains(SETTLED_TITLE_LINE), "{text}");
+    assert!(!text.contains("  fallback conflict: "), "{text}");
+    assert_eq!(row_count(&db, "release_matches").await, 0);
+    assert_eq!(row_count(&db, "match_reviews").await, 0);
+}
+
+#[tokio::test]
+async fn a_review_keeps_the_conflicts_the_files_settled_in_its_notes() {
+    let db = db_path("dry-run-fallback-settled-review");
+    let server = seed_settling_scenario(&db, true).await;
+
+    // The live primary's conflict is not settled, so the release is queued, and
+    // the reviewer still sees what the files settled.
+    let output = run(&db, &server, &["match"], Some("test-token"));
+    let text = stdout(&output);
+    assert!(output.status.success(), "{output:?}\n{text}");
+    assert!(!text.contains("would accept"), "{text}");
+    assert_eq!(row_count(&db, "release_matches").await, 0);
+    let pool = radish::db::connect(&db).await.unwrap();
+    let reasons: Vec<(String,)> =
+        sqlx::query_as("SELECT reasons_json FROM match_reviews WHERE provider = 'discogs'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    pool.close().await;
+    let reasons = reasons.into_iter().map(|row| row.0).collect::<String>();
+    assert!(
+        reasons.contains("fallback conflict settled by the files: "),
+        "{reasons}"
+    );
+    assert!(
+        reasons.contains("track titles differ for local track 3 ('Hollow (Live)' versus 'Hollow')"),
+        "{reasons}"
+    );
 }
 
 #[tokio::test]

@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v27";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v26";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v28";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v27";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -654,15 +654,17 @@ fn cut_off_similarity_at(width: usize, local: &str, remote: &str) -> Option<f64>
 /// 30-character local value, and the cut-off reading of
 /// [`cut_off_similarity`].
 pub fn local_similarity(local: &str, remote: &str) -> f64 {
-    local_similarity_with(local, remote, true)
+    local_similarity_with(local, remote, true, true)
 }
 
 /// [`local_similarity`] with the cut-off and ID3v1-prefix readings switched on
 /// or off. They only apply to text that is the raw tag: a title that was
 /// shortened for comparison says nothing about how long the tag was.
-fn local_similarity_with(local: &str, remote: &str, allow_cut_off: bool) -> f64 {
+/// `subtitle` switches on the forgiveness of a subtitle that one side has and
+/// the other lacks ([`suffix_tolerant_similarity`]).
+fn local_similarity_with(local: &str, remote: &str, allow_cut_off: bool, subtitle: bool) -> f64 {
     let mut full = similarity(local, remote);
-    if let Some(value) = suffix_tolerant_similarity(local, remote) {
+    if subtitle && let Some(value) = suffix_tolerant_similarity(local, remote) {
         full = full.max(value);
     }
     if !allow_cut_off {
@@ -1045,9 +1047,10 @@ fn cleaned_track_titles(local: &LocalRelease) -> Vec<Option<CleanedTitle>> {
 
 /// The best reading of a cleaned title, less [`TRACK_TITLE_CLEANUP_PENALTY`]:
 /// the full comparison, and the cut-off reading at the raw tag's width when
-/// [`CleanedTitle::cut_width`] allows it.
-fn cleaned_title_similarity(cleaned: &CleanedTitle, remote: &str) -> f64 {
-    let mut value = local_similarity_with(&cleaned.text, remote, false);
+/// [`CleanedTitle::cut_width`] allows it. `subtitle` is as for
+/// [`local_similarity_with`].
+fn cleaned_title_similarity(cleaned: &CleanedTitle, remote: &str, subtitle: bool) -> f64 {
+    let mut value = local_similarity_with(&cleaned.text, remote, false, subtitle);
     if let Some(cut_off) = cleaned
         .cut_width
         .and_then(|width| cut_off_similarity_at(width, &cleaned.text, remote))
@@ -1060,9 +1063,26 @@ fn cleaned_title_similarity(cleaned: &CleanedTitle, remote: &str) -> f64 {
 /// [`local_similarity`] for a track title: the better of the raw reading and
 /// the `cleaned` one, when the title has one.
 fn track_title_similarity(raw: &str, cleaned: Option<&CleanedTitle>, remote: &str) -> f64 {
-    let value = local_similarity(raw, remote);
+    track_title_similarity_with(raw, cleaned, remote, true)
+}
+
+/// [`track_title_similarity`] without the forgiveness of a subtitle that only
+/// one side has: `I Sold Myself In` does not match `I Sold Myself In / [unknown]`
+/// here. The raw, cut-off, ID3v1-prefix and cleaned readings are kept. For
+/// deciding whether a file's title agrees with one provider and not another.
+fn strict_track_title_similarity(raw: &str, cleaned: Option<&CleanedTitle>, remote: &str) -> f64 {
+    track_title_similarity_with(raw, cleaned, remote, false)
+}
+
+fn track_title_similarity_with(
+    raw: &str,
+    cleaned: Option<&CleanedTitle>,
+    remote: &str,
+    subtitle: bool,
+) -> f64 {
+    let value = local_similarity_with(raw, remote, true, subtitle);
     cleaned.map_or(value, |cleaned| {
-        value.max(cleaned_title_similarity(cleaned, remote))
+        value.max(cleaned_title_similarity(cleaned, remote, subtitle))
     })
 }
 
@@ -1753,7 +1773,7 @@ pub fn album_title_similarity(local: &str, remote: &str) -> f64 {
 /// [`album_title_similarity`], where `allow_cut_off` is false when the local
 /// title was shortened on purpose, so it is never read as a cut-off tag.
 fn album_title_similarity_with(local: &str, remote: &str, allow_cut_off: bool) -> f64 {
-    let mut best = local_similarity_with(local, remote, allow_cut_off);
+    let mut best = local_similarity_with(local, remote, allow_cut_off, true);
     let (local_discs, remote_discs) = (
         numbered_release_types(local),
         numbered_release_types(remote),
@@ -1781,6 +1801,7 @@ fn album_title_similarity_with(local: &str, remote: &str, allow_cut_off: bool) -
                     &local_album,
                     &remote_album,
                     allow_cut_off && local_readings.is_empty(),
+                    true,
                 );
                 best = best.max((reduced - ALBUM_TYPE_PENALTY).max(0.0));
             }
@@ -2750,7 +2771,7 @@ impl<'a> TitleMatrix<'a> {
             ));
         }
         if let Some(cleaned) = &self.cleaned[local_index] {
-            value = value.max(cleaned_title_similarity(cleaned, remote_title));
+            value = value.max(cleaned_title_similarity(cleaned, remote_title, true));
         }
         self.cache[local_index][remote_index] = Some(value);
         Some(value)
@@ -4525,7 +4546,61 @@ pub fn fallback_conflicts(
     embedded_release_resolved: bool,
     text_only_fallback: bool,
 ) -> Vec<String> {
+    fallback_check(
+        local,
+        primary_candidates,
+        fallback,
+        embedded_release_resolved,
+        text_only_fallback,
+    )
+    .conflicts
+}
+
+/// What [`fallback_check`] found: the disagreements that stop an automatic
+/// fallback accept, and the ones the files themselves settled.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FallbackCheck {
+    /// Disagreements between the fallback and the local edition or a plausible
+    /// primary candidate. Any one of them sends the release to review.
+    pub conflicts: Vec<String>,
+    /// Track title and duration disagreements between a plausible primary and
+    /// the fallback where the file agrees with the fallback and not with the
+    /// primary. They do not stop the accept; the runner reports them.
+    pub settled: Vec<String>,
+}
+
+/// [`fallback_conflicts`] that also reports the conflicts the files settle.
+///
+/// A track title conflict on local track *k* is settled when the file's title
+/// is present, reads at least [`TITLE_SIMILARITY_THRESHOLD`] against the
+/// fallback's title and below it against the primary's
+/// ([`strict_track_title_similarity`], so a subtitle only one side has counts
+/// against the match), the file's length and the fallback's are both known,
+/// positive and within [`DURATION_TOLERANCE_SECS`], the two titles carry the
+/// same track version qualifiers, and the primary's title does not name another
+/// take ([`local_title_is_another_take`]). A duration conflict is settled when
+/// the file's length is within [`DURATION_TOLERANCE_SECS`] of the fallback's
+/// and further than that from the primary's, and the file's title also reads at
+/// least [`TITLE_SIMILARITY_THRESHOLD`] against the fallback's (so a settle
+/// never rests on a track the fallback matched through a weak, junk or
+/// near-miss title). Nothing is settled when the fallback's album title scores
+/// below [`TITLE_SIMILARITY_THRESHOLD`]. A primary that is plausible only
+/// through its durations has no title conflicts and no duration conflict that
+/// can be settled. Edition qualifiers, contradicting primary lengths, embedded
+/// evidence and an unresolved release ID are never settled. A settled line
+/// that several primaries produce is reported once.
+pub fn fallback_check(
+    local: &LocalRelease,
+    primary_candidates: &[Candidate],
+    fallback: &Candidate,
+    embedded_release_resolved: bool,
+    text_only_fallback: bool,
+) -> FallbackCheck {
     let mut conflicts = Vec::new();
+    let mut settled = Vec::new();
+    // The files only settle a conflict for a fallback whose album is the files'.
+    let files_may_settle = fallback.score.album_title >= TITLE_SIMILARITY_THRESHOLD;
+    let cleaned_titles = cleaned_track_titles(local);
 
     for problem in &local.embedded_evidence.problems {
         conflicts.push(problem.clone());
@@ -4592,31 +4667,104 @@ pub fn fallback_conflicts(
             let Some(primary_track) = primary.release.tracklist.get(remote_index) else {
                 continue;
             };
+            let local_track = local.tracks.get(local_index);
+            let fallback_duration = fallback_durations.get(&local_index).copied();
+            // The file's length when it is known, positive and within
+            // [`DURATION_TOLERANCE_SECS`] of the fallback's.
+            let file_length_agreeing_with_fallback = local_track
+                .and_then(|track| track.duration_secs)
+                .zip(fallback_duration)
+                .filter(|(file, fallback)| {
+                    file.is_finite()
+                        && fallback.is_finite()
+                        && *file > 0.0
+                        && *fallback > 0.0
+                        && (file - fallback).abs() <= DURATION_TOLERANCE_SECS
+                })
+                .map(|(file, _)| file);
+            let file_title = local_track.and_then(|track| track.title.as_deref());
+            let cleaned = cleaned_titles.get(local_index).and_then(Option::as_ref);
+            // Whether the file's title reads like `remote_title`, without the
+            // forgiveness of a subtitle that only one side has.
+            let file_reads_like = |remote_title: &str| {
+                file_title.is_some_and(|title| {
+                    strict_track_title_similarity(title, cleaned, remote_title)
+                        >= TITLE_SIMILARITY_THRESHOLD
+                })
+            };
             if plausible_by_score && let Some(fallback_title) = fallback_titles.get(&local_index) {
                 let similarity = similarity(&primary_track.title, fallback_title);
                 if similarity < TITLE_SIMILARITY_THRESHOLD {
-                    conflicts.push(format!(
+                    let message = format!(
                         "primary and fallback track titles differ for local track {} ('{}' versus '{}')",
                         local_index + 1,
                         primary_track.title,
                         fallback_title
-                    ));
+                    );
+                    let file_reads_like_fallback = file_reads_like(fallback_title);
+                    // The primary's title names another recording of the song
+                    // (a different version qualifier, or another take), which
+                    // the file's plain title does not rule out.
+                    let primary_names_another_version = !qualifiers_agree(
+                        &album_track_qualifiers(&primary_track.title),
+                        &album_track_qualifiers(fallback_title),
+                    ) || local_title_is_another_take(
+                        &primary_track.title,
+                        None,
+                        fallback_title,
+                    );
+                    match file_title {
+                        Some(file_title)
+                            if files_may_settle
+                                && file_length_agreeing_with_fallback.is_some()
+                                && file_reads_like_fallback
+                                && !primary_names_another_version
+                                && !file_reads_like(&primary_track.title) =>
+                        {
+                            settled.push(format!(
+                                "{message}; the file '{file_title}' agrees with the fallback"
+                            ));
+                        }
+                        _ => conflicts.push(message),
+                    }
                 }
             }
-            if let (Some(primary_duration), Some(fallback_duration)) = (
-                primary_track.duration_secs,
-                fallback_durations.get(&local_index).copied(),
-            ) && (primary_duration - fallback_duration).abs() > DURATION_TOLERANCE_SECS
+            if let (Some(primary_duration), Some(fallback_duration)) =
+                (primary_track.duration_secs, fallback_duration)
+                && (primary_duration - fallback_duration).abs() > DURATION_TOLERANCE_SECS
             {
-                conflicts.push(format!(
-                    "primary and fallback durations differ for local track {}",
-                    local_index + 1
-                ));
+                // The file's title must also read like the fallback's, so a
+                // settle never rests on a track the fallback itself matched
+                // despite a weak, junk or near-miss title.
+                let title_agrees_with_fallback = fallback_titles
+                    .get(&local_index)
+                    .is_some_and(|title| file_reads_like(title));
+                match file_length_agreeing_with_fallback {
+                    Some(file_duration)
+                        if files_may_settle
+                            && title_agrees_with_fallback
+                            && (file_duration - primary_duration).abs()
+                                > DURATION_TOLERANCE_SECS =>
+                    {
+                        settled.push(format!(
+                            "primary and fallback durations differ for local track {} ({primary_duration:.1}s versus {fallback_duration:.1}s); the file's {file_duration:.1}s agrees with the fallback",
+                            local_index + 1
+                        ));
+                    }
+                    _ => conflicts.push(format!(
+                        "primary and fallback durations differ for local track {}",
+                        local_index + 1
+                    )),
+                }
             }
         }
     }
 
-    conflicts
+    // Several primaries can disagree with the fallback in the same words.
+    let mut seen = HashSet::new();
+    settled.retain(|line| seen.insert(line.clone()));
+
+    FallbackCheck { conflicts, settled }
 }
 
 #[cfg(test)]
@@ -6363,11 +6511,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v27"
+            "discogs-match-v28"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v26"
+            "musicbrainz-match-v27"
         );
     }
 
@@ -8072,6 +8220,494 @@ mod tests {
         let fallback = Candidate::new(&off, remote);
         let conflicts = fallback_conflicts(&off, &[primary], &fallback, true, false);
         assert!(conflicts.is_empty(), "{conflicts:?}");
+    }
+
+    const MUSICBRAINZ_PRIMARY_ID: &str = "76df3287-6cda-33eb-8e9a-044b5e15ffdd";
+
+    /// The titles of [`TITLES_6`] with local track `number` (1-based) renamed.
+    fn titles_with(number: usize, title: &'static str) -> [&'static str; 6] {
+        let mut titles = TITLES_6;
+        titles[number - 1] = title;
+        titles
+    }
+
+    const TITLES_12: [&str; 12] = [
+        "Opening",
+        "Second Wind",
+        "Hollow",
+        "Undertow",
+        "Lantern",
+        "Closing",
+        "Harbor Lights",
+        "Paper Crowns",
+        "Slow Rain",
+        "Iron Garden",
+        "Weather Vane",
+        "Last Orders",
+    ];
+
+    /// The titles of [`TITLES_12`] with local track `number` (1-based) renamed.
+    fn titles_12_with(number: usize, title: &'static str) -> [&'static str; 12] {
+        let mut titles = TITLES_12;
+        titles[number - 1] = title;
+        titles
+    }
+
+    /// Files titled `file_titles`, a MusicBrainz primary titled
+    /// `primary_titles` and a Discogs fallback titled like the files, all with
+    /// the same lengths. `adjust` may change the files, the primary or the
+    /// fallback before candidates are built. The primary must be plausible by
+    /// score, so the title and length checks run against it.
+    fn settling_check(
+        file_titles: &[&str],
+        primary_titles: &[&str],
+        adjust: impl FnOnce(&mut LocalRelease, &mut RemoteRelease, &mut RemoteRelease),
+    ) -> FallbackCheck {
+        let (mut local, mut primary_release) = spaced_pair(file_titles, primary_titles);
+        let (_, mut fallback_release) = spaced_pair(file_titles, file_titles);
+        primary_release.id = ReleaseId::MusicBrainz(mbid(MUSICBRAINZ_PRIMARY_ID));
+        adjust(&mut local, &mut primary_release, &mut fallback_release);
+        let primary = Candidate::new(&local, primary_release);
+        assert!(
+            plausibility_score(&local, &primary) >= PLAUSIBLE_PRIMARY_SCORE,
+            "{:?}",
+            primary.score
+        );
+        let fallback = Candidate::new(&local, fallback_release);
+        fallback_check(&local, &[primary], &fallback, true, false)
+    }
+
+    #[test]
+    fn the_files_settle_a_title_conflict_with_a_placeholder_subtitle() {
+        let file_titles = titles_with(3, "I Sold Myself In");
+        let primary_titles = titles_with(3, "I Sold Myself In / [unknown]");
+        // The lenient reading forgives the placeholder, the strict one does not.
+        assert!(
+            track_title_similarity("I Sold Myself In", None, "I Sold Myself In / [unknown]")
+                >= TITLE_SIMILARITY_THRESHOLD
+        );
+        assert!(
+            strict_track_title_similarity("I Sold Myself In", None, "I Sold Myself In / [unknown]")
+                < TITLE_SIMILARITY_THRESHOLD
+        );
+
+        let check = settling_check(&file_titles, &primary_titles, |_, _, _| {});
+        assert_eq!(check.conflicts, Vec::<String>::new());
+        assert_eq!(
+            check.settled,
+            vec![
+                "primary and fallback track titles differ for local track 3 ('I Sold Myself In / [unknown]' versus 'I Sold Myself In'); the file 'I Sold Myself In' agrees with the fallback".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn the_files_settle_a_title_typo_a_number_prefix_and_a_subtitle() {
+        // A typo in the primary.
+        let check = settling_check(
+            &titles_with(3, "Free Like The Wind"),
+            &titles_with(3, "Feel Like the Wind"),
+            |_, _, _| {},
+        );
+        assert_eq!(check.conflicts, Vec::<String>::new());
+        assert_eq!(check.settled.len(), 1, "{check:?}");
+        assert!(check.settled[0].contains("local track 3"), "{check:?}");
+
+        // A track number left in the file's title: the cleaned reading agrees
+        // with the fallback.
+        let check = settling_check(
+            &titles_with(3, "03 - Free Like The Wind"),
+            &titles_with(3, "Feel Like the Wind"),
+            |_, _, fallback| fallback.tracklist[2].title = "Free Like The Wind".to_string(),
+        );
+        assert_eq!(check.conflicts, Vec::<String>::new());
+        assert_eq!(
+            check.settled,
+            vec![
+                "primary and fallback track titles differ for local track 3 ('Feel Like the Wind' versus 'Free Like The Wind'); the file '03 - Free Like The Wind' agrees with the fallback".to_string()
+            ]
+        );
+
+        // A subtitle the file and the fallback carry and the primary lacks.
+        let check = settling_check(
+            &titles_with(3, "Scary Monsters (and Super Creeps)"),
+            &titles_with(3, "Scary Monsters"),
+            |_, _, _| {},
+        );
+        assert_eq!(check.conflicts, Vec::<String>::new());
+        assert_eq!(check.settled.len(), 1, "{check:?}");
+    }
+
+    #[test]
+    fn the_files_settle_a_duration_conflict() {
+        // The primary lists 241.0 s for a track the files and the fallback
+        // give as about 155 s.
+        let check = settling_check(&TITLES_6, &TITLES_6, |local, primary, fallback| {
+            local.tracks[3].duration_secs = Some(155.3);
+            fallback.tracklist[3].duration_secs = Some(155.2);
+            primary.tracklist[3].duration_secs = Some(241.0);
+        });
+        assert_eq!(check.conflicts, Vec::<String>::new());
+        assert_eq!(
+            check.settled,
+            vec![
+                "primary and fallback durations differ for local track 4 (241.0s versus 155.2s); the file's 155.3s agrees with the fallback".to_string()
+            ]
+        );
+
+        // An 85.7 s length in the primary.
+        let check = settling_check(&TITLES_6, &TITLES_6, |_, primary, _| {
+            primary.tracklist[3].duration_secs = Some(85.7);
+        });
+        assert_eq!(check.conflicts, Vec::<String>::new());
+        assert_eq!(check.settled.len(), 1, "{check:?}");
+        assert!(check.settled[0].contains("local track 4"), "{check:?}");
+    }
+
+    #[test]
+    fn two_primaries_are_settled_on_different_tracks() {
+        let (local, mut typo) = spaced_pair(&TITLES_6, &titles_with(2, "Secnd Wnd"));
+        typo.id = ReleaseId::MusicBrainz(mbid(MUSICBRAINZ_PRIMARY_ID));
+        let (_, mut short) = spaced_pair(&TITLES_6, &TITLES_6);
+        short.id = ReleaseId::MusicBrainz(mbid("1e2a3b4c-6cda-33eb-8e9a-044b5e15ffdd"));
+        short.tracklist[4].duration_secs = Some(85.7);
+        let primaries = [Candidate::new(&local, typo), Candidate::new(&local, short)];
+        for primary in &primaries {
+            assert!(plausibility_score(&local, primary) >= PLAUSIBLE_PRIMARY_SCORE);
+        }
+        let (_, fallback_release) = spaced_pair(&TITLES_6, &TITLES_6);
+        let fallback = Candidate::new(&local, fallback_release);
+        let check = fallback_check(&local, &primaries, &fallback, true, false);
+        assert_eq!(check.conflicts, Vec::<String>::new());
+        assert_eq!(check.settled.len(), 2, "{check:?}");
+        assert!(check.settled[0].contains("local track 2"), "{check:?}");
+        assert!(check.settled[1].contains("local track 5"), "{check:?}");
+    }
+
+    #[test]
+    fn the_files_do_not_settle_a_title_they_do_not_read_like_the_fallback() {
+        // A junk file title agrees with neither provider. The primary is
+        // plausible by score and not by its lengths, so its titles are compared,
+        // and only the file-versus-fallback title guard keeps the title conflict.
+        let (local, mut primary_release) = spaced_pair(
+            &titles_12_with(3, "Track03"),
+            &titles_12_with(3, "Hollow Men"),
+        );
+        primary_release.id = ReleaseId::MusicBrainz(mbid(MUSICBRAINZ_PRIMARY_ID));
+        // Two seconds off the file, which is within the tolerance against the
+        // fallback but breaks the duration rule.
+        primary_release.tracklist[7].duration_secs = primary_release.tracklist[7]
+            .duration_secs
+            .map(|secs| secs + 2.0);
+        let primary = Candidate::new(&local, primary_release);
+        assert!(
+            plausibility_score(&local, &primary) >= PLAUSIBLE_PRIMARY_SCORE,
+            "{:?}",
+            primary.score
+        );
+        assert!(!durations_identify_tracks(&local, &primary));
+        let (_, fallback_release) = spaced_pair(&TITLES_12, &TITLES_12);
+        let fallback = Candidate::new(&local, fallback_release);
+        let check = fallback_check(&local, &[primary], &fallback, true, false);
+        assert_eq!(check.settled, Vec::<String>::new());
+        assert_eq!(check.conflicts.len(), 1, "{check:?}");
+        assert!(check.conflicts[0].contains("local track 3"), "{check:?}");
+
+        // A file that agrees with the primary and not with the fallback.
+        let (local, primary_release) = spaced_pair(&TITLES_6, &TITLES_6);
+        let mut primary_release = primary_release;
+        primary_release.id = ReleaseId::MusicBrainz(mbid(MUSICBRAINZ_PRIMARY_ID));
+        let primary = Candidate::new(&local, primary_release);
+        let (_, mut other) = spaced_pair(&TITLES_6, &titles_with(3, "Hollow Men"));
+        other.tracklist[0].duration_secs = Some(160.5);
+        let fallback = Candidate::new(&local, other);
+        let check = fallback_check(&local, &[primary], &fallback, true, false);
+        assert_eq!(check.settled, Vec::<String>::new());
+        assert!(!check.conflicts.is_empty(), "{check:?}");
+    }
+
+    #[test]
+    fn the_files_do_not_settle_what_they_agree_with_both_providers_on() {
+        // The title: the file reads 0.90 or better against both, which differ
+        // from each other by more.
+        let file = "Mary Jane Last Dance Tonight";
+        let primary_title = "Mary Jane Lest Dence Tonight";
+        let fallback_title = "Mary Jane Last Dancy Tonighx";
+        assert!(
+            strict_track_title_similarity(file, None, primary_title) >= TITLE_SIMILARITY_THRESHOLD
+        );
+        assert!(
+            strict_track_title_similarity(file, None, fallback_title) >= TITLE_SIMILARITY_THRESHOLD
+        );
+        assert!(similarity(primary_title, fallback_title) < TITLE_SIMILARITY_THRESHOLD);
+        let check = settling_check(
+            &titles_with(3, file),
+            &titles_with(3, primary_title),
+            |_, _, fallback| fallback.tracklist[2].title = fallback_title.to_string(),
+        );
+        assert_eq!(check.settled, Vec::<String>::new());
+        assert_eq!(check.conflicts.len(), 1, "{check:?}");
+
+        // The length: 200 s in the files, 198 s in the primary, 202 s in the
+        // fallback. The files are within 3 s of each.
+        let check = settling_check(&TITLES_6, &TITLES_6, |local, primary, fallback| {
+            local.tracks[3].duration_secs = Some(200.0);
+            primary.tracklist[3].duration_secs = Some(198.0);
+            fallback.tracklist[3].duration_secs = Some(202.0);
+        });
+        assert_eq!(check.settled, Vec::<String>::new());
+        assert_eq!(
+            check.conflicts,
+            vec!["primary and fallback durations differ for local track 4".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_files_do_not_settle_a_conflict_without_a_length_they_can_compare() {
+        // A fallback that lists no length for the track: the title agreement
+        // rests on text alone, against a primary that names a live version.
+        let check = settling_check(
+            &titles_with(3, "Hollow"),
+            &titles_with(3, "Hollow (Live)"),
+            |_, _, fallback| fallback.tracklist[2].duration_secs = None,
+        );
+        assert_eq!(check.settled, Vec::<String>::new());
+        assert_eq!(check.conflicts.len(), 1, "{check:?}");
+
+        // A fallback length 5 s from the file's, in a title conflict and in a
+        // duration conflict.
+        let check = settling_check(
+            &titles_with(3, "I Sold Myself In"),
+            &titles_with(3, "I Sold Myself In / [unknown]"),
+            |_, _, fallback| {
+                fallback.tracklist[2].duration_secs =
+                    fallback.tracklist[2].duration_secs.map(|secs| secs + 5.0);
+            },
+        );
+        assert_eq!(check.settled, Vec::<String>::new());
+        assert!(check.conflicts.len() >= 2, "{check:?}");
+    }
+
+    #[test]
+    fn nothing_is_settled_for_a_fallback_with_a_weak_album_title() {
+        let (local, primary_release) = spaced_pair(
+            &titles_with(3, "I Sold Myself In"),
+            &titles_with(3, "I Sold Myself In / [unknown]"),
+        );
+        let mut primary_release = primary_release;
+        primary_release.id = ReleaseId::MusicBrainz(mbid(MUSICBRAINZ_PRIMARY_ID));
+        let primary = Candidate::new(&local, primary_release);
+        let (_, fallback_release) = spaced_pair(
+            &titles_with(3, "I Sold Myself In"),
+            &titles_with(3, "I Sold Myself In"),
+        );
+        let mut fallback = Candidate::new(&local, fallback_release);
+
+        let settled = fallback_check(
+            &local,
+            std::slice::from_ref(&primary),
+            &fallback,
+            true,
+            false,
+        );
+        assert_eq!(settled.settled.len(), 1, "{settled:?}");
+
+        fallback.score.album_title = 0.80;
+        let weak = fallback_check(&local, &[primary], &fallback, true, false);
+        assert_eq!(weak.settled, Vec::<String>::new());
+        assert_eq!(weak.conflicts.len(), 1, "{weak:?}");
+    }
+
+    #[test]
+    fn nothing_is_settled_for_a_fallback_with_a_weak_album_title_by_duration() {
+        // A length that the files settle for a fallback whose album title is
+        // the files' ...
+        let (local, mut primary_release) = spaced_pair(&TITLES_6, &TITLES_6);
+        primary_release.id = ReleaseId::MusicBrainz(mbid(MUSICBRAINZ_PRIMARY_ID));
+        primary_release.tracklist[3].duration_secs = Some(85.7);
+        let primary = Candidate::new(&local, primary_release);
+        let (_, fallback_release) = spaced_pair(&TITLES_6, &TITLES_6);
+        let mut fallback = Candidate::new(&local, fallback_release);
+        let check = fallback_check(
+            &local,
+            std::slice::from_ref(&primary),
+            &fallback,
+            true,
+            false,
+        );
+        assert_eq!(check.settled.len(), 1, "{check:?}");
+        assert_eq!(check.conflicts, Vec::<String>::new());
+
+        // ... is a conflict for one whose album title is not.
+        fallback.score.album_title = 0.80;
+        let weak = fallback_check(&local, &[primary], &fallback, true, false);
+        assert_eq!(weak.settled, Vec::<String>::new());
+        assert_eq!(
+            weak.conflicts,
+            vec!["primary and fallback durations differ for local track 4".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_files_do_not_settle_a_title_when_the_primary_names_another_version() {
+        for primary_title in [
+            "Hollow (Live)",
+            "Hollow (Alternate Take)",
+            "Hollow (Take 2)",
+            "Hollow (Acoustic)",
+        ] {
+            let check = settling_check(
+                &titles_with(3, "Hollow"),
+                &titles_with(3, primary_title),
+                |_, _, _| {},
+            );
+            assert_eq!(check.settled, Vec::<String>::new(), "{primary_title}");
+            assert_eq!(check.conflicts.len(), 1, "{primary_title}: {check:?}");
+        }
+    }
+
+    #[test]
+    fn the_files_do_not_settle_a_duration_when_their_title_reads_unlike_the_fallback() {
+        // 12 tracks; the file's title on track 5 is junk, the fallback names it
+        // by its real title (a lone weak title its own gates tolerate), and the
+        // primary lists 85.7 s more than the file and the fallback.
+        let check = settling_check(
+            &titles_12_with(5, "Track 5"),
+            &TITLES_12,
+            |_, primary, fallback| {
+                fallback.tracklist[4].title = "Lantern".to_string();
+                primary.tracklist[4].duration_secs =
+                    primary.tracklist[4].duration_secs.map(|secs| secs + 85.7);
+            },
+        );
+        assert_eq!(check.settled, Vec::<String>::new());
+        assert_eq!(
+            check.conflicts,
+            vec!["primary and fallback durations differ for local track 5".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_settled_line_is_reported_once_however_many_primaries_agree() {
+        let (local, mut first) = spaced_pair(&TITLES_6, &titles_with(3, "Hollow Men"));
+        first.id = ReleaseId::MusicBrainz(mbid(MUSICBRAINZ_PRIMARY_ID));
+        let (_, mut second) = spaced_pair(&TITLES_6, &titles_with(3, "Hollow Men"));
+        second.id = ReleaseId::MusicBrainz(mbid("1e2a3b4c-6cda-33eb-8e9a-044b5e15ffdd"));
+        let primaries = [
+            Candidate::new(&local, first),
+            Candidate::new(&local, second),
+        ];
+        for primary in &primaries {
+            assert!(plausibility_score(&local, primary) >= PLAUSIBLE_PRIMARY_SCORE);
+        }
+        let (_, fallback_release) = spaced_pair(&TITLES_6, &TITLES_6);
+        let fallback = Candidate::new(&local, fallback_release);
+        let check = fallback_check(&local, &primaries, &fallback, true, false);
+        assert_eq!(check.conflicts, Vec::<String>::new());
+        assert_eq!(check.settled.len(), 1, "{check:?}");
+    }
+
+    #[test]
+    fn one_primary_settling_does_not_settle_what_another_primary_conflicts_on() {
+        // Both primaries disagree with the fallback on track 3. The files side
+        // with the fallback against the first, whose title is a typo, but the
+        // second names a live recording, which the files do not rule out.
+        let file_titles = titles_with(3, "Free Like The Wind");
+        let (local, mut typo) = spaced_pair(&file_titles, &titles_with(3, "Feel Like the Wind"));
+        typo.id = ReleaseId::MusicBrainz(mbid(MUSICBRAINZ_PRIMARY_ID));
+        let (_, mut live) = spaced_pair(&file_titles, &titles_with(3, "Free Like The Wind (Live)"));
+        live.id = ReleaseId::MusicBrainz(mbid("1e2a3b4c-6cda-33eb-8e9a-044b5e15ffdd"));
+        let primaries = [Candidate::new(&local, typo), Candidate::new(&local, live)];
+        for primary in &primaries {
+            assert!(plausibility_score(&local, primary) >= PLAUSIBLE_PRIMARY_SCORE);
+        }
+        let (_, fallback_release) = spaced_pair(&file_titles, &file_titles);
+        let fallback = Candidate::new(&local, fallback_release);
+        let check = fallback_check(&local, &primaries, &fallback, true, false);
+        assert_eq!(check.settled.len(), 1, "{check:?}");
+        assert_eq!(check.conflicts.len(), 1, "{check:?}");
+        assert!(
+            check.conflicts[0].contains("'Free Like The Wind (Live)'"),
+            "{check:?}"
+        );
+    }
+
+    #[test]
+    fn the_files_settle_conflicts_on_a_disc_scoped_mapping() {
+        // The files are disc 2 of a two-disc set. The primary's titles and
+        // lengths on that disc are off for two tracks; the fallback and the
+        // files agree.
+        let local = disc_folder("/music/Set-2CD/CD2", 2, 12);
+        let mut primary_release = disc_set(&[12, 12]);
+        primary_release.id = ReleaseId::MusicBrainz(mbid(MUSICBRAINZ_PRIMARY_ID));
+        primary_release.tracklist[14].title = "Another Song 2-3".to_string();
+        primary_release.tracklist[16].duration_secs = Some(85.7);
+        let primary = Candidate::new(&local, primary_release);
+        assert_eq!(primary.mapping.medium, Some(2));
+        assert!(
+            plausibility_score(&local, &primary) >= PLAUSIBLE_PRIMARY_SCORE,
+            "{:?}",
+            primary.score
+        );
+        let fallback = Candidate::new(&local, disc_set(&[12, 12]));
+        assert_eq!(fallback.mapping.medium, Some(2));
+        let check = fallback_check(&local, &[primary], &fallback, true, false);
+        assert_eq!(check.conflicts, Vec::<String>::new());
+        assert_eq!(check.settled.len(), 2, "{check:?}");
+        assert!(check.settled[0].contains("local track 3"), "{check:?}");
+        assert!(check.settled[1].contains("local track 5"), "{check:?}");
+    }
+
+    #[test]
+    fn the_files_do_not_settle_a_primary_that_is_plausible_only_by_durations_or_a_qualifier() {
+        // Romanized files, a Japanese-titled primary that only the lengths
+        // identify: its titles are not compared, so nothing is conflicting or
+        // settled.
+        let romanized = [
+            "Aoi Sora",
+            "Yoru no Uta",
+            "Kaze no Machi",
+            "Tsuki no Hikari",
+            "Hana Fubuki",
+            "Owari no Hi",
+        ];
+        let japanese = [
+            "\u{9752}\u{3044}\u{7a7a}",
+            "\u{591c}\u{306e}\u{6b4c}",
+            "\u{98a8}\u{306e}\u{8857}",
+            "\u{6708}\u{306e}\u{5149}",
+            "\u{82b1}\u{5439}\u{96ea}",
+            "\u{7d42}\u{308f}\u{308a}\u{306e}\u{65e5}",
+        ];
+        let (local, mut primary_release) = spaced_pair(&romanized, &japanese);
+        primary_release.id = ReleaseId::MusicBrainz(mbid(MUSICBRAINZ_PRIMARY_ID));
+        let primary = Candidate::new(&local, primary_release);
+        assert!(plausibility_score(&local, &primary) < PLAUSIBLE_PRIMARY_SCORE);
+        assert!(durations_identify_tracks(&local, &primary));
+        let (_, fallback_release) = spaced_pair(&romanized, &romanized);
+        let fallback = Candidate::new(&local, fallback_release);
+        let check = fallback_check(&local, &[primary], &fallback, true, false);
+        assert_eq!(check, FallbackCheck::default());
+
+        // The qualifier line stays a conflict next to a settled title.
+        let file_titles = titles_with(3, "I Sold Myself In");
+        let (local, mut live) = spaced_pair(
+            &file_titles,
+            &titles_with(3, "I Sold Myself In / [unknown]"),
+        );
+        live.id = ReleaseId::MusicBrainz(mbid(MUSICBRAINZ_PRIMARY_ID));
+        live.edition_notes = vec!["Live".to_string()];
+        let primary = Candidate::new(&local, live);
+        assert!(plausibility_score(&local, &primary) >= PLAUSIBLE_PRIMARY_SCORE);
+        let (_, fallback_release) = spaced_pair(&file_titles, &file_titles);
+        let fallback = Candidate::new(&local, fallback_release);
+        let check = fallback_check(&local, &[primary], &fallback, true, false);
+        assert_eq!(check.conflicts.len(), 1, "{check:?}");
+        assert!(
+            check.conflicts[0].contains("primary candidates describe"),
+            "{check:?}"
+        );
+        assert_eq!(check.settled.len(), 1, "{check:?}");
     }
 
     #[test]

@@ -734,6 +734,10 @@ fn primary_failed_transiently(attempts: &[ProviderAttempt]) -> bool {
     })
 }
 
+/// Starts a line about a primary-versus-fallback disagreement that the files
+/// settled, in the transcript and in a review's notes.
+const SETTLED_NOTE_PREFIX: &str = "fallback conflict settled by the files: ";
+
 const TRANSIENT_PRIMARY_NOTE: &str =
     "MusicBrainz stage failed transiently; fallback candidates need review";
 
@@ -942,7 +946,7 @@ where
         && !primary_failed_transiently(&attempts)
     {
         let primary = &attempts[0];
-        let conflicts = matcher::fallback_conflicts(
+        let matcher::FallbackCheck { conflicts, settled } = matcher::fallback_check(
             release,
             &primary.candidates,
             candidate,
@@ -956,6 +960,9 @@ where
                     "  recovered the release from a failed MusicBrainz stage: {}",
                     Clean(&error.to_string())
                 );
+            }
+            for line in &settled {
+                outln_to!(transcript, "  {SETTLED_NOTE_PREFIX}{}", Clean(line));
             }
             return accept(
                 pool,
@@ -974,6 +981,12 @@ where
             outln_to!(transcript, "  fallback conflict: {}", Clean(conflict));
         }
         attempts[1].notes.extend(conflicts);
+        // The reviewer still sees what the files settled.
+        attempts[1].notes.extend(
+            settled
+                .into_iter()
+                .map(|line| format!("{SETTLED_NOTE_PREFIX}{line}")),
+        );
     }
 
     let has_candidates = attempts
