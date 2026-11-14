@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Compare two `match --offline` runs made by measure-matching.sh.
 
-usage: compare-matching.py [--slice NAME]... [--sample N] [--seed N]
+usage: compare-matching.py [--log VARIANT.log] [--slice NAME]... [--sample N]
+                           [--seed N]
                            BASE.accepted.tsv VARIANT.accepted.tsv VARIANT.db AUDIT.tsv
 
 Prints lost, switched and new accepts. New accepts are split by provider and by
@@ -23,6 +24,28 @@ own: no-lengths adds the 30 accepts with the fewest local tracks (marked
 sibling disc folders with their remote ids side by side.
 
     compare-matching.py --slice junk-titles --slice disc \\
+        base.accepted.tsv new.accepted.tsv new.db audit.tsv
+
+Log slices: --log takes the stdout and stderr of the variant's
+`radish match --offline` (measure-matching.sh writes it as VARIANT.log). The
+lines printed for each release, from its "Matching local release N" header to
+the next one, are attached to its id. That enables slices keyed by the note
+text of an acceptance rule, which the database does not store:
+
+    fallback-settled  "settled by the files"
+    labels            "read as a labelling difference"
+    odd-length        "every title and every other length agrees"
+    tracklist         "track titles and lengths agree in track order"
+    leading           "after the files' last"
+    complete-first    no note: see complete_first below
+
+With --log the audit sheet gets these extra columns, filled where the slice has
+the data: note (the matched log line), gap_secs, last_track and local_vs_remote
+(odd-length), title_sim, artist_sim, track_count and various (tracklist),
+present, listed and media (leading and complete-first). Without --log the
+script reads and writes exactly what it did before.
+
+    compare-matching.py --log new.log --slice odd-length --slice tracklist \\
         base.accepted.tsv new.accepted.tsv new.db audit.tsv
 """
 import argparse
@@ -49,6 +72,11 @@ LOCAL_COLUMNS = ["slice", "local_id", "provider", "title_relation", "score", "sc
                  "local_artist", "local_title", "remote_artist", "remote_title", "url"]
 EXTRA_COLUMNS = ["reason", "weak_pairs", "lowest_pair", "unknown_lengths", "formats",
                  "dirs", "medium_position"]
+# Only written with --log.
+LOG_COLUMNS = ["note", "gap_secs", "last_track", "local_vs_remote", "title_sim",
+               "artist_sim", "track_count", "various", "present", "listed", "media"]
+RELEASE_HEADER = re.compile(r"^Matching local release (\d+) ")
+SCORES_NOTE = re.compile(r"album title scores ([\d.]+) and artist ([\d.]+)")
 
 
 def read(path):
@@ -101,10 +129,25 @@ def path_parts(directory):
     return [part for part in (directory or "").replace("\\", "/").split("/") if part]
 
 
+def read_log(path):
+    """The lines printed for each local release, by release id, without blank lines."""
+    logs, current = {}, None
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            line = line.rstrip("\n")
+            header = RELEASE_HEADER.match(line)
+            if header:
+                current = logs.setdefault(int(header.group(1)), [])
+            elif current is not None and line.strip():
+                current.append(line.strip())
+    return logs
+
+
 def load_release(db, release, has_medium):
     """Everything a slice may look at for one local release and its accepted match."""
     local = db.execute(
-        "SELECT album_artist, album_title, directory_path FROM local_releases WHERE id=?",
+        "SELECT album_artist, album_title, directory_path, artist_kind "
+        "FROM local_releases WHERE id=?",
         (release,),
     ).fetchone()
     medium = "medium_position" if has_medium else "NULL"
@@ -122,7 +165,14 @@ def load_release(db, release, has_medium):
         "JOIN tracks t ON t.id = m.track_id WHERE m.match_id=? ORDER BY m.remote_ordinal",
         (match[0],),
     ).fetchall()
+    timed = db.execute(
+        "SELECT t.title, m.remote_title, t.duration_secs, m.remote_duration_secs "
+        "FROM release_track_matches m JOIN tracks t ON t.id = m.track_id "
+        "WHERE m.match_id=? ORDER BY m.remote_ordinal",
+        (match[0],),
+    ).fetchall()
     return {
+        "artist_kind": local[3] or "", "timed": timed, "log": [],
         "local_artist": (local[0] or "").strip(), "local_title": (local[1] or "").strip(),
         "directory": local[2] or "", "remote_artist": match[1] or "",
         "remote_title": match[2] or "", "url": match[3], "snapshot": json.loads(match[4]),
@@ -193,6 +243,112 @@ def placeholder(r):
     return None
 
 
+def note_lines(r, text):
+    """The log lines of a release that contain `text`."""
+    return [line for line in r["log"] if text in line]
+
+
+def noted(text):
+    """A slice of the releases whose log has a line with `text`, and that line."""
+    def select(r):
+        lines = note_lines(r, text)
+        return {"note": " | ".join(lines)} if lines else None
+    return select
+
+
+def remote_playable(snapshot):
+    return [e for e in snapshot.get("tracklist") or [] if e.get("entry_type", "track") == "track"]
+
+
+def media_count(snapshot):
+    """Distinct media of the listed tracks: from medium_position, else the position prefix."""
+    media = set()
+    for entry in remote_playable(snapshot):
+        if entry.get("medium_position") is not None:
+            media.add(entry["medium_position"])
+            continue
+        prefix = re.match(r"^\s*([A-Za-z]*\d+)[-.]", entry.get("position") or "")
+        if prefix:
+            media.add(prefix.group(1))
+    return max(len(media), 1)
+
+
+def labels(r):
+    """A labelling-difference note, apart from the settled lines of fallback-settled."""
+    lines = [line for line in note_lines(r, "read as a labelling difference")
+             if not line.startswith("fallback conflict settled")]
+    return {"note": " | ".join(lines)} if lines else None
+
+
+def odd_length(r):
+    extra = noted("every title and every other length agrees")(r)
+    if extra is None:
+        return None
+    # The pair that is furthest apart is the odd one: every other pair agrees.
+    gaps = [(abs(local - remote), index, local - remote)
+            for index, (_, _, local, remote) in enumerate(r["timed"])
+            if local is not None and remote is not None]
+    if gaps:
+        gap, index, signed = max(gaps)
+        extra["gap_secs"] = f"{gap:.1f}"
+        extra["last_track"] = "yes" if index == len(r["timed"]) - 1 else "no"
+        extra["local_vs_remote"] = "local longer" if signed > 0 else "local shorter"
+    return extra
+
+
+def tracklist(r):
+    extra = noted("track titles and lengths agree in track order")(r)
+    if extra is None:
+        return None
+    # The note carries the scores the matcher used; the script's own similarity
+    # is only a fallback for a note that does not say them.
+    scores = SCORES_NOTE.search(extra["note"])
+    if scores:
+        extra["title_sim"], extra["artist_sim"] = scores.group(1), scores.group(2)
+    else:
+        extra["title_sim"] = f"{similarity(r['local_title'], r['remote_title']):.2f}"
+        extra["artist_sim"] = f"{similarity(r['local_artist'], r['remote_artist']):.2f}"
+    extra["track_count"] = len(r["titles"])
+    extra["various"] = "yes" if r["artist_kind"] == "various_artists" else "no"
+    return extra
+
+
+def track_counts(r):
+    return {"present": len(r["titles"]), "listed": len(remote_playable(r["snapshot"])),
+            "media": media_count(r["snapshot"])}
+
+
+def leading(r):
+    extra = noted("after the files' last")(r)
+    return None if extra is None else {**extra, **track_counts(r)}
+
+
+def complete_first(r):
+    """New accepts whose remote release lists exactly as many tracks as the files.
+
+    The log does not say which candidate ranked first before a complete edition was
+    promoted, so the promotion itself cannot be read from it. Every new accept is
+    one the BASE run did not accept, so this selects the new accepts that a complete
+    edition could have rescued: the remote track count equals the local track count.
+    The audit then compares each with the review the BASE run queued.
+    """
+    counts = track_counts(r)
+    if counts["present"] != counts["listed"]:
+        return None
+    accepted = [line for line in r["log"] if line.startswith("accepted ")]
+    return {"note": " | ".join(accepted), **counts}
+
+
+# Slices that read the log; they need --log.
+LOG_SLICES = {
+    "fallback-settled": noted("settled by the files"),
+    "labels": labels,
+    "odd-length": odd_length,
+    "tracklist": tracklist,
+    "complete-first": complete_first,
+    "leading": leading,
+}
+
 SLICES = {
     "junk-titles": junk_titles,
     "stereo": stereo,
@@ -200,6 +356,7 @@ SLICES = {
     "no-lengths": no_lengths,
     "disc": disc,
     "placeholder": placeholder,
+    **LOG_SLICES,
 }
 
 
@@ -232,9 +389,13 @@ def sibling_discs(db, variant):
     return out
 
 
-def write_slices(db, variant, rows, slices, sample, seed, audit_path):
+def write_slices(db, variant, rows, slices, sample, seed, audit_path, logs=None):
     has_medium = any(c[1] == "medium_position" for c in db.execute("PRAGMA table_info(release_matches)"))
     loaded = {row[0]: load_release(db, row[0], has_medium) for row in rows}
+    if logs is not None:
+        for release, data in loaded.items():
+            data["log"] = logs.get(release, [])
+    columns = EXTRA_COLUMNS + (LOG_COLUMNS if logs is not None else [])
     out = []
     for name in slices:
         rng = random.Random(f"{seed}/{name}")
@@ -257,9 +418,9 @@ def write_slices(db, variant, rows, slices, sample, seed, audit_path):
     siblings = sibling_discs(db, variant) if "disc" in slices else []
     with open(audit_path, "w", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t")
-        writer.writerow(LOCAL_COLUMNS + EXTRA_COLUMNS)
+        writer.writerow(LOCAL_COLUMNS + columns)
         for name, row, extra in out:
-            writer.writerow([name, *row] + [extra.get(column, "") for column in EXTRA_COLUMNS])
+            writer.writerow([name, *row] + [extra.get(column, "") for column in columns])
         if siblings:
             writer.writerow([])
             writer.writerow(["disc-siblings", "same_release", "parent_directory", "discs (dir #local_id provider:remote_id)"])
@@ -279,9 +440,17 @@ def main():
     parser.add_argument("audit")
     parser.add_argument("--slice", action="append", default=[], choices=sorted(SLICES),
                         help="audit slice of the new accepts (repeatable)")
+    parser.add_argument("--log", metavar="VARIANT.log",
+                        help="stdout and stderr of the variant's match --offline run; "
+                             "needed by the slices " + ", ".join(sorted(LOG_SLICES)))
     parser.add_argument("--sample", type=int, default=30, help="sample size (default 30)")
     parser.add_argument("--seed", type=int, default=11, help="sampling seed (default 11)")
     args = parser.parse_args()
+    needing_log = sorted(set(args.slice) & set(LOG_SLICES))
+    if needing_log and not args.log:
+        parser.error(f"--slice {', '.join(needing_log)} needs --log")
+    if args.log and not args.slice:
+        parser.error("--log only adds columns to --slice audit sheets")
     base, variant = read(args.base), read(args.variant)
     lost = sorted(set(base) - set(variant))
     switched = sorted(r for r in set(base) & set(variant) if base[r][:2] != variant[r][:2])
@@ -313,7 +482,8 @@ def main():
 
     if args.slice:
         slices = list(dict.fromkeys(args.slice))
-        write_slices(db, variant, rows, slices, args.sample, args.seed, args.audit)
+        logs = read_log(args.log) if args.log else None
+        write_slices(db, variant, rows, slices, args.sample, args.seed, args.audit, logs)
         return
 
     random.seed(args.seed)

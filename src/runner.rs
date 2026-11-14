@@ -1102,12 +1102,8 @@ async fn accept(
                     transcript,
                     "    album and tracks matched; exact edition unconfirmed"
                 );
-                for warning in evaluation
-                    .warnings
-                    .iter()
-                    .filter(|warning| warning.ends_with(matcher::UNCONFIRMED_LENGTHS_NOTE))
-                {
-                    outln_to!(transcript, "    {}", Clean(warning));
+                for note in evaluation.rule_notes() {
+                    outln_to!(transcript, "    {}", Clean(note));
                 }
             }
             Ok(Outcome::Accepted)

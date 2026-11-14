@@ -85,6 +85,10 @@ pub const TEXT_IDENTITY_SCORE: f64 = 0.95;
 /// that the runner can print it next to the unconfirmed-edition note.
 pub const UNCONFIRMED_LENGTHS_NOTE: &str = "track lengths are unconfirmed";
 
+/// The endings that mark a warning as the note of an acceptance rule, which the
+/// runner prints under the accept (see [`Evaluation::rule_notes`]).
+const RULE_NOTES: &[&str] = &[UNCONFIRMED_LENGTHS_NOTE];
+
 /// The fewest local tracks that let a candidate's agreeing durations set a
 /// close alternative aside: with fewer, a matching length is too common.
 pub const DURATION_FIT_MIN_TRACKS: usize = 3;
@@ -2055,13 +2059,17 @@ const STEREO: &str = "stereo";
 /// contradiction. `edition_qualifiers` still reports `stereo`, which keeps it
 /// in messages.
 fn qualifiers_agree(a: &BTreeSet<&'static str>, b: &BTreeSet<&'static str>) -> bool {
-    fn significant<'a>(set: &'a BTreeSet<&'static str>) -> impl Iterator<Item = &'static str> + 'a {
-        let keep_stereo = set.contains("mono");
-        set.iter()
-            .copied()
-            .filter(move |qualifier| *qualifier != STEREO || keep_stereo)
-    }
-    significant(a).eq(significant(b))
+    significant_qualifiers(a) == significant_qualifiers(b)
+}
+
+/// The qualifiers of a set that distinguish an edition: all of them, except
+/// `stereo` when the set does not also say `mono` (see [`qualifiers_agree`]).
+fn significant_qualifiers(set: &BTreeSet<&'static str>) -> BTreeSet<&'static str> {
+    let keep_stereo = set.contains("mono");
+    set.iter()
+        .copied()
+        .filter(|qualifier| *qualifier != STEREO || keep_stereo)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -3342,10 +3350,55 @@ impl Evaluation {
             .any(|warning| warning.ends_with(UNCONFIRMED_LENGTHS_NOTE))
     }
 
+    /// The warnings that carry the note of an acceptance rule, in order. The
+    /// runner prints them under an album-scope accept.
+    pub fn rule_notes(&self) -> impl Iterator<Item = &str> {
+        self.warnings
+            .iter()
+            .map(String::as_str)
+            .filter(|warning| RULE_NOTES.iter().any(|note| warning.ends_with(note)))
+    }
+
     /// Manual acceptance can override score and identity uncertainty, but never
     /// an incomplete or structurally unsupported mapping.
     pub fn can_apply(&self, candidate: &Candidate) -> bool {
         candidate.mapping.complete && !candidate.release.has_unsupported_entries()
+    }
+}
+
+/// What another candidate says about the acceptance rules for a candidate.
+/// The default lets every rule apply.
+#[derive(Debug, Clone)]
+struct RuleGuards {
+    /// The text-only rule ([`titles_identify_tracks`]) may apply.
+    text_identity: bool,
+    /// Why the odd-length rule must not apply, naming the alternative release.
+    /// `None` lets the rule apply. The rule pushes the text as a blocker, and
+    /// only when it would otherwise have applied. Reserved for the odd-length
+    /// rule, which is not implemented yet.
+    #[expect(
+        dead_code,
+        reason = "read by the odd-length rule, added in a later step"
+    )]
+    odd_length_blocker: Option<String>,
+    /// Why the leading-tracks rule must not apply, naming the alternative
+    /// release. `None` lets the rule apply. The rule pushes the text as a
+    /// blocker, and only when it would otherwise have applied. Reserved for the
+    /// leading-tracks rule, which is not implemented yet.
+    #[expect(
+        dead_code,
+        reason = "read by the leading-tracks rule, added in a later step"
+    )]
+    leading_tracks_blocker: Option<String>,
+}
+
+impl Default for RuleGuards {
+    fn default() -> Self {
+        Self {
+            text_identity: true,
+            odd_length_blocker: None,
+            leading_tracks_blocker: None,
+        }
     }
 }
 
@@ -3377,10 +3430,11 @@ pub fn evaluate_for_matching(
     // Another edition of the same provider that agrees in text but whose
     // lengths are far from the files contradicts a text-only match: the lengths
     // the candidate lacks may well be those, so the text cannot stand alone.
-    let text_identity_allowed = !alternatives.iter().any(|other| {
+    let cleaned = cleaned_track_titles(local);
+    let text_identity = !alternatives.iter().any(|other| {
         other.release.id != candidate.release.id
             && other.release.provider() == candidate.release.provider()
-            && text_agrees_but_lengths_do_not(local, other, SOFT_DURATION_MAX_SECS)
+            && text_agrees_but_lengths_do_not(local, other, &cleaned, SOFT_DURATION_MAX_SECS)
     });
     let mut album = evaluate_with(
         local,
@@ -3388,7 +3442,10 @@ pub fn evaluate_for_matching(
         None,
         discovery,
         MatchScope::Album,
-        text_identity_allowed,
+        RuleGuards {
+            text_identity,
+            ..RuleGuards::default()
+        },
     );
     for other in alternatives {
         if other.release.id != candidate.release.id
@@ -3488,10 +3545,24 @@ fn mapped_in_local_order(local: &LocalRelease, candidate: &Candidate) -> bool {
     let playable = candidate.release.playable_tracks_in(mapping.medium);
     local.tracks.len() == playable.len()
         && mapping.pairs.len() == playable.len()
+        && maps_onto_leading(local, mapping, &playable)
+}
+
+/// Whether local track `k` is mapped to `playable[k]` for every local track,
+/// with no more local tracks than playable remote tracks. The remote may list
+/// more tracks after the last local one. Says nothing about completeness or
+/// ambiguity, which the caller checks.
+fn maps_onto_leading(
+    local: &LocalRelease,
+    mapping: &Mapping,
+    playable: &[(usize, &RemoteTrack)],
+) -> bool {
+    local.tracks.len() <= playable.len()
+        && mapping.pairs.len() >= local.tracks.len()
         && mapping
             .pairs
             .iter()
-            .zip(&playable)
+            .zip(playable)
             .all(|(pair, (remote_index, _))| *pair == Some(*remote_index))
 }
 
@@ -3572,16 +3643,35 @@ fn is_unofficial(remote: &RemoteRelease) -> bool {
 /// Whether the text of a candidate agrees with the files in track order: album
 /// title and artist each at least [`TITLE_SIMILARITY_THRESHOLD`], a mapping that
 /// is [`mapped_in_local_order`], and a local title on every track that scores at
-/// least that against its mapped track. Says nothing about lengths.
-fn text_agrees_in_order(local: &LocalRelease, candidate: &Candidate) -> bool {
+/// least that against its mapped track. Says nothing about lengths. `cleaned` is
+/// [`cleaned_track_titles`] of `local`.
+fn text_agrees_in_order(
+    local: &LocalRelease,
+    candidate: &Candidate,
+    cleaned: &[Option<CleanedTitle>],
+) -> bool {
+    album_text_agrees(candidate)
+        && mapped_in_local_order(local, candidate)
+        && track_titles_agree(local, candidate, cleaned)
+}
+
+/// Whether the album title and the album artist of a candidate each score at
+/// least [`TITLE_SIMILARITY_THRESHOLD`] against the files.
+fn album_text_agrees(candidate: &Candidate) -> bool {
     let score = &candidate.score;
-    if score.album_title < TITLE_SIMILARITY_THRESHOLD
-        || score.album_artist < TITLE_SIMILARITY_THRESHOLD
-        || !mapped_in_local_order(local, candidate)
-    {
-        return false;
-    }
-    let cleaned = cleaned_track_titles(local);
+    score.album_title >= TITLE_SIMILARITY_THRESHOLD
+        && score.album_artist >= TITLE_SIMILARITY_THRESHOLD
+}
+
+/// Whether every assigned track has a local title that scores at least
+/// [`TITLE_SIMILARITY_THRESHOLD`] against its mapped track, wherever the tracks
+/// sit in the remote list. `cleaned` is [`cleaned_track_titles`] of `local`.
+/// Says nothing about the order of the mapping, the album text or lengths.
+fn track_titles_agree(
+    local: &LocalRelease,
+    candidate: &Candidate,
+    cleaned: &[Option<CleanedTitle>],
+) -> bool {
     candidate.mapping.assigned_pairs().all(|(l, r)| {
         let (Some(local_track), Some(remote_track)) =
             (local.tracks.get(l), candidate.release.tracklist.get(r))
@@ -3594,7 +3684,7 @@ fn text_agrees_in_order(local: &LocalRelease, candidate: &Candidate) -> bool {
             .is_some_and(|title| !title.trim().is_empty())
             && candidate
                 .mapping
-                .title_similarity(local, &cleaned, l, r, remote_track)
+                .title_similarity(local, cleaned, l, r, remote_track)
                 .is_some_and(|similarity| similarity >= TITLE_SIMILARITY_THRESHOLD)
     })
 }
@@ -3700,9 +3790,22 @@ fn titles_identify_tracks(local: &LocalRelease, candidate: &Candidate) -> bool {
                 &remote_track.title,
             )
     });
-    if !lengths_agree || unlisted == 0 || !text_agrees_in_order(local, candidate) {
+    if !lengths_agree || unlisted == 0 || !text_agrees_in_order(local, candidate, &cleaned) {
         return false;
     }
+    titles_prefer_own_tracks(local, candidate, &cleaned)
+}
+
+/// Whether no local title scores strictly higher against another playable
+/// remote track than against the track it is mapped to. It is what stops
+/// near-identical titles (`Part 1`, `Part 2`) from passing when the edition
+/// orders them differently. A mapped track without a local title fails.
+/// `cleaned` is [`cleaned_track_titles`] of `local`.
+fn titles_prefer_own_tracks(
+    local: &LocalRelease,
+    candidate: &Candidate,
+    cleaned: &[Option<CleanedTitle>],
+) -> bool {
     let playable = candidate.release.playable_tracks();
     candidate.mapping.assigned_pairs().all(|(l, r)| {
         let (Some(local_track), Some(remote_track)) =
@@ -3714,7 +3817,7 @@ fn titles_identify_tracks(local: &LocalRelease, candidate: &Candidate) -> bool {
             local_track.title.as_deref(),
             candidate
                 .mapping
-                .title_similarity(local, &cleaned, l, r, remote_track),
+                .title_similarity(local, cleaned, l, r, remote_track),
         ) else {
             return false;
         };
@@ -3782,13 +3885,15 @@ fn names_another_take(local_title: &str, remote_title: &str) -> bool {
 
 /// Whether `other` contradicts the lengths of the files while its text agrees:
 /// [`text_agrees_in_order`] and a known mapped length more than
-/// `limit_secs` from the local file's.
+/// `limit_secs` from the local file's. `cleaned` is [`cleaned_track_titles`] of
+/// `local`.
 fn text_agrees_but_lengths_do_not(
     local: &LocalRelease,
     other: &Candidate,
+    cleaned: &[Option<CleanedTitle>],
     limit_secs: f64,
 ) -> bool {
-    text_agrees_in_order(local, other)
+    text_agrees_in_order(local, other, cleaned)
         && other
             .mapping
             .assigned_pairs()
@@ -3941,18 +4046,25 @@ fn evaluate_at_scope(
     discovery: &DiscoveryEvidence,
     match_scope: MatchScope,
 ) -> Evaluation {
-    evaluate_with(local, candidate, runner_up, discovery, match_scope, true)
+    evaluate_with(
+        local,
+        candidate,
+        runner_up,
+        discovery,
+        match_scope,
+        RuleGuards::default(),
+    )
 }
 
-/// [`evaluate_at_scope`], where `text_identity_allowed` is false when another
-/// candidate makes a text-only album match unsafe.
+/// [`evaluate_at_scope`], where `guards` turn off the rules that another
+/// candidate makes unsafe.
 fn evaluate_with(
     local: &LocalRelease,
     candidate: &Candidate,
     runner_up: Option<&Candidate>,
     discovery: &DiscoveryEvidence,
     match_scope: MatchScope,
-    text_identity_allowed: bool,
+    guards: RuleGuards,
 ) -> Evaluation {
     let mut blockers = Vec::new();
     let mut warnings = Vec::new();
@@ -3986,6 +4098,8 @@ fn evaluate_with(
     let corroborated_title =
         match_scope == MatchScope::Album && corroborated_album(local, candidate);
 
+    let cleaned = cleaned_track_titles(local);
+
     // Lengths that identify every track in track order stand in for the track
     // titles, so the album score gate does not apply. Album scope only, and not
     // together with the weak album title rule, which needs a title below the
@@ -4000,7 +4114,7 @@ fn evaluate_with(
     // apply. Album scope only. It needs at least one unlisted length, which
     // the duration-identity rule rules out, so the two never overlap.
     let text_identity = match_scope == MatchScope::Album
-        && text_identity_allowed
+        && guards.text_identity
         && !corroborated_title
         && titles_identify_tracks(local, candidate);
 
@@ -4055,7 +4169,6 @@ fn evaluate_with(
     }
 
     // Per-track evidence.
-    let cleaned = cleaned_track_titles(local);
     let mut worst_title = 1.0f64;
     let mut worst_title_track = String::new();
     let mut worst_title_duration_gap: Option<f64> = None;
@@ -4445,12 +4558,12 @@ pub fn fallback_conflicts(
     // well, which is exactly what such lengths cause. A fallback accepted at
     // edition scope, or on lengths it lists, is judged as before.
     let fallback_lists_every_length = fallback_durations.len() == fallback.mapping.assigned_count();
-    if text_only_fallback
-        && !fallback_lists_every_length
-        && primary_candidates
-            .iter()
-            .any(|primary| text_agrees_but_lengths_do_not(local, primary, DURATION_TOLERANCE_SECS))
-    {
+    if text_only_fallback && !fallback_lists_every_length && {
+        let cleaned = cleaned_track_titles(local);
+        primary_candidates.iter().any(|primary| {
+            text_agrees_but_lengths_do_not(local, primary, &cleaned, DURATION_TOLERANCE_SECS)
+        })
+    } {
         conflicts.push(
             "primary lengths contradict the files while the fallback lists no length for some tracks"
                 .to_string(),

@@ -15,6 +15,8 @@ out=${3:?output directory}
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
 mkdir -p "$out/bin" "$out/work-$label"
+# The run starts from a work directory, so every path into OUT_DIR must be absolute.
+out=$(cd "$out" && pwd)
 
 CARGO_TARGET_DIR="$out/target" cargo build --release --locked --manifest-path "$repo/Cargo.toml"
 cp "$out/target/release/radish" "$out/bin/radish-$label"
