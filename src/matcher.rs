@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v32";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v31";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v33";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v32";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -110,19 +110,55 @@ pub const ODD_LENGTH_MIN_VARIOUS_TRACKS: usize = 8;
 /// unconfirmed-edition note.
 pub const ODD_LENGTH_NOTE: &str = "every title and every other length agrees";
 
+/// The tracklist-identity rule: when exactly one of album title and artist
+/// agrees (at least [`TITLE_SIMILARITY_THRESHOLD`]) and the other scores at
+/// least `TRACKLIST_IDENTITY_TAG_FLOOR`, an album of at least
+/// `TRACKLIST_IDENTITY_MIN_TRACKS` tracks whose every title and length agrees in
+/// track order (every length within `TRACKLIST_IDENTITY_GAP_SECS`) is identified
+/// by its tracklist. The score over the track titles and durations alone (see
+/// [`ScoreBreakdown::tracklist_score`]) must reach `TRACKLIST_IDENTITY_SCORE`.
+/// This is the fewest tracks when the album title is the tag that is off; see
+/// `TRACKLIST_IDENTITY_MIN_ARTIST_OFF_TRACKS` for the artist.
+pub const TRACKLIST_IDENTITY_MIN_TRACKS: usize = 5;
+
+/// The fewest local tracks the tracklist-identity rule accepts for a Various
+/// Artists release, whose artist is no evidence (see
+/// [`ODD_LENGTH_MIN_VARIOUS_TRACKS`]).
+pub const TRACKLIST_IDENTITY_MIN_VARIOUS_TRACKS: usize = 8;
+
+/// The fewest local tracks the tracklist-identity rule accepts when the artist
+/// is the tag that is off. An artist below [`TITLE_SIMILARITY_THRESHOLD`] is the
+/// weakest evidence any rule accepts: a tribute act such as `Brit Floyd` scores
+/// 0.60 against `Pink Floyd`, so the tracklist alone must be longer to identify
+/// the album than when only its title is off.
+pub const TRACKLIST_IDENTITY_MIN_ARTIST_OFF_TRACKS: usize = 8;
+
+/// The lowest score the album title or the artist, whichever disagrees, may have
+/// under the tracklist-identity rule: below it the tag names something else.
+pub const TRACKLIST_IDENTITY_TAG_FLOOR: f64 = 0.50;
+pub const TRACKLIST_IDENTITY_GAP_SECS: f64 = 1.5;
+pub const TRACKLIST_IDENTITY_SCORE: f64 = 0.95;
+
+/// What the warning of an accept under the tracklist-identity rule ends with
+/// (see [`tracklist_identifies_album`]), so that the runner can print it next to
+/// the unconfirmed-edition note.
+pub const TRACKLIST_IDENTITY_NOTE: &str = "track titles and lengths agree in track order";
+
 /// The endings that mark a warning as the note of an acceptance rule, which the
 /// runner prints under the accept (see [`Evaluation::rule_notes`]).
 const RULE_NOTES: &[&str] = &[
     UNCONFIRMED_LENGTHS_NOTE,
     LABEL_DIFFERENCE_NOTE,
     ODD_LENGTH_NOTE,
+    TRACKLIST_IDENTITY_NOTE,
 ];
 
 /// The edition qualifiers that a release may carry on one side only without
 /// being a different recording, when every length agrees: a provider's `Live`
 /// edition note or a `Remastered` format that the files' tags never mention. The
-/// other qualifiers never count: `instrumental`, `mono` and `remix` name audio
-/// that really differs, and `stereo` is already ignored by [`qualifiers_agree`].
+/// other qualifiers never count: `instrumental`, `karaoke`, `acapella`, `mono`
+/// and `remix` name audio that really differs, and `stereo` is already ignored
+/// by [`qualifiers_agree`].
 const RELEASE_LABEL_QUALIFIERS: &[&str] = &["acoustic", "deluxe", "demo", "live", "remastered"];
 
 /// [`RELEASE_LABEL_QUALIFIERS`] for a single track title. Narrower, since
@@ -2073,13 +2109,18 @@ fn leading_number(raw: &str) -> Option<u32> {
 }
 
 /// Edition words that change what a release is. They are meaningful, so a
-/// mismatch is a contradiction rather than noise.
+/// mismatch is a contradiction rather than noise. The audio-only editions
+/// (`instrumental`, `karaoke`, `a cappella`) are among them, in their plural
+/// and alternative spellings, so a provider title `Album (Instrumentals)` never
+/// agrees with a silent local title.
 pub fn edition_qualifiers(text: &str) -> BTreeSet<&'static str> {
     const QUALIFIERS: &[&str] = &[
+        "acapella",
         "acoustic",
         "deluxe",
         "demo",
         "instrumental",
+        "karaoke",
         "live",
         "mono",
         "remastered",
@@ -2089,10 +2130,23 @@ pub fn edition_qualifiers(text: &str) -> BTreeSet<&'static str> {
     ];
 
     let normalized = normalize_text(text);
+    let mut words = Vec::new();
+    for word in normalized.split_whitespace() {
+        // Plurals and spellings of the audio-only editions read as one word:
+        // `Instrumentals`, `A Cappella`, `Acappellas`. A bare `cappella` is a
+        // word, not the edition, so it needs the `a` before it.
+        let word = match word {
+            "instrumentals" => "instrumental",
+            "acapellas" | "acappella" | "acappellas" => "acapella",
+            "cappella" | "cappellas" if words.last() == Some(&"a") => "acapella",
+            other => other,
+        };
+        words.push(word);
+    }
     QUALIFIERS
         .iter()
         .copied()
-        .filter(|qualifier| normalized.split_whitespace().any(|word| word == *qualifier))
+        .filter(|qualifier| words.contains(qualifier))
         .collect()
 }
 
@@ -2997,6 +3051,14 @@ impl ScoreBreakdown {
             / (1.0 - WEIGHT_YEAR - WEIGHT_TRACK_TITLES)
     }
 
+    /// The score over the track titles and the durations alone, scaled so that
+    /// a perfect pair scores 1.0. Used where the tracklist identifies the album
+    /// and neither the album title nor the artist carries evidence.
+    pub fn tracklist_score(&self) -> f64 {
+        (WEIGHT_TRACK_TITLES * self.track_titles + WEIGHT_DURATIONS * self.durations)
+            / (WEIGHT_TRACK_TITLES + WEIGHT_DURATIONS)
+    }
+
     /// The album score over the components other than the durations, scaled so
     /// that a perfect rest scores 1.0. Used where the provider lists no lengths
     /// and the text alone identifies the tracks.
@@ -3830,6 +3892,112 @@ fn odd_length_edge_score(local: &LocalRelease, candidate: &Candidate, odd: usize
     candidate.score.album_score_with_durations(durations)
 }
 
+/// Whether the tracklist alone identifies the album when exactly one of the
+/// album title and the artist is off: the files carry real tags (a usable album
+/// title, and a real artist or Various Artists, so that filler stays with the
+/// rules for missing tags), one of the two scores below
+/// [`TITLE_SIMILARITY_THRESHOLD`] and the other at least that, the one below
+/// still at least [`TRACKLIST_IDENTITY_TAG_FLOOR`], and the album titles
+/// [`album_titles_identify`] (numbers must not contradict, no bootleg).
+///
+/// The tracks must then agree in every respect: at least
+/// [`TRACKLIST_IDENTITY_MIN_TRACKS`] local tracks
+/// ([`TRACKLIST_IDENTITY_MIN_VARIOUS_TRACKS`] for Various Artists, whose artist
+/// is no evidence), a mapping that is [`mapped_in_local_order`], every title at
+/// least [`TITLE_SIMILARITY_THRESHOLD`] ([`track_titles_agree`], with no near
+/// miss and no lone-track exception) and also strictly so
+/// ([`strict_track_title_similarity`], so that a subtitle only one side has
+/// never helps), each title preferring its own track
+/// ([`titles_prefer_own_tracks`]), no track version qualifier that differs on
+/// any pair, a known positive length on both sides of every pair with each gap
+/// within [`TRACKLIST_IDENTITY_GAP_SECS`], and a
+/// [`ScoreBreakdown::tracklist_score`] of at least
+/// [`TRACKLIST_IDENTITY_SCORE`], which replaces the album score gate.
+///
+/// Further conditions keep it no looser than the rules it sits beside: the
+/// candidate is not unofficial ([`is_unofficial`]); an artist that is off needs
+/// [`TRACKLIST_IDENTITY_MIN_ARTIST_OFF_TRACKS`] tracks; an album title off in the
+/// weak album title range (at least [`CORROBORATED_TITLE_FLOOR`]) needs the mean
+/// title score of that rule ([`CORROBORATED_MEAN_TITLE`]); and the two album
+/// titles carry the same [`title_version_words`], so `Album (Radio Edit)` is no
+/// reading of `Album`.
+///
+/// A tracklist of this size that agrees in order and in every length is rarely
+/// shared by two albums, so the tags that disagree (`Microphones, The`, a joint
+/// credit, `OST` for `The Soundtrack`) do not decide the album. The caller
+/// leaves the weak album title rule its precedence. `cleaned` is
+/// [`cleaned_track_titles`] of `local`.
+fn tracklist_identifies_album(
+    local: &LocalRelease,
+    candidate: &Candidate,
+    cleaned: &[Option<CleanedTitle>],
+) -> bool {
+    let score = &candidate.score;
+    let various = matches!(local.artist_kind, ArtistKind::VariousArtists);
+    if lacks_album_title(local)
+        || !(various || tag_identity(local).artist.is_some())
+        || is_unofficial(&candidate.release)
+    {
+        return false;
+    }
+    let agrees = |value: f64| value >= TITLE_SIMILARITY_THRESHOLD;
+    let off = score.album_title.min(score.album_artist);
+    if agrees(score.album_title) == agrees(score.album_artist) || off < TRACKLIST_IDENTITY_TAG_FLOOR
+    {
+        return false;
+    }
+    let artist_is_off = !agrees(score.album_artist);
+    let min_tracks = if various {
+        TRACKLIST_IDENTITY_MIN_VARIOUS_TRACKS
+    } else if artist_is_off {
+        TRACKLIST_IDENTITY_MIN_ARTIST_OFF_TRACKS
+    } else {
+        TRACKLIST_IDENTITY_MIN_TRACKS
+    };
+    if local.tracks.len() < min_tracks {
+        return false;
+    }
+    // An album title in the weak album title range is that rule's to read, and
+    // this rule is never looser than it: the mean title must reach its floor.
+    let weak_album_title = !artist_is_off && score.album_title >= CORROBORATED_TITLE_FLOOR;
+    let local_title = local.album_title.as_deref().unwrap_or_default();
+    if (weak_album_title && score.track_titles < CORROBORATED_MEAN_TITLE)
+        || title_version_words(local_title) != title_version_words(&candidate.release.title)
+        || score.tracklist_score() + 1e-9 < TRACKLIST_IDENTITY_SCORE
+        || !album_titles_identify(local, candidate)
+        || !mapped_in_local_order(local, candidate)
+        || !track_titles_agree(local, candidate, cleaned)
+        || !titles_prefer_own_tracks(local, candidate, cleaned)
+    {
+        return false;
+    }
+    let known = |duration: Option<f64>| duration.filter(|secs| secs.is_finite() && *secs > 0.0);
+    candidate.mapping.assigned_pairs().all(|(l, r)| {
+        let (Some(local_track), Some(remote_track)) =
+            (local.tracks.get(l), candidate.release.tracklist.get(r))
+        else {
+            return false;
+        };
+        let Some(title) = local_track.title.as_deref() else {
+            return false;
+        };
+        let strictly_the_same = strict_track_title_similarity(
+            title,
+            cleaned.get(l).and_then(Option::as_ref),
+            &remote_track.title,
+        ) >= TITLE_SIMILARITY_THRESHOLD;
+        let qualifiers_match = qualifiers_agree(
+            &album_track_qualifiers(title),
+            &album_track_qualifiers(&remote_track.title),
+        );
+        let lengths_agree = matches!(
+            (known(local_track.duration_secs), known(remote_track.duration_secs)),
+            (Some(a), Some(b)) if (a - b).abs() <= TRACKLIST_IDENTITY_GAP_SECS
+        );
+        strictly_the_same && qualifiers_match && lengths_agree
+    })
+}
+
 /// Whether the mapping pairs every local track, in local track order, with the
 /// remote playable tracks in tracklist order: complete, unambiguous, as many
 /// local tracks as playable remote tracks, and local track `k` mapped to remote
@@ -4661,6 +4829,15 @@ fn evaluate_with(
     };
     let odd_length_rule = odd_length.filter(|_| guards.odd_length_blocker.is_none());
 
+    // One of album title and artist is off, but the tracklist agrees in every
+    // title and every length: the tracks identify the album. Album scope only,
+    // and not together with the weak album title rule, which keeps precedence.
+    // It needs exactly one of title and artist below the minimum, which the
+    // duration-identity, text-identity and odd-length rules rule out.
+    let tracklist_identity = match_scope == MatchScope::Album
+        && !corroborated_title
+        && tracklist_identifies_album(local, candidate, &cleaned);
+
     // A label on one side only is a labelling difference, not another recording,
     // when the lengths identify the tracks and every other title agrees. The
     // gate holds with an empty list when no track carries a label.
@@ -4678,6 +4855,7 @@ fn evaluate_with(
         && !duration_identity
         && !text_identity
         && odd_length_rule.is_none()
+        && !tracklist_identity
         && acceptance_score + 1e-9 < minimum_score
     {
         blockers.push(format!(
@@ -4695,6 +4873,13 @@ fn evaluate_with(
         warnings.push(format!(
             "album title scores {:.3} but every track and duration agrees",
             candidate.score.album_title
+        ));
+    } else if tracklist_identity {
+        warnings.push(format!(
+            "album title scores {:.3} and artist {:.3}, but all {} {TRACKLIST_IDENTITY_NOTE}",
+            candidate.score.album_title,
+            candidate.score.album_artist,
+            local.tracks.len()
         ));
     } else if match_scope == MatchScope::Album
         && (candidate.score.album_title < minimum_title_similarity
@@ -4859,8 +5044,10 @@ fn evaluate_with(
     // title rule: when that rule is in play, which replaces the acceptance score
     // gate, any track title below the minimum blocks. The duration-identity rule
     // accepts any number of weak titles instead, as one warning.
-    let lone_weak_title =
-        match_scope == MatchScope::Album && !corroborated_title && titles_below_minimum == 1;
+    let lone_weak_title = match_scope == MatchScope::Album
+        && !corroborated_title
+        && !tracklist_identity
+        && titles_below_minimum == 1;
     let near_miss_title = lone_weak_title
         && worst_title >= NEAR_MISS_TITLE_FLOOR
         && worst_title_duration_gap.is_some_and(|gap| gap <= DURATION_TOLERANCE_SECS);
@@ -5194,8 +5381,9 @@ pub struct FallbackCheck {
 /// to the fallback plus [`DURATION_TOLERANCE_SECS`]), and the file's title also reads at
 /// least [`TITLE_SIMILARITY_THRESHOLD`] against the fallback's (so a settle
 /// never rests on a track the fallback matched through a weak, junk or
-/// near-miss title). Nothing is settled when the fallback's album title scores
-/// below [`TITLE_SIMILARITY_THRESHOLD`]. A primary that is plausible only
+/// near-miss title). Nothing is settled when the fallback's album title or
+/// artist scores below [`TITLE_SIMILARITY_THRESHOLD`] ([`album_text_agrees`]).
+/// A primary that is plausible only
 /// through its durations has no title conflicts and no duration conflict that
 /// can be settled. An edition qualifier line is settled only when the
 /// qualifiers differ by a label on one side ([`one_sided_labels`]) and the
@@ -5214,7 +5402,7 @@ pub fn fallback_check(
     let mut conflicts = Vec::new();
     let mut settled = Vec::new();
     // The files only settle a conflict for a fallback whose album is the files'.
-    let files_may_settle = fallback.score.album_title >= TITLE_SIMILARITY_THRESHOLD;
+    let files_may_settle = album_text_agrees(fallback);
     let cleaned_titles = cleaned_track_titles(local);
 
     for problem in &local.embedded_evidence.problems {
@@ -7166,11 +7354,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v32"
+            "discogs-match-v33"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v31"
+            "musicbrainz-match-v32"
         );
     }
 
@@ -9330,6 +9518,36 @@ mod tests {
         assert_eq!(weak.settled, Vec::<String>::new());
         assert_eq!(
             weak.conflicts,
+            vec!["primary and fallback durations differ for local track 4".to_string()]
+        );
+    }
+
+    #[test]
+    fn nothing_is_settled_for_a_fallback_with_an_artist_that_does_not_agree() {
+        // The fallback's album title is the files', its artist is not (the
+        // shape the tracklist rule accepts), and the primary's artist is right.
+        let (local, mut primary_release) = spaced_pair(&TITLES_6, &TITLES_6);
+        primary_release.id = ReleaseId::MusicBrainz(mbid(MUSICBRAINZ_PRIMARY_ID));
+        primary_release.tracklist[3].duration_secs = Some(85.7);
+        let primary = Candidate::new(&local, primary_release);
+        assert!(primary.score.album_artist >= TITLE_SIMILARITY_THRESHOLD);
+        let (_, fallback_release) = spaced_pair(&TITLES_6, &TITLES_6);
+        let mut fallback = Candidate::new(&local, fallback_release);
+        let check = fallback_check(
+            &local,
+            std::slice::from_ref(&primary),
+            &fallback,
+            true,
+            false,
+        );
+        assert_eq!(check.settled.len(), 1, "{check:?}");
+
+        fallback.score.album_artist = 0.60;
+        assert!(fallback.score.album_title >= TITLE_SIMILARITY_THRESHOLD);
+        let off = fallback_check(&local, &[primary], &fallback, true, false);
+        assert_eq!(off.settled, Vec::<String>::new());
+        assert_eq!(
+            off.conflicts,
             vec!["primary and fallback durations differ for local track 4".to_string()]
         );
     }
@@ -11693,11 +11911,13 @@ mod tests {
         let (mut local, remote) = spaced_pair(&LABEL_TITLES, &LABEL_TITLES);
         local.album_title = Some("Test Album (Live)".to_string());
         let evaluation = assert_not_read_as_label(&local, &remote);
+        // The tracklist agrees, so the tracklist rule reads the album title as
+        // the one off tag and the title blocker gives way to the qualifier one.
         assert!(
             evaluation
                 .blockers
                 .iter()
-                .any(|blocker| blocker.contains("album title or artist")),
+                .any(|blocker| blocker.starts_with("edition qualifiers differ")),
             "{:?}",
             evaluation.blockers
         );
@@ -12764,5 +12984,810 @@ mod tests {
         for title in ["Hollow", "Second Wind", "Paper Crowns"] {
             assert!(!names_a_version(title), "{title}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The tracklist-identity rule
+    // -----------------------------------------------------------------------
+
+    /// A local release and a remote release over the first `count` titles of
+    /// [`TITLES_12`], with the tags and credits given: the files' album title
+    /// and artist, the provider's album title and artist credits.
+    fn tracklist_pair(
+        count: usize,
+        tags: (&str, &str),
+        provider: (&str, &[&str]),
+    ) -> (LocalRelease, RemoteRelease) {
+        let mut local = local_release(&TITLES_12[..count]);
+        local.album_title = Some(tags.0.to_string());
+        local.album_artist = Some(tags.1.to_string());
+        let mut remote = remote_release(&TITLES_12[..count]);
+        remote.title = provider.0.to_string();
+        remote.artists = provider.1.iter().map(|name| (*name).to_string()).collect();
+        (local, remote)
+    }
+
+    /// [`tracklist_pair`] with the files' artist off and the album title right.
+    fn tracklist_pair_off_artist(count: usize) -> (LocalRelease, RemoteRelease) {
+        tracklist_pair(
+            count,
+            ("Test Album", "Test Artst Band"),
+            ("Test Album", &["Test Artist"]),
+        )
+    }
+
+    /// [`tracklist_pair`] with the files' album title off and the artist right.
+    fn tracklist_pair_off_title(count: usize) -> (LocalRelease, RemoteRelease) {
+        tracklist_pair(
+            count,
+            ("With Open & Loving Arms", "Test Artist"),
+            ("With Loving and Open Arms", &["Test Artist"]),
+        )
+    }
+
+    /// A Various Artists pair of `count` tracks whose album title is off.
+    fn tracklist_pair_various(count: usize) -> (LocalRelease, RemoteRelease) {
+        let (mut local, remote) = tracklist_pair(
+            count,
+            ("Blazin OST", "Various Artists"),
+            ("Blazin\u{2019}: The Soundtrack", &["Various Artists"]),
+        );
+        local.artist_kind = ArtistKind::VariousArtists;
+        (local, remote)
+    }
+
+    fn tracklist_warning(evaluation: &Evaluation) -> Option<&str> {
+        evaluation
+            .warnings
+            .iter()
+            .map(String::as_str)
+            .find(|warning| warning.ends_with(TRACKLIST_IDENTITY_NOTE))
+    }
+
+    fn tracklist_identifies(local: &LocalRelease, remote: &RemoteRelease) -> bool {
+        let candidate = Candidate::new(local, remote.clone());
+        tracklist_identifies_album(local, &candidate, &cleaned_track_titles(local))
+    }
+
+    /// Asserts that the rule neither holds nor warns and that the release is not
+    /// accepted.
+    fn assert_not_tracklist_identity(local: &LocalRelease, remote: &RemoteRelease, context: &str) {
+        assert!(!tracklist_identifies(local, remote), "{context}");
+        let evaluation = album_evaluation(local, remote, &[]);
+        assert!(
+            !evaluation.auto_accept,
+            "{context}: {:?}",
+            evaluation.warnings
+        );
+        assert_eq!(tracklist_warning(&evaluation), None, "{context}");
+    }
+
+    fn assert_tracklist_accept(local: &LocalRelease, remote: &RemoteRelease, warning: &str) {
+        assert!(tracklist_identifies(local, remote));
+        let evaluation = album_evaluation(local, remote, &[]);
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert_eq!(tracklist_warning(&evaluation), Some(warning));
+        assert_eq!(
+            evaluation.rule_notes().collect::<Vec<_>>(),
+            [tracklist_warning(&evaluation).unwrap()]
+        );
+    }
+
+    #[test]
+    fn a_reordered_artist_name_is_identified_by_its_tracklist() {
+        let (local, remote) = tracklist_pair(
+            8,
+            ("Test Album", "Microphones, The"),
+            ("Test Album", &["The Microphones"]),
+        );
+        assert_tracklist_accept(
+            &local,
+            &remote,
+            "album title scores 1.000 and artist 0.713, but all 8 track titles and lengths agree in track order",
+        );
+    }
+
+    #[test]
+    fn a_joint_artist_credit_is_identified_by_its_tracklist() {
+        let (local, remote) = tracklist_pair(
+            8,
+            ("Test Album", "Leon Bibb and Eric Bibb"),
+            ("Test Album", &["Leon Bibb", "Eric Bibb"]),
+        );
+        assert_tracklist_accept(
+            &local,
+            &remote,
+            "album title scores 1.000 and artist 0.826, but all 8 track titles and lengths agree in track order",
+        );
+    }
+
+    #[test]
+    fn a_cut_off_featured_credit_is_identified_by_its_tracklist() {
+        let (local, remote) = tracklist_pair(
+            8,
+            ("Test Album", "Basement Jaxx Feat Dizzee Rasc"),
+            ("Test Album", &["Basement Jaxx", "Dizzee Rascal"]),
+        );
+        assert_tracklist_accept(
+            &local,
+            &remote,
+            "album title scores 1.000 and artist 0.767, but all 8 track titles and lengths agree in track order",
+        );
+    }
+
+    #[test]
+    fn a_reworded_album_title_is_identified_by_its_tracklist() {
+        let (local, remote) = tracklist_pair(
+            6,
+            ("With Open & Loving Arms", "Test Artist"),
+            ("With Loving and Open Arms", &["Test Artist"]),
+        );
+        let candidate = Candidate::new(&local, remote.clone());
+        // Under the weak album title floor, so only this rule can take it.
+        assert!(
+            candidate.score.album_title < CORROBORATED_TITLE_FLOOR,
+            "{}",
+            candidate.score.album_title
+        );
+        assert_tracklist_accept(
+            &local,
+            &remote,
+            "album title scores 0.680 and artist 1.000, but all 6 track titles and lengths agree in track order",
+        );
+    }
+
+    #[test]
+    fn a_various_artists_soundtrack_is_identified_by_eight_tracks() {
+        let (local, remote) = tracklist_pair_various(TRACKLIST_IDENTITY_MIN_VARIOUS_TRACKS);
+        assert_tracklist_accept(
+            &local,
+            &remote,
+            "album title scores 0.637 and artist 1.000, but all 8 track titles and lengths agree in track order",
+        );
+    }
+
+    #[test]
+    fn the_tracklist_rule_applies_to_musicbrainz() {
+        let (local, mut remote) = tracklist_pair_off_artist(8);
+        remote.id = ReleaseId::MusicBrainz(mbid(MUSICBRAINZ_PRIMARY_ID));
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert!(tracklist_warning(&evaluation).is_some());
+    }
+
+    #[test]
+    fn the_weak_album_title_rule_keeps_precedence_over_the_tracklist_rule() {
+        // A title in the weak album title range with everything else perfect:
+        // that rule reads it, with its own warning.
+        let (local, remote) = tracklist_pair(
+            6,
+            ("Microphones, The", "Test Artist"),
+            ("The Microphones", &["Test Artist"]),
+        );
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(corroborated_album(&local, &candidate));
+        assert!(tracklist_identifies(&local, &remote));
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert_eq!(tracklist_warning(&evaluation), None);
+        assert!(
+            evaluation.warnings.contains(
+                &"album title scores 0.756 but every track and duration agrees".to_string()
+            ),
+            "{:?}",
+            evaluation.warnings
+        );
+    }
+
+    #[test]
+    fn the_tracklist_score_leaves_out_the_album_tags() {
+        let (local, remote) = tracklist_pair_off_artist(8);
+        let mut candidate = Candidate::new(&local, remote);
+        assert!((candidate.score.tracklist_score() - 1.0).abs() < 1e-9);
+        candidate.score.track_titles = 0.99;
+        assert!((candidate.score.tracklist_score() - (0.35 * 0.99 + 0.15) / 0.5).abs() < 1e-9);
+        // Under the gate: the rule does not hold.
+        candidate.score.track_titles = 0.90;
+        assert!(candidate.score.tracklist_score() < TRACKLIST_IDENTITY_SCORE);
+        let cleaned = cleaned_track_titles(&local);
+        assert!(!tracklist_identifies_album(&local, &candidate, &cleaned));
+    }
+
+    #[test]
+    fn four_tracks_are_too_few_for_the_tracklist_rule() {
+        let (local, remote) = tracklist_pair_off_title(TRACKLIST_IDENTITY_MIN_TRACKS - 1);
+        assert_not_tracklist_identity(&local, &remote, "four tracks");
+        let (local, remote) = tracklist_pair_off_title(TRACKLIST_IDENTITY_MIN_TRACKS);
+        assert!(tracklist_identifies(&local, &remote));
+    }
+
+    #[test]
+    fn a_various_artists_release_needs_eight_tracks_for_the_tracklist_rule() {
+        let (local, remote) = tracklist_pair_various(TRACKLIST_IDENTITY_MIN_VARIOUS_TRACKS - 1);
+        assert_not_tracklist_identity(&local, &remote, "seven tracks");
+    }
+
+    #[test]
+    fn one_length_two_seconds_off_stops_the_tracklist_rule() {
+        let (mut local, remote) = tracklist_pair_off_artist(8);
+        local.tracks[3].duration_secs = Some(local.tracks[3].duration_secs.unwrap() + 2.0);
+        assert_not_tracklist_identity(&local, &remote, "2 s off");
+
+        let (mut local, remote) = tracklist_pair_off_artist(8);
+        local.tracks[3].duration_secs = Some(local.tracks[3].duration_secs.unwrap() + 1.4);
+        assert!(tracklist_identifies(&local, &remote));
+    }
+
+    #[test]
+    fn a_track_title_at_zero_point_eight_stops_the_tracklist_rule() {
+        let (mut local, remote) = tracklist_pair_off_artist(8);
+        local.tracks[3].title = Some("Undertw".to_string());
+        let candidate = Candidate::new(&local, remote.clone());
+        let cleaned = cleaned_track_titles(&local);
+        let similarity = candidate
+            .mapping
+            .title_similarity(&local, &cleaned, 3, 3, &remote.tracklist[3])
+            .unwrap();
+        assert!((0.75..0.90).contains(&similarity), "{similarity}");
+        // The score alone would still pass.
+        assert!(candidate.score.tracklist_score() >= TRACKLIST_IDENTITY_SCORE);
+        assert_not_tracklist_identity(&local, &remote, "a title at 0.8");
+    }
+
+    #[test]
+    fn the_title_score_recorded_for_a_pair_counts_for_the_tracklist_rule() {
+        // The rule reads every pair's title score as the mapping recorded it,
+        // as the album score does, and not only the strict reading of the text.
+        let (local, remote) = tracklist_pair_off_artist(8);
+        let mut candidate = Candidate::new(&local, remote);
+        let cleaned = cleaned_track_titles(&local);
+        assert!(tracklist_identifies_album(&local, &candidate, &cleaned));
+        candidate.mapping.pair_similarity[3] = Some((3, 0.85));
+        assert!(!track_titles_agree(&local, &candidate, &cleaned));
+        assert!(!tracklist_identifies_album(&local, &candidate, &cleaned));
+    }
+
+    #[test]
+    fn a_subtitle_on_one_side_of_one_track_stops_the_tracklist_rule() {
+        let (mut local, mut remote) = tracklist_pair_off_artist(8);
+        local.tracks[2].title = Some("Hollow".to_string());
+        remote.tracklist[2].title = "Hollow / [unknown]".to_string();
+        let candidate = Candidate::new(&local, remote.clone());
+        let cleaned = cleaned_track_titles(&local);
+        assert!(
+            candidate
+                .mapping
+                .title_similarity(&local, &cleaned, 2, 2, &remote.tracklist[2])
+                .unwrap()
+                >= TITLE_SIMILARITY_THRESHOLD
+        );
+        assert!(
+            strict_track_title_similarity("Hollow", None, "Hollow / [unknown]")
+                < TITLE_SIMILARITY_THRESHOLD
+        );
+        assert_not_tracklist_identity(&local, &remote, "one-sided subtitle");
+    }
+
+    #[test]
+    fn swapped_titles_one_second_apart_stop_the_tracklist_rule() {
+        let mut titles = TITLES_12[..8].to_vec();
+        titles[0] = "Intro (Part 1)";
+        titles[1] = "Intro (Part 2)";
+        let mut local = local_release(&titles);
+        titles[0] = "Intro (Part 2)";
+        titles[1] = "Intro (Part 1)";
+        let remote = remote_release(&titles);
+        local.artist_kind = ArtistKind::AlbumArtist;
+        local.album_artist = Some("Test Artst Band".to_string());
+        assert_not_tracklist_identity(&local, &remote, "swapped parts");
+    }
+
+    #[test]
+    fn a_remote_order_that_differs_stops_the_tracklist_rule() {
+        let (local, mut remote) = tracklist_pair_off_artist(8);
+        remote.tracklist.swap(0, 1);
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(candidate.mapping.complete && !candidate.mapping.ambiguous);
+        assert!(!mapped_in_local_order(&local, &candidate));
+        assert_not_tracklist_identity(&local, &remote, "swapped order");
+    }
+
+    #[test]
+    fn a_title_nearer_to_another_track_stops_the_tracklist_rule() {
+        // Local track 4 reads `Harbor Lights` and maps to the provider's
+        // `Harbor Lightz`, but the provider's track 3 is `Harbor Lights`.
+        let mut local_titles = TITLES_12[..8].to_vec();
+        local_titles[2] = "Harbor Light";
+        local_titles[3] = "Harbor Lights";
+        let mut remote_titles = TITLES_12[..8].to_vec();
+        remote_titles[2] = "Harbor Lights";
+        remote_titles[3] = "Harbor Lightz";
+        let (mut local, mut remote) = spaced_pair(&local_titles, &remote_titles);
+        local.album_artist = Some("Test Artst Band".to_string());
+        remote.artists = vec!["Test Artist".to_string()];
+        let candidate = Candidate::new(&local, remote.clone());
+        let cleaned = cleaned_track_titles(&local);
+        assert!(mapped_in_local_order(&local, &candidate));
+        assert!(track_titles_agree(&local, &candidate, &cleaned));
+        assert!(!titles_prefer_own_tracks(&local, &candidate, &cleaned));
+        assert_not_tracklist_identity(&local, &remote, "title nearer another track");
+    }
+
+    #[test]
+    fn a_length_that_is_missing_or_zero_stops_the_tracklist_rule() {
+        let (local, mut remote) = tracklist_pair_off_artist(8);
+        remote.tracklist[4].duration_secs = None;
+        // The score alone would still pass.
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(candidate.score.tracklist_score() >= TRACKLIST_IDENTITY_SCORE);
+        assert_not_tracklist_identity(&local, &remote, "remote length missing");
+
+        let (mut local, remote) = tracklist_pair_off_artist(8);
+        local.tracks[4].duration_secs = None;
+        assert_not_tracklist_identity(&local, &remote, "local length missing");
+
+        let (mut local, mut remote) = tracklist_pair_off_artist(8);
+        local.tracks[4].duration_secs = Some(0.0);
+        remote.tracklist[4].duration_secs = Some(0.0);
+        assert_not_tracklist_identity(&local, &remote, "zero lengths");
+    }
+
+    #[test]
+    fn both_album_tags_off_stop_the_tracklist_rule() {
+        let (local, remote) = tracklist_pair(
+            6,
+            ("With Open & Loving Arms", "Test Artst Band"),
+            ("With Loving and Open Arms", &["Test Artist"]),
+        );
+        assert_not_tracklist_identity(&local, &remote, "both tags off");
+    }
+
+    #[test]
+    fn a_tag_that_names_something_else_stops_the_tracklist_rule() {
+        let (local, remote) = tracklist_pair(
+            6,
+            ("The Complete Studio Recordings", "Test Artist"),
+            ("Arrival", &["Test Artist"]),
+        );
+        assert_not_tracklist_identity(&local, &remote, "title 0.10");
+
+        let (local, remote) =
+            tracklist_pair(6, ("Test Album", "Tribute Band"), ("Test Album", &["ABBA"]));
+        assert_not_tracklist_identity(&local, &remote, "artist 0.25");
+    }
+
+    #[test]
+    fn a_title_that_names_another_number_stops_the_tracklist_rule() {
+        let (mut local, mut remote) = tracklist_pair_various(8);
+        local.album_title = Some("Blazin OST Vol 2".to_string());
+        remote.title = "Blazin\u{2019}: The Soundtrack Vol 3".to_string();
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(
+            (TRACKLIST_IDENTITY_TAG_FLOOR..CORROBORATED_TITLE_FLOOR)
+                .contains(&candidate.score.album_title),
+            "{}",
+            candidate.score.album_title
+        );
+        assert_not_tracklist_identity(&local, &remote, "part 2 against 3");
+
+        // The same number is the same album.
+        remote.title = "Blazin\u{2019}: The Soundtrack Vol 2".to_string();
+        assert!(tracklist_identifies(&local, &remote));
+    }
+
+    #[test]
+    fn a_bootleg_title_stops_the_tracklist_rule() {
+        let (mut local, remote) = tracklist_pair_off_artist(8);
+        local.album_title = Some("Test Album (Bootleg)".to_string());
+        assert_not_tracklist_identity(&local, &remote, "bootleg");
+    }
+
+    #[test]
+    fn a_junk_or_missing_tag_is_no_real_tag_for_the_tracklist_rule() {
+        // The scorer gives filler no credit, so the tag floor and the exactly
+        // one off condition already keep these out. The rule still asks for real
+        // tags itself, which shows when the score is forced up.
+        let identifies = |local: &LocalRelease, remote: &RemoteRelease, title: f64, artist: f64| {
+            let mut candidate = Candidate::new(local, remote.clone());
+            candidate.score.album_title = title;
+            candidate.score.album_artist = artist;
+            tracklist_identifies_album(local, &candidate, &cleaned_track_titles(local))
+        };
+        let (local, remote) = tracklist_pair_off_artist(8);
+        assert!(identifies(&local, &remote, 1.0, 0.6));
+
+        let (mut junk_title, remote) = tracklist_pair_off_artist(8);
+        for title in ["Unknown Album", "Unknown Title", ".", "", "   "] {
+            junk_title.album_title = Some(title.to_string());
+            assert!(!identifies(&junk_title, &remote, 1.0, 0.6), "{title:?}");
+        }
+        junk_title.album_title = None;
+        assert!(!identifies(&junk_title, &remote, 1.0, 0.6));
+
+        let (mut local, remote) = tracklist_pair(
+            6,
+            ("Microphones, The", "Unknown Artist"),
+            ("The Microphones", &["Test Artist"]),
+        );
+        assert!(!identifies(&local, &remote, 0.6, 1.0));
+        for artist in [None, Some(""), Some("  ")] {
+            local.album_artist = artist.map(str::to_string);
+            assert!(!identifies(&local, &remote, 0.6, 1.0), "{artist:?}");
+        }
+        local.album_artist = Some("Test Artist".to_string());
+        assert!(identifies(&local, &remote, 0.6, 1.0));
+        // Various Artists is a real credit, with the artist off the album title.
+        let (local, remote) = tracklist_pair_various(8);
+        assert!(identifies(&local, &remote, 0.6, 1.0));
+
+        // The evaluations of the same releases, as the scorer gives them.
+        let (local, remote) = tracklist_pair(
+            8,
+            ("Unknown Album", "Test Artst Band"),
+            ("Unknown Album", &["Test Artist"]),
+        );
+        assert_not_tracklist_identity(&local, &remote, "junk title");
+        let (local, remote) = tracklist_pair(
+            6,
+            ("Microphones, The", "Unknown Artist"),
+            ("The Microphones", &["Unknown Artist"]),
+        );
+        assert_not_tracklist_identity(&local, &remote, "junk artist");
+        let (mut local, remote) = tracklist_pair(
+            6,
+            ("Microphones, The", "Test Artist"),
+            ("The Microphones", &["Test Artist"]),
+        );
+        local.album_artist = None;
+        assert_not_tracklist_identity(&local, &remote, "missing artist");
+    }
+
+    #[test]
+    fn a_version_qualifier_on_a_pair_stops_the_tracklist_rule() {
+        // Every remote title says live, and none of the files' does.
+        let (local, mut remote) = tracklist_pair_off_artist(8);
+        for track in &mut remote.tracklist {
+            track.title = format!("{} (Live)", track.title);
+        }
+        assert_not_tracklist_identity(&local, &remote, "(Live) on every track");
+
+        // One letter apart, so the titles agree strictly and only the
+        // qualifier tells the two apart.
+        let (mut local, mut remote) = tracklist_pair_off_artist(8);
+        local.tracks[2].title = Some("Harbor Lights Remix".to_string());
+        remote.tracklist[2].title = "Harbor Lights Remit".to_string();
+        assert!(
+            strict_track_title_similarity("Harbor Lights Remix", None, "Harbor Lights Remit")
+                >= TITLE_SIMILARITY_THRESHOLD
+        );
+        assert_not_tracklist_identity(&local, &remote, "remix against remit");
+    }
+
+    #[test]
+    fn another_album_within_the_gap_still_blocks_the_tracklist_rule() {
+        let (local, remote) = tracklist_pair_off_artist(8);
+        let mut other = remote.clone();
+        other.id = ReleaseId::Discogs(43);
+        other.tracklist[2].title = "Hollow Ground".to_string();
+        let alternative = Candidate::new(&local, other);
+        let primary = Candidate::new(&local, remote.clone());
+        assert!(within_gap(
+            primary.score.album_score() - alternative.score.album_score()
+        ));
+        let evaluation = album_evaluation(&local, &remote, std::slice::from_ref(&alternative));
+        assert!(!evaluation.auto_accept);
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|blocker| blocker.starts_with("close alternative")),
+            "{:?}",
+            evaluation.blockers
+        );
+    }
+
+    #[test]
+    fn the_tracklist_rule_is_for_album_scope_only() {
+        let (local, remote) = tracklist_pair_off_artist(8);
+        let candidate = Candidate::new(&local, remote);
+        let evaluation = evaluate(&local, &candidate, None, &DiscoveryEvidence::default());
+        assert!(!evaluation.auto_accept);
+        assert_eq!(tracklist_warning(&evaluation), None);
+    }
+
+    #[test]
+    fn an_artist_that_is_off_needs_eight_tracks_for_the_tracklist_rule() {
+        let (local, remote) =
+            tracklist_pair_off_artist(TRACKLIST_IDENTITY_MIN_ARTIST_OFF_TRACKS - 1);
+        assert_eq!(local.tracks.len(), 7);
+        assert_not_tracklist_identity(&local, &remote, "artist off, seven tracks");
+
+        let (local, remote) = tracklist_pair_off_artist(TRACKLIST_IDENTITY_MIN_ARTIST_OFF_TRACKS);
+        assert_eq!(local.tracks.len(), 8);
+        assert!(tracklist_identifies(&local, &remote));
+
+        // A title that is off keeps the shorter minimum.
+        let (local, remote) = tracklist_pair_off_title(TRACKLIST_IDENTITY_MIN_TRACKS);
+        assert!(tracklist_identifies(&local, &remote));
+    }
+
+    #[test]
+    fn a_tribute_act_artist_needs_the_longer_tracklist() {
+        let (local, remote) = tracklist_pair(
+            7,
+            ("Test Album", "Brit Floyd"),
+            ("Test Album", &["Pink Floyd"]),
+        );
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(
+            (TRACKLIST_IDENTITY_TAG_FLOOR..0.70).contains(&candidate.score.album_artist),
+            "{}",
+            candidate.score.album_artist
+        );
+        assert_not_tracklist_identity(&local, &remote, "tribute act, seven tracks");
+    }
+
+    #[test]
+    fn an_unofficial_release_is_not_identified_by_its_tracklist() {
+        let (local, mut remote) = tracklist_pair_off_title(6);
+        assert!(tracklist_identifies(&local, &remote));
+
+        remote.formats = vec!["CDr (Album, Unofficial Release)".to_string()];
+        assert_not_tracklist_identity(&local, &remote, "unofficial Discogs release");
+
+        let (local, mut remote) = tracklist_pair_off_title(6);
+        remote.id = ReleaseId::MusicBrainz(mbid(MUSICBRAINZ_PRIMARY_ID));
+        remote.provider_metadata = serde_json::json!({"status": "Official"});
+        assert!(tracklist_identifies(&local, &remote));
+        remote.provider_metadata = serde_json::json!({"status": "Bootleg"});
+        assert_not_tracklist_identity(&local, &remote, "bootleg MusicBrainz release");
+    }
+
+    #[test]
+    fn a_weak_album_title_needs_the_mean_title_of_its_own_rule_for_the_tracklist_rule() {
+        // An album title between the weak title floor and the minimum, an
+        // artist that agrees, and three titles at about 0.92: every title
+        // agrees and the tracklist score passes, but the mean title stays
+        // below what the weak album title rule asks, so this rule is no
+        // looser than the one it defers to.
+        let (mut local, mut remote) = tracklist_pair(
+            6,
+            ("Test Alb", "Test Artist"),
+            ("Test Album", &["Test Artist"]),
+        );
+        for (index, (file, provider)) in [
+            ("Harbor Lights", "Harbour Lights"),
+            ("Paper Crowns", "Paper Crown"),
+            ("Weather Vane", "Weather Vanes"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            local.tracks[index].title = Some(file.to_string());
+            remote.tracklist[index].title = provider.to_string();
+        }
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(
+            (CORROBORATED_TITLE_FLOOR..TITLE_SIMILARITY_THRESHOLD)
+                .contains(&candidate.score.album_title),
+            "{}",
+            candidate.score.album_title
+        );
+        assert!(candidate.score.album_artist >= TITLE_SIMILARITY_THRESHOLD);
+        assert!(
+            (0.95..CORROBORATED_MEAN_TITLE).contains(&candidate.score.track_titles),
+            "{}",
+            candidate.score.track_titles
+        );
+        let cleaned = cleaned_track_titles(&local);
+        assert!(track_titles_agree(&local, &candidate, &cleaned));
+        assert!(candidate.score.tracklist_score() >= TRACKLIST_IDENTITY_SCORE);
+        assert!(!corroborated_album(&local, &candidate));
+        assert_not_tracklist_identity(&local, &remote, "weak title, mean 0.96");
+
+        // The same weak title with exact titles is the weak album title
+        // rule's, which accepts it with its own warning.
+        let (local, mut remote) = tracklist_pair(
+            6,
+            ("Test Alb", "Test Artist"),
+            ("Test Album", &["Test Artist"]),
+        );
+        remote.title = "Test Album".to_string();
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert_eq!(tracklist_warning(&evaluation), None);
+    }
+
+    #[test]
+    fn a_title_below_the_weak_title_range_is_not_held_to_its_mean_title() {
+        // Under the weak album title floor only this rule can take it, with
+        // titles at about 0.92, and it does.
+        let (mut local, mut remote) = tracklist_pair_off_title(6);
+        local.tracks[0].title = Some("Harbor Lights".to_string());
+        remote.tracklist[0].title = "Harbour Lights".to_string();
+        local.tracks[1].title = Some("Paper Crowns".to_string());
+        remote.tracklist[1].title = "Paper Crown".to_string();
+        local.tracks[2].title = Some("Weather Vane".to_string());
+        remote.tracklist[2].title = "Weather Vanes".to_string();
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(candidate.score.album_title < CORROBORATED_TITLE_FLOOR);
+        assert!(candidate.score.track_titles < CORROBORATED_MEAN_TITLE);
+        assert!(tracklist_identifies(&local, &remote));
+    }
+
+    #[test]
+    fn an_album_title_at_zero_point_four_stays_blocked_and_the_floor_is_pinned() {
+        let (local, remote) = tracklist_pair(
+            6,
+            ("Test Album", "Test Artist"),
+            ("Test Collection", &["Test Artist"]),
+        );
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(
+            (0.30..TRACKLIST_IDENTITY_TAG_FLOOR).contains(&candidate.score.album_title),
+            "{}",
+            candidate.score.album_title
+        );
+        assert_not_tracklist_identity(&local, &remote, "title 0.40");
+
+        let (local, remote) = tracklist_pair(
+            6,
+            ("Test Album", "Test Artist"),
+            ("Test Album Special", &["Test Artist"]),
+        );
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(
+            (TRACKLIST_IDENTITY_TAG_FLOOR..CORROBORATED_TITLE_FLOOR)
+                .contains(&candidate.score.album_title),
+            "{}",
+            candidate.score.album_title
+        );
+        assert!(tracklist_identifies(&local, &remote));
+
+        // The floor itself, on the recorded score.
+        let (local, remote) = tracklist_pair_off_title(6);
+        let mut candidate = Candidate::new(&local, remote);
+        let cleaned = cleaned_track_titles(&local);
+        candidate.score.album_title = TRACKLIST_IDENTITY_TAG_FLOOR - 0.01;
+        assert!(!tracklist_identifies_album(&local, &candidate, &cleaned));
+        candidate.score.album_title = TRACKLIST_IDENTITY_TAG_FLOOR + 0.01;
+        assert!(tracklist_identifies_album(&local, &candidate, &cleaned));
+    }
+
+    #[test]
+    fn one_length_one_point_six_seconds_off_stops_the_tracklist_rule() {
+        let (mut local, remote) = tracklist_pair_off_artist(8);
+        local.tracks[3].duration_secs = Some(local.tracks[3].duration_secs.unwrap() + 1.6);
+        assert_not_tracklist_identity(&local, &remote, "1.6 s off");
+    }
+
+    #[test]
+    fn an_edition_of_other_audio_never_passes_for_the_vocal_files() {
+        for (files, provider) in [
+            (
+                "Enter the Wu-Tang (36 Chambers)",
+                "Enter the Wu-Tang (36 Chambers) (Instrumentals)",
+            ),
+            (
+                "The College Dropout",
+                "The College Dropout (Karaoke Version)",
+            ),
+            ("Album", "Album (A Cappellas)"),
+            ("Album", "Album (A Cappella)"),
+            ("Album", "Album (Acapella)"),
+            ("Album", "Album (Acappella)"),
+            ("Album", "Album (Instrumentals)"),
+        ] {
+            let (local, remote) =
+                tracklist_pair(12, (files, "Test Artist"), (provider, &["Test Artist"]));
+            let evaluation = album_evaluation(&local, &remote, &[]);
+            assert!(
+                !evaluation.auto_accept,
+                "{provider}: {:?}",
+                evaluation.warnings
+            );
+            assert!(
+                evaluation
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.starts_with("edition qualifiers differ")),
+                "{provider}: {:?}",
+                evaluation.blockers
+            );
+        }
+        // The tracklist rule also reads the version words of the album titles.
+        for (files, provider) in [
+            (
+                "Enter the Wu-Tang (36 Chambers)",
+                "Enter the Wu-Tang (36 Chambers) (Instrumentals)",
+            ),
+            (
+                "The College Dropout",
+                "The College Dropout (Karaoke Version)",
+            ),
+        ] {
+            let (local, remote) =
+                tracklist_pair(12, (files, "Test Artist"), (provider, &["Test Artist"]));
+            let candidate = Candidate::new(&local, remote.clone());
+            assert!(
+                (TRACKLIST_IDENTITY_TAG_FLOOR..TITLE_SIMILARITY_THRESHOLD)
+                    .contains(&candidate.score.album_title),
+                "{provider}: {}",
+                candidate.score.album_title
+            );
+            assert!(!tracklist_identifies(&local, &remote), "{provider}");
+        }
+    }
+
+    #[test]
+    fn instrumental_karaoke_and_a_cappella_are_edition_qualifiers_and_never_labels() {
+        for text in [
+            "Album (Instrumentals)",
+            "Album (Instrumental)",
+            "Album (Karaoke Version)",
+            "Album (A Cappella)",
+            "Album (A Cappellas)",
+            "Album (Acapella)",
+            "Album (Acappella)",
+        ] {
+            let qualifiers = edition_qualifiers(text);
+            assert_eq!(qualifiers.len(), 1, "{text}: {qualifiers:?}");
+            let silent = edition_qualifiers("Album");
+            assert!(!qualifiers_agree(&silent, &qualifiers), "{text}");
+            assert!(
+                !one_sided_labels(&silent, &qualifiers, RELEASE_LABEL_QUALIFIERS),
+                "{text}"
+            );
+            assert!(
+                !one_sided_labels(&silent, &qualifiers, TRACK_LABEL_QUALIFIERS),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            edition_qualifiers("Album (Instrumentals)"),
+            edition_qualifiers("Album Instrumental")
+        );
+        assert_eq!(
+            edition_qualifiers("Album (A Cappella)"),
+            edition_qualifiers("Album (Acappella)")
+        );
+        // A bare `cappella` is a word, not the edition.
+        assert!(edition_qualifiers("Cappella Gloria").is_empty());
+    }
+
+    #[test]
+    fn a_title_that_names_another_version_stops_the_tracklist_rule() {
+        // No edition qualifier differs, but the provider's title names a radio
+        // edit that the files' title lacks.
+        let (local, remote) = tracklist_pair(
+            6,
+            ("Enter the Wu-Tang", "Test Artist"),
+            ("Enter the Wu-Tang (Radio Edit)", &["Test Artist"]),
+        );
+        assert_eq!(
+            edition_qualifiers(local.album_title.as_deref().unwrap()),
+            remote_edition_qualifiers(&remote)
+        );
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(
+            (TRACKLIST_IDENTITY_TAG_FLOOR..TITLE_SIMILARITY_THRESHOLD)
+                .contains(&candidate.score.album_title),
+            "{}",
+            candidate.score.album_title
+        );
+        assert_not_tracklist_identity(&local, &remote, "radio edit on one side");
+
+        // Both sides naming the same version still identify.
+        let (local, remote) = tracklist_pair(
+            6,
+            ("Enter the Wu Tang (Radio Edit)", "Test Artist"),
+            ("Enter the Wu-Tang (Radio Edit)", &["Test Artist"]),
+        );
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(candidate.score.album_title >= TITLE_SIMILARITY_THRESHOLD);
+        assert_eq!(
+            title_version_words(local.album_title.as_deref().unwrap()),
+            title_version_words(&remote.title)
+        );
     }
 }

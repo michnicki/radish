@@ -2327,6 +2327,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accept_prints_that_the_tracklist_identified_the_album() {
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let directory_id = store::upsert_directory(&pool, std::path::Path::new("/music"))
+            .await
+            .unwrap();
+        let files: Vec<_> = (1..=5)
+            .map(|number| {
+                scanned_track(
+                    &format!("/music/a/{number:02}.flac"),
+                    "With Open & Loving Arms",
+                    number,
+                )
+            })
+            .collect();
+        store::upsert_tracks(&pool, &files, directory_id)
+            .await
+            .unwrap();
+        store::rebuild_local_releases(&pool, None).await.unwrap();
+        let release = store::load_local_releases(&pool, None)
+            .await
+            .unwrap()
+            .remove(0);
+        let guard = store::load_match_guard(&pool, release.id).await.unwrap();
+
+        // The provider lists the same five titles and lengths under an album
+        // title that words the same title another way.
+        let (_, mut remote) = album_fixture();
+        remote.title = "With Loving and Open Arms".into();
+        remote.tracklist.truncate(5);
+        for (index, track) in remote.tracklist.iter_mut().enumerate() {
+            track.title = format!("Track {}", index + 1);
+            track.duration_secs = Some(180.0);
+        }
+        let candidate = Candidate::new(&release, remote);
+        let evaluation = matcher::evaluate_for_matching(
+            &release,
+            &candidate,
+            &[],
+            &matcher::DiscoveryEvidence::default(),
+        );
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+
+        let mut transcript = Transcript::held();
+        let outcome = accept(
+            &pool,
+            &release,
+            ProviderKind::Discogs,
+            &candidate,
+            &evaluation,
+            AcceptanceMethod::Automatic,
+            false,
+            &guard,
+            &mut transcript,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, Outcome::Accepted), "{outcome:?}");
+        let lines: Vec<&str> = transcript
+            .held
+            .iter()
+            .flatten()
+            .filter_map(|line| match line {
+                Line::Out(text) => Some(text.as_str()),
+                Line::Err(_) => None,
+            })
+            .collect();
+        let unconfirmed = lines
+            .iter()
+            .position(|line| line.contains("exact edition unconfirmed"))
+            .expect("the album scope note");
+        assert_eq!(
+            lines.get(unconfirmed + 1),
+            Some(
+                &"    album title scores 0.680 and artist 1.000, but all 5 track titles and lengths agree in track order"
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn accept_turns_a_changed_snapshot_into_a_skip() {
         let pool = crate::db::connect_in_memory().await.unwrap();
         let directory_id = store::upsert_directory(&pool, std::path::Path::new("/music"))
