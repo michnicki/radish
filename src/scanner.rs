@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Cursor, ErrorKind, Read, Seek};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -124,6 +125,25 @@ pub fn read_tags(path: &Path) -> Result<ScannedTrack> {
     read_tags_noting(path).map(|(track, _)| track)
 }
 
+/// What a read had to leave out of a file to read it at all.
+#[derive(Debug)]
+struct Dropped {
+    /// What was left out, as the import's note names it.
+    what: String,
+    /// Why: the error of the read that could not leave it in.
+    error: anyhow::Error,
+}
+
+impl Dropped {
+    /// Fields of a tag that Lofty's relaxed mode skipped.
+    fn fields(error: anyhow::Error) -> Self {
+        Self {
+            what: "malformed tag fields".to_string(),
+            error,
+        }
+    }
+}
+
 /// Reads a file's tags with Lofty's default parsing, or leniently when that
 /// fails.
 ///
@@ -131,27 +151,100 @@ pub fn read_tags(path: &Path) -> Result<ScannedTrack> {
 /// give up on the whole tag and so on every field in it. The relaxed mode
 /// drops only the fields it cannot parse. A tag whose header says ID3v2.3 over
 /// ID3v2.2 frames is read as the ID3v2.2 tag it is, see [`mislabeled_id3v22`].
-/// Both run only after the default read failed, so every file the default
+/// A file those reads refuse gets the further reads of [`read_damaged`]. All
+/// of them run only after the default read failed, so every file the default
 /// mode can read keeps exactly its values.
-fn read_file(path: &Path) -> Result<(TaggedFile, Option<anyhow::Error>)> {
+fn read_file(path: &Path) -> Result<(TaggedFile, Option<Dropped>)> {
     let strict = match Probe::open(path)?.read() {
         Ok(file) => return Ok((file, None)),
         Err(error) => anyhow::Error::from(error),
     };
-    let Some(bytes) = relabeled_id3v22(path) else {
-        return read_relaxed(Probe::open(path)?, strict);
+    // The type the extension names, as `Probe::open` uses.
+    let named = FileType::from_path(path);
+    let relabeled = relabeled_id3v22(path);
+    let read = match &relabeled {
+        Some(bytes) => read_leniently(|| Ok(probe_bytes(bytes, named))),
+        None => read_relaxed(Probe::open(path)?, strict),
     };
-    let probe = || {
-        // The type the extension names, as `Probe::open` does.
-        let probe = Probe::new(Cursor::new(bytes.as_slice()));
-        match FileType::from_path(path) {
-            Some(file_type) => probe.set_file_type(file_type),
-            None => probe,
+    match read {
+        Ok(read) => Ok(read),
+        Err(error) => read_damaged(path, named, relabeled, error),
+    }
+}
+
+/// Reads a file that Lofty refused as the type its extension names.
+///
+/// A file whose first bytes carry the signature of another type is read as
+/// that type: an Ogg Vorbis file named `.mp3` looks to Lofty like an MP3
+/// without any audio. An MPEG file is then read with the tags Lofty refused
+/// hidden from it, see [`read_mpeg_hiding_tags`]. When every read fails,
+/// gives the error that says most about the file: that of the type its
+/// signature names, or else `error`.
+fn read_damaged(
+    path: &Path,
+    named: Option<FileType>,
+    relabeled: Option<Vec<u8>>,
+    mut error: anyhow::Error,
+) -> Result<(TaggedFile, Option<Dropped>)> {
+    let signed = signed_type(path);
+    if let Some(signed) = signed
+        && Some(signed) != named
+    {
+        match read_leniently(|| Ok(Probe::open(path)?.set_file_type(signed))) {
+            Ok(read) => return Ok(read),
+            Err(signed_error) => error = signed_error,
         }
-    };
-    match probe().read() {
+    }
+    if signed.or(named) != Some(FileType::Mpeg) {
+        return Err(error);
+    }
+    match relabeled.or_else(|| std::fs::read(path).ok()) {
+        Some(bytes) => read_mpeg_hiding_tags(bytes, error),
+        None => Err(error),
+    }
+}
+
+/// How many bytes Lofty reads to tell a file's type by its signature. An Ogg
+/// file names its codec within them.
+const SIGNATURE_LEN: u64 = 36;
+
+/// The type a file's first bytes name by a signature Lofty knows, such as
+/// `OggS` or `fLaC`.
+///
+/// Lofty's own guess goes further, past an ID3v2 tag or other bytes: it
+/// takes a file for MPEG when its first kilobyte there holds two bytes that
+/// look like the start of an MPEG frame header, as many headers of other
+/// formats do by chance. Such a guess is not reason enough to read a file as
+/// another type than its extension names.
+fn signed_type(path: &Path) -> Option<FileType> {
+    let mut start = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(SIGNATURE_LEN)
+        .read_to_end(&mut start)
+        .ok()?;
+    FileType::from_buffer(&start)
+}
+
+/// A probe that reads `bytes` as `file_type`.
+fn probe_bytes(bytes: &[u8], file_type: Option<FileType>) -> Probe<Cursor<&[u8]>> {
+    let probe = Probe::new(Cursor::new(bytes));
+    match file_type {
+        Some(file_type) => probe.set_file_type(file_type),
+        None => probe,
+    }
+}
+
+/// Reads a file with Lofty's default parsing, or leniently when that fails.
+///
+/// `probe` makes a fresh probe for each read. When both reads fail, gives
+/// the default read's error.
+fn read_leniently<R: Read + Seek>(
+    probe: impl Fn() -> Result<Probe<R>>,
+) -> Result<(TaggedFile, Option<Dropped>)> {
+    match probe()?.read() {
         Ok(file) => Ok((file, None)),
-        Err(error) => read_relaxed(probe(), error.into()),
+        Err(error) => read_relaxed(probe()?, error.into()),
     }
 }
 
@@ -160,10 +253,10 @@ fn read_file(path: &Path) -> Result<(TaggedFile, Option<anyhow::Error>)> {
 fn read_relaxed<R: Read + Seek>(
     probe: Probe<R>,
     strict: anyhow::Error,
-) -> Result<(TaggedFile, Option<anyhow::Error>)> {
+) -> Result<(TaggedFile, Option<Dropped>)> {
     let relaxed = ParseOptions::new().parsing_mode(ParsingMode::Relaxed);
     match probe.options(relaxed).read() {
-        Ok(file) => Ok((file, Some(strict))),
+        Ok(file) => Ok((file, Some(Dropped::fields(strict)))),
         // The default mode's error says more about the file.
         Err(_) => Err(strict),
     }
@@ -257,6 +350,190 @@ fn relabeled_id3v22(path: &Path) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// How an ID3v2 tag header starts.
+const ID3V2_MAGIC: &[u8] = b"ID3";
+
+/// The ID3v2 major versions Lofty reads. It refuses a file with any other
+/// version in a tag header where it expects one.
+const ID3V2_VERSIONS: std::ops::RangeInclusive<u8> = 2..=4;
+
+/// Where an ID3v2 tag header holds its flags, after the version.
+const ID3V2_FLAGS_AT: usize = 5;
+
+/// The ID3v2 header flag for a footer: a copy of the header, of the same
+/// length, after the tag.
+const ID3V2_FOOTER_FLAG: u8 = 0x10;
+
+/// Where an ID3v2 tag header holds its synchsafe size, after the flags.
+const ID3V2_SIZE_AT: usize = 6;
+
+/// How an ID3v1 tag starts.
+const ID3V1_MAGIC: &[u8] = b"TAG";
+
+/// Length of an ID3v1 tag, which ends the file.
+const ID3V1_LEN: usize = 128;
+
+/// How the footer (and the header) of an APE tag starts.
+const APE_MAGIC: &[u8] = b"APETAGEX";
+
+/// Length of an APE tag footer, which ends the tag, and of the header that
+/// may start it.
+const APE_FOOTER_LEN: usize = 32;
+
+/// Where an APE tag footer holds the size of the items and the footer, as a
+/// little-endian `u32`.
+const APE_SIZE_AT: usize = 12;
+
+/// Where an MPEG file holds the tags Lofty reads.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MpegTags {
+    /// Where each ID3v2 tag at the start of the file begins. Lofty reads them
+    /// one after another and merges them.
+    id3v2: Vec<usize>,
+    /// Where an `ID3` of a version Lofty does not know begins, right after
+    /// those tags. Lofty takes it for a tag header and refuses the whole
+    /// file.
+    unknown_id3v2: Option<usize>,
+    /// The whole of an APE tag, which Lofty reads from its footer.
+    ape: Option<Range<usize>>,
+}
+
+/// Finds the tags of an MPEG file where Lofty looks for them.
+///
+/// Lofty reads ID3v2 tags from the start of the file, past any zero bytes,
+/// for as long as one follows another. It reads an APE tag whose footer ends
+/// the file or comes right before the ID3v1 tag; it checks for a Lyrics3v2
+/// block there too, but compares nine bytes with eight and never finds one.
+fn find_mpeg_tags(bytes: &[u8]) -> MpegTags {
+    let mut tags = MpegTags::default();
+    let mut at = bytes
+        .iter()
+        .position(|&byte| byte != 0)
+        .unwrap_or(bytes.len());
+    while let Some(header) = bytes
+        .get(at..at + ID3V2_HEADER_LEN)
+        .filter(|header| header.starts_with(ID3V2_MAGIC))
+    {
+        let version = header[ID3V2_VERSION_AT];
+        if !ID3V2_VERSIONS.contains(&version) {
+            tags.unknown_id3v2 = Some(at);
+            break;
+        }
+        tags.id3v2.push(at);
+        // Lofty ignores the top bit of each size byte rather than refuse it.
+        let size = header[ID3V2_SIZE_AT..]
+            .iter()
+            .fold(0, |size, &byte| size << 7 | usize::from(byte & 0x7f));
+        // Lofty skips a footer in an ID3v2.3 tag too.
+        let footer = if version >= 3 && header[ID3V2_FLAGS_AT] & ID3V2_FOOTER_FLAG != 0 {
+            ID3V2_HEADER_LEN
+        } else {
+            0
+        };
+        at += ID3V2_HEADER_LEN + size + footer;
+    }
+    let end = match bytes.len().checked_sub(ID3V1_LEN) {
+        Some(id3v1) if bytes[id3v1..].starts_with(ID3V1_MAGIC) => id3v1,
+        _ => bytes.len(),
+    };
+    tags.ape = end
+        .checked_sub(APE_FOOTER_LEN)
+        .filter(|&footer| bytes[footer..].starts_with(APE_MAGIC))
+        .map(|footer| ape_start(bytes, footer)..footer + APE_FOOTER_LEN);
+    tags
+}
+
+/// Where the APE tag whose footer is at `footer` starts: at its header, if
+/// it has one, or else at its first item.
+///
+/// A size in the footer that does not fit in front of it is not trusted, and
+/// the tag is taken to be the footer alone.
+fn ape_start(bytes: &[u8], footer: usize) -> usize {
+    let size = bytes
+        .get(footer + APE_SIZE_AT..footer + APE_SIZE_AT + 4)
+        .and_then(|size| size.try_into().ok())
+        .map(u32::from_le_bytes)
+        .and_then(|size| usize::try_from(size).ok());
+    let Some(items) = size
+        .filter(|&size| size >= APE_FOOTER_LEN)
+        .and_then(|size| (footer + APE_FOOTER_LEN).checked_sub(size))
+    else {
+        return footer;
+    };
+    match items.checked_sub(APE_FOOTER_LEN) {
+        Some(header) if bytes[header..].starts_with(APE_MAGIC) => header,
+        _ => items,
+    }
+}
+
+/// Reads an MPEG file with the tags Lofty refused hidden from it.
+///
+/// Lofty gives up on the whole file when one of its tags fails to parse, even
+/// in relaxed mode, and so loses the tags it could read and the duration
+/// too. This reads `bytes` again with tags zeroed, so that Lofty does not see
+/// them: an `ID3` of an unknown version, which holds nothing it could read,
+/// and then also the APE tag, the ID3v2 tags, or both, whichever first lets
+/// Lofty read the file. Of an ID3v2 tag only the magic bytes are zeroed,
+/// since its header may claim a size that runs into the audio; Lofty then
+/// finds the audio by its frame headers. An APE tag is zeroed whole, so that
+/// nothing in it counts as audio when Lofty searches backwards for the last
+/// frame. When no read succeeds, gives `error`.
+fn read_mpeg_hiding_tags(
+    mut bytes: Vec<u8>,
+    error: anyhow::Error,
+) -> Result<(TaggedFile, Option<Dropped>)> {
+    let tags = find_mpeg_tags(&bytes);
+    let magic = |at: usize| at..at + ID3V2_MAGIC.len();
+    if let Some(at) = tags.unknown_id3v2 {
+        bytes[magic(at)].fill(0);
+    }
+    let id3v2: Vec<Range<usize>> = tags.id3v2.iter().map(|&at| magic(at)).collect();
+    for (what, hide_id3v2, hide_ape) in [
+        (None, false, false),
+        (Some("the unreadable APE tag"), false, true),
+        (Some("the unreadable ID3v2 tag"), true, false),
+        (Some("the unreadable ID3v2 and APE tags"), true, true),
+    ] {
+        let unchanged = tags.unknown_id3v2.is_none() && !hide_id3v2 && !hide_ape;
+        if unchanged || hide_id3v2 && id3v2.is_empty() || hide_ape && tags.ape.is_none() {
+            continue;
+        }
+        let hidden: Vec<Range<usize>> = id3v2
+            .iter()
+            .filter(|_| hide_id3v2)
+            .chain(tags.ape.iter().filter(|_| hide_ape))
+            .cloned()
+            .collect();
+        let kept: Vec<Vec<u8>> = hidden
+            .iter()
+            .map(|range| bytes[range.clone()].to_vec())
+            .collect();
+        for range in &hidden {
+            bytes[range.clone()].fill(0);
+        }
+        if let Ok((file, fields)) = read_leniently(|| Ok(probe_bytes(&bytes, Some(FileType::Mpeg))))
+        {
+            let dropped = match (what, fields) {
+                (None, fields) => fields,
+                (Some(what), None) => Some(Dropped {
+                    what: what.to_string(),
+                    error,
+                }),
+                (Some(what), Some(_)) => Some(Dropped {
+                    what: format!("{what} and malformed tag fields"),
+                    error,
+                }),
+            };
+            return Ok((file, dropped));
+        }
+        // Put the tags back for the next attempt.
+        for (range, kept) in hidden.iter().zip(kept) {
+            bytes[range.clone()].copy_from_slice(&kept);
+        }
+    }
+    Err(error)
+}
+
 /// Sets an absent or blank `field` to the ID3v1 `value`, if that has text.
 ///
 /// ID3v1 pads each field to a fixed width, with NUL bytes or with spaces;
@@ -274,9 +551,8 @@ fn fill(field: &mut Option<String>, value: Option<Cow<'_, str>>) {
     }
 }
 
-/// [`read_tags`], plus the error that made the read drop malformed fields,
-/// when it had to.
-fn read_tags_noting(path: &Path) -> Result<(ScannedTrack, Option<anyhow::Error>)> {
+/// [`read_tags`], plus what the read had to drop, when it had to.
+fn read_tags_noting(path: &Path) -> Result<(ScannedTrack, Option<Dropped>)> {
     let (tagged_file, dropped) = read_file(path)?;
     let tag = tagged_file
         .primary_tag()
@@ -492,10 +768,12 @@ pub async fn scan_directory_incremental(
             let warning = match outcome {
                 Ok(Ok((track, dropped))) => {
                     result.tracks.push(track);
-                    dropped.map(|error| {
+                    dropped.map(|dropped| {
                         format!(
-                            "note: dropped malformed tag fields from {}: {error:#}",
-                            clean_path(path)
+                            "note: dropped {} from {}: {:#}",
+                            dropped.what,
+                            clean_path(path),
+                            dropped.error
                         )
                     })
                 }
@@ -670,14 +948,12 @@ mod tests {
         assert_eq!(read_tags(&path).unwrap().year, Some(1999));
     }
 
-    #[tokio::test]
-    async fn an_import_notes_the_tag_fields_it_dropped() {
-        let dir = crate::test_support::ScratchDir::new("malformed-year-scan");
-        tagged_mp3(&dir.path().join("song.mp3"), "199x");
-
+    /// What an import of `dir`, which holds one file it can read, prints
+    /// about that file.
+    async fn import_warnings(dir: &Path) -> Vec<String> {
         let mut warnings = Vec::new();
         let result = scan_directory_incremental(
-            dir.path(),
+            dir,
             |_, _| false,
             |event| {
                 if let ScanEvent::FileFinished {
@@ -694,6 +970,15 @@ mod tests {
 
         assert_eq!(result.tracks.len(), 1);
         assert!(result.unreadable.is_empty(), "{:?}", result.unreadable);
+        warnings
+    }
+
+    #[tokio::test]
+    async fn an_import_notes_the_tag_fields_it_dropped() {
+        let dir = crate::test_support::ScratchDir::new("malformed-year-scan");
+        tagged_mp3(&dir.path().join("song.mp3"), "199x");
+
+        let warnings = import_warnings(dir.path()).await;
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(
             warnings[0].starts_with("note: dropped malformed tag fields from ")
@@ -703,21 +988,284 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_import_notes_the_tag_it_dropped() {
+        let dir = crate::test_support::ScratchDir::new("dropped-tag-scan");
+        let path = dir.path().join("song.mp3");
+        tagged_mp3(&path, "1999");
+        crate::test_support::append_ape(&path, &[("Album", b"4\xe8me")]);
+
+        let warnings = import_warnings(dir.path()).await;
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("note: dropped the unreadable APE tag from ")
+                && warnings[0].contains("song.mp3")
+                && warnings[0].contains("APE tag item 'Album'"),
+            "{warnings:?}"
+        );
+    }
+
     #[test]
-    fn an_encrypted_frame_without_its_length_still_fails_the_read() {
+    fn an_id3v2_tag_with_an_encrypted_frame_without_its_length_is_dropped() {
+        use crate::test_support::{id3v23_frames, id3v23_tag};
         let dir = crate::test_support::ScratchDir::new("encrypted-frame");
         let path = dir.path().join("song.mp3");
-        crate::test_support::write_id3v23_mp3(
+        let frames = [("TIT2", "Song", 0), ("TENC", "Encoder", 0x0040)];
+        crate::test_support::write_id3v23_mp3(&path, &frames);
+        // Lofty refuses this in every parsing mode, so the file is read
+        // without its ID3v2 tag.
+        let (track, dropped) = read_tags_noting(&path).unwrap();
+        assert_eq!(track.title, None);
+        assert!(track.duration_secs.is_some_and(|secs| secs > 0.9));
+        let dropped = dropped.unwrap();
+        assert_eq!(dropped.what, "the unreadable ID3v2 tag");
+        let error = format!("{:#}", dropped.error);
+        assert!(error.contains("encrypted frame"), "{error}");
+
+        // With no audio either, nothing is left to read: the file stays
+        // unreadable, its stored row, if any, is kept, and the warning says
+        // why the tag failed.
+        std::fs::write(&path, id3v23_tag(&id3v23_frames(&frames))).unwrap();
+        let error = format!("{:#}", read_tags(&path).unwrap_err());
+        assert!(error.contains("encrypted frame"), "{error}");
+    }
+
+    #[test]
+    fn a_file_in_another_format_than_its_extension_names_is_read_as_that_format() {
+        let dir = crate::test_support::ScratchDir::new("other-format");
+        // As found in the wild: an Ogg Vorbis file named `.mp3`. A tagged WAV
+        // file stands in for it.
+        let wav = dir.path().join("song.wav");
+        crate::test_support::write_tagged_wav(&wav, "Tools Of The Trade", 1992);
+        let path = dir.path().join("song.mp3");
+        std::fs::rename(&wav, &path).unwrap();
+        assert!(Probe::open(&path).unwrap().read().is_err());
+
+        let (track, dropped) = read_tags_noting(&path).unwrap();
+        assert_eq!(track.album.as_deref(), Some("Tools Of The Trade"));
+        assert_eq!(track.year, Some(1992));
+        assert!(track.duration_secs.is_some());
+        assert!(dropped.is_none(), "{dropped:?}");
+
+        // A file that fails as that format too is reported as that format.
+        std::fs::write(&path, b"RIFF\x04\x00\x00\x00WAVE").unwrap();
+        let error = format!("{:#}", read_tags(&path).unwrap_err());
+        assert!(error.contains("Wav"), "{error}");
+    }
+
+    #[test]
+    fn a_format_lofty_only_guesses_from_frame_sync_bytes_is_not_trusted() {
+        let dir = crate::test_support::ScratchDir::new("guessed-format");
+        let path = dir.path().join("song.wma");
+        // Lofty cannot read WMA, and takes any file whose first kilobyte
+        // holds bytes that look like an MPEG frame header for MPEG. Many WMA
+        // headers do by chance; here, real MPEG frames after a few bytes of
+        // something else stand in for one.
+        crate::test_support::write_mp3(&path, b"\x30\x26\xb2\x75\x8e\x66\xcf\x11");
+        assert!(read_tags(&path).is_err());
+    }
+
+    #[test]
+    fn an_empty_id3_header_after_the_tag_is_passed_over() {
+        use crate::test_support::{id3v23_frames, id3v23_tag, write_mp3};
+        let dir = crate::test_support::ScratchDir::new("empty-id3-header");
+        let path = dir.path().join("song.mp3");
+        // As found in the wild: a padded ID3v2.3 tag, then `ID3` and eight
+        // zero bytes, then the audio. Lofty takes those for the header of a
+        // tag of version 0 and refuses the whole file.
+        let frames = id3v23_frames(&[
+            ("TPE1", "Morrissey", 0),
+            ("TALB", "Who Put the M in Manchester", 0),
+            ("TIT2", "First Of The Gang To Die", 0),
+            ("TRCK", "1/24", 0),
+            ("TYER", "2005", 0),
+        ]);
+        let tag = id3v23_tag(&[frames, vec![0; 64]].concat());
+        write_mp3(&path, &[tag, b"ID3".to_vec(), vec![0; 8]].concat());
+
+        let (track, dropped) = read_tags_noting(&path).unwrap();
+        assert_eq!(track.artist.as_deref(), Some("Morrissey"));
+        assert_eq!(track.album.as_deref(), Some("Who Put the M in Manchester"));
+        assert_eq!(track.title.as_deref(), Some("First Of The Gang To Die"));
+        assert_eq!(track.track_number, Some(1));
+        assert_eq!(track.year, Some(2005));
+        assert!(track.duration_secs.is_some_and(|secs| secs > 0.9));
+        // The header holds nothing, so nothing was dropped.
+        assert!(dropped.is_none(), "{dropped:?}");
+    }
+
+    #[test]
+    fn an_ape_tag_lofty_refuses_is_dropped_and_the_other_tags_read() {
+        use crate::test_support::{append_ape, append_id3v1, write_id3v23_mp3};
+        let dir = crate::test_support::ScratchDir::new("latin1-ape");
+        let path = dir.path().join("song.mp3");
+        write_id3v23_mp3(
             &path,
-            &[("TIT2", "Song", 0), ("TENC", "Encoder", 0x0040)],
+            &[
+                ("TIT2", "Sabotage", 0),
+                ("TPE1", "Severin 24", 0),
+                ("TALB", "Rencontre Du 4eme Type", 0),
+                ("TYER", "2005", 0),
+            ],
         );
-        // Lofty refuses this in every parsing mode, so the file stays
-        // unreadable and its stored row, if any, is kept.
-        let error = read_tags(&path).unwrap_err();
-        assert!(
-            format!("{error:#}").contains("encrypted frame"),
-            "{error:#}"
+        // As found in the wild: APE text must be UTF-8, but this album title
+        // is Latin-1, its `è` a single byte.
+        append_ape(
+            &path,
+            &[
+                ("Title", b"Sabotage"),
+                ("Album", b"Rencontre Du 4\xe8me Type"),
+            ],
         );
+        append_id3v1(
+            &path,
+            ["Sabotage", "Severin 24", "Rencontre Du 4eme Type", "2005"],
+            1,
+        );
+
+        let (track, dropped) = read_tags_noting(&path).unwrap();
+        assert_eq!(track.title.as_deref(), Some("Sabotage"));
+        assert_eq!(track.artist.as_deref(), Some("Severin 24"));
+        assert_eq!(track.album.as_deref(), Some("Rencontre Du 4eme Type"));
+        assert_eq!(track.year, Some(2005));
+        assert!(track.duration_secs.is_some_and(|secs| secs > 0.9));
+        let dropped = dropped.unwrap();
+        assert_eq!(dropped.what, "the unreadable APE tag");
+        let error = format!("{:#}", dropped.error);
+        assert!(error.contains("APE tag item 'Album'"), "{error}");
+    }
+
+    #[test]
+    fn a_dropped_ape_tag_does_not_count_toward_the_duration() {
+        use crate::test_support::{append_ape, write_id3v23_mp3};
+        let dir = crate::test_support::ScratchDir::new("ape-duration");
+        let path = dir.path().join("song.mp3");
+        write_id3v23_mp3(&path, &[("TIT2", "Song", 0)]);
+        // A large item, such as a cover image, that holds bytes that look
+        // like one of the file's MPEG frame headers. Lofty finds the end of
+        // the audio by searching backwards for such a header.
+        let cover = [&[0; 150_000][..], &[0xff, 0xfb, 0x90, 0x00], &[0; 64]].concat();
+        append_ape(&path, &[("Cover", &cover)]);
+
+        let (track, dropped) = read_tags_noting(&path).unwrap();
+        assert_eq!(track.title.as_deref(), Some("Song"));
+        let secs = track.duration_secs.unwrap();
+        assert!((1.0..1.1).contains(&secs), "{secs}");
+        assert_eq!(dropped.unwrap().what, "the unreadable APE tag");
+    }
+
+    #[test]
+    fn a_corrupt_id3v2_tag_is_dropped_and_the_id3v1_tag_read() {
+        use crate::test_support::{append_id3v1, write_mp3};
+        let dir = crate::test_support::ScratchDir::new("corrupt-id3v2");
+        let path = dir.path().join("song.mp3");
+        // As found in the wild: ID3v2.3 headers that claim thousands of
+        // bytes, over a few dozen bytes of mangled frames with ID3v2.2 IDs,
+        // then the audio. Lofty reads a letter where a frame's text encoding
+        // belongs.
+        let public_enemy = b"ID3\x03\x00\x00\x00\x00\x26\x54\
+            TT2\x00\x00\x00\x0a\x00\x00\x00k 04\x00TRK\x00\x00\x06\x004/18\x00"
+            .to_vec();
+        let horse = [
+            &b"ID3\x03\x00\x00\x00\x01\x62\x4eCOM\x00\x00\x00\x68\x00\x00\x00TunNORM\x00"[..],
+            b" 00001B5B 00001EE2 00005A39 00006E03 00007216 00004D78 00008000 00008000 \
+            00004D61 00004D4A\x00",
+        ]
+        .concat();
+        let public_enemy_v1 = [
+            "Bring The Noise",
+            "Public Enemy",
+            "Power To The People And The Be",
+            "2005",
+        ];
+        let horse_v1 = [
+            "Opening Montage",
+            "HORSE the Band",
+            "Effing 69 Tour",
+            "2005",
+        ];
+
+        // Where each header says its tag ends.
+        for (tag, id3v1, number, claimed_end) in [
+            (public_enemy, public_enemy_v1, 4, 4958),
+            (horse, horse_v1, 1, 29016),
+        ] {
+            write_mp3(&path, &tag);
+            // In real audio, bytes that look like an AAC frame header may
+            // follow there, so that Lofty would guess the file is AAC.
+            let mut bytes = std::fs::read(&path).unwrap();
+            if let Some(sync) = bytes.get_mut(claimed_end..claimed_end + 2) {
+                sync.copy_from_slice(&[0xff, 0xf1]);
+            }
+            std::fs::write(&path, bytes).unwrap();
+            append_id3v1(&path, id3v1, number);
+
+            let (track, dropped) =
+                read_tags_noting(&path).unwrap_or_else(|error| panic!("{id3v1:?}: {error:#}"));
+            assert_eq!(track.title.as_deref(), Some(id3v1[0]));
+            assert_eq!(track.artist.as_deref(), Some(id3v1[1]));
+            assert_eq!(track.album.as_deref(), Some(id3v1[2]));
+            assert_eq!(track.year, Some(2005));
+            assert_eq!(track.track_number, Some(i64::from(number)));
+            // All of the audio counts, from right after the frames.
+            let secs = track.duration_secs.unwrap();
+            assert!((1.0..1.1).contains(&secs), "{id3v1:?}: {secs}");
+            let dropped = dropped.unwrap();
+            assert_eq!(dropped.what, "the unreadable ID3v2 tag");
+            let error = format!("{:#}", dropped.error);
+            assert!(error.contains("invalid text encoding"), "{error}");
+        }
+    }
+
+    #[test]
+    fn mpeg_tags_are_found_where_lofty_looks_for_them() {
+        use crate::test_support::{ape_tag, id3v23_tag};
+        let audio = [0xff; 64];
+        let tag = id3v23_tag(&[0; 4]);
+        // Lofty skips zero bytes, reads ID3v2 tags one after another, and
+        // stops at an `ID3` of a version it does not know.
+        let unknown = b"ID3\x00\x00\x00\x00\x00\x00\x00";
+        let bytes = [&[0, 0][..], &tag, &tag, unknown, &audio].concat();
+        assert_eq!(
+            find_mpeg_tags(&bytes),
+            MpegTags {
+                id3v2: vec![2, 16],
+                unknown_id3v2: Some(30),
+                ape: None,
+            }
+        );
+        // A footer follows the tag; Lofty allows one in ID3v2.3 too.
+        for version in [4, 3] {
+            let mut footed =
+                *b"ID3\x04\x00\x10\x00\x00\x00\x02\x00\x003DI\x04\x00\x10\x00\x00\x00\x02";
+            footed[3] = version;
+            let bytes = [&footed[..], &tag, &audio].concat();
+            assert_eq!(find_mpeg_tags(&bytes).id3v2, [0, 22]);
+        }
+
+        // An APE tag ends the file, or comes right before an ID3v1 tag, and
+        // may start with a header.
+        let ape = ape_tag(&[("Album", b"Album")]);
+        let bytes = [&audio[..], &ape].concat();
+        assert_eq!(find_mpeg_tags(&bytes).ape, Some(64..bytes.len()));
+        let id3v1 = [&b"TAG"[..], &[0; 125]].concat();
+        let bytes = [&audio[..], &ape, &id3v1].concat();
+        assert_eq!(find_mpeg_tags(&bytes).ape, Some(64..bytes.len() - 128));
+        let header = [&b"APETAGEX"[..], &[0; 24]].concat();
+        let bytes = [&audio[..], &header, &ape].concat();
+        assert_eq!(find_mpeg_tags(&bytes).ape, Some(64..bytes.len()));
+        // A footer whose size does not fit covers only itself.
+        let mut oversized = ape.clone();
+        let size_at = ape.len() - 32 + 12;
+        oversized[size_at..size_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let bytes = [&audio[..], &oversized].concat();
+        assert_eq!(
+            find_mpeg_tags(&bytes).ape,
+            Some(bytes.len() - 32..bytes.len())
+        );
+        // Lofty looks nowhere else.
+        let bytes = [&audio[..], &ape, &[0; 16]].concat();
+        assert_eq!(find_mpeg_tags(&bytes), MpegTags::default());
     }
 
     /// Writes an MP3 whose tag header says ID3v2.3 but whose `frames` are
@@ -807,8 +1355,10 @@ mod tests {
         assert_eq!(track.title.as_deref(), Some("Song"));
         assert_eq!(track.artist.as_deref(), Some("Artist"));
         assert_eq!(track.year, None);
-        let dropped = format!("{:#}", dropped.unwrap());
-        assert!(dropped.contains("unexpected character 'x'"), "{dropped}");
+        let dropped = dropped.unwrap();
+        assert_eq!(dropped.what, "malformed tag fields");
+        let error = format!("{:#}", dropped.error);
+        assert!(error.contains("unexpected character 'x'"), "{error}");
     }
 
     #[test]

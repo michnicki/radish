@@ -156,6 +156,37 @@ pub(crate) fn append_id3v1(path: &Path, fields: [&str; 4], track: u8) {
     file.write_all(&tag).unwrap();
 }
 
+/// An APEv2 tag, with no header, holding `(key, value)` text items.
+///
+/// Each value is stored exactly as given, so a test can store text that is
+/// not the UTF-8 the format requires.
+pub(crate) fn ape_tag(items: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for (key, value) in items {
+        bytes.extend_from_slice(&u32::try_from(value.len()).unwrap().to_le_bytes());
+        // Flags 0: a text item that may be changed.
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(value);
+    }
+    // The footer: version 2000, the size of the items and the footer, the
+    // item count, flags 0 (no header) and eight reserved bytes.
+    let size = u32::try_from(bytes.len() + 32).unwrap();
+    bytes.extend_from_slice(b"APETAGEX");
+    for field in [2000, size, u32::try_from(items.len()).unwrap(), 0] {
+        bytes.extend_from_slice(&field.to_le_bytes());
+    }
+    bytes.extend_from_slice(&[0; 8]);
+    bytes
+}
+
+/// Appends an APEv2 tag holding `(key, value)` text items, see [`ape_tag`].
+pub(crate) fn append_ape(path: &Path, items: &[(&str, &[u8])]) {
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    file.write_all(&ape_tag(items)).unwrap();
+}
+
 /// Writes a WAV file whose tag holds `album` and the release `year`.
 pub(crate) fn write_tagged_wav(path: &Path, album: &str, year: u16) {
     use lofty::config::WriteOptions;
