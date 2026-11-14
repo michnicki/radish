@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v34";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v33";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v36";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v35";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -101,8 +101,8 @@ pub const ODD_LENGTH_MIN_TRACKS: usize = 5;
 /// The fewest local tracks the odd-length rule accepts for a Various Artists
 /// release. Its artist component is 1.0 by construction and track artists are
 /// not compared, so the artist is no evidence and the track count has to make
-/// up for it. The leading-tracks rule uses the same minimum for the same
-/// reason.
+/// up for it. The leading-tracks shape has a minimum of its own for the same
+/// reason ([`LEADING_TRACKS_MIN_VARIOUS`]).
 pub const ODD_LENGTH_MIN_VARIOUS_TRACKS: usize = 8;
 
 /// What the warning of an accept under the odd-length rule ends with (see
@@ -144,6 +144,31 @@ pub const TRACKLIST_IDENTITY_SCORE: f64 = 0.95;
 /// the unconfirmed-edition note.
 pub const TRACKLIST_IDENTITY_NOTE: &str = "track titles and lengths agree in track order";
 
+/// The leading-tracks rule: when the files are exactly the first tracks of a
+/// release that lists more (a bonus track, a hidden track or a remix after the
+/// album), in order, the release may be accepted at album scope. The files must
+/// be at least `LEADING_TRACKS_MIN` tracks and at least
+/// `LEADING_TRACKS_MIN_SHARE` of the release's playable tracks, so that a
+/// single is no stand-in for an album and an album is no stand-in for a box set;
+/// a Various Artists release needs [`LEADING_TRACKS_MIN_VARIOUS`] files.
+/// The same shape is the only partial mapping that can be applied at all (see
+/// [`mapping_can_apply`]). Every other condition is in [`leading_tracks_identify`].
+pub const LEADING_TRACKS_MIN: usize = 5;
+pub const LEADING_TRACKS_MIN_SHARE: f64 = 0.75;
+
+/// The fewest files the leading-tracks shape takes for a Various Artists
+/// release, whose artist is no evidence, so the track count has to make up for
+/// it (see [`ODD_LENGTH_MIN_VARIOUS_TRACKS`]). It is part of the shape and not of
+/// the identity rule, so that a smaller subset cannot be applied by a manual
+/// decision either. Compilations are the releases most likely to share a few
+/// tracks with another one.
+pub const LEADING_TRACKS_MIN_VARIOUS: usize = 8;
+
+/// What the warning of an accept under the leading-tracks rule ends with (see
+/// [`leading_tracks_identify`]), so that the runner can print it next to the
+/// unconfirmed-edition note.
+pub const MORE_TRACKS_NOTE: &str = "lists more tracks after the files' last";
+
 /// The endings that mark a warning as the note of an acceptance rule, which the
 /// runner prints under the accept (see [`Evaluation::rule_notes`]).
 const RULE_NOTES: &[&str] = &[
@@ -151,6 +176,7 @@ const RULE_NOTES: &[&str] = &[
     LABEL_DIFFERENCE_NOTE,
     ODD_LENGTH_NOTE,
     TRACKLIST_IDENTITY_NOTE,
+    MORE_TRACKS_NOTE,
 ];
 
 /// The edition qualifiers that a release may carry on one side only without
@@ -3507,10 +3533,24 @@ impl Evaluation {
     }
 
     /// Manual acceptance can override score and identity uncertainty, but never
-    /// an incomplete or structurally unsupported mapping.
-    pub fn can_apply(&self, candidate: &Candidate) -> bool {
-        candidate.mapping.complete && !candidate.release.has_unsupported_entries()
+    /// a partial mapping other than the files being the first tracks of an album
+    /// (see [`mapping_can_apply`]), nor a structurally unsupported one. `local`
+    /// is the release the `candidate` was mapped from.
+    pub fn can_apply(&self, local: &LocalRelease, candidate: &Candidate) -> bool {
+        mapping_can_apply(local, candidate, self.match_scope)
     }
+}
+
+/// Whether `candidate`'s mapping may be written as an accepted match at `scope`,
+/// by an automatic or a manual decision alike: the release has no unsupported
+/// entries and the mapping is complete, or the scope is [`MatchScope::Album`]
+/// and the files are the first tracks of the release ([`leading_tracks`]). No
+/// other subset of a release can be applied, and an edition match, which
+/// claims the release's own tracklist, never applies a partial mapping.
+pub fn mapping_can_apply(local: &LocalRelease, candidate: &Candidate, scope: MatchScope) -> bool {
+    !candidate.release.has_unsupported_entries()
+        && (candidate.mapping.complete
+            || (scope == MatchScope::Album && leading_tracks(local, candidate).is_some()))
 }
 
 /// What another candidate says about the acceptance rules for a candidate.
@@ -3523,14 +3563,10 @@ struct RuleGuards {
     /// the alternative release. `None` lets the rule apply. The rule pushes the
     /// text as a blocker, and only when it would otherwise have applied.
     odd_length_blocker: Option<String>,
-    /// Why the leading-tracks rule must not apply, naming the alternative
-    /// release. `None` lets the rule apply. The rule pushes the text as a
-    /// blocker, and only when it would otherwise have applied. Reserved for the
-    /// leading-tracks rule, which is not implemented yet.
-    #[expect(
-        dead_code,
-        reason = "read by the leading-tracks rule, added in a later step"
-    )]
+    /// Why the leading-tracks rule ([`leading_tracks_identify`]) must not apply,
+    /// naming the alternative release. `None` lets the rule apply. The rule
+    /// pushes the text as a blocker, and only when it would otherwise have
+    /// applied.
     leading_tracks_blocker: Option<String>,
 }
 
@@ -3598,6 +3634,21 @@ pub fn evaluate_for_matching(
     } else {
         None
     };
+    // An edition that lists exactly the files is the likelier source of them
+    // than one that lists more tracks after them.
+    let leading_tracks_blocker = if leading_tracks(local, candidate).is_some() {
+        alternatives
+            .iter()
+            .find(|other| lists_exactly_the_files(local, candidate, other))
+            .map(|other| {
+                format!(
+                    "release {} lists exactly the local tracks",
+                    other.release.id
+                )
+            })
+    } else {
+        None
+    };
     let mut album = evaluate_with(
         local,
         candidate,
@@ -3607,7 +3658,7 @@ pub fn evaluate_for_matching(
         RuleGuards {
             text_identity,
             odd_length_blocker,
-            ..RuleGuards::default()
+            leading_tracks_blocker,
         },
     );
     for other in alternatives {
@@ -3971,31 +4022,7 @@ fn tracklist_identifies_album(
     {
         return false;
     }
-    let known = |duration: Option<f64>| duration.filter(|secs| secs.is_finite() && *secs > 0.0);
-    candidate.mapping.assigned_pairs().all(|(l, r)| {
-        let (Some(local_track), Some(remote_track)) =
-            (local.tracks.get(l), candidate.release.tracklist.get(r))
-        else {
-            return false;
-        };
-        let Some(title) = local_track.title.as_deref() else {
-            return false;
-        };
-        let strictly_the_same = strict_track_title_similarity(
-            title,
-            cleaned.get(l).and_then(Option::as_ref),
-            &remote_track.title,
-        ) >= TITLE_SIMILARITY_THRESHOLD;
-        let qualifiers_match = qualifiers_agree(
-            &album_track_qualifiers(title),
-            &album_track_qualifiers(&remote_track.title),
-        );
-        let lengths_agree = matches!(
-            (known(local_track.duration_secs), known(remote_track.duration_secs)),
-            (Some(a), Some(b)) if (a - b).abs() <= TRACKLIST_IDENTITY_GAP_SECS
-        );
-        strictly_the_same && qualifiers_match && lengths_agree
-    })
+    mapped_pairs_agree_strictly(local, candidate, cleaned, TRACKLIST_IDENTITY_GAP_SECS)
 }
 
 /// Whether the mapping pairs every local track, in local track order, with the
@@ -4040,6 +4067,184 @@ fn maps_onto_leading(
             .iter()
             .zip(playable)
             .all(|(pair, (remote_index, _))| *pair == Some(*remote_index))
+}
+
+/// How many of a release's playable tracks the files are, when they are its
+/// first tracks (see [`leading_tracks`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeadingTracks {
+    /// The local tracks, all of them mapped to the release's first tracks.
+    pub present: usize,
+    /// The playable tracks the release lists.
+    pub listed: usize,
+}
+
+/// Whether the files are exactly the first tracks of a release that lists more:
+/// the mapping is not onto one disc, the files name no disc ([`local_disc_hint`]),
+/// the mapping is incomplete but unambiguous and the release has no unsupported
+/// entries, the release lists more playable tracks than there are files, local
+/// track `k` is mapped to playable track `k` for every file
+/// ([`maps_onto_leading`]), and the files are at least [`LEADING_TRACKS_MIN`]
+/// tracks ([`LEADING_TRACKS_MIN_VARIOUS`] for a Various Artists release) and at
+/// least [`LEADING_TRACKS_MIN_SHARE`] of the playable tracks.
+///
+/// This is the only shape of a partial mapping that can be applied (see
+/// [`mapping_can_apply`]). A release of several media is mapped as a whole, so
+/// the files may open its first disc and the remote lists the rest after them.
+/// Says nothing about the titles or the lengths: see [`leading_tracks_identify`].
+pub fn leading_tracks(local: &LocalRelease, candidate: &Candidate) -> Option<LeadingTracks> {
+    let mapping = &candidate.mapping;
+    if mapping.medium.is_some()
+        || mapping.complete
+        || mapping.ambiguous
+        || candidate.release.has_unsupported_entries()
+        || local_disc_hint(local).is_some()
+    {
+        return None;
+    }
+    let playable = candidate.release.playable_tracks();
+    let (present, listed) = (local.tracks.len(), playable.len());
+    let min_present = if matches!(local.artist_kind, ArtistKind::VariousArtists) {
+        LEADING_TRACKS_MIN_VARIOUS
+    } else {
+        LEADING_TRACKS_MIN
+    };
+    if present >= listed
+        || present < min_present
+        || (present as f64) < LEADING_TRACKS_MIN_SHARE * listed as f64
+        || !maps_onto_leading(local, mapping, &playable)
+    {
+        return None;
+    }
+    Some(LeadingTracks { present, listed })
+}
+
+/// The words that name a short release: the decoration of an album title or a
+/// word of a format that says the release is an EP or a single.
+const SHORT_RELEASE_WORDS: &[&str] = &["cdep", "cds", "cdm", "ep", "maxi", "mcd", "single", "vls"];
+
+/// Whether `word` (lowercase letters and digits) names a short release, with or
+/// without a disc number (`cds2`).
+fn is_short_release_word(word: &str) -> bool {
+    SHORT_RELEASE_WORDS.contains(&word.trim_end_matches(|ch: char| ch.is_ascii_digit()))
+}
+
+/// Whether the decoration at the end of an album title names a short release
+/// ([`SHORT_RELEASE_WORDS`]): `Hello EP`, `Hello-CD Single`, `Clocks-RETAIL CDS`.
+fn decoration_names_short_release(title: &str) -> bool {
+    decoration_run(title).is_some_and(|run| {
+        run.units.first().is_some_and(|first| {
+            decoration_tokens(&title[first.start..])
+                .iter()
+                .any(|(_, token)| is_short_release_word(&alphanumeric_lowercase(token)))
+        })
+    })
+}
+
+/// Whether the remote title's decoration or any word of its formats names a
+/// short release (`CD (Single, EP)`, `Vinyl (12", Maxi-Single)`). The phrase
+/// `Single Sided` (or `Single-sided`) says how a disc is printed and names no
+/// release, so its `single` does not count.
+fn remote_names_short_release(remote: &RemoteRelease) -> bool {
+    decoration_names_short_release(&remote.title)
+        || remote.formats.iter().any(|format| {
+            let words: Vec<String> = format
+                .split(|ch: char| !ch.is_alphanumeric())
+                .filter(|word| !word.is_empty())
+                .map(str::to_lowercase)
+                .collect();
+            words.iter().enumerate().any(|(index, word)| {
+                is_short_release_word(word)
+                    && !(word == "single"
+                        && words.get(index + 1).is_some_and(|next| next == "sided"))
+            })
+        })
+}
+
+/// Whether every mapped pair agrees strictly and in length: a local title, a
+/// score of at least [`TITLE_SIMILARITY_THRESHOLD`] by
+/// [`strict_track_title_similarity`] (a subtitle only one side has is not
+/// forgiven), the same track version qualifiers on both sides, and a known
+/// positive length on both sides within `max_gap_secs`. `cleaned` is
+/// [`cleaned_track_titles`] of `local`.
+fn mapped_pairs_agree_strictly(
+    local: &LocalRelease,
+    candidate: &Candidate,
+    cleaned: &[Option<CleanedTitle>],
+    max_gap_secs: f64,
+) -> bool {
+    let known = |duration: Option<f64>| duration.filter(|secs| secs.is_finite() && *secs > 0.0);
+    candidate.mapping.assigned_pairs().all(|(l, r)| {
+        let (Some(local_track), Some(remote_track)) =
+            (local.tracks.get(l), candidate.release.tracklist.get(r))
+        else {
+            return false;
+        };
+        let Some(title) = local_track.title.as_deref() else {
+            return false;
+        };
+        let strictly_the_same = strict_track_title_similarity(
+            title,
+            cleaned.get(l).and_then(Option::as_ref),
+            &remote_track.title,
+        ) >= TITLE_SIMILARITY_THRESHOLD;
+        let qualifiers_match = qualifiers_agree(
+            &album_track_qualifiers(title),
+            &album_track_qualifiers(&remote_track.title),
+        );
+        let lengths_agree = matches!(
+            (known(local_track.duration_secs), known(remote_track.duration_secs)),
+            (Some(a), Some(b)) if (a - b).abs() <= max_gap_secs
+        );
+        strictly_the_same && qualifiers_match && lengths_agree
+    })
+}
+
+/// The files' place in the release when they are its first tracks
+/// ([`leading_tracks`]) and every other condition of the rule holds, or `None`.
+///
+/// The album title and artist must agree ([`album_text_agrees`], and the titles
+/// [`album_titles_identify`]: numbers must not contradict, no bootleg) and the
+/// release must not be unofficial ([`is_unofficial`]). Every mapped title must
+/// agree by [`track_titles_agree`] and also strictly ([`strict_track_title_similarity`]), so
+/// that a subtitle only one side has never helps, and each title must prefer its
+/// own track over every playable track of the release, those after the files
+/// included ([`titles_prefer_own_tracks`]). Every mapped length must be known on
+/// both sides and within [`DURATION_TOLERANCE_SECS`], and no track version
+/// qualifier may differ on any pair. The album score must reach
+/// [`SCORE_THRESHOLD`] as usual. The files' count is part of the shape
+/// ([`leading_tracks`]), which also holds a Various Artists release to
+/// [`LEADING_TRACKS_MIN_VARIOUS`] files.
+///
+/// The release must also not be a longer name for a short one: when the album
+/// title ends in a word that names an EP or a single ([`SHORT_RELEASE_WORDS`]),
+/// the release's title or its formats must say so as well, because an EP's
+/// tracks open many an album and its title is what tells them apart. The tracks
+/// after the files are no evidence against the album, since the scores average
+/// over the files, and nothing here says why they exist; the warning of the rule
+/// says so. `cleaned` is [`cleaned_track_titles`] of `local`.
+fn leading_tracks_identify(
+    local: &LocalRelease,
+    candidate: &Candidate,
+    cleaned: &[Option<CleanedTitle>],
+) -> Option<LeadingTracks> {
+    let leading = leading_tracks(local, candidate)?;
+    let names_short_release = local
+        .album_title
+        .as_deref()
+        .is_some_and(decoration_names_short_release);
+    if is_unofficial(&candidate.release)
+        || candidate.score.album_score() + 1e-9 < SCORE_THRESHOLD
+        || !album_text_agrees(candidate)
+        || !album_titles_identify(local, candidate)
+        || (names_short_release && !remote_names_short_release(&candidate.release))
+        || !track_titles_agree(local, candidate, cleaned)
+        || !mapped_pairs_agree_strictly(local, candidate, cleaned, DURATION_TOLERANCE_SECS)
+        || !titles_prefer_own_tracks(local, candidate, cleaned)
+    {
+        return None;
+    }
+    Some(leading)
 }
 
 /// Whether the lengths alone identify the tracks of an album-level match: at
@@ -4593,13 +4798,23 @@ fn in_same_release_group(a: &Candidate, b: &Candidate) -> bool {
 /// group or an album whose score is within [`RUNNER_UP_GAP`] of `first`'s. Scores
 /// average over the local tracks, so an edition with bonus tracks ties with the
 /// one that lists exactly the files, and only the second can be applied.
-pub(crate) fn lists_exactly_the_files(first: &Candidate, other: &Candidate) -> bool {
+///
+/// When the files are the first tracks of `first` ([`leading_tracks`]), `first`
+/// can be applied, so another album's exact count is no reason to put it
+/// ahead: only an edition of the same release group is. A near score between
+/// two albums says nothing about which of them the files come from.
+pub(crate) fn lists_exactly_the_files(
+    local: &LocalRelease,
+    first: &Candidate,
+    other: &Candidate,
+) -> bool {
     other.release.id != first.release.id
         && other.mapping.complete
         && !other.mapping.ambiguous
         && !other.release.has_unsupported_entries()
         && (in_same_release_group(first, other)
-            || within_gap(first.score.album_score() - other.score.album_score()))
+            || (leading_tracks(local, first).is_none()
+                && within_gap(first.score.album_score() - other.score.album_score())))
 }
 
 /// Whether any local track maps to a different known recording in each
@@ -4789,8 +5004,36 @@ fn evaluate_with(
         ReleaseId::MusicBrainz(id) => local.embedded_evidence.release_id == Some(*id),
     };
 
-    if !candidate.mapping.complete {
+    let cleaned = cleaned_track_titles(local);
+
+    // The files are the first tracks of a release that lists more, and every
+    // title, length and tag agrees: the missing tracks after the files do not
+    // block. Album scope only. It needs an incomplete mapping, which the rules
+    // that follow rule out, since each needs the mapping in local order. Another
+    // edition that lists exactly the files switches it off with a blocker.
+    let leading = if match_scope == MatchScope::Album {
+        leading_tracks_identify(local, candidate, &cleaned)
+    } else {
+        None
+    };
+    let leading_rule = leading.filter(|_| guards.leading_tracks_blocker.is_none());
+    if !candidate.mapping.complete && leading_rule.is_none() {
+        // The rule would have applied but for another edition that lists
+        // exactly the files, which says why.
+        if leading.is_some()
+            && let Some(blocker) = &guards.leading_tracks_blocker
+        {
+            blockers.push(blocker.clone());
+        }
         blockers.push("track mapping is incomplete".to_string());
+    }
+    if let Some(leading) = leading_rule {
+        warnings.push(format!(
+            "the files are the first {} of {} tracks; {} {MORE_TRACKS_NOTE}",
+            leading.present,
+            leading.listed,
+            remote.provider()
+        ));
     }
     if remote.has_unsupported_entries() {
         blockers.push(
@@ -4806,8 +5049,6 @@ fn evaluate_with(
     // Album scope only.
     let corroborated_title =
         match_scope == MatchScope::Album && corroborated_album(local, candidate);
-
-    let cleaned = cleaned_track_titles(local);
 
     // Lengths that identify every track in track order stand in for the track
     // titles, so the album score gate does not apply. Album scope only, and not
@@ -5393,9 +5634,9 @@ pub struct FallbackCheck {
 /// (raw or cleaned reading), so a file that merely lacks a word only the
 /// primary names settles nothing. A duration conflict is settled when
 /// the file's length is within [`DURATION_TOLERANCE_SECS`] of the fallback's
-/// and at least one tolerance closer to it than to the primary's (further than
-/// the tolerance from the primary's, and the gap to the primary at least the gap
-/// to the fallback plus [`DURATION_TOLERANCE_SECS`]), and the file's title also reads at
+/// and clearly closer to it than to the primary's (further than the tolerance
+/// from the primary's, and the gap to the primary at least the gap to the
+/// fallback plus [`CORROBORATED_DURATION_SECS`]), and the file's title also reads at
 /// least [`TITLE_SIMILARITY_THRESHOLD`] against the fallback's (so a settle
 /// never rests on a track the fallback matched through a weak, junk or
 /// near-miss title). Nothing is settled when the fallback's album title or
@@ -5466,7 +5707,10 @@ pub fn fallback_check(
     }
 
     for primary in primary_candidates {
-        if !primary.mapping.complete {
+        // A primary that lists more tracks after the files guards the fallback
+        // as well as one that lists exactly them: it is the edition the files
+        // would be accepted as, so its qualifiers and lengths count.
+        if !primary.mapping.complete && leading_tracks(local, primary).is_none() {
             continue;
         }
         // A primary that is plausible only because its durations identify the
@@ -5604,7 +5848,7 @@ pub fn fallback_check(
                                 > DURATION_TOLERANCE_SECS
                             && (file_duration - primary_duration).abs()
                                 >= (file_duration - fallback_duration).abs()
-                                    + DURATION_TOLERANCE_SECS =>
+                                    + CORROBORATED_DURATION_SECS =>
                     {
                         settled.push(format!(
                             "primary and fallback durations differ for local track {} ({primary_duration:.1}s versus {fallback_duration:.1}s); the file's {file_duration:.1}s agrees with the fallback",
@@ -6658,7 +6902,7 @@ mod tests {
         let candidate = Candidate::new(&local, remote);
         let evaluation = evaluate(&local, &candidate, None, &DiscoveryEvidence::default());
         assert!(!evaluation.auto_accept);
-        assert!(!evaluation.can_apply(&candidate));
+        assert!(!evaluation.can_apply(&local, &candidate));
     }
 
     #[test]
@@ -7285,7 +7529,7 @@ mod tests {
             None,
             &DiscoveryEvidence::default(),
         );
-        assert!(!incomplete_evaluation.can_apply(&incomplete_candidate));
+        assert!(!incomplete_evaluation.can_apply(&local, &incomplete_candidate));
     }
 
     #[test]
@@ -7371,11 +7615,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v34"
+            "discogs-match-v36"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v33"
+            "musicbrainz-match-v35"
         );
     }
 
@@ -9669,9 +9913,9 @@ mod tests {
     }
 
     #[test]
-    fn the_files_do_not_settle_a_length_less_than_a_tolerance_closer_to_the_fallback() {
+    fn the_files_do_not_settle_a_length_less_than_a_margin_closer_to_the_fallback() {
         // 2.4 s from the fallback and 3.6 s from the primary: more than the
-        // tolerance from the primary, but not one tolerance apart.
+        // tolerance from the primary, but a margin of only 1.2 s.
         let check = settling_check(&TITLES_6, &TITLES_6, |local, primary, fallback| {
             local.tracks[3].duration_secs = Some(217.4);
             fallback.tracklist[3].duration_secs = Some(215.0);
@@ -9683,7 +9927,7 @@ mod tests {
             vec!["primary and fallback durations differ for local track 4".to_string()]
         );
 
-        // One tolerance apart settles: 1.0 s from the fallback, 4.0 s from the
+        // A margin of 3.0 s settles: 1.0 s from the fallback, 4.0 s from the
         // primary.
         let check = settling_check(&TITLES_6, &TITLES_6, |local, primary, fallback| {
             local.tracks[3].duration_secs = Some(216.0);
@@ -9692,6 +9936,33 @@ mod tests {
         });
         assert_eq!(check.conflicts, Vec::<String>::new(), "{check:?}");
         assert_eq!(check.settled.len(), 1, "{check:?}");
+    }
+
+    #[test]
+    fn the_files_settle_a_length_that_is_a_margin_closer_to_the_fallback() {
+        // 2.1 s from the fallback and 4.7 s from the primary: a margin of 2.6 s.
+        let check = settling_check(&TITLES_6, &TITLES_6, |local, primary, fallback| {
+            local.tracks[3].duration_secs = Some(306.1);
+            fallback.tracklist[3].duration_secs = Some(304.0);
+            primary.tracklist[3].duration_secs = Some(310.8);
+        });
+        assert_eq!(check.conflicts, Vec::<String>::new(), "{check:?}");
+        assert_eq!(check.settled.len(), 1, "{check:?}");
+
+        // A margin of exactly CORROBORATED_DURATION_SECS settles, one under does
+        // not: 2.0 s from the fallback and 3.5 s, then 3.4 s, from the primary.
+        let check = settling_check(&TITLES_6, &TITLES_6, |local, primary, fallback| {
+            local.tracks[3].duration_secs = Some(306.0);
+            fallback.tracklist[3].duration_secs = Some(304.0);
+            primary.tracklist[3].duration_secs = Some(309.5);
+        });
+        assert_eq!(check.settled.len(), 1, "{check:?}");
+        let check = settling_check(&TITLES_6, &TITLES_6, |local, primary, fallback| {
+            local.tracks[3].duration_secs = Some(306.0);
+            fallback.tracklist[3].duration_secs = Some(304.0);
+            primary.tracklist[3].duration_secs = Some(309.4);
+        });
+        assert_eq!(check.settled, Vec::<String>::new(), "{check:?}");
     }
 
     #[test]
@@ -9784,6 +10055,44 @@ mod tests {
         assert_eq!(check.settled.len(), 2, "{check:?}");
         assert!(check.settled[0].contains("local track 3"), "{check:?}");
         assert!(check.settled[1].contains("local track 5"), "{check:?}");
+    }
+
+    #[test]
+    fn a_primary_that_lists_more_tracks_after_the_files_still_guards_the_fallback() {
+        // The files are the first ten of twelve tracks; the primary says
+        // `Mono` and the fallback lists exactly the ten.
+        let primary_with = |count: usize| {
+            let (local, mut primary_release) = spaced_pair(&TITLES_12[..10], &TITLES_12[..count]);
+            primary_release.id = ReleaseId::MusicBrainz(mbid(MUSICBRAINZ_PRIMARY_ID));
+            primary_release.edition_notes = vec!["Mono".to_string()];
+            let primary = Candidate::new(&local, primary_release);
+            let (_, fallback_release) = spaced_pair(&TITLES_12[..10], &TITLES_12[..10]);
+            let fallback = Candidate::new(&local, fallback_release);
+            (local, primary, fallback)
+        };
+        for count in [10, 12] {
+            let (local, primary, fallback) = primary_with(count);
+            assert_eq!(primary.mapping.complete, count == 10);
+            assert!(plausibility_score(&local, &primary) >= PLAUSIBLE_PRIMARY_SCORE);
+            let check = fallback_check(&local, &[primary], &fallback, true, false);
+            assert_eq!(
+                check.conflicts,
+                vec![
+                    "primary candidates describe {\"mono\"} but the fallback describes {}"
+                        .to_string()
+                ],
+                "{count} tracks: {check:?}"
+            );
+        }
+
+        // A subset that is not the first tracks does not take part: the
+        // sixth file is missing from the primary's mapping.
+        let (mut local, primary, fallback) = primary_with(12);
+        local.tracks.remove(5);
+        let primary = Candidate::new(&local, primary.release);
+        assert!(!primary.mapping.complete && leading_tracks(&local, &primary).is_none());
+        let check = fallback_check(&local, &[primary], &fallback, true, false);
+        assert_eq!(check.conflicts, Vec::<String>::new(), "{check:?}");
     }
 
     #[test]
@@ -10914,7 +11223,7 @@ mod tests {
         let evaluation =
             evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default());
         assert!(!evaluation.auto_accept);
-        assert!(!evaluation.can_apply(&candidate));
+        assert!(!evaluation.can_apply(&local, &candidate));
         assert!(
             evaluation
                 .blockers
@@ -10930,7 +11239,7 @@ mod tests {
         let candidate = Candidate::new(&local, remote);
         let evaluation =
             evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default());
-        assert!(!evaluation.can_apply(&candidate));
+        assert!(!evaluation.can_apply(&local, &candidate));
     }
 
     #[test]
@@ -11033,7 +11342,7 @@ mod tests {
             "{:?}",
             evaluation.evidence
         );
-        assert!(evaluation.can_apply(&candidate));
+        assert!(evaluation.can_apply(&local, &candidate));
 
         // Disc tags name their source too.
         let mut tagged = local.clone();
@@ -13805,6 +14114,721 @@ mod tests {
         assert_eq!(
             title_version_words(local.album_title.as_deref().unwrap()),
             title_version_words(&remote.title)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The leading-tracks rule
+    // -----------------------------------------------------------------------
+
+    const BONUS_TITLES: [&str; 12] = [
+        "Bonus One",
+        "Bonus Two",
+        "Bonus Three",
+        "Bonus Four",
+        "Bonus Five",
+        "Bonus Six",
+        "Bonus Seven",
+        "Bonus Eight",
+        "Bonus Nine",
+        "Bonus Ten",
+        "Bonus Eleven",
+        "Bonus Twelve",
+    ];
+
+    /// `present` files with the first `present` titles of [`TITLES_12`] and a
+    /// release that lists those tracks and then bonus tracks up to `listed`.
+    /// Lengths agree exactly.
+    fn leading_pair(present: usize, listed: usize) -> (LocalRelease, RemoteRelease) {
+        let local = local_release(&TITLES_12[..present]);
+        let mut titles: Vec<&str> = TITLES_12[..present].to_vec();
+        titles.extend_from_slice(&BONUS_TITLES[..listed - present]);
+        (local, remote_release(&titles))
+    }
+
+    fn leading_warning(evaluation: &Evaluation) -> Option<&str> {
+        evaluation
+            .warnings
+            .iter()
+            .map(String::as_str)
+            .find(|warning| warning.ends_with(MORE_TRACKS_NOTE))
+    }
+
+    fn leading_identifies(local: &LocalRelease, remote: &RemoteRelease) -> bool {
+        let candidate = Candidate::new(local, remote.clone());
+        leading_tracks_identify(local, &candidate, &cleaned_track_titles(local)).is_some()
+    }
+
+    /// Asserts that the rule does not hold, that the release is not accepted
+    /// and that no warning of the rule is printed.
+    fn assert_not_leading(local: &LocalRelease, remote: &RemoteRelease, context: &str) {
+        assert!(!leading_identifies(local, remote), "{context}");
+        let evaluation = album_evaluation(local, remote, &[]);
+        assert!(
+            !evaluation.auto_accept,
+            "{context}: {:?}",
+            evaluation.warnings
+        );
+        assert_eq!(leading_warning(&evaluation), None, "{context}");
+    }
+
+    fn assert_leading_accept(local: &LocalRelease, remote: &RemoteRelease, warning: &str) {
+        let candidate = Candidate::new(local, remote.clone());
+        assert!(leading_tracks(local, &candidate).is_some());
+        assert!(leading_identifies(local, remote));
+        let evaluation = album_evaluation(local, remote, &[]);
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert_eq!(leading_warning(&evaluation), Some(warning));
+        assert_eq!(evaluation.rule_notes().collect::<Vec<_>>(), [warning]);
+        assert!(evaluation.can_apply(local, &candidate));
+    }
+
+    #[test]
+    fn ten_files_that_open_a_twelve_track_release_are_accepted_with_a_warning() {
+        let (local, remote) = leading_pair(10, 12);
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(!candidate.mapping.complete && !candidate.mapping.ambiguous);
+        assert_eq!(
+            leading_tracks(&local, &candidate),
+            Some(LeadingTracks {
+                present: 10,
+                listed: 12
+            })
+        );
+        assert_leading_accept(
+            &local,
+            &remote,
+            "the files are the first 10 of 12 tracks; discogs lists more tracks after the files' last",
+        );
+        // The incomplete mapping is no blocker when the rule applies.
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(
+            !evaluation
+                .blockers
+                .contains(&"track mapping is incomplete".to_string())
+        );
+    }
+
+    #[test]
+    fn the_leading_tracks_rule_applies_to_musicbrainz() {
+        let (local, mut remote) = leading_pair(10, 12);
+        remote.id = ReleaseId::MusicBrainz(mbid(MUSICBRAINZ_PRIMARY_ID));
+        assert_leading_accept(
+            &local,
+            &remote,
+            "the files are the first 10 of 12 tracks; musicbrainz lists more tracks after the files' last",
+        );
+    }
+
+    #[test]
+    fn the_share_of_the_release_that_the_files_make_up_decides() {
+        for (present, listed) in [(5, 6), (6, 8), (9, 12), (12, 16)] {
+            let (local, remote) = leading_pair(present, listed);
+            assert_leading_accept(
+                &local,
+                &remote,
+                &format!(
+                    "the files are the first {present} of {listed} tracks; discogs lists more tracks after the files' last"
+                ),
+            );
+        }
+        for (present, listed) in [(5, 7), (9, 13)] {
+            let (local, remote) = leading_pair(present, listed);
+            let candidate = Candidate::new(&local, remote.clone());
+            assert_eq!(leading_tracks(&local, &candidate), None);
+            assert_not_leading(&local, &remote, &format!("{present} of {listed}"));
+            assert!(
+                !album_evaluation(&local, &remote, &[]).can_apply(&local, &candidate),
+                "{present} of {listed}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_files_of_a_multi_disc_release_that_open_its_first_disc_are_accepted() {
+        // Twelve files, a release of two media with twelve tracks on the first
+        // and three on the second, mapped as a whole.
+        let (local, mut remote) = leading_pair(12, 12);
+        for (index, title) in BONUS_TITLES[..3].iter().enumerate() {
+            remote.tracklist.push(RemoteTrack {
+                position: Some(format!("2-{}", index + 1)),
+                title: (*title).to_string(),
+                artists: Vec::new(),
+                duration_secs: Some(300.0),
+                entry_type: TrackEntryType::Track,
+                medium_position: Some(2),
+                track_position: Some(index as u32 + 1),
+                release_track_id: None,
+                recording_id: None,
+                artist_credit: None,
+            });
+        }
+        for (index, track) in remote.tracklist.iter_mut().take(12).enumerate() {
+            track.position = Some(format!("1-{}", index + 1));
+            track.medium_position = Some(1);
+            track.track_position = Some(index as u32 + 1);
+        }
+        assert!(remote_media(&remote).is_some());
+        let candidate = Candidate::new(&local, remote.clone());
+        assert_eq!(candidate.mapping.medium, None);
+        assert_leading_accept(
+            &local,
+            &remote,
+            "the files are the first 12 of 15 tracks; discogs lists more tracks after the files' last",
+        );
+    }
+
+    #[test]
+    fn the_leading_tracks_rule_is_for_album_scope_only() {
+        let (local, remote) = leading_pair(10, 12);
+        let candidate = Candidate::new(&local, remote);
+        let evaluation = evaluate(&local, &candidate, None, &DiscoveryEvidence::default());
+        assert!(!evaluation.auto_accept);
+        assert!(
+            evaluation
+                .blockers
+                .contains(&"track mapping is incomplete".to_string())
+        );
+        assert_eq!(leading_warning(&evaluation), None);
+        assert!(!evaluation.can_apply(&local, &candidate));
+        assert!(mapping_can_apply(&local, &candidate, MatchScope::Album));
+        assert!(!mapping_can_apply(&local, &candidate, MatchScope::Edition));
+    }
+
+    #[test]
+    fn no_other_subset_of_a_release_can_be_applied() {
+        // The file for the sixth track is missing: not the first tracks.
+        let mut titles = TITLES_12[..10].to_vec();
+        titles.remove(5);
+        let mut local = local_release(&titles);
+        let remote = remote_release(&TITLES_12[..10]);
+        // The files keep their track numbers.
+        for track in local.tracks.iter_mut().skip(5) {
+            track.track_number = track.track_number.map(|number| number + 1);
+        }
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(!candidate.mapping.complete);
+        assert_eq!(leading_tracks(&local, &candidate), None);
+        assert!(!mapping_can_apply(&local, &candidate, MatchScope::Album));
+        assert_not_leading(&local, &remote, "a missing middle track");
+        // Renumbered, the files would sit in the first nine places, but their
+        // titles do not agree there.
+        let renumbered = local_release(&titles);
+        let candidate = Candidate::new(&renumbered, remote.clone());
+        assert!(leading_tracks(&renumbered, &candidate).is_some());
+        assert_not_leading(&renumbered, &remote, "a missing middle track, renumbered");
+        assert!(
+            album_evaluation(&local, &remote, &[])
+                .blockers
+                .contains(&"track mapping is incomplete".to_string())
+        );
+
+        // The last tracks of a release, and every track from the second on.
+        let mut local = local_release(&TITLES_12[2..]);
+        for track in &mut local.tracks {
+            track.track_number = track.track_number.map(|number| number + 2);
+        }
+        let remote = remote_release(&TITLES_12);
+        let candidate = Candidate::new(&local, remote.clone());
+        assert_eq!(leading_tracks(&local, &candidate), None);
+        assert_not_leading(&local, &remote, "the last tracks");
+
+        // Complete mappings stay as they were, and a structural issue blocks.
+        let (local, remote) = leading_pair(10, 10);
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(mapping_can_apply(&local, &candidate, MatchScope::Edition));
+        let (local, mut remote) = leading_pair(10, 12);
+        remote.structure_issues = vec!["medium 1 has a pregap track".to_string()];
+        let candidate = Candidate::new(&local, remote);
+        assert_eq!(leading_tracks(&local, &candidate), None);
+        assert!(!mapping_can_apply(&local, &candidate, MatchScope::Album));
+
+        // A complete mapping of a release that gains an unsupported entry after
+        // it was mapped is not applied either.
+        let (local, remote) = leading_pair(10, 10);
+        let mut candidate = Candidate::new(&local, remote);
+        assert!(candidate.mapping.complete);
+        candidate.release.structure_issues = vec!["medium 1 has a pregap track".to_string()];
+        assert!(!mapping_can_apply(&local, &candidate, MatchScope::Album));
+        assert!(!mapping_can_apply(&local, &candidate, MatchScope::Edition));
+    }
+
+    #[test]
+    fn the_shape_needs_an_incomplete_mapping_that_is_not_onto_one_disc() {
+        // As many files as tracks, but a mapping that says it is incomplete.
+        let (local, remote) = leading_pair(10, 10);
+        let mut candidate = Candidate::new(&local, remote);
+        candidate.mapping.complete = false;
+        assert_eq!(leading_tracks(&local, &candidate), None);
+        assert!(!mapping_can_apply(&local, &candidate, MatchScope::Album));
+
+        // A mapping onto one medium, even for files that name no disc.
+        let (local, remote) = leading_pair(10, 12);
+        let mut candidate = Candidate::new(&local, remote);
+        assert!(leading_tracks(&local, &candidate).is_some());
+        candidate.mapping.medium = Some(2);
+        assert_eq!(leading_tracks(&local, &candidate), None);
+        assert!(!mapping_can_apply(&local, &candidate, MatchScope::Album));
+    }
+
+    #[test]
+    fn a_score_under_the_gate_stays_blocked() {
+        // Four titles at about 0.91 and every length 3 s off: every pair agrees,
+        // but the album score is under 0.95.
+        let (mut local, mut remote) = leading_pair(10, 12);
+        for (index, typo) in [
+            (1, "Second Wing"),
+            (6, "Harbor Lighta"),
+            (7, "Paper Crowna"),
+            (9, "Iron Gardew"),
+        ] {
+            remote.tracklist[index].title = typo.to_string();
+        }
+        for track in &mut local.tracks {
+            track.duration_secs = track.duration_secs.map(|secs| secs + 3.0);
+        }
+        let candidate = Candidate::new(&local, remote.clone());
+        let cleaned = cleaned_track_titles(&local);
+        assert!(track_titles_agree(&local, &candidate, &cleaned));
+        assert!(candidate.score.album_score() < SCORE_THRESHOLD);
+        assert_not_leading(&local, &remote, "album score under 0.95");
+    }
+
+    #[test]
+    fn too_few_files_stay_blocked() {
+        // A three-track single against a twelve-track album.
+        let (local, remote) = leading_pair(3, 12);
+        assert_not_leading(&local, &remote, "single against album");
+        // A five-track EP against twelve tracks, and four of five.
+        let (local, remote) = leading_pair(5, 12);
+        assert_not_leading(&local, &remote, "EP against album");
+        let (local, remote) = leading_pair(4, 5);
+        let candidate = Candidate::new(&local, remote.clone());
+        assert_eq!(leading_tracks(&local, &candidate), None);
+        assert_not_leading(&local, &remote, "four of five");
+    }
+
+    #[test]
+    fn files_out_of_the_release_order_stay_blocked() {
+        let (local, mut remote) = leading_pair(10, 12);
+        remote.tracklist.swap(2, 3);
+        let candidate = Candidate::new(&local, remote.clone());
+        assert_eq!(leading_tracks(&local, &candidate), None);
+        assert_not_leading(&local, &remote, "out of order");
+    }
+
+    #[test]
+    fn an_ambiguous_mapping_stays_blocked() {
+        let (local, remote) = leading_pair(10, 12);
+        let mut candidate = Candidate::new(&local, remote);
+        assert!(leading_tracks(&local, &candidate).is_some());
+        candidate.mapping.ambiguous = true;
+        assert_eq!(leading_tracks(&local, &candidate), None);
+        assert!(!mapping_can_apply(&local, &candidate, MatchScope::Album));
+        let evaluation =
+            evaluate_for_matching(&local, &candidate, &[], &DiscoveryEvidence::default());
+        assert!(!evaluation.auto_accept);
+        assert_eq!(leading_warning(&evaluation), None);
+    }
+
+    #[test]
+    fn a_disc_folder_is_never_the_first_tracks_of_a_release() {
+        // `CD1` of a single-disc release listing two more tracks.
+        let (mut local, remote) = leading_pair(10, 12);
+        local.directory = "/music/Set/CD1".to_string();
+        assert!(local_disc_hint(&local).is_some());
+        let candidate = Candidate::new(&local, remote.clone());
+        assert_eq!(leading_tracks(&local, &candidate), None);
+        assert_not_leading(&local, &remote, "CD1 folder");
+
+        // The tenth to twelfth... ten files of the twelve on the second disc of
+        // a set: mapped onto that disc alone.
+        let remote = disc_set(&[4, 12]);
+        let local = disc_folder("/music/Set/CD2", 2, 10);
+        let candidate = Candidate::new(&local, remote.clone());
+        assert_eq!(candidate.mapping.medium, Some(2));
+        assert_eq!(leading_tracks(&local, &candidate), None);
+        assert!(!mapping_can_apply(&local, &candidate, MatchScope::Album));
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(!evaluation.auto_accept);
+        assert_eq!(leading_warning(&evaluation), None);
+    }
+
+    #[test]
+    fn a_disc_named_by_the_album_title_or_the_disc_tags_is_not_the_first_tracks() {
+        // `Album (Disc 1)`: the files say they are one disc of a set.
+        let (mut local, mut remote) = leading_pair(10, 12);
+        local.album_title = Some("Test Album (Disc 1)".to_string());
+        remote.title = "Test Album (Disc 1)".to_string();
+        assert!(local_disc_hint(&local).is_some());
+        let candidate = Candidate::new(&local, remote.clone());
+        assert_eq!(leading_tracks(&local, &candidate), None);
+        assert!(!mapping_can_apply(&local, &candidate, MatchScope::Album));
+        assert_not_leading(&local, &remote, "disc 1 in the album title");
+
+        // Every file tagged disc 2.
+        let (mut local, remote) = leading_pair(10, 12);
+        for track in &mut local.tracks {
+            track.disc = Some(2);
+        }
+        assert!(local_disc_hint(&local).is_some());
+        let candidate = Candidate::new(&local, remote.clone());
+        assert_eq!(leading_tracks(&local, &candidate), None);
+        assert!(!mapping_can_apply(&local, &candidate, MatchScope::Album));
+        assert_not_leading(&local, &remote, "uniform disc 2 tags");
+
+        // A uniform disc 1 tag is what a missing tag means, so it gives no hint.
+        let (mut local, remote) = leading_pair(10, 12);
+        for track in &mut local.tracks {
+            track.disc = Some(1);
+        }
+        assert!(local_disc_hint(&local).is_none());
+        assert!(leading_identifies(&local, &remote));
+    }
+
+    #[test]
+    fn the_longer_edition_with_a_release_level_qualifier_stays_blocked() {
+        // The files carry no qualifier and the release that lists more tracks
+        // is a `Deluxe` edition. The label exception needs lengths that
+        // identify a complete mapping, which an incomplete one cannot give.
+        let (local, mut remote) = leading_pair(10, 12);
+        remote.edition_notes = vec!["Deluxe".to_string()];
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(leading_tracks(&local, &candidate).is_some());
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(!evaluation.auto_accept);
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|blocker| blocker.starts_with("edition qualifiers differ")),
+            "{:?}",
+            evaluation.blockers
+        );
+    }
+
+    #[test]
+    fn a_weak_title_stays_blocked() {
+        let (mut local, mut remote) = leading_pair(10, 12);
+        local.tracks[6].title = Some("Harbor Lights".to_string());
+        remote.tracklist[6].title = "Harbor Lighters".to_string();
+        let candidate = Candidate::new(&local, remote.clone());
+        let cleaned = cleaned_track_titles(&local);
+        let similarity = candidate
+            .mapping
+            .title_similarity(&local, &cleaned, 6, 6, &remote.tracklist[6])
+            .unwrap();
+        assert!(
+            (0.75..TITLE_SIMILARITY_THRESHOLD).contains(&similarity),
+            "{similarity}"
+        );
+        assert_not_leading(&local, &remote, "a title at 0.8");
+    }
+
+    #[test]
+    fn a_subtitle_on_one_side_of_a_mapped_pair_stays_blocked() {
+        let (mut local, mut remote) = leading_pair(10, 12);
+        local.tracks[2].title = Some("Hollow".to_string());
+        remote.tracklist[2].title = "Hollow / [unknown]".to_string();
+        let candidate = Candidate::new(&local, remote.clone());
+        let cleaned = cleaned_track_titles(&local);
+        assert!(
+            candidate
+                .mapping
+                .title_similarity(&local, &cleaned, 2, 2, &remote.tracklist[2])
+                .unwrap()
+                >= TITLE_SIMILARITY_THRESHOLD
+        );
+        assert!(
+            strict_track_title_similarity("Hollow", None, "Hollow / [unknown]")
+                < TITLE_SIMILARITY_THRESHOLD
+        );
+        assert_not_leading(&local, &remote, "one-sided subtitle");
+    }
+
+    #[test]
+    fn a_title_nearer_an_extra_track_stays_blocked() {
+        // The mapped title is a near match while a track after the files has
+        // the file's title exactly.
+        let (local, mut remote) = leading_pair(10, 12);
+        remote.tracklist[6].title = "Harbor Lightss".to_string();
+        remote.tracklist[11].title = "Harbor Lights".to_string();
+        let candidate = Candidate::new(&local, remote.clone());
+        let cleaned = cleaned_track_titles(&local);
+        assert!(leading_tracks(&local, &candidate).is_some());
+        assert!(track_titles_agree(&local, &candidate, &cleaned));
+        assert!(!titles_prefer_own_tracks(&local, &candidate, &cleaned));
+        assert_not_leading(&local, &remote, "a title nearer an extra track");
+    }
+
+    #[test]
+    fn a_length_that_is_off_or_missing_stays_blocked() {
+        // The fifth track is 184 s on both sides to begin with.
+        let (mut local, remote) = leading_pair(10, 12);
+        local.tracks[4].duration_secs = Some(189.0);
+        assert_not_leading(&local, &remote, "5 s off");
+
+        let (mut local, remote) = leading_pair(10, 12);
+        local.tracks[4].duration_secs = Some(187.0);
+        assert!(leading_identifies(&local, &remote), "exactly 3 s off");
+        local.tracks[4].duration_secs = Some(187.5);
+        assert_not_leading(&local, &remote, "3.5 s off");
+
+        let (local, mut remote) = leading_pair(10, 12);
+        remote.tracklist[4].duration_secs = None;
+        assert_not_leading(&local, &remote, "a remote length missing");
+
+        let (mut local, remote) = leading_pair(10, 12);
+        local.tracks[4].duration_secs = None;
+        assert_not_leading(&local, &remote, "a local length missing");
+
+        // A length missing on a track after the files does not matter.
+        let (local, mut remote) = leading_pair(10, 12);
+        remote.tracklist[11].duration_secs = None;
+        assert!(leading_identifies(&local, &remote));
+    }
+
+    #[test]
+    fn an_album_title_that_does_not_agree_stays_blocked() {
+        let (mut local, remote) = leading_pair(10, 12);
+        local.album_title = Some("Test Albumxx".to_string());
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(
+            (0.80..TITLE_SIMILARITY_THRESHOLD).contains(&candidate.score.album_title),
+            "{}",
+            candidate.score.album_title
+        );
+        assert_not_leading(&local, &remote, "album title 0.85");
+
+        let (mut local, mut remote) = leading_pair(10, 12);
+        local.album_title = Some("Hits Vol. 2".to_string());
+        remote.title = "Hits Vol. 3".to_string();
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(candidate.score.album_title >= TITLE_SIMILARITY_THRESHOLD);
+        assert_not_leading(&local, &remote, "Vol. 2 against Vol. 3");
+
+        let (mut local, remote) = leading_pair(10, 12);
+        local.album_artist = Some("Somebody Else".to_string());
+        assert_not_leading(&local, &remote, "another artist");
+    }
+
+    #[test]
+    fn a_track_version_qualifier_that_differs_stays_blocked() {
+        let (mut local, mut remote) = leading_pair(10, 12);
+        local.tracks[6].title = Some("Harbor Lights Remix".to_string());
+        remote.tracklist[6].title = "Harbor Lights Remit".to_string();
+        assert!(
+            strict_track_title_similarity("Harbor Lights Remix", None, "Harbor Lights Remit")
+                >= TITLE_SIMILARITY_THRESHOLD
+        );
+        assert_not_leading(&local, &remote, "remix against remit");
+    }
+
+    #[test]
+    fn an_unofficial_release_stays_blocked() {
+        let (local, mut remote) = leading_pair(10, 12);
+        remote.formats = vec!["CD (Unofficial Release)".to_string()];
+        assert_not_leading(&local, &remote, "unofficial Discogs release");
+
+        let (local, mut remote) = leading_pair(10, 12);
+        remote.id = ReleaseId::MusicBrainz(mbid(MUSICBRAINZ_PRIMARY_ID));
+        remote.provider_metadata = serde_json::json!({"status": "Bootleg"});
+        assert_not_leading(&local, &remote, "bootleg MusicBrainz release");
+    }
+
+    #[test]
+    fn a_title_that_names_a_short_release_needs_the_release_to_say_so() {
+        for word in ["EP", "CDEP", "Single", "CDS", "CDM", "Maxi", "MCD", "VLS"] {
+            let (mut local, mut remote) = leading_pair(6, 8);
+            local.album_title = Some(format!("Test Album {word}"));
+            remote.formats = vec!["CD".to_string()];
+            let candidate = Candidate::new(&local, remote.clone());
+            assert!(
+                candidate.score.album_title >= TITLE_SIMILARITY_THRESHOLD,
+                "{word}: {}",
+                candidate.score.album_title
+            );
+            assert_not_leading(&local, &remote, &format!("{word} against CD"));
+
+            // A format that names a short release.
+            remote.formats = vec!["CD (Single, EP)".to_string()];
+            assert!(
+                leading_identifies(&local, &remote),
+                "{word} against EP format"
+            );
+            // A title that does.
+            remote.formats = vec!["CD".to_string()];
+            remote.title = format!("Test Album {word}");
+            assert!(leading_identifies(&local, &remote), "{word} against title");
+        }
+
+        // The wording of the format is read word by word.
+        let (mut local, mut remote) = leading_pair(6, 8);
+        local.album_title = Some("Test Album EP".to_string());
+        remote.formats = vec!["Vinyl (12\", Maxi-Single)".to_string()];
+        assert!(leading_identifies(&local, &remote));
+        remote.formats = vec!["CD (Album)".to_string(), "DVD".to_string()];
+        assert_not_leading(&local, &remote, "album and DVD formats");
+
+        // A title that names none needs nothing, and `Epic` is not `EP`.
+        let (local, mut remote) = leading_pair(6, 8);
+        remote.formats = vec!["CD".to_string()];
+        assert!(leading_identifies(&local, &remote));
+        let (mut local, mut remote) = leading_pair(6, 8);
+        local.album_title = Some("Test Album Epic".to_string());
+        remote.title = "Test Album Epic".to_string();
+        remote.formats = vec!["CD".to_string()];
+        assert!(leading_identifies(&local, &remote));
+    }
+
+    #[test]
+    fn a_single_sided_format_does_not_name_a_single() {
+        let (mut local, mut remote) = leading_pair(6, 8);
+        local.album_title = Some("Test Album EP".to_string());
+        for format in [
+            "CD (Single Sided)",
+            "Vinyl (12\", Single-sided)",
+            "DVD (single sided)",
+        ] {
+            remote.formats = vec![format.to_string()];
+            assert!(!remote_names_short_release(&remote), "{format}");
+            assert_not_leading(&local, &remote, format);
+        }
+        // A format that also names a short release still does.
+        for format in ["CD (Single Sided, EP)", "Vinyl (7\", Single, Single-sided)"] {
+            remote.formats = vec![format.to_string()];
+            assert!(remote_names_short_release(&remote), "{format}");
+            assert!(leading_identifies(&local, &remote), "{format}");
+        }
+    }
+
+    #[test]
+    fn a_various_artists_release_needs_eight_files() {
+        let various = |present, listed| {
+            let (mut local, mut remote) = leading_pair(present, listed);
+            local.artist_kind = ArtistKind::VariousArtists;
+            local.album_artist = Some("Various Artists".to_string());
+            remote.artists = vec!["Various Artists".to_string()];
+            (local, remote)
+        };
+        // The minimum is part of the shape, so a smaller subset cannot be
+        // applied either, not even by a manual decision.
+        for (present, listed) in [(5, 6), (7, 9)] {
+            let (local, remote) = various(present, listed);
+            let candidate = Candidate::new(&local, remote.clone());
+            assert_eq!(leading_tracks(&local, &candidate), None, "{present} files");
+            assert!(
+                !mapping_can_apply(&local, &candidate, MatchScope::Album),
+                "{present} files"
+            );
+            assert_not_leading(
+                &local,
+                &remote,
+                &format!("Various Artists, {present} files"),
+            );
+        }
+        let (local, remote) = various(LEADING_TRACKS_MIN_VARIOUS, 10);
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(leading_tracks(&local, &candidate).is_some());
+        assert!(mapping_can_apply(&local, &candidate, MatchScope::Album));
+        assert!(leading_identifies(&local, &remote));
+        // Other artists keep the smaller minimum.
+        let (local, remote) = leading_pair(LEADING_TRACKS_MIN, 6);
+        let candidate = Candidate::new(&local, remote);
+        assert!(mapping_can_apply(&local, &candidate, MatchScope::Album));
+    }
+
+    #[test]
+    fn an_edition_that_lists_exactly_the_files_blocks_the_longer_one() {
+        let (local, longer) = leading_pair(10, 12);
+        let (_, mut exact) = leading_pair(10, 10);
+        exact.id = ReleaseId::Discogs(43);
+        let exact_candidate = Candidate::new(&local, exact.clone());
+        assert!(exact_candidate.mapping.complete);
+
+        // Another edition of the same group.
+        let mut longer_in_group = longer.clone();
+        longer_in_group.group_id = Some(GroupId::DiscogsMaster(7));
+        let mut exact_in_group = exact.clone();
+        exact_in_group.group_id = Some(GroupId::DiscogsMaster(7));
+        let exact_in_group = Candidate::new(&local, exact_in_group);
+        let evaluation = album_evaluation(
+            &local,
+            &longer_in_group,
+            std::slice::from_ref(&exact_in_group),
+        );
+        assert!(!evaluation.auto_accept);
+        assert!(
+            evaluation
+                .blockers
+                .contains(&"release discogs 43 lists exactly the local tracks".to_string()),
+            "{:?}",
+            evaluation.blockers
+        );
+        assert_eq!(leading_warning(&evaluation), None);
+
+        // The exact edition itself is accepted, with no warning.
+        let longer_candidate = Candidate::new(&local, longer_in_group);
+        let evaluation = album_evaluation(
+            &local,
+            &exact_in_group.release,
+            std::slice::from_ref(&longer_candidate),
+        );
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert_eq!(leading_warning(&evaluation), None);
+
+        // An album of another group within the score gap does not: the files
+        // are the first tracks of this one, and a near score says nothing about
+        // which album they come from. The close-alternative gate still decides.
+        let evaluation = album_evaluation(&local, &longer, std::slice::from_ref(&exact_candidate));
+        assert!(
+            !evaluation
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("lists exactly")),
+            "{:?}",
+            evaluation.blockers
+        );
+        assert!(!lists_exactly_the_files(
+            &local,
+            &Candidate::new(&local, longer.clone()),
+            &exact_candidate
+        ));
+        // Without the leading shape the same pair counts as before.
+        let mut not_leading = Candidate::new(&local, longer.clone());
+        not_leading.mapping.ambiguous = true;
+        assert!(leading_tracks(&local, &not_leading).is_none());
+        assert!(lists_exactly_the_files(
+            &local,
+            &not_leading,
+            &exact_candidate
+        ));
+
+        // An alternative that does not list the files exactly does not.
+        let (_, mut other_longer) = leading_pair(10, 11);
+        other_longer.id = ReleaseId::Discogs(44);
+        other_longer.group_id = Some(GroupId::DiscogsMaster(7));
+        let mut longer_in_group = longer.clone();
+        longer_in_group.group_id = Some(GroupId::DiscogsMaster(7));
+        let evaluation = album_evaluation(
+            &local,
+            &longer_in_group,
+            &[Candidate::new(&local, other_longer)],
+        );
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert!(leading_warning(&evaluation).is_some());
+
+        // A guard is only a blocker when the rule would have applied.
+        let (local, mut longer) = leading_pair(10, 12);
+        longer.tracklist[4].duration_secs = Some(190.0);
+        let evaluation = album_evaluation(&local, &longer, std::slice::from_ref(&exact_candidate));
+        assert!(
+            !evaluation
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("lists exactly")),
+            "{:?}",
+            evaluation.blockers
         );
     }
 }

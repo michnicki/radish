@@ -1999,11 +1999,13 @@ pub async fn accept_match(
     guard: &MatchGuard,
 ) -> Result<()> {
     let local_release_id = release.id;
-    if !candidate.mapping.complete {
-        bail!("refusing to accept an incomplete track mapping");
-    }
     if candidate.release.has_unsupported_entries() {
         bail!("refusing to accept a release with unsupported structure");
+    }
+    // Only the files being the first tracks of an album may leave tracks of the
+    // release unmatched, and only at album scope. Those tracks get no row.
+    if !matcher::mapping_can_apply(release, candidate, match_scope) {
+        bail!("refusing to accept an incomplete track mapping");
     }
     if candidate.mapping.pairs.len() != release.tracks.len() {
         return Err(snapshot_changed(
@@ -3122,6 +3124,166 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(matches, 0);
+    }
+
+    #[tokio::test]
+    async fn the_first_tracks_of_a_release_are_applied_at_album_scope_only() {
+        let pool = test_pool().await;
+        let files: Vec<ScannedTrack> = (1..=5)
+            .map(|number| {
+                scanned(
+                    &format!("/music/a/{number:02}.flac"),
+                    Some("Blue"),
+                    Some("Artist"),
+                    number,
+                )
+            })
+            .collect();
+        insert(&pool, "/music/a", &files).await;
+        let release = load_local_releases(&pool, None).await.unwrap().remove(0);
+        let guard = load_match_guard(&pool, release.id).await.unwrap();
+        let titles: Vec<String> = (1..=6).map(|number| format!("Track {number}")).collect();
+        let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let candidate = Candidate::new(&release, remote_with(&titles));
+        assert!(!candidate.mapping.complete);
+        assert!(matcher::leading_tracks(&release, &candidate).is_some());
+
+        let rows = |pool: SqlitePool| async move {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM release_track_matches")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+
+        // An edition match claims the release's own tracklist: refused.
+        let error = accept_match(
+            &pool,
+            &release,
+            &candidate,
+            AcceptanceMethod::Manual,
+            MatchScope::Edition,
+            &guard,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("incomplete"), "{error}");
+        assert_eq!(rows(pool.clone()).await, 0);
+
+        // An album match applies the five files and nothing for the sixth track.
+        accept_match(
+            &pool,
+            &release,
+            &candidate,
+            AcceptanceMethod::Manual,
+            MatchScope::Album,
+            &guard,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows(pool.clone()).await, 5);
+        let ordinals: Vec<i64> = sqlx::query_scalar(
+            "SELECT remote_ordinal FROM release_track_matches ORDER BY remote_ordinal",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ordinals, vec![1, 2, 3, 4, 5]);
+        let matches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_matches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(matches, 1);
+    }
+
+    #[tokio::test]
+    async fn another_subset_of_a_release_is_never_applied() {
+        let pool = test_pool().await;
+        let files: Vec<ScannedTrack> = (1..=3)
+            .map(|number| {
+                scanned(
+                    &format!("/music/a/{number:02}.flac"),
+                    Some("Blue"),
+                    Some("Artist"),
+                    number,
+                )
+            })
+            .collect();
+        insert(&pool, "/music/a", &files).await;
+        let release = load_local_releases(&pool, None).await.unwrap().remove(0);
+        let guard = load_match_guard(&pool, release.id).await.unwrap();
+        let titles: Vec<String> = (1..=6).map(|number| format!("Track {number}")).collect();
+        let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let candidate = Candidate::new(&release, remote_with(&titles));
+        assert!(!candidate.mapping.complete);
+        // Three of six: the leading shape, but too few files and too small a share.
+        assert!(matcher::leading_tracks(&release, &candidate).is_none());
+
+        for scope in [MatchScope::Album, MatchScope::Edition] {
+            let result = accept_match(
+                &pool,
+                &release,
+                &candidate,
+                AcceptanceMethod::Manual,
+                scope,
+                &guard,
+            )
+            .await;
+            assert!(result.is_err(), "{scope:?}");
+        }
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_track_matches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn a_subset_with_a_missing_middle_track_is_never_applied() {
+        let pool = test_pool().await;
+        // Six of eight tracks, enough files and enough of the release, but the
+        // fourth track has no file: not the first tracks.
+        let files: Vec<ScannedTrack> = [1, 2, 3, 5, 6, 7]
+            .into_iter()
+            .map(|number| {
+                scanned(
+                    &format!("/music/a/{number:02}.flac"),
+                    Some("Blue"),
+                    Some("Artist"),
+                    number,
+                )
+            })
+            .collect();
+        insert(&pool, "/music/a", &files).await;
+        let release = load_local_releases(&pool, None).await.unwrap().remove(0);
+        let guard = load_match_guard(&pool, release.id).await.unwrap();
+        let titles: Vec<String> = (1..=8).map(|number| format!("Track {number}")).collect();
+        let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let candidate = Candidate::new(&release, remote_with(&titles));
+        assert!(!candidate.mapping.complete && !candidate.mapping.ambiguous);
+        assert_eq!(release.tracks.len(), 6);
+        assert!(matcher::leading_tracks(&release, &candidate).is_none());
+
+        for scope in [MatchScope::Album, MatchScope::Edition] {
+            let error = accept_match(
+                &pool,
+                &release,
+                &candidate,
+                AcceptanceMethod::Manual,
+                scope,
+                &guard,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("incomplete"),
+                "{scope:?}: {error}"
+            );
+        }
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_track_matches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[tokio::test]

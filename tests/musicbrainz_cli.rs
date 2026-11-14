@@ -496,3 +496,107 @@ async fn a_folder_without_a_disc_number_is_not_matched_to_one_disc() {
     assert_eq!(matches, 0);
     pool.close().await;
 }
+
+fn longer_release_handler(target: &str) -> (u16, String) {
+    if target.contains(&format!("/ws/2/release/{MBID}")) {
+        let titles: Vec<String> = (1..=7).map(|number| format!("Track {number}!")).collect();
+        let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let durations: Vec<f64> = (0..7).map(|index| 180.0 + index as f64).collect();
+        return (200, musicbrainz_release_json(MBID, &titles, &durations));
+    }
+    if target.contains("/ws/2/release") {
+        let release = serde_json::json!({
+            "id": MBID, "title": "Blue", "date": "2001-05-01",
+            "artist-credit": [{"name": "Test Artist", "joinphrase": ""}]
+        });
+        return (
+            200,
+            serde_json::json!({"count": 1, "offset": 0, "releases": [release]}).to_string(),
+        );
+    }
+    (500, "unexpected Discogs request".to_string())
+}
+
+/// `count` files named `Track N` of one album with no MusicBrainz identifiers,
+/// each as long as the same track of [`longer_release_handler`]'s release.
+async fn seed_first_tracks(db: &Path, count: i64) {
+    let pool = radish::db::connect(db).await.unwrap();
+    let directory = Path::new("/music/blue");
+    let directory_id = store::upsert_directory(&pool, directory).await.unwrap();
+    for number in 1..=count {
+        let track = ScannedTrack {
+            path: directory.join(format!("{number:02}.flac")),
+            title: Some(format!("Track {number}")),
+            artist: Some("Test Artist".to_string()),
+            album: Some("Blue".to_string()),
+            album_artist: Some("Test Artist".to_string()),
+            year: Some(2001),
+            track_number: Some(number),
+            disc_number: None,
+            barcode: None,
+            catalog_number: None,
+            discogs_release_id: None,
+            musicbrainz: ObservedMusicBrainzIds::default(),
+            duration_secs: Some(179.0 + number as f64),
+            modified_at: 1,
+        };
+        store::upsert_track(&pool, &track, directory_id)
+            .await
+            .unwrap();
+    }
+    store::rebuild_local_releases(&pool, None).await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn files_that_open_a_longer_musicbrainz_release_are_accepted_with_a_note() {
+    let db = db_path("musicbrainz-first-tracks");
+    seed_first_tracks(&db, 6).await;
+    let server = MockServer::start(longer_release_handler);
+
+    let output = run(&db, &server, &["match"]);
+    let text = stdout(&output);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("Accepted: 1"), "{text}");
+    assert!(text.contains("edition unconfirmed"), "{text}");
+    assert!(
+        text.contains(
+            "the files are the first 6 of 7 tracks; musicbrainz lists more tracks after the files' last"
+        ),
+        "{text}"
+    );
+    assert_eq!(server.requests_matching("/database/search"), 0);
+
+    let pool = radish::db::connect(&db).await.unwrap();
+    let scope: String = sqlx::query_scalar("SELECT match_scope FROM release_matches")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(scope, "album");
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_track_matches")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 6);
+    pool.close().await;
+
+    let listed = stdout(&run(&db, &server, &["list"]));
+    assert!(listed.contains("Track 1!"), "{listed}");
+    assert!(listed.contains("Track 6!"), "{listed}");
+    assert!(!listed.contains("Track 7!"), "{listed}");
+}
+
+#[tokio::test]
+async fn too_few_files_of_a_longer_musicbrainz_release_stay_in_review() {
+    // Five of seven is under three quarters of the release.
+    let db = db_path("musicbrainz-too-few-first-tracks");
+    seed_first_tracks(&db, 5).await;
+    let server = MockServer::start(longer_release_handler);
+
+    let output = run(&db, &server, &["match"]);
+    let text = stdout(&output);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("Accepted: 0"), "{text}");
+    assert!(text.contains("Queued for review: 1"), "{text}");
+    assert!(text.contains("track mapping is incomplete"), "{text}");
+}

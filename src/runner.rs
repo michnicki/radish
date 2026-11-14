@@ -307,7 +307,7 @@ impl ProviderAttempt {
             .map(|candidate| candidate.release.id.clone());
         // Evaluations are computed after the final order, so each stays paired
         // with its candidate whatever moved it.
-        let promotion = rank_candidates(&mut candidates, exact_id.as_ref());
+        let promotion = rank_candidates(local, &mut candidates, exact_id.as_ref());
 
         let evaluations = candidates
             .iter()
@@ -1071,7 +1071,7 @@ async fn accept(
     guard: &MatchGuard,
     transcript: &mut Transcript,
 ) -> Result<Outcome> {
-    if !evaluation.can_apply(candidate) {
+    if !evaluation.can_apply(release, candidate) {
         outln_to!(
             transcript,
             "  cannot accept {provider} release {}: the track mapping is invalid or incomplete ({})",
@@ -1231,14 +1231,12 @@ async fn queue_attempts(
     Ok(())
 }
 
-async fn review_saved_release(
-    pool: &SqlitePool,
-    release: &LocalRelease,
-    saved: Vec<store::StoredReview>,
-    dry_run: bool,
-    guard: &MatchGuard,
-) -> Result<Outcome> {
-    let mut groups: Vec<(ProviderKind, Vec<Candidate>, Vec<Evaluation>)> = saved
+/// The candidates and evaluations of saved reviews as the review prompt takes
+/// them, one group per provider, each evaluation as it was decided and stored.
+fn review_groups(
+    saved: &[store::StoredReview],
+) -> Vec<(ProviderKind, Vec<Candidate>, Vec<Evaluation>)> {
+    saved
         .iter()
         .map(|review| {
             let candidates: Vec<Candidate> = review
@@ -1263,7 +1261,17 @@ async fn review_saved_release(
                 .collect();
             (review.provider, candidates, evaluations)
         })
-        .collect();
+        .collect()
+}
+
+async fn review_saved_release(
+    pool: &SqlitePool,
+    release: &LocalRelease,
+    saved: Vec<store::StoredReview>,
+    dry_run: bool,
+    guard: &MatchGuard,
+) -> Result<Outcome> {
+    let mut groups = review_groups(&saved);
 
     print_release_header(release);
     for (provider, candidates, evaluations) in &groups {
@@ -1424,6 +1432,7 @@ fn print_candidate(
 /// Sorts `candidates` into the order they are judged in, then lets
 /// [`prefer_complete`] correct it unless an exact edition was selected.
 fn rank_candidates(
+    local: &LocalRelease,
     candidates: &mut [Candidate],
     exact_id: Option<&ReleaseId>,
 ) -> Option<Promotion> {
@@ -1431,7 +1440,7 @@ fn rank_candidates(
     if exact_id.is_some() {
         return None;
     }
-    prefer_complete(candidates)
+    prefer_complete(local, candidates)
 }
 
 /// Moves the first candidate that lists exactly the files to the front when the
@@ -1439,13 +1448,15 @@ fn rank_candidates(
 ///
 /// Scores average over the local tracks, so an edition with bonus tracks ties
 /// with the one that lists exactly the files and can sort first, yet its mapping
-/// is incomplete and can never be applied. Only the first candidate decides, so
-/// the complete edition is ranked ahead of it. This is a pass over the sorted
+/// is incomplete and can be applied only when the files are its first tracks
+/// (see [`matcher::leading_tracks`]), and then only with the warning that it
+/// lists more. Only the first candidate decides, so the complete edition is
+/// ranked ahead of it. This is a pass over the sorted
 /// list rather than part of [`candidate_order`], because "within the score gap"
 /// is not transitive and a comparator built on it is not a total order. The
 /// others keep their order, and the promoted candidate still has to pass every
 /// gate.
-fn prefer_complete(candidates: &mut [Candidate]) -> Option<Promotion> {
+fn prefer_complete(local: &LocalRelease, candidates: &mut [Candidate]) -> Option<Promotion> {
     let first = candidates.first()?;
     if first.mapping.complete {
         return None;
@@ -1453,7 +1464,7 @@ fn prefer_complete(candidates: &mut [Candidate]) -> Option<Promotion> {
     let index = candidates
         .iter()
         .skip(1)
-        .position(|other| matcher::lists_exactly_the_files(first, other))?
+        .position(|other| matcher::lists_exactly_the_files(local, first, other))?
         + 1;
     let previous = first.release.id.clone();
     candidates[..=index].rotate_right(1);
@@ -1670,7 +1681,7 @@ where
                 let candidate = &candidates[index];
                 let evaluation = &evaluations[index];
 
-                if !evaluation.can_apply(candidate) {
+                if !evaluation.can_apply(local, candidate) {
                     outln!(
                         "cannot accept: the track mapping is invalid, incomplete, or structurally unsupported ({})",
                         Clean(&candidate.mapping.notes.join("; "))
@@ -2477,6 +2488,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accept_prints_that_the_files_are_the_first_tracks() {
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let directory_id = store::upsert_directory(&pool, std::path::Path::new("/music"))
+            .await
+            .unwrap();
+        let files: Vec<_> = (1..=5)
+            .map(|number| scanned_track(&format!("/music/a/{number:02}.flac"), "Album", number))
+            .collect();
+        store::upsert_tracks(&pool, &files, directory_id)
+            .await
+            .unwrap();
+        store::rebuild_local_releases(&pool, None).await.unwrap();
+        let release = store::load_local_releases(&pool, None)
+            .await
+            .unwrap()
+            .remove(0);
+        let guard = store::load_match_guard(&pool, release.id).await.unwrap();
+
+        let attempt = attempt_over(&release, vec![edition(10, 6, None)]);
+        let (candidate, evaluation) = (&attempt.candidates[0], &attempt.evaluations[0]);
+        assert!(!candidate.mapping.complete);
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert!(attempt.settled(false));
+
+        let mut transcript = Transcript::held();
+        let outcome = accept(
+            &pool,
+            &release,
+            ProviderKind::Discogs,
+            candidate,
+            evaluation,
+            AcceptanceMethod::Automatic,
+            false,
+            &guard,
+            &mut transcript,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, Outcome::Accepted), "{outcome:?}");
+        let lines = out_lines(&transcript);
+        let unconfirmed = lines
+            .iter()
+            .position(|line| line.contains("exact edition unconfirmed"))
+            .expect("the album scope note");
+        assert_eq!(
+            lines.get(unconfirmed + 1),
+            Some(
+                &"    the files are the first 5 of 6 tracks; discogs lists more tracks after the files' last"
+            )
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_track_matches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 5);
+    }
+
+    #[test]
+    fn the_longer_edition_names_the_exact_one_that_blocks_it() {
+        let mut local = ten_files();
+        local.tracks[0].title = Some("Track 1".into());
+        let attempt = attempt_over(
+            &local,
+            vec![edition(10, 12, Some(1)), edition(11, 10, Some(1))],
+        );
+        assert_eq!(ids(&attempt), vec![11, 10]);
+        assert!(attempt.evaluations[0].auto_accept);
+        assert!(
+            attempt.evaluations[1]
+                .blockers
+                .contains(&"release discogs 11 lists exactly the local tracks".to_string()),
+            "{:?}",
+            attempt.evaluations[1].blockers
+        );
+    }
+
+    #[tokio::test]
     async fn accept_turns_a_changed_snapshot_into_a_skip() {
         let pool = crate::db::connect_in_memory().await.unwrap();
         let directory_id = store::upsert_directory(&pool, std::path::Path::new("/music"))
@@ -2502,7 +2590,7 @@ mod tests {
             None,
             &matcher::DiscoveryEvidence::default(),
         );
-        assert!(evaluation.can_apply(&candidate));
+        assert!(evaluation.can_apply(&release, &candidate));
 
         // The files change after the release was loaded and the guard taken.
         let mut retagged = file;
@@ -2877,11 +2965,14 @@ mod tests {
             .collect();
         assert!(!candidates[0].mapping.complete && candidates[1].mapping.complete);
         let selected = ReleaseId::Discogs(10);
-        assert_eq!(rank_candidates(&mut candidates, Some(&selected)), None);
+        assert_eq!(
+            rank_candidates(&local, &mut candidates, Some(&selected)),
+            None
+        );
         assert_eq!(candidates[0].release.id, selected);
 
         // Without the selection the same candidates are reordered.
-        let promotion = rank_candidates(&mut candidates, None).expect("a promotion");
+        let promotion = rank_candidates(&local, &mut candidates, None).expect("a promotion");
         assert_eq!(promotion.promoted, ReleaseId::Discogs(11));
         assert_eq!(promotion.previous, ReleaseId::Discogs(10));
     }
@@ -2904,6 +2995,196 @@ mod tests {
         ));
         assert_eq!(ids(&attempt), vec![10, 11]);
         assert_eq!(attempt.promotion, None);
+    }
+
+    const SONGS: [&str; 12] = [
+        "Opening",
+        "Second Wind",
+        "Hollow",
+        "Undertow",
+        "Lantern",
+        "Closing",
+        "Harbor Lights",
+        "Paper Crowns",
+        "Slow Rain",
+        "Iron Garden",
+        "Weather Vane",
+        "Last Orders",
+    ];
+
+    /// The fixture's first ten files, titled by [`SONGS`].
+    fn songs_on_ten_files() -> LocalRelease {
+        let mut local = ten_files();
+        for (track, song) in local.tracks.iter_mut().zip(SONGS) {
+            track.title = Some(song.to_string());
+        }
+        local
+    }
+
+    /// [`edition`] titled by [`SONGS`].
+    fn songs_on_edition(id: u64, count: usize, group: Option<u64>) -> RemoteRelease {
+        let mut remote = edition(id, count, group);
+        for (track, song) in remote.tracklist.iter_mut().zip(SONGS) {
+            track.title = song.to_string();
+        }
+        remote
+    }
+
+    #[test]
+    fn an_album_the_files_open_is_not_displaced_by_an_exact_edition_of_another_album() {
+        let local = songs_on_ten_files();
+        // The files are the first ten of twelve tracks. Another release group
+        // lists ten tracks, one of them at a title similarity near 0.87, which
+        // is within the score gap of the first candidate.
+        let leading = songs_on_edition(10, 12, Some(1));
+        let mut other = songs_on_edition(11, 10, Some(2));
+        other.tracklist[6].title = "Harbor Lighta".to_string();
+        let attempt = attempt_over(&local, vec![leading, other]);
+        let first = &attempt.candidates[0];
+        let second = &attempt.candidates[1];
+        assert_eq!(ids(&attempt), vec![10, 11]);
+        assert!(matcher::leading_tracks(&local, first).is_some());
+        assert!(second.mapping.complete);
+        assert!(matcher::within_gap(
+            first.score.album_score() - second.score.album_score()
+        ));
+        assert_eq!(attempt.promotion, None);
+        // The album the files open stays the one judged. The other album is a
+        // close alternative that does not establish the same recordings, so
+        // the first candidate is not accepted on its own, but it is the one
+        // reviewed first rather than the one promoted past it.
+        assert_eq!(
+            attempt.evaluations[0].blockers,
+            vec![
+                "close alternative discogs 11 does not establish the same album and recordings"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reviewed_album_the_files_open_is_applied_with_the_mapped_files_only() {
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let directory_id = store::upsert_directory(&pool, std::path::Path::new("/music"))
+            .await
+            .unwrap();
+        let files: Vec<_> = (1..=10)
+            .map(|number| {
+                let mut file =
+                    scanned_track(&format!("/music/a/{number:02}.flac"), "Album", number);
+                file.title = Some(SONGS[number as usize - 1].to_string());
+                file
+            })
+            .collect();
+        store::upsert_tracks(&pool, &files, directory_id)
+            .await
+            .unwrap();
+        store::rebuild_local_releases(&pool, None).await.unwrap();
+        let release = store::load_local_releases(&pool, None)
+            .await
+            .unwrap()
+            .remove(0);
+        let guard = store::load_match_guard(&pool, release.id).await.unwrap();
+        let track_rows = || async {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM release_track_matches")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+
+        // The direct path (`i`) judges a fetched release at edition scope,
+        // which never applies a partial mapping.
+        let fetched = Candidate::new(&release, songs_on_edition(10, 12, Some(1)));
+        assert!(matcher::leading_tracks(&release, &fetched).is_some());
+        let entered = matcher::evaluate(&release, &fetched, None, &DiscoveryEvidence::default());
+        assert!(!entered.can_apply(&release, &fetched));
+        let mut transcript = Transcript::held();
+        let outcome = accept(
+            &pool,
+            &release,
+            ProviderKind::Discogs,
+            &fetched,
+            &entered,
+            AcceptanceMethod::Manual,
+            false,
+            &guard,
+            &mut transcript,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, Outcome::Skipped), "{outcome:?}");
+        assert_eq!(track_rows().await, 0);
+
+        // Queue the album-scope review of the twelve-track release: another
+        // album with ten tracks is a close alternative, so it is not accepted
+        // automatically.
+        let mut other = songs_on_edition(11, 10, Some(2));
+        other.tracklist[6].title = "Harbor Lighta".to_string();
+        let attempt = attempt_over(&release, vec![songs_on_edition(10, 12, Some(1)), other]);
+        assert!(!attempt.evaluations[0].auto_accept);
+        assert_eq!(attempt.evaluations[0].match_scope, MatchScope::Album);
+        queue_attempts(&pool, &release, &[attempt], &guard, &mut transcript)
+            .await
+            .unwrap();
+
+        // Interactive review loads it back and may accept it.
+        let saved = store::load_review(&pool, release.id, ProviderKind::Discogs)
+            .await
+            .unwrap()
+            .expect("a saved review");
+        let groups = review_groups(&[saved]);
+        let (provider, candidates, evaluations) = &groups[0];
+        assert_eq!(candidates[0].release.id, ReleaseId::Discogs(10));
+        assert!(evaluations[0].can_apply(&release, &candidates[0]));
+        let outcome = accept(
+            &pool,
+            &release,
+            *provider,
+            &candidates[0],
+            &evaluations[0],
+            AcceptanceMethod::Manual,
+            false,
+            &guard,
+            &mut transcript,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, Outcome::Accepted), "{outcome:?}");
+        // Ten files are mapped and the release's two later tracks have no rows.
+        assert_eq!(track_rows().await, 10);
+        let ordinals: Vec<i64> = sqlx::query_scalar(
+            "SELECT remote_ordinal FROM release_track_matches ORDER BY remote_ordinal",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ordinals, (1..=10).collect::<Vec<i64>>());
+    }
+
+    #[test]
+    fn an_exact_edition_of_the_same_group_still_displaces_the_album_the_files_open() {
+        let local = songs_on_ten_files();
+        let attempt = attempt_over(
+            &local,
+            vec![
+                songs_on_edition(10, 12, Some(1)),
+                songs_on_edition(11, 10, Some(1)),
+            ],
+        );
+        assert!(matcher::leading_tracks(&local, &attempt.candidates[1]).is_some());
+        assert_eq!(ids(&attempt), vec![11, 10]);
+        assert_eq!(
+            attempt.promotion,
+            Some(Promotion {
+                promoted: ReleaseId::Discogs(11),
+                previous: ReleaseId::Discogs(10),
+            })
+        );
+        assert!(
+            attempt.settled(false),
+            "{:?}",
+            attempt.evaluations[0].blockers
+        );
     }
 
     #[test]
