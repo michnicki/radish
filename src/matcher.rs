@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v29";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v28";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v30";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v29";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -4891,7 +4891,11 @@ pub struct FallbackCheck {
 /// near-miss title). Nothing is settled when the fallback's album title scores
 /// below [`TITLE_SIMILARITY_THRESHOLD`]. A primary that is plausible only
 /// through its durations has no title conflicts and no duration conflict that
-/// can be settled. Edition qualifiers, contradicting primary lengths, embedded
+/// can be settled. An edition qualifier line is settled only when the
+/// qualifiers differ by a label on one side ([`one_sided_labels`]) and the
+/// durations of both the primary and the fallback identify the files' tracks
+/// ([`durations_identify_tracks`]); any other qualifier disagreement stays a
+/// conflict. Contradicting primary lengths, embedded
 /// evidence and an unresolved release ID are never settled. A settled line
 /// that several primaries produce is reported once.
 pub fn fallback_check(
@@ -4963,10 +4967,30 @@ pub fn fallback_check(
         }
         let primary_qualifiers = remote_edition_qualifiers(&primary.release);
         if !qualifiers_agree(&primary_qualifiers, &fallback_qualifiers) {
-            conflicts.push(format!(
+            let line = format!(
                 "primary candidates describe {:?} but the fallback describes {:?}",
                 primary_qualifiers, fallback_qualifiers
-            ));
+            );
+            // A label one provider omits is a labelling difference, not a
+            // conflict, when both providers' lengths identify the files'
+            // tracks. The files themselves do not decide qualifiers: a silent
+            // local title is no evidence of "not live". A text-only fallback
+            // never identifies by lengths.
+            if !text_only_fallback
+                && one_sided_labels(
+                    &primary_qualifiers,
+                    &fallback_qualifiers,
+                    RELEASE_LABEL_QUALIFIERS,
+                )
+                && durations_identify_tracks(local, primary)
+                && durations_identify_tracks(local, fallback)
+            {
+                settled.push(format!(
+                    "{line}; both providers' lengths identify the files' tracks, so this is read as a labelling difference"
+                ));
+            } else {
+                conflicts.push(line);
+            }
         }
         for (local_index, remote_index) in primary.mapping.assigned_pairs() {
             let Some(primary_track) = primary.release.tracklist.get(remote_index) else {
@@ -6816,11 +6840,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v29"
+            "discogs-match-v30"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v28"
+            "musicbrainz-match-v29"
         );
     }
 
@@ -8472,11 +8496,26 @@ mod tests {
         );
         assert!(conflicts.is_empty(), "{conflicts:?}");
 
-        // Edition qualifiers are still compared against such a primary.
+        // Edition qualifiers are still compared against such a primary. A
+        // label on one side only is settled by both providers' lengths ...
         let mut live = primary.release.clone();
         live.edition_notes = vec!["Live".to_string()];
         let live = Candidate::new(&local, live);
-        let conflicts = fallback_conflicts(&local, &[live], &fallback, true, false);
+        assert!(durations_identify_tracks(&local, &fallback));
+        let check = fallback_check(&local, &[live], &fallback, true, false);
+        assert_eq!(check.conflicts, Vec::<String>::new());
+        assert_eq!(check.settled.len(), 1, "{:?}", check.settled);
+        assert!(
+            check.settled[0].starts_with("primary candidates describe"),
+            "{:?}",
+            check.settled
+        );
+
+        // ... but `Mono`, and `{demo}` against `{live}`, still conflict.
+        let mut mono = primary.release.clone();
+        mono.edition_notes = vec!["Mono".to_string()];
+        let mono = Candidate::new(&local, mono);
+        let conflicts = fallback_conflicts(&local, &[mono], &fallback, true, false);
         assert!(
             conflicts
                 .iter()
@@ -8488,6 +8527,23 @@ mod tests {
                 .iter()
                 .any(|conflict| conflict.contains("track titles differ")),
             "{conflicts:?}"
+        );
+
+        let mut demo = primary.release.clone();
+        demo.edition_notes = vec!["Demo".to_string()];
+        let demo = Candidate::new(&local, demo);
+        let mut live_fallback = fallback.release.clone();
+        live_fallback.edition_notes = vec!["Live".to_string()];
+        let live_fallback = Candidate::new(&local, live_fallback);
+        let check = fallback_check(&local, &[demo], &live_fallback, true, false);
+        assert!(check.settled.is_empty(), "{:?}", check.settled);
+        assert!(
+            check
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.contains("primary candidates describe")),
+            "{:?}",
+            check.conflicts
         );
     }
 
@@ -8501,19 +8557,118 @@ mod tests {
         assert!(plausibility_score(&local, &primary) < PLAUSIBLE_PRIMARY_SCORE);
         assert!(durations_identify_tracks(&local, &primary));
 
+        // Both providers' lengths identify the files' tracks, so a label on one
+        // side only is a labelling difference, not a provider conflict.
         let fallback = Candidate::new(&local, remote.clone());
-        let conflicts = fallback_conflicts(
+        assert!(durations_identify_tracks(&local, &fallback));
+        let check = fallback_check(
             &local,
             std::slice::from_ref(&primary),
             &fallback,
             true,
             false,
         );
+        assert_eq!(check.conflicts, Vec::<String>::new());
+        assert_eq!(
+            check.settled,
+            vec![
+                "primary candidates describe {\"live\"} but the fallback describes {}; both providers' lengths identify the files' tracks, so this is read as a labelling difference"
+                    .to_string()
+            ]
+        );
+
+        // The same pair of editions with the label on the fallback's side.
+        let mut live_fallback = remote.clone();
+        live_fallback.edition_notes = vec!["Live".to_string()];
+        let live_fallback = Candidate::new(&local, live_fallback);
+        let plain_primary = Candidate::new(&local, {
+            let mut release = remote.clone();
+            release.id = ReleaseId::MusicBrainz(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"));
+            release
+        });
+        let check = fallback_check(&local, &[plain_primary], &live_fallback, true, false);
+        assert_eq!(check.conflicts, Vec::<String>::new());
+        assert_eq!(check.settled.len(), 1, "{:?}", check.settled);
+
+        // Only a label settles: `Mono`, `Instrumental` and `{demo}` against
+        // `{live}` stay conflicts although both providers' lengths identify the
+        // tracks.
+        let qualifier_conflict = |primary_notes: &str, fallback_notes: Option<&str>| {
+            let mut primary_release = remote.clone();
+            primary_release.id =
+                ReleaseId::MusicBrainz(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"));
+            primary_release.edition_notes = vec![primary_notes.to_string()];
+            let mut fallback_release = remote.clone();
+            fallback_release.edition_notes =
+                fallback_notes.map(str::to_string).into_iter().collect();
+            let primary = Candidate::new(&local, primary_release);
+            let fallback = Candidate::new(&local, fallback_release);
+            assert!(durations_identify_tracks(&local, &primary));
+            assert!(durations_identify_tracks(&local, &fallback));
+            let check = fallback_check(&local, &[primary], &fallback, true, false);
+            assert!(check.settled.is_empty(), "{:?}", check.settled);
+            check.conflicts
+        };
+        for (primary_notes, fallback_notes) in [
+            ("Mono", None),
+            ("Instrumental", None),
+            ("Demo", Some("Live")),
+        ] {
+            let conflicts = qualifier_conflict(primary_notes, fallback_notes);
+            assert!(
+                conflicts
+                    .iter()
+                    .any(|conflict| conflict.contains("primary candidates describe")),
+                "{primary_notes}: {conflicts:?}"
+            );
+        }
+
+        // A fallback with one length 2 s off does not identify the tracks by
+        // its lengths, so the label stays a conflict.
+        let mut off_fallback = remote.clone();
+        off_fallback.tracklist[3].duration_secs =
+            Some(off_fallback.tracklist[3].duration_secs.unwrap() + 2.0);
+        let off_fallback = Candidate::new(&local, off_fallback);
+        assert!(!durations_identify_tracks(&local, &off_fallback));
+        let check = fallback_check(
+            &local,
+            std::slice::from_ref(&primary),
+            &off_fallback,
+            true,
+            false,
+        );
+        assert!(check.settled.is_empty(), "{:?}", check.settled);
         assert!(
-            conflicts
+            check
+                .conflicts
                 .iter()
                 .any(|conflict| conflict.contains("primary candidates describe")),
-            "{conflicts:?}"
+            "{:?}",
+            check.conflicts
+        );
+
+        // A text-only fallback lists no lengths and never identifies by them.
+        let mut text_only = remote.clone();
+        for track in &mut text_only.tracklist {
+            track.duration_secs = None;
+        }
+        let text_only = Candidate::new(&local, text_only);
+        assert!(!durations_identify_tracks(&local, &text_only));
+        let check = fallback_check(
+            &local,
+            std::slice::from_ref(&primary),
+            &text_only,
+            true,
+            true,
+        );
+        assert!(check.settled.is_empty(), "{:?}", check.settled);
+        assert!(
+            check
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.contains("primary candidates describe")),
+            "{:?}",
+            check.conflicts
         );
 
         // A length that is off leaves the primary implausible, so it is ignored.
@@ -8994,15 +9149,17 @@ mod tests {
         let check = fallback_check(&local, &[primary], &fallback, true, false);
         assert_eq!(check, FallbackCheck::default());
 
-        // The qualifier line stays a conflict next to a settled title.
+        // A qualifier that is not a label stays a conflict next to a settled
+        // title (`Live` would be settled too: both providers' lengths identify
+        // the tracks).
         let file_titles = titles_with(3, "I Sold Myself In");
-        let (local, mut live) = spaced_pair(
+        let (local, mut mono) = spaced_pair(
             &file_titles,
             &titles_with(3, "I Sold Myself In / [unknown]"),
         );
-        live.id = ReleaseId::MusicBrainz(mbid(MUSICBRAINZ_PRIMARY_ID));
-        live.edition_notes = vec!["Live".to_string()];
-        let primary = Candidate::new(&local, live);
+        mono.id = ReleaseId::MusicBrainz(mbid(MUSICBRAINZ_PRIMARY_ID));
+        mono.edition_notes = vec!["Mono".to_string()];
+        let primary = Candidate::new(&local, mono);
         assert!(plausibility_score(&local, &primary) >= PLAUSIBLE_PRIMARY_SCORE);
         let (_, fallback_release) = spaced_pair(&file_titles, &file_titles);
         let fallback = Candidate::new(&local, fallback_release);
