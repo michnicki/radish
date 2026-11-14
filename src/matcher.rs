@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v36";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v35";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v37";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v36";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -2134,46 +2134,119 @@ fn leading_number(raw: &str) -> Option<u32> {
     }
 }
 
+/// The words that qualify a track title, and an edition as well: the audio of
+/// a track or of a release differs when only one side carries one. Matched as
+/// whole words, with no spellings folded.
+const TRACK_QUALIFIERS: &[&str] = &[
+    "acoustic",
+    "deluxe",
+    "demo",
+    "instrumental",
+    "live",
+    "mono",
+    "remastered",
+    "remix",
+    "remixes",
+    "stereo",
+];
+
+/// The edition words that only a release carries: an album title, an edition
+/// note or a format. As a track label `(a cappella)` or `(Karaoke)` is one of
+/// many version words, and a provider names it as often as the files do, so it
+/// is no track qualifier (see [`album_track_qualifiers`]).
+const RELEASE_ONLY_QUALIFIERS: &[&str] = &["acapella", "karaoke"];
+
+/// Spellings of a qualifier word that read as that word at release level, and
+/// the word each one reads as.
+const QUALIFIER_SPELLINGS: &[(&str, &str)] = &[
+    ("accapella", "acapella"),
+    ("accapellas", "acapella"),
+    ("acapela", "acapella"),
+    ("acapelas", "acapella"),
+    ("acapellas", "acapella"),
+    ("acappella", "acapella"),
+    ("acappellas", "acapella"),
+    ("instrumentals", "instrumental"),
+];
+
+/// The words after `a` that spell `a cappella` as two words (`a-cappella`
+/// reads as two as well). A bare `cappella` is a word, not the edition, so it
+/// needs the `a` before it.
+const A_CAPPELLA_SECOND_WORDS: &[&str] = &[
+    "capella",
+    "capellas",
+    "cappella",
+    "cappellas",
+    "capela",
+    "capelas",
+];
+
 /// Edition words that change what a release is. They are meaningful, so a
 /// mismatch is a contradiction rather than noise. The audio-only editions
 /// (`instrumental`, `karaoke`, `a cappella`) are among them, in their plural
-/// and alternative spellings, so a provider title `Album (Instrumentals)` never
-/// agrees with a silent local title.
+/// and alternative spellings (`Instrumentals`, `A Capella`, `Acapela`,
+/// `Accapella`, `A-Cappella`), so a provider title `Album (Instrumentals)`
+/// never agrees with a silent local title.
 pub fn edition_qualifiers(text: &str) -> BTreeSet<&'static str> {
-    const QUALIFIERS: &[&str] = &[
-        "acapella",
-        "acoustic",
-        "deluxe",
-        "demo",
-        "instrumental",
-        "karaoke",
-        "live",
-        "mono",
-        "remastered",
-        "remix",
-        "remixes",
-        "stereo",
-    ];
-
     let normalized = normalize_text(text);
-    let mut words = Vec::new();
+    let mut words: Vec<&str> = Vec::new();
     for word in normalized.split_whitespace() {
-        // Plurals and spellings of the audio-only editions read as one word:
-        // `Instrumentals`, `A Cappella`, `Acappellas`. A bare `cappella` is a
-        // word, not the edition, so it needs the `a` before it.
-        let word = match word {
-            "instrumentals" => "instrumental",
-            "acapellas" | "acappella" | "acappellas" => "acapella",
-            "cappella" | "cappellas" if words.last() == Some(&"a") => "acapella",
-            other => other,
+        let word = if words.last() == Some(&"a") && A_CAPPELLA_SECOND_WORDS.contains(&word) {
+            "acapella"
+        } else {
+            QUALIFIER_SPELLINGS
+                .iter()
+                .find_map(|(spelling, canonical)| (*spelling == word).then_some(*canonical))
+                .unwrap_or(word)
         };
         words.push(word);
     }
-    QUALIFIERS
+    TRACK_QUALIFIERS
         .iter()
+        .chain(RELEASE_ONLY_QUALIFIERS)
         .copied()
         .filter(|qualifier| words.contains(qualifier))
         .collect()
+}
+
+/// The fewest letters of a qualifier word that a cut-off album title may end
+/// in to read as that word. Shorter starts are the start of too many names.
+const CUT_QUALIFIER_MIN_CHARS: usize = 4;
+
+/// [`edition_qualifiers`] for the album title of a local file.
+///
+/// A title of 29 or 30 characters may have been cut to an ID3v1 field
+/// ([`may_be_cut_to_field`]), which can land inside the last word:
+/// `All Saints Collected Instrumen`, `Music for Earthworms (Instrume`. When the
+/// title ends in a letter and its last word is the start, of at least
+/// [`CUT_QUALIFIER_MIN_CHARS`] letters, of a qualifier word or one of its
+/// spellings, the title carries that qualifier. Only the last word reads this
+/// way, and only a title of that width; the remote side is never cut.
+fn local_edition_qualifiers(title: &str) -> BTreeSet<&'static str> {
+    let mut qualifiers = edition_qualifiers(title);
+    if !may_be_cut_to_field(title) || !title.chars().next_back().is_some_and(char::is_alphanumeric)
+    {
+        return qualifiers;
+    }
+    let normalized = normalize_text(title);
+    let Some(last) = normalized.split_whitespace().next_back() else {
+        return qualifiers;
+    };
+    if last.len() < CUT_QUALIFIER_MIN_CHARS || !last.is_ascii() {
+        return qualifiers;
+    }
+    let words = TRACK_QUALIFIERS
+        .iter()
+        .chain(RELEASE_ONLY_QUALIFIERS)
+        .map(|word| (*word, *word))
+        .chain(QUALIFIER_SPELLINGS.iter().copied());
+    for (word, qualifier) in words {
+        // A word that is whole is already read by `edition_qualifiers`.
+        if word.len() > last.len() && word.starts_with(last) {
+            qualifiers.extend(edition_qualifiers(qualifier));
+        }
+    }
+    qualifiers
 }
 
 /// Every qualifier a remote release asserts, across its title, formats, and
@@ -3687,10 +3760,24 @@ pub(crate) fn within_gap(diff: f64) -> bool {
 
 /// Track version qualifiers that distinguish recordings. A remastering is a
 /// different mastering of the same recording, so it never separates tracks.
+///
+/// Only [`TRACK_QUALIFIERS`], as whole words: the release-only words (`karaoke`,
+/// `a cappella`) and the plural and alternative spellings of
+/// [`edition_qualifiers`] are not track qualifiers.
 fn album_track_qualifiers(title: &str) -> BTreeSet<&'static str> {
-    let mut qualifiers = edition_qualifiers(title);
+    let mut qualifiers = track_qualifiers(title);
     qualifiers.remove("remastered");
     qualifiers
+}
+
+/// The [`TRACK_QUALIFIERS`] among the whole words of `text`.
+fn track_qualifiers(text: &str) -> BTreeSet<&'static str> {
+    let normalized = normalize_text(text);
+    TRACK_QUALIFIERS
+        .iter()
+        .copied()
+        .filter(|qualifier| normalized.split_whitespace().any(|word| word == *qualifier))
+        .collect()
 }
 
 /// Words beyond [`VERSION_WORDS`] that name another version of a track, in the
@@ -4330,7 +4417,7 @@ fn split_version_label(title: &str) -> Option<(&str, &str)> {
         (start, &title[start + width..])
     };
     let base = title[..cut].trim_end();
-    (!base.is_empty() && !edition_qualifiers(label).is_empty()).then_some((base, label))
+    (!base.is_empty() && !track_qualifiers(label).is_empty()).then_some((base, label))
 }
 
 /// A track title without the version label it ends with
@@ -4471,7 +4558,7 @@ fn labels_agree_across_levels(
     label_pairs: &[LabelPair],
 ) -> bool {
     let mut local_set = match &local.album_title {
-        Some(title) if tag_identity(local).title.is_some() => edition_qualifiers(title),
+        Some(title) if tag_identity(local).title.is_some() => local_edition_qualifiers(title),
         _ => BTreeSet::new(),
     };
     let mut remote_set = remote_edition_qualifiers(&candidate.release);
@@ -5477,7 +5564,7 @@ fn evaluate_with(
     if tag_identity(local).title.is_some()
         && let Some(local_title) = &local.album_title
     {
-        let local_qualifiers = edition_qualifiers(local_title);
+        let local_qualifiers = local_edition_qualifiers(local_title);
         let remote_qualifiers = remote_edition_qualifiers(remote);
         if !qualifiers_agree(&local_qualifiers, &remote_qualifiers) {
             if label_gate
@@ -7615,11 +7702,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v36"
+            "discogs-match-v37"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v35"
+            "musicbrainz-match-v36"
         );
     }
 
@@ -14079,6 +14166,159 @@ mod tests {
         );
         // A bare `cappella` is a word, not the edition.
         assert!(edition_qualifiers("Cappella Gloria").is_empty());
+    }
+
+    #[test]
+    fn the_audio_only_words_are_no_track_version_qualifiers() {
+        // A track's version label is what it was before the release-level
+        // words `karaoke` and `a cappella` existed: neither counts.
+        for title in [
+            "Rage (a cappella)",
+            "Rage (Accapella)",
+            "Rage (Karaoke)",
+            "What I'm After (A Cappella)",
+            "Kill You / Twist (a cappella)",
+            "Nag Nag Nag (Akufen's Karaoke Slam Mix)",
+            "Behind The Karaoke Room",
+            "Ribbon In The Sky - A Capella",
+        ] {
+            assert!(album_track_qualifiers(title).is_empty(), "{title}");
+        }
+        for (local, remote) in [
+            ("Rage (a cappella)", "Rage (Accapella)"),
+            ("Rage", "Rage (a cappella)"),
+            ("Rage (Accapella)", "Rage"),
+            ("Rage", "Rage (Karaoke)"),
+            ("Ribbon In The Sky - A Capella", "Ribbon In The Sky"),
+        ] {
+            assert!(
+                qualifiers_agree(
+                    &album_track_qualifiers(local),
+                    &album_track_qualifiers(remote)
+                ),
+                "{local} versus {remote}"
+            );
+        }
+        // `instrumental` is a track qualifier as before.
+        assert!(album_track_qualifiers("Rage (Instrumental)").contains("instrumental"));
+        assert!(!qualifiers_agree(
+            &album_track_qualifiers("Rage"),
+            &album_track_qualifiers("Rage (Instrumental)")
+        ));
+    }
+
+    #[test]
+    fn every_spelling_of_a_cappella_is_one_release_edition_qualifier() {
+        let expected = BTreeSet::from(["acapella"]);
+        for text in [
+            "Album (A Cappella)",
+            "Album (A Capella)",
+            "Album (A Cappellas)",
+            "Album (Acapella)",
+            "Album (Acapela)",
+            "Album (Accapella)",
+            "Album (Acappella)",
+            "Album (A-Cappella)",
+            "Album A Capella",
+        ] {
+            assert_eq!(edition_qualifiers(text), expected, "{text}");
+            let (local, remote) =
+                tracklist_pair(12, ("Album", "Test Artist"), (text, &["Test Artist"]));
+            let evaluation = album_evaluation(&local, &remote, &[]);
+            assert!(!evaluation.auto_accept, "{text}: {:?}", evaluation.warnings);
+            assert!(
+                evaluation
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.starts_with("edition qualifiers differ")),
+                "{text}: {:?}",
+                evaluation.blockers
+            );
+        }
+        assert!(edition_qualifiers("A Capital Idea").is_empty());
+    }
+
+    #[test]
+    fn a_title_cut_to_an_id3v1_field_in_a_qualifier_word_carries_it() {
+        let instrumental = BTreeSet::from(["instrumental"]);
+        let cases = [
+            ("All Saints Collected Instrumen", instrumental.clone()),
+            ("Music for Earthworms (Instrume", instrumental.clone()),
+            ("Collected Hits Volume Instrum", instrumental.clone()),
+            ("Collected Hits Volumes Instrum", instrumental.clone()),
+            (
+                "Collected Hits Volume Remaste",
+                BTreeSet::from(["remastered"]),
+            ),
+            (
+                "Collected Hits Volumes Remaste",
+                BTreeSet::from(["remastered"]),
+            ),
+        ];
+        for (title, expected) in cases {
+            let width = title.chars().count();
+            assert!(width == 29 || width == 30, "{title}: {width}");
+            assert_eq!(local_edition_qualifiers(title), expected, "{title}");
+        }
+        // The same word on a title that is not 29 or 30 characters wide is
+        // complete as written, and so is a prefix of fewer than four letters,
+        // one that is no qualifier's, a word that is not the last, a title that
+        // ends in padding or a bracket, and a title wider than a field.
+        for title in [
+            "Plain Title Of Song Instr",
+            "Collected Hits Volume Inst",
+            "Collected Hits Volume Remast ",
+            "Collected Hits Volume Instrux",
+            "Instrume Collected Hits Volume",
+            "Collected Hits Volume Lis Rem",
+            "Collected Hits Volume (Instr)",
+            "Unreleased Rarities Compil Instr",
+        ] {
+            assert_eq!(local_edition_qualifiers(title), BTreeSet::new(), "{title}");
+        }
+        assert_eq!("Plain Title Of Song Instr".chars().count(), 25);
+        assert_eq!("Collected Hits Volume Inst".chars().count(), 26);
+        // Only the local side reads this way.
+        assert!(edition_qualifiers("All Saints Collected Instrumen").is_empty());
+    }
+
+    #[test]
+    fn files_cut_in_the_word_instrumental_are_not_an_edition_qualifier_difference() {
+        let (local, remote) = tracklist_pair(
+            12,
+            ("All Saints Collected Instrumen", "Test Artist"),
+            (
+                "All Saints (Collected Instrumentals 1977\u{2013}1999)",
+                &["Test Artist"],
+            ),
+        );
+        assert_eq!(local.album_title.as_deref().unwrap().chars().count(), 30);
+        assert!(remote_edition_qualifiers(&remote).contains("instrumental"));
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(
+            !evaluation
+                .blockers
+                .iter()
+                .chain(&evaluation.warnings)
+                .any(|reason| reason.contains("edition qualifiers differ")),
+            "{evaluation:?}"
+        );
+
+        // A 25-character title ending in `Instr` is complete as written.
+        let (local, remote) = tracklist_pair(
+            12,
+            ("Plain Title Of Song Instr", "Test Artist"),
+            ("Plain Title Of Song Instrumental", &["Test Artist"]),
+        );
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|blocker| blocker.starts_with("edition qualifiers differ")),
+            "{:?}",
+            evaluation.blockers
+        );
     }
 
     #[test]
