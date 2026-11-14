@@ -5064,14 +5064,16 @@ pub(crate) fn lists_exactly_the_files_shape(
 
 /// Whether every format of a release is a video format (`DVD`, `Blu-ray`,
 /// `VHS`), and it names at least one. Unlike [`lists_video_format`] it applies
-/// to both providers.
+/// to both providers. A `DVD-Audio` disc is audio, not video.
 fn is_video_only(remote: &RemoteRelease) -> bool {
     !remote.formats.is_empty()
         && remote.formats.iter().all(|format| {
             let lower = format.to_ascii_lowercase();
-            ["dvd", "blu-ray", "bluray", "vhs"]
-                .iter()
-                .any(|video| lower.contains(video))
+            !lower.contains("dvd-audio")
+                && !lower.contains("dvd audio")
+                && ["dvd", "blu-ray", "bluray", "vhs"]
+                    .iter()
+                    .any(|video| lower.contains(video))
         })
 }
 
@@ -5080,12 +5082,14 @@ fn is_video_only(remote: &RemoteRelease) -> bool {
 ///
 /// The first reason that applies, in this order: `other` is unofficial and
 /// `first` is not; `other` is video only and `first` is not; and, only when
-/// the files are `first`'s first tracks ([`leading_tracks`]), which is the one
-/// case where `first` itself can be accepted, so that keeping it first does not
-/// just send the release to review, the fit is compared: `other` lists no
-/// length for a track whose length `first` lists, its largest length gap to the
-/// files is more than [`DURATION_IDENTITY_GAP_SECS`] worse than `first`'s, or
-/// its track-title score is more than [`RUNNER_UP_GAP`] below `first`'s.
+/// `first` could itself be accepted through the first-tracks rule, the fit is
+/// compared. That is when the files are `first`'s first tracks, `first` is not
+/// video only and passes the rule's own checks ([`leading_tracks_identify`]);
+/// otherwise keeping `first` first would only send the release to review. Then
+/// `other` is worse when it lists no length for a track whose length `first`
+/// lists, its largest length gap to the files is more than
+/// [`DURATION_IDENTITY_GAP_SECS`] worse than `first`'s, or its track-title
+/// score is more than [`RUNNER_UP_GAP`] below `first`'s.
 pub(crate) fn worse_reference(
     local: &LocalRelease,
     first: &Candidate,
@@ -5097,7 +5101,11 @@ pub(crate) fn worse_reference(
     if is_video_only(&other.release) && !is_video_only(&first.release) {
         return Some("it is a video release".to_string());
     }
-    leading_tracks(local, first)?;
+    if is_video_only(&first.release)
+        || leading_tracks_identify(local, first, &cleaned_track_titles(local)).is_none()
+    {
+        return None;
+    }
     let mut missing_length = false;
     let mut max_gap_first: Option<f64> = None;
     let mut max_gap_other: Option<f64> = None;
@@ -5148,7 +5156,7 @@ pub(crate) fn worse_reference(
         && gap_other > gap_first + DURATION_IDENTITY_GAP_SECS + TIE_EPSILON
     {
         return Some(format!(
-            "its lengths fit the files worse (up to {gap_other:.1}s against {gap_first:.1}s)"
+            "its lengths fit the files worse (up to {gap_other:.2}s against {gap_first:.2}s)"
         ));
     }
     if other.score.track_titles + RUNNER_UP_GAP < first.score.track_titles - TIE_EPSILON {
@@ -15581,7 +15589,7 @@ mod tests {
         assert!(leading_tracks(&local, &first).is_some());
         assert_eq!(
             worse_reference(&local, &first, &exact),
-            Some("its lengths fit the files worse (up to 3.0s against 0.5s)".to_string())
+            Some("its lengths fit the files worse (up to 3.00s against 0.50s)".to_string())
         );
         assert!(!lists_exactly_the_files(&local, &first, &exact));
 
@@ -15589,6 +15597,71 @@ mod tests {
         let (local, first, exact) = reference_pair(10, 0.2, 1.0);
         assert_eq!(worse_reference(&local, &first, &exact), None);
         assert!(lists_exactly_the_files(&local, &first, &exact));
+    }
+
+    #[test]
+    fn the_length_margin_is_exactly_one_and_a_half_seconds() {
+        // 2.0 s against 0.5 s is exactly the margin.
+        let (local, first, exact) = reference_pair(10, 0.5, 2.0);
+        assert_eq!(worse_reference(&local, &first, &exact), None);
+        assert!(lists_exactly_the_files(&local, &first, &exact));
+
+        // Just past it, and the text says so with two decimals.
+        let (local, first, exact) = reference_pair(10, 0.5, 2.01);
+        assert_eq!(
+            worse_reference(&local, &first, &exact),
+            Some("its lengths fit the files worse (up to 2.01s against 0.50s)".to_string())
+        );
+    }
+
+    #[test]
+    fn the_fit_is_compared_only_when_first_could_be_accepted_itself() {
+        let lacks_a_length = |exact: &mut Candidate| {
+            exact.release.tracklist[3].duration_secs = None;
+        };
+
+        // The control: a first candidate the rule accepts keeps its place.
+        let (local, first, mut exact) = reference_pair(10, 0.0, 0.0);
+        lacks_a_length(&mut exact);
+        assert!(
+            worse_reference(&local, &first, &exact)
+                .is_some_and(|reason| reason.starts_with("it lists no length"))
+        );
+
+        // Unofficial: the rule refuses it, so the exact edition is promoted.
+        let (local, mut first, mut exact) = reference_pair(10, 0.0, 0.0);
+        first.release.formats = vec!["CD, Unofficial Release".to_string()];
+        lacks_a_length(&mut exact);
+        assert!(leading_tracks(&local, &first).is_some());
+        assert_eq!(worse_reference(&local, &first, &exact), None);
+        assert!(lists_exactly_the_files(&local, &first, &exact));
+
+        // Video only: never kept first against an audio edition.
+        let (local, mut first, mut exact) = reference_pair(10, 0.0, 0.0);
+        first.release.formats = vec!["DVD (Album)".to_string()];
+        lacks_a_length(&mut exact);
+        assert!(leading_tracks(&local, &first).is_some());
+        assert_eq!(worse_reference(&local, &first, &exact), None);
+
+        // A mapped length 4.5 s off fails the rule's three second limit.
+        let (local, first, mut exact) = reference_pair(10, 4.5, 0.0);
+        lacks_a_length(&mut exact);
+        assert!(leading_tracks(&local, &first).is_some());
+        assert!(leading_tracks_identify(&local, &first, &cleaned_track_titles(&local)).is_none());
+        assert_eq!(worse_reference(&local, &first, &exact), None);
+        assert!(lists_exactly_the_files(&local, &first, &exact));
+    }
+
+    #[test]
+    fn a_dvd_audio_disc_is_not_a_video_release() {
+        let (_, _, exact) = reference_pair(10, 0.0, 0.0);
+        let mut remote = exact.release;
+        remote.formats = vec!["DVD (DVD-Audio, Album)".to_string()];
+        assert!(!is_video_only(&remote));
+        remote.formats = vec!["DVD Audio".to_string()];
+        assert!(!is_video_only(&remote));
+        remote.formats = vec!["DVD (DVD-Video, Album)".to_string()];
+        assert!(is_video_only(&remote));
     }
 
     #[test]
@@ -15604,9 +15677,14 @@ mod tests {
         );
         assert!(!lists_exactly_the_files(&local, &first, &exact));
 
-        // Within 0.05 it is not.
+        // Within 0.05 it is not, and just past it is.
         exact.score.track_titles = first.score.track_titles - RUNNER_UP_GAP;
         assert_eq!(worse_reference(&local, &first, &exact), None);
+        exact.score.track_titles = first.score.track_titles - RUNNER_UP_GAP - 0.001;
+        assert!(
+            worse_reference(&local, &first, &exact)
+                .is_some_and(|reason| reason.starts_with("its track titles fit the files worse"))
+        );
     }
 
     #[test]
