@@ -5078,29 +5078,44 @@ fn is_video_only(remote: &RemoteRelease) -> bool {
 }
 
 /// Why `other`, which lists exactly the files, is a worse reference for them
-/// than `first`, or `None` when it is not.
-///
-/// The first reason that applies, in this order: `other` is unofficial and
-/// `first` is not; `other` is video only and `first` is not; and, only when
-/// `first` could itself be accepted through the first-tracks rule, the fit is
-/// compared. That is when the files are `first`'s first tracks, `first` is not
-/// video only and passes the rule's own checks ([`leading_tracks_identify`]);
-/// otherwise keeping `first` first would only send the release to review. Then
-/// `other` is worse when it lists no length for a track whose length `first`
-/// lists, its largest length gap to the files is more than
-/// [`DURATION_IDENTITY_GAP_SECS`] worse than `first`'s, or its track-title
-/// score is more than [`RUNNER_UP_GAP`] below `first`'s.
+/// than `first`, or `None` when it is not: the first reason of [`worse_kind`],
+/// then of [`worse_fit`].
 pub(crate) fn worse_reference(
     local: &LocalRelease,
     first: &Candidate,
     other: &Candidate,
 ) -> Option<String> {
+    worse_kind(first, other).or_else(|| worse_fit(local, first, other))
+}
+
+/// Why `other` is a worse kind of release than `first`: unofficial where
+/// `first` is not, or video only where `first` is not. It says nothing about
+/// how well either fits the files.
+pub(crate) fn worse_kind(first: &Candidate, other: &Candidate) -> Option<String> {
     if is_unofficial(&other.release) && !is_unofficial(&first.release) {
         return Some("it is unofficial".to_string());
     }
     if is_video_only(&other.release) && !is_video_only(&first.release) {
         return Some("it is a video release".to_string());
     }
+    None
+}
+
+/// Why `other` fits the files worse than `first`, which only matters when
+/// `first` could itself be accepted through the first-tracks rule.
+///
+/// That is when the files are `first`'s first tracks, `first` is not video only
+/// and passes the rule's own checks ([`leading_tracks_identify`]); otherwise
+/// keeping `first` first would only send the release to review. Then `other` is
+/// worse when it lists no length for a track whose length `first` lists, its
+/// largest length gap to the files is more than [`DURATION_IDENTITY_GAP_SECS`]
+/// worse than `first`'s, or its track-title score is more than [`RUNNER_UP_GAP`]
+/// below `first`'s.
+pub(crate) fn worse_fit(
+    local: &LocalRelease,
+    first: &Candidate,
+    other: &Candidate,
+) -> Option<String> {
     if is_video_only(&first.release)
         || leading_tracks_identify(local, first, &cleaned_track_titles(local)).is_none()
     {

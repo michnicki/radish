@@ -250,6 +250,10 @@ pub struct ProviderAttempt {
 struct Promotion {
     promoted: ReleaseId,
     previous: ReleaseId,
+    /// Set when the exact edition was refused for its fit and ranked first
+    /// after all, because the first candidate kept ahead of it is not accepted
+    /// (see [`fall_back_to_refused_exact`]).
+    fallback: bool,
 }
 
 /// An edition that lists exactly the files but was not ranked first, because
@@ -325,28 +329,24 @@ impl ProviderAttempt {
                     .then_with(|| b.release.id.cmp(&a.release.id))
             })
             .map(|candidate| candidate.release.id.clone());
-        // Evaluations are computed after the final order, so each stays paired
-        // with its candidate whatever moved it.
-        let Reranking { promotion, refusal } =
-            rank_candidates(local, &mut candidates, exact_id.as_ref());
+        let Reranking {
+            mut promotion,
+            refusal,
+        } = rank_candidates(local, &mut candidates, exact_id.as_ref());
 
-        let evaluations = candidates
-            .iter()
-            .enumerate()
-            .map(|(index, candidate)| {
-                let evidence = result
-                    .evidence
-                    .get(&candidate.release.id)
-                    .cloned()
-                    .unwrap_or_default();
-                let runner_up = if index == 0 { candidates.get(1) } else { None };
-                if direct {
-                    matcher::evaluate(local, candidate, runner_up, &evidence)
-                } else {
-                    matcher::evaluate_for_matching(local, candidate, &candidates, &evidence)
-                }
-            })
-            .collect();
+        let mut evaluations = evaluate_candidates(local, &candidates, &result.evidence, direct);
+        if !direct
+            && exact_id.is_none()
+            && promotion.is_none()
+            && refusal.is_some()
+            && evaluations
+                .first()
+                .is_some_and(|evaluation| !evaluation.auto_accept)
+            && let Some(fallback) = fall_back_to_refused_exact(local, &mut candidates)
+        {
+            promotion = Some(fallback);
+            evaluations = evaluate_candidates(local, &candidates, &result.evidence, direct);
+        }
 
         Self {
             provider,
@@ -1520,9 +1520,70 @@ fn prefer_complete(local: &LocalRelease, candidates: &mut [Candidate]) -> Rerank
         promotion: Some(Promotion {
             promoted: candidates[0].release.id.clone(),
             previous,
+            fallback: false,
         }),
         refusal: None,
     }
+}
+
+/// Evaluates every candidate in its final order, so that each evaluation stays
+/// paired with its candidate whatever moved it.
+fn evaluate_candidates(
+    local: &LocalRelease,
+    candidates: &[Candidate],
+    evidence: &HashMap<ReleaseId, DiscoveryEvidence>,
+    direct: bool,
+) -> Vec<Evaluation> {
+    candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            let evidence = evidence
+                .get(&candidate.release.id)
+                .cloned()
+                .unwrap_or_default();
+            let runner_up = if index == 0 { candidates.get(1) } else { None };
+            if direct {
+                matcher::evaluate(local, candidate, runner_up, &evidence)
+            } else {
+                matcher::evaluate_for_matching(local, candidate, candidates, &evidence)
+            }
+        })
+        .collect()
+}
+
+/// Moves the first exact edition that [`prefer_complete`] refused only for its
+/// fit to the front, after the candidate kept ahead of it turned out not to be
+/// accepted.
+///
+/// The fit gate keeps the first candidate first so that it can be accepted
+/// through the first-tracks rule with a better reference. It must only ever
+/// trade the exact edition for a first candidate that is actually accepted: one
+/// that fails another gate (a close alternative, an edition qualifier, a
+/// provider conflict) would send the release to review, or on to a worse
+/// listing of the other provider, where the exact edition could have been
+/// accepted. An edition refused as unofficial or video only never falls back.
+fn fall_back_to_refused_exact(
+    local: &LocalRelease,
+    candidates: &mut [Candidate],
+) -> Option<Promotion> {
+    let first = candidates.first()?;
+    let index = candidates
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find_map(|(index, other)| {
+            (matcher::lists_exactly_the_files_shape(local, first, other)
+                && matcher::worse_kind(first, other).is_none())
+            .then_some(index)
+        })?;
+    let previous = first.release.id.clone();
+    candidates[..=index].rotate_right(1);
+    Some(Promotion {
+        promoted: candidates[0].release.id.clone(),
+        previous,
+        fallback: true,
+    })
 }
 
 /// The order candidates are shown and judged in: the proven edition first, then
@@ -1805,7 +1866,12 @@ where
 /// sorted first, or that one was kept behind it as a worse reference, so an
 /// audit can find the releases this changed.
 fn print_promotion(attempt: &ProviderAttempt, transcript: &mut Transcript) {
-    if let Some(Promotion { promoted, previous }) = &attempt.promotion {
+    if let Some(Promotion {
+        promoted,
+        previous,
+        fallback: false,
+    }) = &attempt.promotion
+    {
         outln_to!(
             transcript,
             "  ranked {} before {}: it lists exactly the files",
@@ -1825,6 +1891,20 @@ fn print_promotion(attempt: &ProviderAttempt, transcript: &mut Transcript) {
             Clean(&first.to_string()),
             Clean(&exact.to_string()),
             Clean(reason)
+        );
+    }
+    if let Some(Promotion {
+        promoted,
+        previous,
+        fallback: true,
+    }) = &attempt.promotion
+    {
+        outln_to!(
+            transcript,
+            "  ranked {} before {}: it lists exactly the files and {} is not accepted",
+            Clean(&promoted.to_string()),
+            Clean(&previous.to_string()),
+            Clean(&previous.to_string())
         );
     }
 }
@@ -3101,6 +3181,7 @@ mod tests {
             Some(Promotion {
                 promoted: ReleaseId::Discogs(12),
                 previous: ReleaseId::Discogs(10),
+                fallback: false,
             })
         );
         assert_eq!(attempt.refusal, None);
@@ -3110,6 +3191,82 @@ mod tests {
             out_lines(&transcript),
             vec!["  ranked discogs 12 before discogs 10: it lists exactly the files"]
         );
+    }
+
+    #[test]
+    fn a_kept_first_candidate_that_is_not_accepted_falls_back_to_the_refused_exact_edition() {
+        let local = songs_on_ten_files();
+        // Another album within the score gap, one of whose lengths is far off,
+        // makes the incomplete first candidate a close alternative that does
+        // not establish the same recordings, while the exact edition's lengths
+        // are within three seconds and set that album aside.
+        let mut other_album = songs_on_edition(12, 10, Some(2));
+        other_album.tracklist[6].title = "Harbor Lighta".to_string();
+        other_album.tracklist[2].duration_secs = Some(190.0);
+        let mut exact = songs_on_edition(11, 10, Some(1));
+        for track in &mut exact.tracklist {
+            track.duration_secs = Some(182.5);
+        }
+        let releases = vec![songs_on_edition(10, 12, Some(1)), exact, other_album];
+        let attempt = attempt_over(&local, releases.clone());
+        assert_eq!(ids(&attempt)[0], 11);
+        assert_eq!(
+            attempt.promotion,
+            Some(Promotion {
+                promoted: ReleaseId::Discogs(11),
+                previous: ReleaseId::Discogs(10),
+                fallback: true,
+            })
+        );
+        assert!(attempt.refusal.is_some());
+        let mut transcript = Transcript::held();
+        print_promotion(&attempt, &mut transcript);
+        assert_eq!(
+            out_lines(&transcript),
+            vec![
+                "  kept discogs 10 first: discogs 11 lists exactly the files but its lengths fit the files worse (up to 2.50s against 0.00s)",
+                "  ranked discogs 11 before discogs 10: it lists exactly the files and discogs 10 is not accepted",
+            ]
+        );
+        assert!(
+            attempt.evaluations[0].auto_accept,
+            "{:?}",
+            attempt.evaluations[0].blockers
+        );
+    }
+
+    #[test]
+    fn a_kept_first_candidate_that_is_accepted_does_not_fall_back() {
+        let local = songs_on_ten_files();
+        let attempt = attempt_over(
+            &local,
+            vec![
+                songs_on_edition(10, 12, Some(1)),
+                lengthless_edition(11, 10, Some(1)),
+            ],
+        );
+        assert!(attempt.evaluations[0].auto_accept);
+        assert_eq!(ids(&attempt), vec![10, 11]);
+        assert_eq!(attempt.promotion, None);
+        assert!(attempt.refusal.is_some());
+    }
+
+    #[test]
+    fn an_exact_edition_refused_as_unofficial_never_falls_back() {
+        let local = songs_on_ten_files();
+        let mut other_album = songs_on_edition(12, 10, Some(2));
+        other_album.tracklist[6].title = "Harbor Lighta".to_string();
+        let mut bootleg = songs_on_edition(11, 10, Some(1));
+        bootleg.formats = vec!["CD, Unofficial Release".to_string()];
+        let attempt = attempt_over(
+            &local,
+            vec![songs_on_edition(10, 12, Some(1)), bootleg, other_album],
+        );
+        assert_eq!(ids(&attempt)[0], 10);
+        assert!(!attempt.evaluations[0].auto_accept);
+        assert_eq!(attempt.promotion, None);
+        let refusal = attempt.refusal.as_ref().expect("a refusal");
+        assert_eq!(refusal.reason, "it is unofficial");
     }
 
     #[test]
@@ -3336,6 +3493,7 @@ mod tests {
             Some(Promotion {
                 promoted: ReleaseId::Discogs(11),
                 previous: ReleaseId::Discogs(10),
+                fallback: false,
             })
         );
         assert!(
@@ -3370,6 +3528,7 @@ mod tests {
             Some(Promotion {
                 promoted: ReleaseId::Discogs(11),
                 previous: ReleaseId::Discogs(10),
+                fallback: false,
             })
         );
         assert!(
@@ -3525,6 +3684,7 @@ mod tests {
             Some(Promotion {
                 promoted: ReleaseId::Discogs(11),
                 previous: ReleaseId::Discogs(10),
+                fallback: false,
             })
         );
     }
@@ -3569,6 +3729,7 @@ mod tests {
             Some(Promotion {
                 promoted: ReleaseId::Discogs(13),
                 previous: ReleaseId::Discogs(10),
+                fallback: false,
             })
         );
     }
