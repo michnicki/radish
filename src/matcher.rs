@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v39";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v38";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v40";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v39";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -5922,10 +5922,11 @@ pub fn fallback_check(
     }
 
     for primary in primary_candidates {
-        // A primary that lists more tracks after the files guards the fallback
-        // as well as one that lists exactly them: it is the edition the files
-        // would be accepted as, so its qualifiers and lengths count.
-        if !primary.mapping.complete && leading_tracks(local, primary).is_none() {
+        // Only a primary that maps the files completely guards the fallback:
+        // one whose first tracks the files are, but that failed its own gates,
+        // describes a longer edition, so its later tracks, merged hidden tracks
+        // and edition notes are not the files.
+        if !primary.mapping.complete {
             continue;
         }
         // A primary that is plausible only because its durations identify the
@@ -7830,11 +7831,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v39"
+            "discogs-match-v40"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v38"
+            "musicbrainz-match-v39"
         );
     }
 
@@ -10297,9 +10298,11 @@ mod tests {
     }
 
     #[test]
-    fn a_primary_that_lists_more_tracks_after_the_files_still_guards_the_fallback() {
+    fn a_primary_that_lists_more_tracks_after_the_files_does_not_guard_the_fallback() {
         // The files are the first ten of twelve tracks; the primary says
-        // `Mono` and the fallback lists exactly the ten.
+        // `Mono` and the fallback lists exactly the ten. Only the primary that
+        // maps the files completely guards the fallback: the longer edition's
+        // notes describe its bonus tracks, not the files.
         let primary_with = |count: usize| {
             let (local, mut primary_release) = spaced_pair(&TITLES_12[..10], &TITLES_12[..count]);
             primary_release.id = ReleaseId::MusicBrainz(mbid(MUSICBRAINZ_PRIMARY_ID));
@@ -10314,17 +10317,18 @@ mod tests {
             assert_eq!(primary.mapping.complete, count == 10);
             assert!(plausibility_score(&local, &primary) >= PLAUSIBLE_PRIMARY_SCORE);
             let check = fallback_check(&local, &[primary], &fallback, true, false);
-            assert_eq!(
-                check.conflicts,
+            let expected = if count == 10 {
                 vec![
                     "primary candidates describe {\"mono\"} but the fallback describes {}"
-                        .to_string()
-                ],
-                "{count} tracks: {check:?}"
-            );
+                        .to_string(),
+                ]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(check.conflicts, expected, "{count} tracks: {check:?}");
         }
 
-        // A subset that is not the first tracks does not take part: the
+        // A subset that is not the first tracks does not take part either: the
         // sixth file is missing from the primary's mapping.
         let (mut local, primary, fallback) = primary_with(12);
         local.tracks.remove(5);
