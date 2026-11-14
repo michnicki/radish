@@ -240,6 +240,9 @@ pub struct ProviderAttempt {
     /// The candidate [`prefer_complete`] moved to the front, and the one it
     /// displaced. Printed with the release's other progress lines.
     promotion: Option<Promotion>,
+    /// The exact edition [`prefer_complete`] refused to rank first because it
+    /// is a worse reference than the candidate that sorted first.
+    refusal: Option<Refusal>,
 }
 
 /// A complete edition ranked before the incomplete one that sorted first.
@@ -247,6 +250,22 @@ pub struct ProviderAttempt {
 struct Promotion {
     promoted: ReleaseId,
     previous: ReleaseId,
+}
+
+/// An edition that lists exactly the files but was not ranked first, because
+/// it is a worse reference than the first candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Refusal {
+    first: ReleaseId,
+    exact: ReleaseId,
+    reason: String,
+}
+
+/// What [`prefer_complete`] did to the order of the candidates.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Reranking {
+    promotion: Option<Promotion>,
+    refusal: Option<Refusal>,
 }
 
 impl ProviderAttempt {
@@ -260,6 +279,7 @@ impl ProviderAttempt {
             partial_failures: Vec::new(),
             embedded_release_resolved: false,
             promotion: None,
+            refusal: None,
         }
     }
 
@@ -307,7 +327,8 @@ impl ProviderAttempt {
             .map(|candidate| candidate.release.id.clone());
         // Evaluations are computed after the final order, so each stays paired
         // with its candidate whatever moved it.
-        let promotion = rank_candidates(local, &mut candidates, exact_id.as_ref());
+        let Reranking { promotion, refusal } =
+            rank_candidates(local, &mut candidates, exact_id.as_ref());
 
         let evaluations = candidates
             .iter()
@@ -336,6 +357,7 @@ impl ProviderAttempt {
             partial_failures: result.failures,
             embedded_release_resolved,
             promotion,
+            refusal,
         }
     }
 
@@ -1435,43 +1457,72 @@ fn rank_candidates(
     local: &LocalRelease,
     candidates: &mut [Candidate],
     exact_id: Option<&ReleaseId>,
-) -> Option<Promotion> {
+) -> Reranking {
     candidates.sort_by(|a, b| candidate_order(exact_id, a, b));
     if exact_id.is_some() {
-        return None;
+        return Reranking::default();
     }
     prefer_complete(local, candidates)
 }
 
-/// Moves the first candidate that lists exactly the files to the front when the
-/// first candidate's mapping is incomplete.
+/// Moves the first candidate that lists exactly the files, and is no worse a
+/// reference for them, to the front when the first candidate's mapping is
+/// incomplete.
 ///
 /// Scores average over the local tracks, so an edition with bonus tracks ties
 /// with the one that lists exactly the files and can sort first, yet its mapping
 /// is incomplete and can be applied only when the files are its first tracks
 /// (see [`matcher::leading_tracks`]), and then only with the warning that it
 /// lists more. Only the first candidate decides, so the complete edition is
-/// ranked ahead of it. This is a pass over the sorted
+/// ranked ahead of it, unless it is a worse reference
+/// ([`matcher::worse_reference`]): then the first candidate stays first, and the
+/// first such refusal is returned so that the run can say so. This is a pass over the sorted
 /// list rather than part of [`candidate_order`], because "within the score gap"
 /// is not transitive and a comparator built on it is not a total order. The
 /// others keep their order, and the promoted candidate still has to pass every
 /// gate.
-fn prefer_complete(local: &LocalRelease, candidates: &mut [Candidate]) -> Option<Promotion> {
-    let first = candidates.first()?;
+fn prefer_complete(local: &LocalRelease, candidates: &mut [Candidate]) -> Reranking {
+    let Some(first) = candidates.first() else {
+        return Reranking::default();
+    };
     if first.mapping.complete {
-        return None;
+        return Reranking::default();
     }
-    let index = candidates
-        .iter()
-        .skip(1)
-        .position(|other| matcher::lists_exactly_the_files(local, first, other))?
-        + 1;
+    let mut refusal = None;
+    let mut promoted = None;
+    for (offset, other) in candidates.iter().enumerate().skip(1) {
+        if !matcher::lists_exactly_the_files_shape(local, first, other) {
+            continue;
+        }
+        match matcher::worse_reference(local, first, other) {
+            None => {
+                promoted = Some(offset);
+                break;
+            }
+            Some(reason) => {
+                refusal.get_or_insert_with(|| Refusal {
+                    first: first.release.id.clone(),
+                    exact: other.release.id.clone(),
+                    reason,
+                });
+            }
+        }
+    }
+    let Some(index) = promoted else {
+        return Reranking {
+            promotion: None,
+            refusal,
+        };
+    };
     let previous = first.release.id.clone();
     candidates[..=index].rotate_right(1);
-    Some(Promotion {
-        promoted: candidates[0].release.id.clone(),
-        previous,
-    })
+    Reranking {
+        promotion: Some(Promotion {
+            promoted: candidates[0].release.id.clone(),
+            previous,
+        }),
+        refusal: None,
+    }
 }
 
 /// The order candidates are shown and judged in: the proven edition first, then
@@ -1751,7 +1802,8 @@ where
 }
 
 /// Says that a complete edition was ranked before the incomplete one that
-/// sorted first, so an audit can find the releases this changed.
+/// sorted first, or that one was kept behind it as a worse reference, so an
+/// audit can find the releases this changed.
 fn print_promotion(attempt: &ProviderAttempt, transcript: &mut Transcript) {
     if let Some(Promotion { promoted, previous }) = &attempt.promotion {
         outln_to!(
@@ -1759,6 +1811,20 @@ fn print_promotion(attempt: &ProviderAttempt, transcript: &mut Transcript) {
             "  ranked {} before {}: it lists exactly the files",
             Clean(&promoted.to_string()),
             Clean(&previous.to_string())
+        );
+    }
+    if let Some(Refusal {
+        first,
+        exact,
+        reason,
+    }) = &attempt.refusal
+    {
+        outln_to!(
+            transcript,
+            "  kept {} first: {} lists exactly the files but {}",
+            Clean(&first.to_string()),
+            Clean(&exact.to_string()),
+            Clean(reason)
         );
     }
 }
@@ -1825,6 +1891,7 @@ fn print_decision_for(
             partial_failures: Vec::new(),
             embedded_release_resolved: false,
             promotion: None,
+            refusal: None,
         },
         transcript,
     );
@@ -2956,6 +3023,95 @@ mod tests {
         assert!(out_lines(&transcript).is_empty());
     }
 
+    /// [`songs_on_edition`] with no length on any track.
+    fn lengthless_edition(id: u64, count: usize, group: Option<u64>) -> RemoteRelease {
+        let mut remote = songs_on_edition(id, count, group);
+        for track in &mut remote.tracklist {
+            track.duration_secs = None;
+        }
+        remote
+    }
+
+    #[test]
+    fn a_leading_first_candidate_stays_ahead_of_a_worse_exact_edition() {
+        let local = songs_on_ten_files();
+        let mut candidates: Vec<Candidate> = [
+            songs_on_edition(10, 12, Some(1)),
+            lengthless_edition(11, 10, Some(1)),
+        ]
+        .into_iter()
+        .map(|release| Candidate::new(&local, release))
+        .collect();
+        candidates.sort_by(|a, b| candidate_order(None, a, b));
+        assert_eq!(candidates[0].release.id, ReleaseId::Discogs(10));
+        assert!(matcher::leading_tracks(&local, &candidates[0]).is_some());
+        assert!(candidates[1].mapping.complete);
+
+        let reranking = prefer_complete(&local, &mut candidates);
+        assert_eq!(reranking.promotion, None);
+        assert_eq!(candidates[0].release.id, ReleaseId::Discogs(10));
+        assert_eq!(
+            reranking.refusal,
+            Some(Refusal {
+                first: ReleaseId::Discogs(10),
+                exact: ReleaseId::Discogs(11),
+                reason: "it lists no length for a track whose length discogs 10 lists".to_string(),
+            })
+        );
+
+        let attempt = attempt_over(
+            &local,
+            vec![
+                songs_on_edition(10, 12, Some(1)),
+                lengthless_edition(11, 10, Some(1)),
+            ],
+        );
+        assert_eq!(ids(&attempt), vec![10, 11]);
+        assert_eq!(attempt.promotion, None);
+        // The first candidate is accepted through the first-tracks rule.
+        assert!(
+            attempt.evaluations[0].auto_accept,
+            "{:?}",
+            attempt.evaluations[0].blockers
+        );
+        let mut transcript = Transcript::held();
+        print_promotion(&attempt, &mut transcript);
+        assert_eq!(
+            out_lines(&transcript),
+            vec![
+                "  kept discogs 10 first: discogs 11 lists exactly the files but it lists no length for a track whose length discogs 10 lists"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_later_exact_edition_that_is_no_worse_is_promoted_past_a_worse_one() {
+        let local = songs_on_ten_files();
+        let attempt = attempt_over(
+            &local,
+            vec![
+                songs_on_edition(10, 12, Some(1)),
+                lengthless_edition(11, 10, Some(1)),
+                songs_on_edition(12, 10, Some(1)),
+            ],
+        );
+        assert_eq!(ids(&attempt)[0], 12);
+        assert_eq!(
+            attempt.promotion,
+            Some(Promotion {
+                promoted: ReleaseId::Discogs(12),
+                previous: ReleaseId::Discogs(10),
+            })
+        );
+        assert_eq!(attempt.refusal, None);
+        let mut transcript = Transcript::held();
+        print_promotion(&attempt, &mut transcript);
+        assert_eq!(
+            out_lines(&transcript),
+            vec!["  ranked discogs 12 before discogs 10: it lists exactly the files"]
+        );
+    }
+
     #[test]
     fn an_exact_edition_selection_is_never_reordered() {
         let local = ten_files();
@@ -2967,12 +3123,14 @@ mod tests {
         let selected = ReleaseId::Discogs(10);
         assert_eq!(
             rank_candidates(&local, &mut candidates, Some(&selected)),
-            None
+            Reranking::default()
         );
         assert_eq!(candidates[0].release.id, selected);
 
         // Without the selection the same candidates are reordered.
-        let promotion = rank_candidates(&local, &mut candidates, None).expect("a promotion");
+        let promotion = rank_candidates(&local, &mut candidates, None)
+            .promotion
+            .expect("a promotion");
         assert_eq!(promotion.promoted, ReleaseId::Discogs(11));
         assert_eq!(promotion.previous, ReleaseId::Discogs(10));
     }

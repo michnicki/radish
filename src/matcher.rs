@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v41";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v40";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v42";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v41";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -5010,7 +5010,25 @@ fn either_lacks_group(a: &Candidate, b: &Candidate) -> bool {
 }
 
 /// Whether `other` lists exactly the files where `first`, ranked ahead of it,
-/// does not.
+/// does not, and is no worse a reference for them than `first`.
+///
+/// It must have the shape of [`lists_exactly_the_files_shape`] and
+/// [`worse_reference`] must find nothing against it: an exact edition that is
+/// unofficial, video only, lists fewer lengths, fits the lengths worse or has
+/// worse track titles than `first` does not displace it, so that a longer
+/// edition that fits the files better is not set aside for a thin listing.
+pub(crate) fn lists_exactly_the_files(
+    local: &LocalRelease,
+    first: &Candidate,
+    other: &Candidate,
+) -> bool {
+    lists_exactly_the_files_shape(local, first, other)
+        && worse_reference(local, first, other).is_none()
+}
+
+/// Whether `other` has the shape of an edition that lists exactly the files
+/// where `first`, ranked ahead of it, does not, whatever its quality as a
+/// reference (see [`worse_reference`]).
 ///
 /// `other` must be a different release whose mapping is complete, unambiguous
 /// and free of unsupported entries, and either an edition of `first`'s release
@@ -5028,7 +5046,7 @@ fn either_lacks_group(a: &Candidate, b: &Candidate) -> bool {
 /// An edition of the same release group has neither restriction, and neither
 /// does a release without a group that is the same audio under another name
 /// ([`equivalent_audio`]): the provider just does not file it with `first`.
-pub(crate) fn lists_exactly_the_files(
+pub(crate) fn lists_exactly_the_files_shape(
     local: &LocalRelease,
     first: &Candidate,
     other: &Candidate,
@@ -5042,6 +5060,104 @@ pub(crate) fn lists_exactly_the_files(
             || (within_gap(first.score.album_score() - other.score.album_score())
                 && album_text_agrees(other)
                 && !maps_onto_leading(local, &first.mapping, &first.release.playable_tracks())))
+}
+
+/// Whether every format of a release is a video format (`DVD`, `Blu-ray`,
+/// `VHS`), and it names at least one. Unlike [`lists_video_format`] it applies
+/// to both providers.
+fn is_video_only(remote: &RemoteRelease) -> bool {
+    !remote.formats.is_empty()
+        && remote.formats.iter().all(|format| {
+            let lower = format.to_ascii_lowercase();
+            ["dvd", "blu-ray", "bluray", "vhs"]
+                .iter()
+                .any(|video| lower.contains(video))
+        })
+}
+
+/// Why `other`, which lists exactly the files, is a worse reference for them
+/// than `first`, or `None` when it is not.
+///
+/// The first reason that applies, in this order: `other` is unofficial and
+/// `first` is not; `other` is video only and `first` is not; and, only when
+/// the files are `first`'s first tracks ([`leading_tracks`]), which is the one
+/// case where `first` itself can be accepted, so that keeping it first does not
+/// just send the release to review, the fit is compared: `other` lists no
+/// length for a track whose length `first` lists, its largest length gap to the
+/// files is more than [`DURATION_IDENTITY_GAP_SECS`] worse than `first`'s, or
+/// its track-title score is more than [`RUNNER_UP_GAP`] below `first`'s.
+pub(crate) fn worse_reference(
+    local: &LocalRelease,
+    first: &Candidate,
+    other: &Candidate,
+) -> Option<String> {
+    if is_unofficial(&other.release) && !is_unofficial(&first.release) {
+        return Some("it is unofficial".to_string());
+    }
+    if is_video_only(&other.release) && !is_video_only(&first.release) {
+        return Some("it is a video release".to_string());
+    }
+    leading_tracks(local, first)?;
+    let mut missing_length = false;
+    let mut max_gap_first: Option<f64> = None;
+    let mut max_gap_other: Option<f64> = None;
+    for local_index in 0..local.tracks.len() {
+        let (Some(f), Some(e)) = (
+            first.mapping.pairs.get(local_index).copied().flatten(),
+            other.mapping.pairs.get(local_index).copied().flatten(),
+        ) else {
+            continue;
+        };
+        let first_length = first
+            .release
+            .tracklist
+            .get(f)
+            .and_then(|track| known_length(track.duration_secs));
+        let other_length = other
+            .release
+            .tracklist
+            .get(e)
+            .and_then(|track| known_length(track.duration_secs));
+        if first_length.is_some() && other_length.is_none() {
+            missing_length = true;
+        }
+        let local_known = local
+            .tracks
+            .get(local_index)
+            .and_then(|track| known_length(track.duration_secs))
+            .is_some();
+        if local_known
+            && first_length.is_some()
+            && other_length.is_some()
+            && let (Some(gap_first), Some(gap_other)) = (
+                duration_gap(local, first, local_index, f),
+                duration_gap(local, other, local_index, e),
+            )
+        {
+            max_gap_first = Some(max_gap_first.map_or(gap_first, |gap| gap.max(gap_first)));
+            max_gap_other = Some(max_gap_other.map_or(gap_other, |gap| gap.max(gap_other)));
+        }
+    }
+    if missing_length {
+        return Some(format!(
+            "it lists no length for a track whose length {} lists",
+            first.release.id
+        ));
+    }
+    if let (Some(gap_first), Some(gap_other)) = (max_gap_first, max_gap_other)
+        && gap_other > gap_first + DURATION_IDENTITY_GAP_SECS + TIE_EPSILON
+    {
+        return Some(format!(
+            "its lengths fit the files worse (up to {gap_other:.1}s against {gap_first:.1}s)"
+        ));
+    }
+    if other.score.track_titles + RUNNER_UP_GAP < first.score.track_titles - TIE_EPSILON {
+        return Some(format!(
+            "its track titles fit the files worse ({:.2} against {:.2})",
+            other.score.track_titles, first.score.track_titles
+        ));
+    }
+    None
 }
 
 /// Whether any local track maps to a different known recording in each
@@ -7845,11 +7961,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v41"
+            "discogs-match-v42"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v40"
+            "musicbrainz-match-v41"
         );
     }
 
@@ -15396,6 +15512,197 @@ mod tests {
         let (local, remote) = leading_pair(LEADING_TRACKS_MIN, 6);
         let candidate = Candidate::new(&local, remote);
         assert!(mapping_can_apply(&local, &candidate, MatchScope::Album));
+    }
+
+    /// A leading first candidate (the files are the first `present` of
+    /// `listed` tracks) and an exact edition of the same release group, with
+    /// every length a fixed offset from the file's.
+    fn reference_pair(
+        present: usize,
+        first_offset: f64,
+        exact_offset: f64,
+    ) -> (LocalRelease, Candidate, Candidate) {
+        let (local, mut longer) = leading_pair(present, present + 2);
+        let (_, mut exact) = leading_pair(present, present);
+        longer.group_id = Some(GroupId::DiscogsMaster(7));
+        exact.group_id = Some(GroupId::DiscogsMaster(7));
+        exact.id = ReleaseId::Discogs(43);
+        for track in &mut longer.tracklist {
+            track.duration_secs = track.duration_secs.map(|secs| secs + first_offset);
+        }
+        for track in &mut exact.tracklist {
+            track.duration_secs = track.duration_secs.map(|secs| secs + exact_offset);
+        }
+        let first = Candidate::new(&local, longer);
+        let exact = Candidate::new(&local, exact);
+        (local, first, exact)
+    }
+
+    #[test]
+    fn a_lengthless_exact_edition_is_a_worse_reference_than_a_leading_first() {
+        let (local, first, mut exact) = reference_pair(10, 0.0, 0.0);
+        assert!(leading_tracks(&local, &first).is_some());
+        assert!(lists_exactly_the_files_shape(&local, &first, &exact));
+        assert_eq!(worse_reference(&local, &first, &exact), None);
+        assert!(lists_exactly_the_files(&local, &first, &exact));
+
+        for track in &mut exact.release.tracklist {
+            track.duration_secs = None;
+        }
+        assert!(lists_exactly_the_files_shape(&local, &first, &exact));
+        assert_eq!(
+            worse_reference(&local, &first, &exact),
+            Some("it lists no length for a track whose length discogs 42 lists".to_string())
+        );
+        assert!(!lists_exactly_the_files(&local, &first, &exact));
+
+        // One missing length is enough, and a zero length is no length.
+        let (local, first, mut exact) = reference_pair(10, 0.0, 0.0);
+        exact.release.tracklist[3].duration_secs = Some(0.0);
+        assert!(
+            worse_reference(&local, &first, &exact)
+                .is_some_and(|reason| reason.starts_with("it lists no length"))
+        );
+
+        // A first candidate with no lengths of its own has none to compare.
+        let (local, mut first, mut exact) = reference_pair(10, 0.0, 0.0);
+        for track in &mut first.release.tracklist {
+            track.duration_secs = None;
+        }
+        for track in &mut exact.release.tracklist {
+            track.duration_secs = None;
+        }
+        assert_eq!(worse_reference(&local, &first, &exact), None);
+    }
+
+    #[test]
+    fn an_exact_edition_with_lengths_further_off_is_a_worse_reference() {
+        let (local, first, exact) = reference_pair(10, 0.5, 3.0);
+        assert!(leading_tracks(&local, &first).is_some());
+        assert_eq!(
+            worse_reference(&local, &first, &exact),
+            Some("its lengths fit the files worse (up to 3.0s against 0.5s)".to_string())
+        );
+        assert!(!lists_exactly_the_files(&local, &first, &exact));
+
+        // Within the margin of the first candidate's gap it is not.
+        let (local, first, exact) = reference_pair(10, 0.2, 1.0);
+        assert_eq!(worse_reference(&local, &first, &exact), None);
+        assert!(lists_exactly_the_files(&local, &first, &exact));
+    }
+
+    #[test]
+    fn an_exact_edition_with_worse_track_titles_is_a_worse_reference() {
+        let (local, first, mut exact) = reference_pair(10, 0.0, 0.0);
+        exact.score.track_titles = first.score.track_titles - 0.2;
+        assert_eq!(
+            worse_reference(&local, &first, &exact),
+            Some(format!(
+                "its track titles fit the files worse ({:.2} against {:.2})",
+                exact.score.track_titles, first.score.track_titles
+            ))
+        );
+        assert!(!lists_exactly_the_files(&local, &first, &exact));
+
+        // Within 0.05 it is not.
+        exact.score.track_titles = first.score.track_titles - RUNNER_UP_GAP;
+        assert_eq!(worse_reference(&local, &first, &exact), None);
+    }
+
+    #[test]
+    fn an_unofficial_or_video_only_exact_edition_is_a_worse_reference_whatever_first_is() {
+        // Four files are below the minimum of a leading shape, so only the
+        // checks that do not depend on it apply.
+        let (local, first, exact) = reference_pair(4, 0.0, 0.0);
+        assert!(leading_tracks(&local, &first).is_none());
+        let reason = |first: &Candidate, exact: &Candidate| worse_reference(&local, first, exact);
+
+        let mut unofficial = exact.clone();
+        unofficial.release.formats = vec!["CD, Unofficial Release".to_string()];
+        assert_eq!(
+            reason(&first, &unofficial),
+            Some("it is unofficial".to_string())
+        );
+        let mut bootleg = exact.clone();
+        bootleg.release.provider_metadata = serde_json::json!({"status": "Bootleg"});
+        assert_eq!(
+            reason(&first, &bootleg),
+            Some("it is unofficial".to_string())
+        );
+        // Not when the first candidate is just as unofficial.
+        let mut unofficial_first = first.clone();
+        unofficial_first.release.formats = vec!["CD, Unofficial Release".to_string()];
+        assert_eq!(reason(&unofficial_first, &unofficial), None);
+
+        let mut vhs = exact.clone();
+        vhs.release.formats = vec!["VHS".to_string()];
+        assert_eq!(
+            reason(&first, &vhs),
+            Some("it is a video release".to_string())
+        );
+        let mut video_pair = exact.clone();
+        video_pair.release.formats = vec!["DVD".to_string(), "Blu-ray".to_string()];
+        assert_eq!(
+            reason(&first, &video_pair),
+            Some("it is a video release".to_string())
+        );
+        let mut video_first = first.clone();
+        video_first.release.formats = vec!["DVD".to_string()];
+        assert_eq!(reason(&video_first, &vhs), None);
+        let mut cd_and_dvd = exact.clone();
+        cd_and_dvd.release.formats = vec!["CD".to_string(), "DVD".to_string()];
+        assert_eq!(reason(&first, &cd_and_dvd), None);
+        let mut no_format = exact.clone();
+        no_format.release.formats = Vec::new();
+        assert_eq!(reason(&first, &no_format), None);
+        assert!(!is_video_only(&no_format.release));
+    }
+
+    #[test]
+    fn the_fit_is_not_compared_when_the_files_are_not_the_first_tracks() {
+        let (local, first, mut exact) = reference_pair(4, 0.0, 0.0);
+        assert!(leading_tracks(&local, &first).is_none());
+        for track in &mut exact.release.tracklist {
+            track.duration_secs = None;
+        }
+        exact.score.track_titles = first.score.track_titles - 0.3;
+        assert_eq!(worse_reference(&local, &first, &exact), None);
+        assert!(lists_exactly_the_files(&local, &first, &exact));
+    }
+
+    #[test]
+    fn only_a_no_worse_exact_edition_blocks_the_first_tracks_rule() {
+        let (local, first, exact) = reference_pair(10, 0.0, 0.0);
+        let blocker = "release discogs 43 lists exactly the local tracks".to_string();
+        let evaluation = evaluate_for_matching(
+            &local,
+            &first,
+            std::slice::from_ref(&exact),
+            &DiscoveryEvidence::default(),
+        );
+        assert!(evaluation.blockers.contains(&blocker));
+        assert!(!evaluation.auto_accept);
+
+        let mut lengthless = exact.clone();
+        for track in &mut lengthless.release.tracklist {
+            track.duration_secs = None;
+        }
+        let evaluation = evaluate_for_matching(
+            &local,
+            &first,
+            std::slice::from_ref(&lengthless),
+            &DiscoveryEvidence::default(),
+        );
+        assert!(
+            !evaluation
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("lists exactly")),
+            "{:?}",
+            evaluation.blockers
+        );
+        assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
+        assert!(leading_warning(&evaluation).is_some());
     }
 
     #[test]
