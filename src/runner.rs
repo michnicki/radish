@@ -748,8 +748,9 @@ fn primary_failed_transiently(attempts: &[ProviderAttempt]) -> bool {
     })
 }
 
-/// Starts a line about a primary-versus-fallback disagreement that the files
-/// settled, in the transcript and in a review's notes.
+/// Starts a line in the transcript about a primary-versus-fallback disagreement
+/// that the files settled. It is printed whether or not the fallback is
+/// accepted, and is never a review reason.
 const SETTLED_NOTE_PREFIX: &str = "fallback conflict settled by the files: ";
 
 const TRANSIENT_PRIMARY_NOTE: &str =
@@ -992,16 +993,15 @@ where
             )
             .await;
         }
+        // What the files settled is reported, as in the accept above, but it is
+        // no reason for the review, so it stays out of the stored reasons.
+        for line in &settled {
+            outln_to!(transcript, "  {SETTLED_NOTE_PREFIX}{}", Clean(line));
+        }
         for conflict in &conflicts {
             outln_to!(transcript, "  fallback conflict: {}", Clean(conflict));
         }
         attempts[1].notes.extend(conflicts);
-        // The reviewer still sees what the files settled.
-        attempts[1].notes.extend(
-            settled
-                .into_iter()
-                .map(|line| format!("{SETTLED_NOTE_PREFIX}{line}")),
-        );
     }
 
     let has_candidates = attempts
@@ -3185,6 +3185,205 @@ mod tests {
             "{:?}",
             attempt.evaluations[0].blockers
         );
+    }
+
+    #[test]
+    fn a_masterless_exact_edition_goes_before_the_longer_edition_of_a_master() {
+        let local = songs_on_ten_files();
+        // The files are the first ten of twelve tracks, but a release with no
+        // master lists the same title, artist, tracks and lengths and exactly
+        // ten of them: it is the same audio, and it can be applied whole.
+        let attempt = attempt_over(
+            &local,
+            vec![
+                songs_on_edition(10, 12, Some(1)),
+                songs_on_edition(11, 10, None),
+            ],
+        );
+        let longer = attempt
+            .candidates
+            .iter()
+            .find(|candidate| candidate.release.id == ReleaseId::Discogs(10))
+            .unwrap();
+        assert!(matcher::leading_tracks(&local, longer).is_some());
+        assert_eq!(ids(&attempt), vec![11, 10]);
+        assert_eq!(
+            attempt.promotion,
+            Some(Promotion {
+                promoted: ReleaseId::Discogs(11),
+                previous: ReleaseId::Discogs(10),
+            })
+        );
+        assert!(
+            attempt.settled(false),
+            "{:?}",
+            attempt.evaluations[0].blockers
+        );
+        assert!(
+            !attempt.evaluations[0]
+                .warnings
+                .iter()
+                .any(|warning| warning.ends_with(matcher::MORE_TRACKS_NOTE)),
+            "{:?}",
+            attempt.evaluations[0].warnings
+        );
+    }
+
+    #[test]
+    fn a_masterless_edition_that_is_not_the_same_audio_does_not_displace_the_album_the_files_open()
+    {
+        let local = songs_on_ten_files();
+        let leading = songs_on_edition(10, 12, Some(1));
+        let mut other = songs_on_edition(11, 10, None);
+        other.tracklist[6].title = "Harbor Lighta".to_string();
+        let attempt = attempt_over(&local, vec![leading, other]);
+        assert_eq!(ids(&attempt), vec![10, 11]);
+        assert!(matcher::within_gap(
+            attempt.candidates[0].score.album_score() - attempt.candidates[1].score.album_score()
+        ));
+        assert_eq!(attempt.promotion, None);
+    }
+
+    /// The titles of a fourteen-track edition: [`SONGS`] and two more.
+    const LONG_SONGS: [&str; 14] = [
+        "Opening",
+        "Second Wind",
+        "Hollow",
+        "Undertow",
+        "Lantern",
+        "Closing",
+        "Harbor Lights",
+        "Paper Crowns",
+        "Slow Rain",
+        "Iron Garden",
+        "Weather Vane",
+        "Last Orders",
+        "Night Ferry",
+        "Encore",
+    ];
+
+    /// [`edition`] with up to fourteen tracks titled by [`LONG_SONGS`].
+    fn long_songs_edition(id: u64, count: usize, group: Option<u64>) -> RemoteRelease {
+        let mut remote = edition(id, 12, group);
+        for number in 13..=14 {
+            let mut track = remote.tracklist[11].clone();
+            track.position = Some(number.to_string());
+            remote.tracklist.push(track);
+        }
+        remote.tracklist.truncate(count);
+        for (track, song) in remote.tracklist.iter_mut().zip(LONG_SONGS) {
+            track.title = song.to_string();
+        }
+        remote
+    }
+
+    #[test]
+    fn another_album_with_a_different_artist_does_not_displace_the_album_the_files_open() {
+        let local = songs_on_ten_files();
+        // The files are the first ten of fourteen tracks (71%, so not the
+        // leading-tracks shape). Another album lists the same ten tracks under
+        // an artist that scores 0.857, which is within the score gap.
+        let mut other = long_songs_edition(11, 10, Some(2));
+        other.artists = vec!["Artiste".to_string()];
+        let attempt = attempt_over(&local, vec![long_songs_edition(10, 14, Some(1)), other]);
+        let (first, second) = (&attempt.candidates[0], &attempt.candidates[1]);
+        assert_eq!(ids(&attempt), vec![10, 11]);
+        assert!(matcher::leading_tracks(&local, first).is_none());
+        assert!(second.mapping.complete);
+        assert!(matcher::within_gap(
+            first.score.album_score() - second.score.album_score()
+        ));
+        assert_eq!(attempt.promotion, None);
+        assert!(!attempt.evaluations[0].auto_accept);
+        assert!(!attempt.settled(false));
+    }
+
+    #[test]
+    fn files_that_open_the_first_album_stop_the_promotion_of_another_album_at_any_count() {
+        let local = songs_on_ten_files();
+        // The other album agrees in text this time, but the files are still the
+        // first ten tracks of the first candidate, so it cannot be told which
+        // album they come from: the first candidate keeps its place.
+        let attempt = attempt_over(
+            &local,
+            vec![
+                long_songs_edition(10, 14, Some(1)),
+                long_songs_edition(11, 10, Some(2)),
+            ],
+        );
+        let (first, second) = (&attempt.candidates[0], &attempt.candidates[1]);
+        assert_eq!(ids(&attempt), vec![10, 11]);
+        assert!(matcher::leading_tracks(&local, first).is_none());
+        assert!(second.mapping.complete);
+        assert!(matcher::within_gap(
+            first.score.album_score() - second.score.album_score()
+        ));
+        assert_eq!(attempt.promotion, None);
+        assert!(!attempt.evaluations[0].auto_accept);
+    }
+
+    /// Ten files numbered 1-4 and 6-11, a twelve-track edition that lists a
+    /// track at 5 the files lack, and another album that lists exactly the
+    /// files, numbered the same way: the files are not the first candidate's
+    /// leading tracks.
+    fn files_that_skip_a_track() -> (LocalRelease, RemoteRelease, RemoteRelease) {
+        let mut local = songs_on_ten_files();
+        for track in &mut local.tracks[4..] {
+            track.track_number = track.track_number.map(|number| number + 1);
+        }
+        let mut first = long_songs_edition(10, 12, Some(1));
+        let titles = LONG_SONGS[..4]
+            .iter()
+            .chain(&["Interlude"])
+            .chain(&LONG_SONGS[4..11]);
+        for (track, title) in first.tracklist.iter_mut().zip(titles) {
+            track.title = title.to_string();
+        }
+        let mut other = long_songs_edition(11, 10, Some(2));
+        for (index, track) in other.tracklist.iter_mut().enumerate().skip(4) {
+            track.position = Some((index + 2).to_string());
+        }
+        (local, first, other)
+    }
+
+    #[test]
+    fn a_complete_album_that_agrees_in_text_displaces_a_first_candidate_the_files_do_not_open() {
+        let (local, first, other) = files_that_skip_a_track();
+        let attempt = attempt_over(&local, vec![first, other]);
+        let first = attempt
+            .candidates
+            .iter()
+            .find(|candidate| candidate.release.id == ReleaseId::Discogs(10))
+            .unwrap();
+        assert!(!first.mapping.complete);
+        assert_eq!(
+            first.mapping.pairs[4],
+            Some(5),
+            "the files skip the extra track"
+        );
+        assert_eq!(ids(&attempt), vec![11, 10]);
+        assert_eq!(
+            attempt.promotion,
+            Some(Promotion {
+                promoted: ReleaseId::Discogs(11),
+                previous: ReleaseId::Discogs(10),
+            })
+        );
+    }
+
+    #[test]
+    fn a_complete_album_with_a_different_artist_does_not_displace_a_first_candidate_the_files_do_not_open()
+     {
+        let (local, first, mut other) = files_that_skip_a_track();
+        other.artists = vec!["Artiste".to_string()];
+        let attempt = attempt_over(&local, vec![first, other]);
+        let (first, second) = (&attempt.candidates[0], &attempt.candidates[1]);
+        assert_eq!(ids(&attempt), vec![10, 11]);
+        assert!(!first.mapping.complete && second.mapping.complete);
+        assert!(matcher::within_gap(
+            first.score.album_score() - second.score.album_score()
+        ));
+        assert_eq!(attempt.promotion, None);
     }
 
     #[test]

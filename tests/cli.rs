@@ -302,17 +302,32 @@ async fn the_files_settle_a_placeholder_title_conflict_between_the_providers() {
     assert_eq!(row_count(&db, "match_reviews").await, 0);
 }
 
+const LIVE_CONFLICT: &str =
+    "track titles differ for local track 3 ('Hollow (Live)' versus 'Hollow')";
+
 #[tokio::test]
-async fn a_review_keeps_the_conflicts_the_files_settled_in_its_notes() {
-    let db = db_path("dry-run-fallback-settled-review");
+async fn a_queued_release_prints_the_conflicts_the_files_settled_and_stores_none_of_them() {
+    let db = db_path("fallback-settled-review");
     let server = seed_settling_scenario(&db, true).await;
 
-    // The live primary's conflict is not settled, so the release is queued, and
-    // the reviewer still sees what the files settled.
+    // The live primary's conflict is not settled, so the release is queued.
+    // What the files settled is printed as its own line, but it is no reason
+    // for the review and is not in the summary of why it was queued.
     let output = run(&db, &server, &["match"], Some("test-token"));
     let text = stdout(&output);
     assert!(output.status.success(), "{output:?}\n{text}");
     assert!(!text.contains("would accept"), "{text}");
+    assert!(
+        text.lines()
+            .any(|line| line == format!("  {SETTLED_TITLE_LINE}")),
+        "{text}"
+    );
+    assert!(text.contains(LIVE_CONFLICT), "{text}");
+    let queued = text
+        .lines()
+        .find(|line| line.starts_with("  queued for review: "))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(!queued.contains("settled by the files"), "{queued}");
     assert_eq!(row_count(&db, "release_matches").await, 0);
     let pool = radish::db::connect(&db).await.unwrap();
     let reasons: Vec<(String,)> =
@@ -322,14 +337,27 @@ async fn a_review_keeps_the_conflicts_the_files_settled_in_its_notes() {
             .unwrap();
     pool.close().await;
     let reasons = reasons.into_iter().map(|row| row.0).collect::<String>();
+    assert!(!reasons.contains("settled by the files"), "{reasons}");
+    assert!(reasons.contains(LIVE_CONFLICT), "{reasons}");
+}
+
+#[tokio::test]
+async fn a_dry_run_of_a_queued_release_prints_the_conflicts_the_files_settled() {
+    let db = db_path("dry-run-fallback-settled-review");
+    let server = seed_settling_scenario(&db, true).await;
+
+    let output = run(&db, &server, &["match", "--dry-run"], Some("test-token"));
+    let text = stdout(&output);
+    assert!(output.status.success(), "{output:?}\n{text}");
+    assert!(text.contains("would queue for review"), "{text}");
+    assert!(text.contains("Queued for review: 1"), "{text}");
     assert!(
-        reasons.contains("fallback conflict settled by the files: "),
-        "{reasons}"
+        text.lines()
+            .any(|line| line == format!("  {SETTLED_TITLE_LINE}")),
+        "{text}"
     );
-    assert!(
-        reasons.contains("track titles differ for local track 3 ('Hollow (Live)' versus 'Hollow')"),
-        "{reasons}"
-    );
+    assert!(text.contains(LIVE_CONFLICT), "{text}");
+    assert_eq!(row_count(&db, "match_reviews").await, 0);
 }
 
 #[tokio::test]

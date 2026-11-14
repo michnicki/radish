@@ -12,13 +12,22 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v38";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v37";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v39";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v38";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
 pub const TITLE_SIMILARITY_THRESHOLD: f64 = 0.90;
 pub const DURATION_TOLERANCE_SECS: f64 = 3.0;
+
+/// How much closer to the fallback than to the primary a file's length must be
+/// for the files to settle a duration conflict between them (see
+/// [`fallback_check`]): the file's gap to the primary must be at least its gap to
+/// the fallback plus this margin. Without a margin a file that sits nearly
+/// between the two lengths would side with whichever it is a hair nearer to.
+/// Raising it settles fewer conflicts; it is independent of
+/// [`CORROBORATED_DURATION_SECS`], which says when a length agrees at all.
+pub const SETTLE_MARGIN_SECS: f64 = 1.5;
 
 /// The album-title rule: an album title between this floor and
 /// [`TITLE_SIMILARITY_THRESHOLD`] may pass when everything else agrees tightly.
@@ -2215,16 +2224,18 @@ const CUT_QUALIFIER_MIN_CHARS: usize = 4;
 
 /// [`edition_qualifiers`] for the album title of a local file.
 ///
-/// A title of 29 or 30 characters may have been cut to an ID3v1 field
-/// ([`may_be_cut_to_field`]), which can land inside the last word:
-/// `All Saints Collected Instrumen`, `Music for Earthworms (Instrume`. When the
-/// title ends in a letter and its last word is the start, of at least
-/// [`CUT_QUALIFIER_MIN_CHARS`] letters, of a qualifier word or one of its
-/// spellings, the title carries that qualifier. Only the last word reads this
-/// way, and only a title of that width; the remote side is never cut.
+/// A title of exactly [`ID3V1_FIELD_CHARS`] characters may have been cut to an
+/// ID3v1 field, which can land inside the last word: `All Saints Collected
+/// Instrumen`, `Music for Earthworms (Instrume`. When the title ends in a letter
+/// and its last word is the start, of at least [`CUT_QUALIFIER_MIN_CHARS`]
+/// letters, of a qualifier word or one of its spellings, the title carries that
+/// qualifier. Only the last word reads this way, and only a title of that
+/// width; the remote side is never cut. A value of one character fewer is cut
+/// before a space (see [`cut_off_similarity`]), so its last word is whole.
 fn local_edition_qualifiers(title: &str) -> BTreeSet<&'static str> {
     let mut qualifiers = edition_qualifiers(title);
-    if !may_be_cut_to_field(title) || !title.chars().next_back().is_some_and(char::is_alphanumeric)
+    if title.chars().count() != ID3V1_FIELD_CHARS
+        || !title.chars().next_back().is_some_and(char::is_alphanumeric)
     {
         return qualifiers;
     }
@@ -3784,7 +3795,7 @@ fn track_qualifiers(text: &str) -> BTreeSet<&'static str> {
 /// spellings [`normalize_text`] leaves: `voice-over` and `voiceover`, `en vivo`,
 /// `wordless`, `[inst.]`, karaoke, `a cappella`, and duets. `backing` is not
 /// listed: backing vocals are a credit as often as a version.
-const EXTRA_TITLE_VERSION_WORDS: &[&str] = &[
+const EXTRA_VERSION_WORDS: &[&str] = &[
     "acapella",
     "duet",
     "inst",
@@ -3794,38 +3805,72 @@ const EXTRA_TITLE_VERSION_WORDS: &[&str] = &[
     "wordless",
 ];
 
-/// The words of a track title that name a version of the recording: the
-/// normalized words that are in [`VERSION_WORDS`] or
-/// [`EXTRA_TITLE_VERSION_WORDS`], except the edition words (`remaster*`,
-/// `stereo`, `deluxe`), which a different mastering of the same recording
-/// carries. `voice over` reads as `voiceover` and `cappella` as `acapella`.
-/// Language words are not version words, so `(Spanish version)` and
-/// `(English Version)` both carry just `version`.
-fn title_version_words(title: &str) -> BTreeSet<&'static str> {
-    let normalized = normalize_text(title);
+/// The version words that name an edition (a mastering, a channel layout, a
+/// bonus package) and not another recording, so that a different mastering of
+/// the same recording does not count as another version of it.
+const EDITION_VERSION_WORDS: &[&str] = &["deluxe", "remaster", "remastered", "stereo"];
+
+/// Whether `token`, which follows `previous` in a normalized title, spells `a
+/// cappella`: one of the single-word spellings (`acapella`, `accapella`,
+/// `acappella`, `acapela` and their plurals), or `cappella`, `capella` and
+/// their plurals after an `a` (`a cappella`, `a-cappella`). A bare `cappella` is
+/// a word, not the version, as for [`edition_qualifiers`].
+fn spells_a_cappella(previous: &str, token: &str) -> bool {
+    token == "acapella"
+        || QUALIFIER_SPELLINGS
+            .iter()
+            .any(|(spelling, canonical)| *canonical == "acapella" && *spelling == token)
+        || (previous == "a" && A_CAPPELLA_SECOND_WORDS.contains(&token))
+}
+
+/// The version words of a track title: the one vocabulary for what names another
+/// version of a recording, whatever the spelling. These are the normalized
+/// words that are in [`VERSION_WORDS`] or [`EXTRA_VERSION_WORDS`], with every
+/// spelling of `a cappella` read as `acapella` ([`spells_a_cappella`]), `voice
+/// over` as `voiceover` and any word containing `remaster` as `remaster`. The
+/// edition words ([`EDITION_VERSION_WORDS`]) are included: see
+/// [`title_version_words`] for the set without them. Language words are not
+/// version words, so `(Spanish version)` and `(English Version)` both carry just
+/// `version`.
+fn version_words(text: &str) -> BTreeSet<&'static str> {
+    let normalized = normalize_text(text);
     let mut words = BTreeSet::new();
     let mut tokens = normalized.split_whitespace().peekable();
+    let mut previous = "";
     while let Some(token) = tokens.next() {
-        let token = match token {
-            "voice" if tokens.peek() == Some(&"over") => {
-                tokens.next();
-                "voiceover"
-            }
-            "cappella" => "acapella",
-            other => other,
+        let word = if token == "voice" && tokens.peek() == Some(&"over") {
+            tokens.next();
+            Some("voiceover")
+        } else if spells_a_cappella(previous, token) {
+            Some("acapella")
+        } else if token.contains("remaster") {
+            Some("remaster")
+        } else {
+            VERSION_WORDS
+                .iter()
+                .chain(EXTRA_VERSION_WORDS)
+                .copied()
+                .find(|word| *word == token)
         };
-        if token.contains("remaster") || matches!(token, "stereo" | "deluxe") {
-            continue;
-        }
-        if let Some(word) = VERSION_WORDS
-            .iter()
-            .chain(EXTRA_TITLE_VERSION_WORDS)
-            .find(|word| **word == token)
-        {
-            words.insert(*word);
-        }
+        previous = token;
+        words.extend(word);
     }
     words
+}
+
+/// The words of a track title that name a version of the recording
+/// ([`version_words`]), except the edition words ([`EDITION_VERSION_WORDS`]),
+/// which a different mastering of the same recording carries.
+fn title_version_words(title: &str) -> BTreeSet<&'static str> {
+    let mut words = version_words(title);
+    words.retain(|word| !EDITION_VERSION_WORDS.contains(word));
+    words
+}
+
+/// A duration that is known: finite and positive. A missing, zero, negative or
+/// non-finite length says nothing about a track.
+fn known_length(duration: Option<f64>) -> Option<f64> {
+    duration.filter(|secs| secs.is_finite() && *secs > 0.0)
 }
 
 /// The distance in seconds between a local track and the remote track it maps
@@ -3904,17 +3949,16 @@ fn is_length_drift(
         && (local_total - remote_total).abs() / remote_total <= SOFT_DURATION_TOTAL_RATIO
 }
 
-/// Whether a title names a version of a song: any of its normalized words is in
-/// [`VERSION_WORDS`] or contains `remaster`. A title that does is another
-/// recording as easily as the same one, so its length is no odd one out.
+/// Whether a title names a version of a song: it carries any of the
+/// [`version_words`] (the edition words, `remaster*` included). A title that
+/// does is another recording as easily as the same one, so its length is no
+/// odd one out.
 fn names_a_version(title: &str) -> bool {
-    normalize_text(title)
-        .split_whitespace()
-        .any(|word| VERSION_WORDS.contains(&word) || word.contains("remaster"))
+    !version_words(title).is_empty()
 }
 
 /// Whether a title names an alternate take, outtake, rehearsal or session in a
-/// trailing bracketed group or after a dash ([`names_take_words`]). `cleaned`
+/// trailing bracketed group or after a dash or en dash ([`names_take_words`]). `cleaned`
 /// is the cleaned reading of a local title, which drops a tag the raw reading
 /// hides the group behind. Unlike [`local_title_is_another_take`] it does not
 /// care whether the other side has a group too.
@@ -3922,9 +3966,7 @@ fn title_names_a_take(title: &str, cleaned: Option<&CleanedTitle>) -> bool {
     let names_take = |text: &str| {
         let text = text.trim_end();
         bracketed_suffix_start(text).is_some_and(|start| names_take_words(&text[start..]))
-            || text
-                .rsplit_once(" - ")
-                .is_some_and(|(_, tail)| names_take_words(tail))
+            || dash_tail(text).is_some_and(|(_, tail)| names_take_words(tail))
     };
     names_take(title) || cleaned.is_some_and(|cleaned| names_take(&cleaned.text))
 }
@@ -3951,7 +3993,7 @@ fn title_names_a_take(title: &str, cleaned: Option<&CleanedTitle>) -> bool {
 /// The rule also does not apply in two cases where the odd file may be another
 /// recording that no label on the odd pair shows. Another playable track on any
 /// medium may share the odd pair's remote base title, the title without its
-/// trailing version or take group ([`bases_agree`]): the file may be that
+/// trailing version or take group ([`same_song_ignoring_versions`]): the file may be that
 /// sibling's recording (`Darts of Pleasure` against `Darts of Pleasure [home
 /// Demo]`, where the file is the demo). And a local title of 29 or 30
 /// characters ([`may_be_cut_to_field`]) that ends inside an unclosed `(` or `[`
@@ -3981,12 +4023,11 @@ fn one_length_differs(
     {
         return None;
     }
-    let known = |duration: Option<f64>| duration.filter(|secs| secs.is_finite() && *secs > 0.0);
     let mut odd: Option<(usize, usize, f64)> = None;
     let (mut local_total, mut remote_total) = (0.0f64, 0.0f64);
     for (l, r) in candidate.mapping.assigned_pairs() {
-        let a = known(local.tracks.get(l)?.duration_secs)?;
-        let b = known(candidate.release.tracklist.get(r)?.duration_secs)?;
+        let a = known_length(local.tracks.get(l)?.duration_secs)?;
+        let b = known_length(candidate.release.tracklist.get(r)?.duration_secs)?;
         local_total += a;
         remote_total += b;
         let gap = (a - b).abs();
@@ -4007,11 +4048,14 @@ fn one_length_differs(
         || names_a_version(remote_title)
         || title_names_a_take(local_title, cleaned_title)
         || title_names_a_take(remote_title, None);
-    let may_be_a_sibling_recording = candidate
-        .release
-        .playable_tracks()
-        .into_iter()
-        .any(|(index, track)| index != r && bases_agree(&track.title, remote_title));
+    let may_be_a_sibling_recording =
+        candidate
+            .release
+            .playable_tracks()
+            .into_iter()
+            .any(|(index, track)| {
+                index != r && same_song_ignoring_versions(&track.title, remote_title)
+            });
     let cut_inside_a_group =
         may_be_cut_to_field(local_title) && ends_inside_open_group(local_title);
     (strictly_the_same && !another_recording && !may_be_a_sibling_recording && !cut_inside_a_group)
@@ -4082,11 +4126,11 @@ fn odd_length_edge_score(local: &LocalRelease, candidate: &Candidate, odd: usize
 ///
 /// Further conditions keep it no looser than the rules it sits beside: the
 /// candidate is not unofficial ([`is_unofficial`]); an artist that is off needs
-/// [`TRACKLIST_IDENTITY_MIN_ARTIST_OFF_TRACKS`] tracks; an album title off in the
-/// weak album title range (at least [`CORROBORATED_TITLE_FLOOR`]) needs the mean
-/// title score of that rule ([`CORROBORATED_MEAN_TITLE`]); and the two album
-/// titles carry the same [`title_version_words`], so `Album (Radio Edit)` is no
-/// reading of `Album`.
+/// [`TRACKLIST_IDENTITY_MIN_ARTIST_OFF_TRACKS`] tracks; an album title off at
+/// [`CORROBORATED_TITLE_FLOOR`] or above is never read by this rule, because
+/// that band belongs to the weak album title rule alone ([`corroborated_album`]);
+/// and the two album titles carry the same [`title_version_words`], so `Album
+/// (Radio Edit)` is no reading of `Album`.
 ///
 /// A tracklist of this size that agrees in order and in every length is rarely
 /// shared by two albums, so the tags that disagree (`Microphones, The`, a joint
@@ -4123,12 +4167,14 @@ fn tracklist_identifies_album(
     if local.tracks.len() < min_tracks {
         return false;
     }
-    // An album title in the weak album title range is that rule's to read, and
-    // this rule is never looser than it: the mean title must reach its floor.
-    let weak_album_title = !artist_is_off && score.album_title >= CORROBORATED_TITLE_FLOOR;
+    // An album title in the weak album title range belongs to that rule alone:
+    // its gates are not the ones of this rule (it asks for the score without the
+    // title, this one for the tracklist score), so this rule must not read it.
+    if !artist_is_off && score.album_title >= CORROBORATED_TITLE_FLOOR {
+        return false;
+    }
     let local_title = local.album_title.as_deref().unwrap_or_default();
-    if (weak_album_title && score.track_titles < CORROBORATED_MEAN_TITLE)
-        || title_version_words(local_title) != title_version_words(&candidate.release.title)
+    if title_version_words(local_title) != title_version_words(&candidate.release.title)
         || score.tracklist_score() + 1e-9 < TRACKLIST_IDENTITY_SCORE
         || !album_titles_identify(local, candidate)
         || !mapped_in_local_order(local, candidate)
@@ -4288,7 +4334,6 @@ fn mapped_pairs_agree_strictly(
     cleaned: &[Option<CleanedTitle>],
     max_gap_secs: f64,
 ) -> bool {
-    let known = |duration: Option<f64>| duration.filter(|secs| secs.is_finite() && *secs > 0.0);
     candidate.mapping.assigned_pairs().all(|(l, r)| {
         let (Some(local_track), Some(remote_track)) =
             (local.tracks.get(l), candidate.release.tracklist.get(r))
@@ -4308,7 +4353,7 @@ fn mapped_pairs_agree_strictly(
             &album_track_qualifiers(&remote_track.title),
         );
         let lengths_agree = matches!(
-            (known(local_track.duration_secs), known(remote_track.duration_secs)),
+            (known_length(local_track.duration_secs), known_length(remote_track.duration_secs)),
             (Some(a), Some(b)) if (a - b).abs() <= max_gap_secs
         );
         strictly_the_same && qualifiers_match && lengths_agree
@@ -4420,14 +4465,23 @@ fn durations_identify_tracks(local: &LocalRelease, candidate: &Candidate) -> boo
     })
 }
 
-/// A track title split into its base and the version label it ends with: a
-/// final `(...)` or `[...]` group, or a ` - ` or en dash tail, whose words
-/// include an edition qualifier (see [`edition_qualifiers`]). `Clean Slate
-/// (live)` gives `("Clean Slate", "live")`; `Live Wire` and `Live Forever` have
-/// no group to lose, and `Song (Live) [Bonus Track]` ends with a group that
-/// names no qualifier, so none of them splits. A title whose base would be empty
-/// does not split either.
-fn split_version_label(title: &str) -> Option<(&str, &str)> {
+/// The text after the last ` - ` or ` \u{2013} ` (en dash) separator of `title`,
+/// with the byte offset of the separator.
+fn dash_tail(title: &str) -> Option<(usize, &str)> {
+    [" - ", " \u{2013} "]
+        .iter()
+        .filter_map(|separator| {
+            title
+                .rfind(separator)
+                .map(|at| (at, &title[at + separator.len()..]))
+        })
+        .max_by_key(|(at, _)| *at)
+}
+
+/// A track title split into its base and the label it ends with, when
+/// `names_label` says the label is one: a final `(...)` or `[...]` group, or a
+/// ` - ` or en dash tail. A title whose base would be empty does not split.
+fn split_label_tail(title: &str, names_label: impl Fn(&str) -> bool) -> Option<(&str, &str)> {
     let title = title.trim();
     let open = match title.chars().next_back() {
         Some(')') => Some('('),
@@ -4438,14 +4492,33 @@ fn split_version_label(title: &str) -> Option<(&str, &str)> {
         let start = title.rfind(open)?;
         (start, &title[start + 1..title.len() - 1])
     } else {
-        let (start, width) = [" - ", " \u{2013} "]
-            .iter()
-            .filter_map(|separator| title.rfind(separator).map(|at| (at, separator.len())))
-            .max_by_key(|(at, _)| *at)?;
-        (start, &title[start + width..])
+        dash_tail(title)?
     };
     let base = title[..cut].trim_end();
-    (!base.is_empty() && !track_qualifiers(label).is_empty()).then_some((base, label))
+    (!base.is_empty() && names_label(label)).then_some((base, label))
+}
+
+/// A track title split into its base and the version label it ends with: a
+/// final `(...)` or `[...]` group, or a ` - ` or en dash tail, whose words
+/// include an edition qualifier (see [`edition_qualifiers`]). `Clean Slate
+/// (live)` gives `("Clean Slate", "live")`; `Live Wire` and `Live Forever` have
+/// no group to lose, and `Song (Live) [Bonus Track]` ends with a group that
+/// names no qualifier, so none of them splits. A title whose base would be empty
+/// does not split either.
+fn split_version_label(title: &str) -> Option<(&str, &str)> {
+    split_label_tail(title, |label| !track_qualifiers(label).is_empty())
+}
+
+/// A track title without the trailing group or dash tail that carries any
+/// version word ([`version_words`]) or take word ([`names_take_words`]), or the
+/// trimmed title when it has none. The wider reading than
+/// [`without_version_label`], for telling whether another track is the same
+/// song under another version or take.
+fn without_version_or_take_tail(title: &str) -> &str {
+    split_label_tail(title, |label| {
+        !version_words(label).is_empty() || names_take_words(label)
+    })
+    .map_or_else(|| title.trim(), |(base, _)| base)
 }
 
 /// A track title without the version label it ends with
@@ -4459,6 +4532,17 @@ fn without_version_label(title: &str) -> &str {
 fn bases_agree(a: &str, b: &str) -> bool {
     track_title_similarity(without_version_label(a), None, without_version_label(b))
         >= TITLE_SIMILARITY_THRESHOLD
+}
+
+/// Whether `a` and `b` are the same song once each loses a trailing version or
+/// take group ([`without_version_or_take_tail`]), at least
+/// [`TITLE_SIMILARITY_THRESHOLD`].
+fn same_song_ignoring_versions(a: &str, b: &str) -> bool {
+    track_title_similarity(
+        without_version_or_take_tail(a),
+        None,
+        without_version_or_take_tail(b),
+    ) >= TITLE_SIMILARITY_THRESHOLD
 }
 
 /// The readings of a local title that [`without_version_label`] may strip: the
@@ -4905,6 +4989,12 @@ fn in_same_release_group(a: &Candidate, b: &Candidate) -> bool {
         )
 }
 
+/// Whether at least one of two candidates has no release group, so that the
+/// provider says nothing about whether they are editions of one album.
+fn either_lacks_group(a: &Candidate, b: &Candidate) -> bool {
+    a.release.group_id.is_none() || b.release.group_id.is_none()
+}
+
 /// Whether `other` lists exactly the files where `first`, ranked ahead of it,
 /// does not.
 ///
@@ -4914,10 +5004,16 @@ fn in_same_release_group(a: &Candidate, b: &Candidate) -> bool {
 /// average over the local tracks, so an edition with bonus tracks ties with the
 /// one that lists exactly the files, and only the second can be applied.
 ///
-/// When the files are the first tracks of `first` ([`leading_tracks`]), `first`
-/// can be applied, so another album's exact count is no reason to put it
-/// ahead: only an edition of the same release group is. A near score between
-/// two albums says nothing about which of them the files come from.
+/// Another album is held to more than a near score, which says nothing about
+/// which of the two the files come from. It must agree with the files in album
+/// title and artist ([`album_text_agrees`]), so that a reading only the
+/// tracklist supports does not displace the first candidate, and it never
+/// displaces a first candidate whose leading tracks the files are
+/// ([`maps_onto_leading`]), however few of its tracks they make up: that
+/// candidate is then judged against the other album as a close alternative.
+/// An edition of the same release group has neither restriction, and neither
+/// does a release without a group that is the same audio under another name
+/// ([`equivalent_audio`]): the provider just does not file it with `first`.
 pub(crate) fn lists_exactly_the_files(
     local: &LocalRelease,
     first: &Candidate,
@@ -4928,8 +5024,10 @@ pub(crate) fn lists_exactly_the_files(
         && !other.mapping.ambiguous
         && !other.release.has_unsupported_entries()
         && (in_same_release_group(first, other)
-            || (leading_tracks(local, first).is_none()
-                && within_gap(first.score.album_score() - other.score.album_score())))
+            || (either_lacks_group(first, other) && equivalent_audio(first, other))
+            || (within_gap(first.score.album_score() - other.score.album_score())
+                && album_text_agrees(other)
+                && !maps_onto_leading(local, &first.mapping, &first.release.playable_tracks())))
 }
 
 /// Whether any local track maps to a different known recording in each
@@ -5690,21 +5788,10 @@ fn plausibility_score(local: &LocalRelease, primary: &Candidate) -> f64 {
     primary.score.total + WEIGHT_DURATIONS * unknown as f64 / local.tracks.len() as f64
 }
 
-/// Cross-provider checks applied before automatic fallback acceptance.
-///
-/// Scores, runner-up gaps, and mappings stay within one provider. This function
-/// only asks whether the fallback contradicts the local edition or a complete,
-/// plausible primary candidate. A primary is plausible when its plausibility
-/// score reaches [`PLAUSIBLE_PRIMARY_SCORE`] or when its durations identify the
-/// tracks ([`durations_identify_tracks`]), so junk local titles do not hide the
-/// right primary. Against a primary that is plausible only through its
-/// durations, edition qualifiers and durations are compared but titles are not.
-///
-/// A fallback accepted on its text alone (`text_only_fallback`, because its
-/// provider lists no length for some tracks) is also checked against every
-/// primary whose text agrees with the files: that primary's lengths must not
-/// contradict them.
-pub fn fallback_conflicts(
+/// The conflicts of [`fallback_check`] alone, for the tests that do not care
+/// what the files settled.
+#[cfg(test)]
+fn fallback_conflicts(
     local: &LocalRelease,
     primary_candidates: &[Candidate],
     fallback: &Candidate,
@@ -5734,7 +5821,20 @@ pub struct FallbackCheck {
     pub settled: Vec<String>,
 }
 
-/// [`fallback_conflicts`] that also reports the conflicts the files settle.
+/// Cross-provider checks applied before automatic fallback acceptance, with the
+/// conflicts the files settle reported apart from the ones that remain.
+///
+/// Scores, runner-up gaps, and mappings stay within one provider. The check only
+/// asks whether the fallback contradicts the local edition or a plausible primary
+/// candidate: one whose mapping is complete or whose first tracks the files are
+/// ([`leading_tracks`]), and whose plausibility score reaches
+/// [`PLAUSIBLE_PRIMARY_SCORE`] or whose durations identify the tracks
+/// ([`durations_identify_tracks`]), so junk local titles do not hide the right
+/// primary. Against a primary that is plausible only through its durations,
+/// edition qualifiers and durations are compared but titles are not. A fallback
+/// accepted on its text alone (`text_only_fallback`, because its provider lists
+/// no length for some tracks) is also checked against every primary whose text
+/// agrees with the files: that primary's lengths must not contradict them.
 ///
 /// A track title conflict on local track *k* is settled when the file's title
 /// is present, reads at least [`TITLE_SIMILARITY_THRESHOLD`] against the
@@ -5751,7 +5851,7 @@ pub struct FallbackCheck {
 /// the file's length is within [`DURATION_TOLERANCE_SECS`] of the fallback's
 /// and clearly closer to it than to the primary's (further than the tolerance
 /// from the primary's, and the gap to the primary at least the gap to the
-/// fallback plus [`CORROBORATED_DURATION_SECS`]), and the file's title also reads at
+/// fallback plus [`SETTLE_MARGIN_SECS`]), and the file's title also reads at
 /// least [`TITLE_SIMILARITY_THRESHOLD`] against the fallback's (so a settle
 /// never rests on a track the fallback matched through a weak, junk or
 /// near-miss title). Nothing is settled when the fallback's album title or
@@ -5963,7 +6063,7 @@ pub fn fallback_check(
                                 > DURATION_TOLERANCE_SECS
                             && (file_duration - primary_duration).abs()
                                 >= (file_duration - fallback_duration).abs()
-                                    + CORROBORATED_DURATION_SECS =>
+                                    + SETTLE_MARGIN_SECS =>
                     {
                         settled.push(format!(
                             "primary and fallback durations differ for local track {} ({primary_duration:.1}s versus {fallback_duration:.1}s); the file's {file_duration:.1}s agrees with the fallback",
@@ -7730,11 +7830,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v38"
+            "discogs-match-v39"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v37"
+            "musicbrainz-match-v38"
         );
     }
 
@@ -9962,6 +10062,30 @@ mod tests {
             let base = primary_title.split(" (").next().unwrap();
             let check = settling_check(
                 &titles_with(3, base),
+                &titles_with(3, primary_title),
+                |_, _, _| {},
+            );
+            assert_eq!(check.settled, Vec::<String>::new(), "{primary_title}");
+            assert_eq!(check.conflicts.len(), 1, "{primary_title}: {check:?}");
+        }
+    }
+
+    #[test]
+    fn the_files_do_not_settle_a_title_when_the_primary_spells_a_version_word_another_way() {
+        for primary_title in [
+            "Rage (Accapella)",
+            "Rage (A Capella)",
+            "Rage (A Cappella)",
+            "Rage (Acappella)",
+            "Rage (Acapela)",
+            "Rage (A-Cappella)",
+            "Rage (Voice Over)",
+            "Rage (Karaoke)",
+            "Rage (Duet)",
+            "Rage (Inst.)",
+        ] {
+            let check = settling_check(
+                &titles_with(3, "Rage"),
                 &titles_with(3, primary_title),
                 |_, _, _| {},
             );
@@ -13263,6 +13387,37 @@ mod tests {
     }
 
     #[test]
+    fn an_odd_pair_titled_with_any_spelling_of_a_version_word_is_another_recording() {
+        // The same title on both sides, so only the version word can stop the
+        // rule.
+        for title in [
+            "Hollow (Karaoke)",
+            "Hollow (Inst.)",
+            "Hollow (Instrumentals)",
+            "Hollow (A Cappella)",
+            "Hollow (A Capella)",
+            "Hollow (Acapella)",
+            "Hollow (Accapella)",
+            "Hollow (Acappella)",
+            "Hollow (Acapela)",
+            "Hollow (A-Cappella)",
+            "Hollow (Duet)",
+            "Hollow (Voice Over)",
+            "Hollow (Voice-over)",
+            "Hollow (Voiceover)",
+            "Hollow (En Vivo)",
+            "Hollow (Wordless)",
+            "Hollow (Radio Edit)",
+            "Hollow - Alternate Take",
+            "Hollow \u{2013} Alternate Take",
+            "Hollow \u{2013} Take 2",
+        ] {
+            let (local, remote) = titled_odd_pair(title);
+            assert_eq!(odd_length_index(&local, &remote), None, "{title}");
+        }
+    }
+
+    #[test]
     fn the_odd_pair_titles_must_agree_strictly() {
         // A subtitle that only one side has is forgiven in the album score but
         // not for the pair that carries the odd length.
@@ -13359,6 +13514,27 @@ mod tests {
             track.medium_position = Some(if index == 4 { 2 } else { 1 });
         }
         assert_eq!(odd_length_index(&local, &remote), None);
+    }
+
+    #[test]
+    fn a_sibling_whose_group_names_any_version_or_take_may_be_the_odd_file() {
+        // Each last track is the same song under a version or take group, so
+        // the odd file may be that recording whatever the group says.
+        for last in [
+            "Darts of Pleasure (Radio Edit)",
+            "Darts of Pleasure (Extended Mix)",
+            "Darts of Pleasure (Single Version)",
+            "Darts of Pleasure (Dub)",
+            "Darts of Pleasure - Radio Edit",
+            "Darts of Pleasure \u{2013} Radio Edit",
+            "Darts of Pleasure (Karaoke)",
+            "Darts of Pleasure (A Cappella)",
+            "Darts of Pleasure (Alternate Take)",
+            "Darts of Pleasure - Take 2",
+        ] {
+            let (local, remote) = darts_pair(last);
+            assert_no_odd_length(&local, &remote, last);
+        }
     }
 
     #[test]
@@ -13704,7 +13880,7 @@ mod tests {
         );
         let candidate = Candidate::new(&local, remote.clone());
         assert!(corroborated_album(&local, &candidate));
-        assert!(tracklist_identifies(&local, &remote));
+        assert!(!tracklist_identifies(&local, &remote));
         let evaluation = album_evaluation(&local, &remote, &[]);
         assert!(evaluation.auto_accept, "{:?}", evaluation.blockers);
         assert_eq!(tracklist_warning(&evaluation), None);
@@ -14082,12 +14258,53 @@ mod tests {
     }
 
     #[test]
-    fn a_weak_album_title_needs_the_mean_title_of_its_own_rule_for_the_tracklist_rule() {
+    fn the_weak_album_title_band_belongs_to_its_own_rule_alone() {
+        // The album title is the off tag at about 0.76 and the artist is at
+        // 0.917. Every length is 1.4 s off, so the tracklist score (0.958)
+        // passes but the weak album title rule's score without the title
+        // (0.946) does not reach its 0.97: only that rule reads this band, and
+        // it refuses.
+        let (mut local, remote) = tracklist_pair(
+            6,
+            ("Microphones, The", "Test Artist"),
+            ("The Microphones", &["Test Artists"]),
+        );
+        for track in &mut local.tracks {
+            track.duration_secs = track.duration_secs.map(|secs| secs + 1.4);
+        }
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(
+            (CORROBORATED_TITLE_FLOOR..TITLE_SIMILARITY_THRESHOLD)
+                .contains(&candidate.score.album_title),
+            "{}",
+            candidate.score.album_title
+        );
+        assert!(candidate.score.album_artist >= TITLE_SIMILARITY_THRESHOLD);
+        assert!(candidate.score.tracklist_score() >= TRACKLIST_IDENTITY_SCORE);
+        assert!(!corroborated_album(&local, &candidate));
+        assert_not_tracklist_identity(
+            &local,
+            &remote,
+            "title 0.76, artist 0.92, lengths 1.4 s off",
+        );
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(
+            evaluation
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("below the")),
+            "{:?}",
+            evaluation.blockers
+        );
+    }
+
+    #[test]
+    fn a_weak_album_title_with_a_low_mean_title_is_not_read_by_the_tracklist_rule() {
         // An album title between the weak title floor and the minimum, an
         // artist that agrees, and three titles at about 0.92: every title
         // agrees and the tracklist score passes, but the mean title stays
-        // below what the weak album title rule asks, so this rule is no
-        // looser than the one it defers to.
+        // below what the weak album title rule asks, and that rule alone
+        // reads the band.
         let (mut local, mut remote) = tracklist_pair(
             6,
             ("Test Alb", "Test Artist"),
@@ -14369,12 +14586,7 @@ mod tests {
         let cases = [
             ("All Saints Collected Instrumen", instrumental.clone()),
             ("Music for Earthworms (Instrume", instrumental.clone()),
-            ("Collected Hits Volume Instrum", instrumental.clone()),
             ("Collected Hits Volumes Instrum", instrumental.clone()),
-            (
-                "Collected Hits Volume Remaste",
-                BTreeSet::from(["remastered"]),
-            ),
             (
                 "Collected Hits Volumes Remaste",
                 BTreeSet::from(["remastered"]),
@@ -14382,14 +14594,17 @@ mod tests {
         ];
         for (title, expected) in cases {
             let width = title.chars().count();
-            assert!(width == 29 || width == 30, "{title}: {width}");
+            assert_eq!(width, ID3V1_FIELD_CHARS, "{title}");
             assert_eq!(local_edition_qualifiers(title), expected, "{title}");
         }
-        // The same word on a title that is not 29 or 30 characters wide is
-        // complete as written, and so is a prefix of fewer than four letters,
-        // one that is no qualifier's, a word that is not the last, a title that
-        // ends in padding or a bracket, and a title wider than a field.
+        // The same word on a title that is not 30 characters wide is complete
+        // as written (a 29-character value is cut before a space, so its last
+        // word is whole), and so is a prefix of fewer than four letters, one
+        // that is no qualifier's, a word that is not the last, a title that ends
+        // in padding or a bracket, and a title wider than a field.
         for title in [
+            "Collected Hits Volume Instrum",
+            "Collected Hits Volume Remaste",
             "Plain Title Of Song Instr",
             "Collected Hits Volume Inst",
             "Collected Hits Volume Remast ",
@@ -14403,6 +14618,7 @@ mod tests {
         }
         assert_eq!("Plain Title Of Song Instr".chars().count(), 25);
         assert_eq!("Collected Hits Volume Inst".chars().count(), 26);
+        assert_eq!("Collected Hits Volume Instrum".chars().count(), 29);
         // Only the local side reads this way.
         assert!(edition_qualifiers("All Saints Collected Instrumen").is_empty());
     }
@@ -15145,7 +15361,16 @@ mod tests {
         // An album of another group within the score gap does not: the files
         // are the first tracks of this one, and a near score says nothing about
         // which album they come from. The close-alternative gate still decides.
-        let evaluation = album_evaluation(&local, &longer, std::slice::from_ref(&exact_candidate));
+        let mut longer_of_master = longer.clone();
+        longer_of_master.group_id = Some(GroupId::DiscogsMaster(7));
+        let mut exact_of_master = exact.clone();
+        exact_of_master.group_id = Some(GroupId::DiscogsMaster(8));
+        let exact_of_master = Candidate::new(&local, exact_of_master);
+        let evaluation = album_evaluation(
+            &local,
+            &longer_of_master,
+            std::slice::from_ref(&exact_of_master),
+        );
         assert!(
             !evaluation
                 .blockers
@@ -15156,18 +15381,53 @@ mod tests {
         );
         assert!(!lists_exactly_the_files(
             &local,
-            &Candidate::new(&local, longer.clone()),
-            &exact_candidate
+            &Candidate::new(&local, longer_of_master.clone()),
+            &exact_of_master
         ));
-        // Without the leading shape the same pair counts as before.
-        let mut not_leading = Candidate::new(&local, longer.clone());
-        not_leading.mapping.ambiguous = true;
+
+        // A release with no group that is the same audio does: the provider
+        // just does not file it with the longer one.
+        let evaluation = album_evaluation(&local, &longer, std::slice::from_ref(&exact_candidate));
+        assert!(
+            evaluation
+                .blockers
+                .contains(&"release discogs 43 lists exactly the local tracks".to_string()),
+            "{:?}",
+            evaluation.blockers
+        );
+        // Unless it is not the same audio.
+        let mut exact_other_title = exact.clone();
+        exact_other_title.title = "Another Album".to_string();
+        let other_title = Candidate::new(&local, exact_other_title);
+        assert!(!lists_exactly_the_files(
+            &local,
+            &Candidate::new(&local, longer.clone()),
+            &other_title
+        ));
+        // Not even when the leading shape is refused for another reason: the
+        // files still open the first candidate.
+        let mut ambiguous = Candidate::new(&local, longer_of_master);
+        ambiguous.mapping.ambiguous = true;
+        assert!(leading_tracks(&local, &ambiguous).is_none());
+        assert!(!lists_exactly_the_files(
+            &local,
+            &ambiguous,
+            &exact_of_master
+        ));
+        // Without the files opening it, the same pair counts.
+        let mut not_leading = ambiguous.clone();
+        not_leading.mapping.ambiguous = false;
+        not_leading.mapping.pairs.swap(0, 1);
         assert!(leading_tracks(&local, &not_leading).is_none());
         assert!(lists_exactly_the_files(
             &local,
             &not_leading,
-            &exact_candidate
+            &exact_of_master
         ));
+        // And an album that does not agree in text never does.
+        let mut off_artist = exact_of_master.clone();
+        off_artist.score.album_artist = 0.857;
+        assert!(!lists_exactly_the_files(&local, &not_leading, &off_artist));
 
         // An alternative that does not list the files exactly does not.
         let (_, mut other_longer) = leading_pair(10, 11);
