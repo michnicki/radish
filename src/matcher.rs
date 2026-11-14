@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v40";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v39";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v41";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v40";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -2222,17 +2222,25 @@ pub fn edition_qualifiers(text: &str) -> BTreeSet<&'static str> {
 /// in to read as that word. Shorter starts are the start of too many names.
 const CUT_QUALIFIER_MIN_CHARS: usize = 4;
 
-/// [`edition_qualifiers`] for the album title of a local file.
+/// [`edition_qualifiers`] for the album title of a local file, given the
+/// qualifiers `remote` that the provider's release names.
 ///
 /// A title of exactly [`ID3V1_FIELD_CHARS`] characters may have been cut to an
 /// ID3v1 field, which can land inside the last word: `All Saints Collected
 /// Instrumen`, `Music for Earthworms (Instrume`. When the title ends in a letter
 /// and its last word is the start, of at least [`CUT_QUALIFIER_MIN_CHARS`]
-/// letters, of a qualifier word or one of its spellings, the title carries that
-/// qualifier. Only the last word reads this way, and only a title of that
-/// width; the remote side is never cut. A value of one character fewer is cut
-/// before a space (see [`cut_off_similarity`]), so its last word is whole.
-fn local_edition_qualifiers(title: &str) -> BTreeSet<&'static str> {
+/// letters, of a qualifier word or one of its spellings, the title may carry
+/// that qualifier. The reading is a guess, so it counts only when `remote`
+/// names the qualifier it completes to: a cut-off word can confirm a
+/// provider's qualifier but never contradict one (`Schoolboy's In Disgrace
+/// (Remas` agrees with a release that does not say remastered). Only the last
+/// word reads this way, and only a title of that width; the remote side is
+/// never cut. A value of one character fewer is cut before a space (see
+/// [`cut_off_similarity`]), so its last word is whole.
+fn local_edition_qualifiers(
+    title: &str,
+    remote: &BTreeSet<&'static str>,
+) -> BTreeSet<&'static str> {
     let mut qualifiers = edition_qualifiers(title);
     if title.chars().count() != ID3V1_FIELD_CHARS
         || !title.chars().next_back().is_some_and(char::is_alphanumeric)
@@ -2254,7 +2262,11 @@ fn local_edition_qualifiers(title: &str) -> BTreeSet<&'static str> {
     for (word, qualifier) in words {
         // A word that is whole is already read by `edition_qualifiers`.
         if word.len() > last.len() && word.starts_with(last) {
-            qualifiers.extend(edition_qualifiers(qualifier));
+            qualifiers.extend(
+                edition_qualifiers(qualifier)
+                    .into_iter()
+                    .filter(|read| remote.contains(read)),
+            );
         }
     }
     qualifiers
@@ -4669,11 +4681,13 @@ fn labels_agree_across_levels(
     candidate: &Candidate,
     label_pairs: &[LabelPair],
 ) -> bool {
+    let mut remote_set = remote_edition_qualifiers(&candidate.release);
     let mut local_set = match &local.album_title {
-        Some(title) if tag_identity(local).title.is_some() => local_edition_qualifiers(title),
+        Some(title) if tag_identity(local).title.is_some() => {
+            local_edition_qualifiers(title, &remote_set)
+        }
         _ => BTreeSet::new(),
     };
-    let mut remote_set = remote_edition_qualifiers(&candidate.release);
     let at_release_level = qualifiers_agree(&local_set, &remote_set)
         || one_sided_labels(&local_set, &remote_set, RELEASE_LABEL_QUALIFIERS);
     for pair in label_pairs {
@@ -5690,8 +5704,8 @@ fn evaluate_with(
     if tag_identity(local).title.is_some()
         && let Some(local_title) = &local.album_title
     {
-        let local_qualifiers = local_edition_qualifiers(local_title);
         let remote_qualifiers = remote_edition_qualifiers(remote);
+        let local_qualifiers = local_edition_qualifiers(local_title, &remote_qualifiers);
         if !qualifiers_agree(&local_qualifiers, &remote_qualifiers) {
             if label_gate
                 && one_sided_labels(
@@ -7831,11 +7845,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v40"
+            "discogs-match-v41"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v39"
+            "musicbrainz-match-v40"
         );
     }
 
@@ -14599,7 +14613,43 @@ mod tests {
         for (title, expected) in cases {
             let width = title.chars().count();
             assert_eq!(width, ID3V1_FIELD_CHARS, "{title}");
-            assert_eq!(local_edition_qualifiers(title), expected, "{title}");
+            assert_eq!(
+                local_edition_qualifiers(title, &expected),
+                expected,
+                "{title}"
+            );
+            // A cut-off reading is a guess: the provider has to name it.
+            assert_eq!(
+                local_edition_qualifiers(title, &BTreeSet::new()),
+                BTreeSet::new(),
+                "{title}"
+            );
+        }
+        // A cut that would read as a qualifier the provider does not say
+        // (`Remas`, `Remast`, `Delux`) agrees with a release that is silent.
+        for title in [
+            "Schoolboy's In Disgrace (Remas",
+            "Younger Than Yesterday (Remast",
+            "The Wild Life (Definitive Rema",
+            "Nothing Lasts Forever - Remast",
+            "Music For Earth Worms (Remaste",
+            "The Longest Barrel Ride (Delux",
+        ] {
+            assert_eq!(title.chars().count(), ID3V1_FIELD_CHARS, "{title}");
+            assert_eq!(
+                local_edition_qualifiers(title, &BTreeSet::new()),
+                BTreeSet::new(),
+                "{title}"
+            );
+        }
+        // A whole last word reads as written, whatever longer word it starts.
+        let remix = BTreeSet::from(["remix"]);
+        for title in [
+            "Intervention: Collection Remix",
+            "Obstacle 1 (Arthur Baker Remix",
+        ] {
+            assert_eq!(title.chars().count(), ID3V1_FIELD_CHARS, "{title}");
+            assert_eq!(local_edition_qualifiers(title, &remix), remix, "{title}");
         }
         // The same word on a title that is not 30 characters wide is complete
         // as written (a 29-character value is cut before a space, so its last
@@ -14618,13 +14668,38 @@ mod tests {
             "Collected Hits Volume (Instr)",
             "Unreleased Rarities Compil Instr",
         ] {
-            assert_eq!(local_edition_qualifiers(title), BTreeSet::new(), "{title}");
+            let everything = BTreeSet::from(["instrumental", "remastered", "deluxe"]);
+            assert_eq!(
+                local_edition_qualifiers(title, &everything),
+                BTreeSet::new(),
+                "{title}"
+            );
         }
         assert_eq!("Plain Title Of Song Instr".chars().count(), 25);
         assert_eq!("Collected Hits Volume Inst".chars().count(), 26);
         assert_eq!("Collected Hits Volume Instrum".chars().count(), 29);
         // Only the local side reads this way.
         assert!(edition_qualifiers("All Saints Collected Instrumen").is_empty());
+    }
+
+    #[test]
+    fn a_title_cut_in_a_word_the_provider_does_not_say_is_not_a_qualifier_difference() {
+        let (local, remote) = tracklist_pair(
+            12,
+            ("Schoolboy's In Disgrace (Remas", "Test Artist"),
+            ("Schoolboy's in Disgrace", &["Test Artist"]),
+        );
+        assert_eq!(local.album_title.as_deref().unwrap().chars().count(), 30);
+        assert!(remote_edition_qualifiers(&remote).is_empty());
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(
+            !evaluation
+                .blockers
+                .iter()
+                .chain(&evaluation.warnings)
+                .any(|reason| reason.contains("edition qualifiers differ")),
+            "{evaluation:?}"
+        );
     }
 
     #[test]
