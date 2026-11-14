@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v31";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v30";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v32";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v31";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -3580,6 +3580,54 @@ fn album_track_qualifiers(title: &str) -> BTreeSet<&'static str> {
     qualifiers
 }
 
+/// Words beyond [`VERSION_WORDS`] that name another version of a track, in the
+/// spellings [`normalize_text`] leaves: `voice-over` and `voiceover`, `en vivo`,
+/// `wordless`, `[inst.]`, karaoke, `a cappella`, and duets. `backing` is not
+/// listed: backing vocals are a credit as often as a version.
+const EXTRA_TITLE_VERSION_WORDS: &[&str] = &[
+    "acapella",
+    "duet",
+    "inst",
+    "karaoke",
+    "vivo",
+    "voiceover",
+    "wordless",
+];
+
+/// The words of a track title that name a version of the recording: the
+/// normalized words that are in [`VERSION_WORDS`] or
+/// [`EXTRA_TITLE_VERSION_WORDS`], except the edition words (`remaster*`,
+/// `stereo`, `deluxe`), which a different mastering of the same recording
+/// carries. `voice over` reads as `voiceover` and `cappella` as `acapella`.
+/// Language words are not version words, so `(Spanish version)` and
+/// `(English Version)` both carry just `version`.
+fn title_version_words(title: &str) -> BTreeSet<&'static str> {
+    let normalized = normalize_text(title);
+    let mut words = BTreeSet::new();
+    let mut tokens = normalized.split_whitespace().peekable();
+    while let Some(token) = tokens.next() {
+        let token = match token {
+            "voice" if tokens.peek() == Some(&"over") => {
+                tokens.next();
+                "voiceover"
+            }
+            "cappella" => "acapella",
+            other => other,
+        };
+        if token.contains("remaster") || matches!(token, "stereo" | "deluxe") {
+            continue;
+        }
+        if let Some(word) = VERSION_WORDS
+            .iter()
+            .chain(EXTRA_TITLE_VERSION_WORDS)
+            .find(|word| **word == token)
+        {
+            words.insert(*word);
+        }
+    }
+    words
+}
+
 /// The distance in seconds between a local track and the remote track it maps
 /// to, or `None` when either duration is unknown.
 fn duration_gap(
@@ -5134,10 +5182,16 @@ pub struct FallbackCheck {
 /// ([`strict_track_title_similarity`], so a subtitle only one side has counts
 /// against the match), the file's length and the fallback's are both known,
 /// positive and within [`DURATION_TOLERANCE_SECS`], the two titles carry the
-/// same track version qualifiers, and the primary's title does not name another
-/// take ([`local_title_is_another_take`]). A duration conflict is settled when
+/// same track version qualifiers, the primary's title does not name another
+/// take ([`local_title_is_another_take`]), and the version words
+/// ([`title_version_words`]) agree: the primary's are among the fallback's, and
+/// every one the fallback has and the primary lacks is also in the file's title
+/// (raw or cleaned reading), so a file that merely lacks a word only the
+/// primary names settles nothing. A duration conflict is settled when
 /// the file's length is within [`DURATION_TOLERANCE_SECS`] of the fallback's
-/// and further than that from the primary's, and the file's title also reads at
+/// and at least one tolerance closer to it than to the primary's (further than
+/// the tolerance from the primary's, and the gap to the primary at least the gap
+/// to the fallback plus [`DURATION_TOLERANCE_SECS`]), and the file's title also reads at
 /// least [`TITLE_SIMILARITY_THRESHOLD`] against the fallback's (so a settle
 /// never rests on a track the fallback matched through a weak, junk or
 /// near-miss title). Nothing is settled when the fallback's album title scores
@@ -5294,11 +5348,28 @@ pub fn fallback_check(
                         None,
                         fallback_title,
                     );
+                    // A version word only the primary has is never settled by
+                    // the file lacking it: rips rarely carry the word, so that
+                    // is absence of evidence. A word only the fallback has is
+                    // settled only when the file's title carries it too.
+                    let primary_words = title_version_words(&primary_track.title);
+                    let fallback_words = title_version_words(fallback_title);
+                    let file_words: BTreeSet<&str> = file_title
+                        .map(title_version_words)
+                        .into_iter()
+                        .chain(cleaned.map(|cleaned| title_version_words(&cleaned.text)))
+                        .flatten()
+                        .collect();
+                    let versions_settle = primary_words.is_subset(&fallback_words)
+                        && fallback_words
+                            .difference(&primary_words)
+                            .all(|word| file_words.contains(word));
                     match file_title {
                         Some(file_title)
                             if files_may_settle
                                 && file_length_agreeing_with_fallback.is_some()
                                 && file_reads_like_fallback
+                                && versions_settle
                                 && !primary_names_another_version
                                 && !file_reads_like(&primary_track.title) =>
                         {
@@ -5325,7 +5396,10 @@ pub fn fallback_check(
                         if files_may_settle
                             && title_agrees_with_fallback
                             && (file_duration - primary_duration).abs()
-                                > DURATION_TOLERANCE_SECS =>
+                                > DURATION_TOLERANCE_SECS
+                            && (file_duration - primary_duration).abs()
+                                >= (file_duration - fallback_duration).abs()
+                                    + DURATION_TOLERANCE_SECS =>
                     {
                         settled.push(format!(
                             "primary and fallback durations differ for local track {} ({primary_duration:.1}s versus {fallback_duration:.1}s); the file's {file_duration:.1}s agrees with the fallback",
@@ -7092,11 +7166,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v31"
+            "discogs-match-v32"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v30"
+            "musicbrainz-match-v31"
         );
     }
 
@@ -9276,6 +9350,113 @@ mod tests {
             assert_eq!(check.settled, Vec::<String>::new(), "{primary_title}");
             assert_eq!(check.conflicts.len(), 1, "{primary_title}: {check:?}");
         }
+    }
+
+    #[test]
+    fn the_files_do_not_settle_a_title_when_the_primary_names_a_version_the_files_lack() {
+        // The file's title lacking a version word is absence of evidence: rips
+        // rarely carry it. Each primary names a version the fallback and the
+        // file do not.
+        for primary_title in [
+            "Drive (Haeusermann mix)",
+            "Threshold (voice-over)",
+            "My Girl (en vivo)",
+            "Glassy-Dusty (Wordless)",
+            "Virus (edit)",
+            "Song (7\" version)",
+        ] {
+            let base = primary_title.split(" (").next().unwrap();
+            let check = settling_check(
+                &titles_with(3, base),
+                &titles_with(3, primary_title),
+                |_, _, _| {},
+            );
+            assert_eq!(check.settled, Vec::<String>::new(), "{primary_title}");
+            assert_eq!(check.conflicts.len(), 1, "{primary_title}: {check:?}");
+        }
+    }
+
+    #[test]
+    fn the_files_settle_a_title_when_the_version_words_they_carry_agree_with_the_fallback() {
+        // The file and the fallback both name the version the primary omits.
+        for (file_title, primary_title) in [
+            ("Midnight Cowboy (Album Version)", "Midnight Cowboy"),
+            ("Song [inst.]", "Song"),
+        ] {
+            let check = settling_check(
+                &titles_with(3, file_title),
+                &titles_with(3, primary_title),
+                |_, _, _| {},
+            );
+            assert_eq!(check.conflicts, Vec::<String>::new(), "{file_title}");
+            assert_eq!(check.settled.len(), 1, "{file_title}: {check:?}");
+        }
+
+        // The fallback names a version the file lacks while the primary also
+        // lacks it: the file does not decide that one.
+        let check = settling_check(
+            &titles_with(3, "Midnight Cowboy"),
+            &titles_with(3, "Midnite Cowboy"),
+            |_, _, fallback| {
+                fallback.tracklist[2].title = "Midnight Cowboy (Album Version)".to_string();
+            },
+        );
+        assert_eq!(check.settled, Vec::<String>::new(), "{check:?}");
+
+        // A language version is not a version word: both titles carry
+        // `version`, and the file says which one it is.
+        let check = settling_check(
+            &titles_with(3, "Song (English Version)"),
+            &titles_with(3, "Song (Spanish version)"),
+            |_, _, _| {},
+        );
+        assert_eq!(check.conflicts, Vec::<String>::new(), "{check:?}");
+        assert_eq!(check.settled.len(), 1, "{check:?}");
+    }
+
+    #[test]
+    fn version_words_of_a_title_are_the_wider_set() {
+        let words = |title: &str| title_version_words(title).into_iter().collect::<Vec<_>>();
+        assert_eq!(words("Drive (Haeusermann mix)"), ["mix"]);
+        assert_eq!(words("Threshold (voice-over)"), ["voiceover"]);
+        assert_eq!(words("Threshold (voiceover)"), ["voiceover"]);
+        assert_eq!(words("My Girl (en vivo)"), ["vivo"]);
+        assert_eq!(words("Song [inst.]"), ["inst"]);
+        assert_eq!(words("Song (A Cappella)"), ["acapella"]);
+        assert_eq!(words("Song (Radio Edit)"), ["edit", "radio"]);
+        assert_eq!(words("Song (Spanish version)"), ["version"]);
+        // Remasters, stereo and deluxe are editions, and `backing` is not one.
+        assert_eq!(
+            words("Song (2011 Remastered Stereo Deluxe)"),
+            Vec::<&str>::new()
+        );
+        assert_eq!(words("Backing Vocals"), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn the_files_do_not_settle_a_length_less_than_a_tolerance_closer_to_the_fallback() {
+        // 2.4 s from the fallback and 3.6 s from the primary: more than the
+        // tolerance from the primary, but not one tolerance apart.
+        let check = settling_check(&TITLES_6, &TITLES_6, |local, primary, fallback| {
+            local.tracks[3].duration_secs = Some(217.4);
+            fallback.tracklist[3].duration_secs = Some(215.0);
+            primary.tracklist[3].duration_secs = Some(221.0);
+        });
+        assert_eq!(check.settled, Vec::<String>::new());
+        assert_eq!(
+            check.conflicts,
+            vec!["primary and fallback durations differ for local track 4".to_string()]
+        );
+
+        // One tolerance apart settles: 1.0 s from the fallback, 4.0 s from the
+        // primary.
+        let check = settling_check(&TITLES_6, &TITLES_6, |local, primary, fallback| {
+            local.tracks[3].duration_secs = Some(216.0);
+            fallback.tracklist[3].duration_secs = Some(215.0);
+            primary.tracklist[3].duration_secs = Some(220.0);
+        });
+        assert_eq!(check.conflicts, Vec::<String>::new(), "{check:?}");
+        assert_eq!(check.settled.len(), 1, "{check:?}");
     }
 
     #[test]
