@@ -71,13 +71,29 @@ const TAG_WORDS: &[&str] = &[
     "cassette",
     "flexi",
     "int",
+    // Source and packaging tags of later releases (`-WEB-`, `-REPACK-`,
+    // `-SAT-`), the most common fields the list above missed in a 263k-release
+    // library.
+    "web",
+    "mag",
+    "repack",
+    "rerip",
+    "sat",
+    "sbd",
+    "aud",
+    "dab",
+    "stream",
+    "cdrep",
+    "mcdr",
+    "readnfo",
+    "boxset",
 ];
 
 /// Country codes scene releases carry as a tag (`-SP-`, `-FR-`).
 const COUNTRY_CODES: &[&str] = &[
     "de", "sp", "es", "fr", "it", "se", "swe", "nl", "jp", "jpn", "uk", "us", "fi", "no", "dk",
     "be", "at", "ch", "pl", "br", "ca", "au", "mx", "ar", "pt", "cz", "sk", "hu", "ru", "gr", "ie",
-    "nz", "gb", "ger",
+    "nz", "gb", "ger", "cn", "kr", "ua", "tr",
 ];
 
 /// Words dropped from the end of a title (`Take_Care_Of_Home_VLS`).
@@ -1020,5 +1036,27 @@ mod tests {
                 "{directory}"
             );
         }
+    }
+
+    #[test]
+    fn source_tags_of_later_releases_are_dropped() {
+        for (directory, artist, title) in [
+            ("Batushka-MARIA-WEB-2022-ENTiTLED", "Batushka", "MARIA"),
+            (
+                "Hot_Milk-A_Call_To_The_Void-(WEB)-2023-RUMBLE",
+                "Hot Milk",
+                "A Call To The Void",
+            ),
+            ("Foo-Bar-REPACK-2001-GRP", "Foo", "Bar"),
+            ("Foo-Bar-(REPACK)-2001-GRP", "Foo", "Bar"),
+            ("Foo-Live_In_Bar-SAT-2001-GRP", "Foo", "Live In Bar"),
+            ("Foo-Live_In_Bar-SBD-2CD-2001-GRP", "Foo", "Live In Bar"),
+            ("Foo-Bar-CN-2001-GRP", "Foo", "Bar"),
+            ("Foo-Bar-WEB-KR-2001-GRP", "Foo", "Bar"),
+        ] {
+            assert_eq!(read(directory), pair(artist, title), "{directory}");
+        }
+        // A title that is one of these words stays a title.
+        assert_eq!(read("Foo-Web-2001-GRP"), pair("Foo", "Web"));
     }
 }
