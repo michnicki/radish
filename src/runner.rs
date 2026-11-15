@@ -41,6 +41,15 @@ macro_rules! eprintln_to {
     };
 }
 
+/// Writes a run-wide notice to stderr through a [`Transcript`].
+///
+/// Unlike [`eprintln_to!`], a notice survives [`Transcript::into_notices`].
+macro_rules! notice_to {
+    ($transcript:expr, $($arg:tt)*) => {
+        $transcript.notice(format_args!($($arg)*))
+    };
+}
+
 /// How many candidates per provider a queued review snapshot keeps.
 const REVIEW_CANDIDATE_LIMIT: usize = 5;
 
@@ -78,6 +87,8 @@ struct Transcript {
 enum Line {
     Out(String),
     Err(String),
+    /// A stderr line about the whole run, which a discarded pass still owes.
+    Notice(String),
 }
 
 impl Transcript {
@@ -109,13 +120,41 @@ impl Transcript {
         }
     }
 
+    /// Writes one run-wide line to stderr, now or when flushed.
+    ///
+    /// Use it for what holds beyond the release being matched, such as Discogs
+    /// being switched off for the rest of the run.
+    fn notice(&mut self, args: fmt::Arguments<'_>) {
+        match &mut self.held {
+            None => eprintln!("{args}"),
+            Some(lines) => lines.push(Line::Notice(args.to_string())),
+        }
+    }
+
     /// Replays the lines of `other` here, in the order they were written.
     fn append(&mut self, other: Transcript) {
         for line in other.held.into_iter().flatten() {
             match line {
                 Line::Out(text) => self.out(format_args!("{text}")),
                 Line::Err(text) => self.err(format_args!("{text}")),
+                Line::Notice(text) => self.notice(format_args!("{text}")),
             }
+        }
+    }
+
+    /// Drops every line except the run-wide notices.
+    ///
+    /// A discarded pass keeps these: they report what the pass did to the run,
+    /// which the next pass does not repeat.
+    fn into_notices(self) -> Transcript {
+        let notices = self
+            .held
+            .into_iter()
+            .flatten()
+            .filter(|line| matches!(line, Line::Notice(_)))
+            .collect();
+        Transcript {
+            held: Some(notices),
         }
     }
 
@@ -124,7 +163,7 @@ impl Transcript {
         for line in self.held.into_iter().flatten() {
             match line {
                 Line::Out(text) => crate::output::write_line(format_args!("{text}")),
-                Line::Err(text) => eprintln!("{text}"),
+                Line::Err(text) | Line::Notice(text) => eprintln!("{text}"),
             }
         }
     }
@@ -935,6 +974,7 @@ where
                 }
             }
         }
+        transcript.append(held.into_notices());
         outln_to!(transcript, "  {DIRECTORY_PASS_NOTE}");
     }
 
@@ -1039,7 +1079,7 @@ where
                             let error = provider_error_from(ProviderKind::Discogs, error);
                             fallback_skip = Some(format!("Discogs fallback was skipped: {error}"));
                             clients.disable_discogs(error);
-                            eprintln_to!(
+                            notice_to!(
                                 transcript,
                                 "  Disabling Discogs fallback for the rest of this run"
                             );
@@ -1051,7 +1091,7 @@ where
                 // A rejected credential rejects every later release too.
                 if let Some(error) = attempt.error.as_ref().filter(|error| error.is_auth()) {
                     clients.disable_discogs(error.clone());
-                    eprintln_to!(transcript, "  Disabling Discogs for the rest of this run");
+                    notice_to!(transcript, "  Disabling Discogs for the rest of this run");
                 }
                 attempts.push(attempt);
             }
@@ -1064,12 +1104,19 @@ where
             eprintln_to!(transcript, "  note ({}): {}", attempt.provider, Clean(note));
         }
         if let Some(error) = &attempt.error {
-            eprintln_to!(
-                transcript,
+            // The error that switched Discogs off is not seen again: the next
+            // pass finds Discogs disabled and makes no attempt.
+            let run_wide = attempt.provider == ProviderKind::Discogs && error.is_auth();
+            let line = format_args!(
                 "  {} stage error: {}",
                 attempt.provider,
                 Clean(&error.to_string())
             );
+            if run_wide {
+                transcript.notice(line);
+            } else {
+                transcript.err(line);
+            }
         }
     }
     if let Some(reason) = &fallback_skip {
@@ -2566,7 +2613,7 @@ mod tests {
             .flatten()
             .filter_map(|line| match line {
                 Line::Out(text) => Some(text.as_str()),
-                Line::Err(_) => None,
+                Line::Err(_) | Line::Notice(_) => None,
             })
             .collect();
         let unconfirmed = lines
@@ -2637,7 +2684,7 @@ mod tests {
             .flatten()
             .filter_map(|line| match line {
                 Line::Out(text) => Some(text.as_str()),
-                Line::Err(_) => None,
+                Line::Err(_) | Line::Notice(_) => None,
             })
             .collect();
         let unconfirmed = lines
@@ -2710,7 +2757,7 @@ mod tests {
             .flatten()
             .filter_map(|line| match line {
                 Line::Out(text) => Some(text.as_str()),
-                Line::Err(_) => None,
+                Line::Err(_) | Line::Notice(_) => None,
             })
             .collect();
         let unconfirmed = lines
@@ -2789,7 +2836,7 @@ mod tests {
             .flatten()
             .filter_map(|line| match line {
                 Line::Out(text) => Some(text.as_str()),
-                Line::Err(_) => None,
+                Line::Err(_) | Line::Notice(_) => None,
             })
             .collect();
         let unconfirmed = lines
@@ -3191,7 +3238,7 @@ mod tests {
             .flatten()
             .filter_map(|line| match line {
                 Line::Out(text) => Some(text.as_str()),
-                Line::Err(_) => None,
+                Line::Err(_) | Line::Notice(_) => None,
             })
             .collect()
     }
@@ -3207,6 +3254,20 @@ mod tests {
         first.append(second);
         assert_eq!(out_lines(&first), ["one", "two", "three"]);
         assert_eq!(first.held.as_ref().map(Vec::len), Some(4));
+    }
+
+    #[test]
+    fn a_discarded_transcript_keeps_only_its_run_wide_notices() {
+        let mut pass = Transcript::held();
+        outln_to!(pass, "ordinary");
+        eprintln_to!(pass, "ordinary error");
+        notice_to!(pass, "Discogs is off");
+        let mut kept = Transcript::held();
+        kept.append(pass.into_notices());
+        assert_eq!(
+            kept.held,
+            Some(vec![Line::Notice("Discogs is off".to_string())])
+        );
     }
 
     #[test]
