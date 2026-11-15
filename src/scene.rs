@@ -211,7 +211,8 @@ struct Field {
 ///
 /// Made by [`parse_release_directory`]. The group, years and format tags are
 /// already gone; what remains is the artist and the album, whose boundary
-/// [`SceneName::split`] or [`SceneName::split_matching`] decides.
+/// [`SceneName::split`], [`SceneName::split_matching`] or
+/// [`SceneName::split_matching_title`] decides.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SceneName {
     fields: Vec<Field>,
@@ -286,8 +287,7 @@ pub fn parse_release_directory(directory: &str) -> Option<SceneName> {
 /// with each cut's title part; a cut stands only when exactly one fits. High
 /// enough that a tag naming a shorter credit (`Stresmatic` against
 /// `Stresmatic and Droop-E`) decides nothing, low enough that spelling
-/// (`Wu-Tang Clan` against `Wu Tang Clan`) still does. Discovery used the same
-/// value for the artist before the album tag could decide.
+/// (`Wu-Tang Clan` against `Wu Tang Clan`) still does.
 const TAG_HINT: f64 = 0.90;
 
 /// The artist and album a release's directory name gives, tags breaking ties.
@@ -319,7 +319,7 @@ pub(crate) fn directory_split(local: &LocalRelease) -> Option<SceneSplit> {
     if split.title.as_deref().is_some_and(matcher::is_junk_title) {
         split.title = None;
     }
-    (split.various || split.artist.is_some() || split.title.is_some()).then_some(split)
+    Some(split)
 }
 
 /// The path component that names the release.
@@ -667,7 +667,8 @@ impl SceneName {
     ///
     /// A name with two fields, a strong first separator, a Various Artists
     /// marker first or a self-titled marker last has one reading. Anything else
-    /// (`Wu-Tang_Clan-Wu-Tang_Forever`) needs [`SceneName::split_matching`].
+    /// (`Wu-Tang_Clan-Wu-Tang_Forever`) needs [`SceneName::split_matching`] or
+    /// [`SceneName::split_matching_title`].
     pub fn split(&self) -> Option<SceneSplit> {
         let count = self.fields.len();
         if is_various_marker(&self.fields[0].text) {
@@ -722,7 +723,9 @@ impl SceneName {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matcher::{album_title_similarity, local_artist_similarity};
+    use crate::matcher::{
+        ArtistKind, EmbeddedReleaseEvidence, album_title_similarity, local_artist_similarity,
+    };
 
     fn read(directory: &str) -> Option<(Option<String>, String, bool)> {
         let split = parse_release_directory(directory)?.split()?;
@@ -1111,9 +1114,6 @@ mod tests {
         assert_eq!(read("Foo-EP_Two-2001-GRP"), pair("Foo", "EP Two"));
     }
 
-    // `LocalRelease` comes in through `super::*`.
-    use crate::matcher::{ArtistKind, EmbeddedReleaseEvidence};
-
     /// A release with no tracks in `directory`, with the given tags.
     fn tagged(directory: &str, album: Option<&str>, artist: Option<&str>) -> LocalRelease {
         LocalRelease {
@@ -1168,12 +1168,29 @@ mod tests {
             reading(&tagged(stresmatic, Some("4005"), Some("Stresmatic"))),
             some("Stresmatic and Droop-E", "4005")
         );
-        // A Various Artists or filler tag decides nothing; nothing decides: no reading.
+        // The artist tag is asked before the album tag.
+        assert_eq!(
+            reading(&tagged(
+                "/mp3/Alpha-Beta-Gamma-2001-GRP",
+                Some("Gamma"),
+                Some("Alpha")
+            )),
+            some("Alpha", "Beta-Gamma")
+        );
+        // A filler album tag or a Various Artists release decides nothing;
+        // nothing decides: no reading.
         assert_eq!(reading(&tagged(stresmatic, None, Some("Stresmatic"))), None);
         assert_eq!(
-            reading(&tagged(wu, Some("Unknown Title"), Some("Various Artists"))),
+            reading(&tagged(
+                "/mp3/Some-Band-Unknown_Title-2001-GRP",
+                Some("Unknown Title"),
+                None
+            )),
             None
         );
+        let mut various = tagged(wu, None, Some("Wu-Tang Clan"));
+        various.artist_kind = ArtistKind::VariousArtists;
+        assert_eq!(reading(&various), None);
         // A filler title in the name is no title; the artist still reads.
         assert_eq!(
             reading(&tagged(
