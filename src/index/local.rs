@@ -86,18 +86,29 @@ impl LocalIndex {
         let offset = i64::from(request.offset);
 
         match &request.strategy {
+            // A blank identifier is refused, as the network adapters refuse
+            // it. One with no usable characters (a barcode tag `ARCODE`, a
+            // catalog number `-`) is not blank, so the network adapters send
+            // it and the service finds nothing. Match that: a clean miss, not
+            // a failure that would abort the release.
             SearchStrategy::Barcode(barcode) => {
+                if barcode.trim().is_empty() {
+                    return Err(self.empty_term());
+                }
                 let value = normalize_barcode(barcode);
                 if value.is_empty() {
-                    return Err(self.empty_term());
+                    return self.page(Vec::new(), offset, limit, Some(0));
                 }
                 self.search_identifier("barcode", &value, offset, limit)
                     .await
             }
             SearchStrategy::CatalogNumber(catalog) => {
+                if catalog.trim().is_empty() {
+                    return Err(self.empty_term());
+                }
                 let value = normalize_identifier(catalog);
                 if value.is_empty() {
-                    return Err(self.empty_term());
+                    return self.page(Vec::new(), offset, limit, Some(0));
                 }
                 self.search_identifier("catalog", &value, offset, limit)
                     .await
@@ -624,6 +635,41 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{title:?} failed: {error}"));
             assert!(page.hits.is_empty(), "{title:?}");
             assert_eq!(page.next_offset, None, "{title:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_identifier_without_usable_characters_is_a_miss_not_a_failure() {
+        let releases = vec![release(
+            "11111111-1111-1111-1111-111111111111",
+            "Blue",
+            "Test Artist",
+            None,
+            None,
+        )];
+        let (_dir, paths) = index_with(&releases, IndexKind::MusicBrainz).await;
+        let index = LocalIndex::open(&paths, IndexKind::MusicBrainz)
+            .await
+            .unwrap();
+
+        // Junk tags seen in a real library (`ARCODE`, a cut-off `BARCODE`):
+        // not blank, so the network adapters send them and find nothing.
+        for strategy in [
+            SearchStrategy::Barcode("ARCODE".to_string()),
+            SearchStrategy::Barcode("N/A".to_string()),
+            SearchStrategy::CatalogNumber("-".to_string()),
+            SearchStrategy::CatalogNumber("—".to_string()),
+        ] {
+            let page = index
+                .search(SearchRequest {
+                    strategy: strategy.clone(),
+                    offset: 0,
+                    limit: 50,
+                })
+                .await
+                .unwrap_or_else(|error| panic!("{strategy:?} failed: {error}"));
+            assert!(page.hits.is_empty(), "{strategy:?}");
+            assert_eq!(page.next_offset, None, "{strategy:?}");
         }
     }
 
