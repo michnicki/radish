@@ -1485,6 +1485,7 @@ pub async fn load_selected_releases(
             embedded_evidence,
             is_compilation: row.is_compilation,
             has_album_tag: row.has_album_tag,
+            reads_directory: true,
             revision: row.source_revision,
             tracks,
         });

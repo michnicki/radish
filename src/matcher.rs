@@ -314,6 +314,12 @@ pub struct LocalRelease {
     pub embedded_evidence: EmbeddedReleaseEvidence,
     pub is_compilation: bool,
     pub has_album_tag: bool,
+    /// Whether matching may read the directory name as a second reading.
+    ///
+    /// The second reading is of the album title and artist, beyond filling a
+    /// missing or junk tag. The runner turns it off for its tags-only first
+    /// pass.
+    pub reads_directory: bool,
     pub revision: String,
     /// In the order of `store::order_release_tracks`. `Mapping::pairs` is
     /// indexed by position in this list.
@@ -3326,7 +3332,7 @@ const DIRECTORY_NOTE: &str = "read from the directory name";
 
 /// Warnings naming the album title or artist the directory name decided.
 fn directory_notes(local: &LocalRelease, candidate: &Candidate) -> Vec<String> {
-    let Some(directory) = scene::directory_split(local) else {
+    let Some(directory) = scene::directory_reading(local) else {
         return Vec::new();
     };
     let remote = &candidate.release;
@@ -3353,7 +3359,7 @@ fn directory_notes(local: &LocalRelease, candidate: &Candidate) -> Vec<String> {
 pub fn score(local: &LocalRelease, remote: &RemoteRelease, mapping: &Mapping) -> ScoreBreakdown {
     // The tags and the directory name are two readings of the album; the
     // better one counts. No other component reads the directory.
-    let directory = scene::directory_split(local);
+    let directory = scene::directory_reading(local);
     let album_title = tag_title_score(local, remote, mapping).max(directory_title_score(
         local,
         directory.as_ref(),
@@ -3557,7 +3563,7 @@ pub(crate) fn rank_identity(local: &LocalRelease) -> RankIdentity {
         .collect();
     // The directory name's reading ranks too, so a hit only it names clears
     // the detailed-lookup floor.
-    if let Some(directory) = scene::directory_split(local) {
+    if let Some(directory) = scene::directory_reading(local) {
         if let Some(artist) = directory.credited_artist()
             && !artists.contains(&artist)
         {
@@ -5502,7 +5508,7 @@ fn weak_rule_title(local: &LocalRelease, candidate: &Candidate) -> Option<f64> {
     if !lacks_album_title(local) {
         return Some(candidate.score.album_title);
     }
-    let directory = scene::directory_split(local)?;
+    let directory = scene::directory_reading(local)?;
     directory_title_similarity(local, &directory, &candidate.release)
         .map(|similarity| (similarity - DIRECTORY_PENALTY).max(0.0))
 }
@@ -5679,7 +5685,7 @@ fn evaluate_with(
         );
     } else if corroborated_title && lacks_album_title(local) {
         let title = weak_rule_title(local, candidate).unwrap_or_default();
-        let name = scene::directory_split(local)
+        let name = scene::directory_reading(local)
             .and_then(|split| split.title)
             .unwrap_or_default();
         warnings.push(format!(
@@ -6467,6 +6473,7 @@ mod tests {
             embedded_evidence: EmbeddedReleaseEvidence::default(),
             is_compilation: false,
             has_album_tag: true,
+            reads_directory: true,
             revision: "rev-1".to_string(),
             tracks,
         }
@@ -14148,6 +14155,50 @@ mod tests {
         );
         // The cut-off artist tag already reads as the whole credit: the tag wins.
         assert_eq!(score.album_artist, tags.album_artist);
+    }
+
+    #[test]
+    fn a_release_that_does_not_read_its_directory_scores_as_if_it_had_none() {
+        let titles = &TITLES_12[..4];
+        let remote = fellers_remote(titles);
+        let plain = in_directory(
+            titles,
+            "/music/album",
+            "The Natural Finger 7 Inch Viny",
+            "Thinking Fellers Union Local 2",
+        );
+        let mut local = plain.clone();
+        local.directory = FELLERS.to_string();
+        let read = Candidate::new(&local, remote.clone()).score;
+        local.reads_directory = false;
+        let off = Candidate::new(&local, remote.clone()).score;
+        let tags = Candidate::new(&plain, remote).score;
+        assert!(read.album_title > off.album_title, "{read:?} {off:?}");
+        assert_eq!(off.album_title, tags.album_title);
+        assert_eq!(off.album_artist, tags.album_artist);
+    }
+
+    #[test]
+    fn a_release_that_does_not_read_its_directory_ranks_on_its_tags() {
+        let mut local = in_directory(&["One"], "/music/album", "Zzzz Qqqq", "Someone Else");
+        let hit = SearchSummary {
+            id: ReleaseId::Discogs(42),
+            title: "Blue".to_string(),
+            artists: vec!["Test Artist".to_string()],
+            artist_credit: None,
+            year: None,
+            country: None,
+            labels: Vec::new(),
+            catalog_numbers: Vec::new(),
+            formats: Vec::new(),
+            barcodes: Vec::new(),
+            result_type: "release".to_string(),
+        };
+        let tags = rank_search_summary(&local, &hit);
+        local.directory = "/mp3/Test_Artist-Blue-2001-GRP".to_string();
+        assert!(rank_search_summary(&local, &hit) > tags);
+        local.reads_directory = false;
+        assert_eq!(rank_search_summary(&local, &hit), tags);
     }
 
     #[test]

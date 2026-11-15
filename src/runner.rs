@@ -2046,6 +2046,7 @@ mod tests {
             embedded_evidence: EmbeddedReleaseEvidence::default(),
             is_compilation: false,
             has_album_tag: true,
+            reads_directory: true,
             revision: "rev".into(),
             tracks: (1..=12)
                 .map(|number| LocalTrack {

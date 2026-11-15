@@ -333,6 +333,18 @@ pub(crate) fn directory_split(local: &LocalRelease) -> Option<SceneSplit> {
     Some(split)
 }
 
+/// The directory name's reading of `local`, when it may be consulted.
+///
+/// This is [`directory_split`] when `local.reads_directory` is set, and `None`
+/// otherwise. Everything except filling a missing or junk tag asks this.
+pub(crate) fn directory_reading(local: &LocalRelease) -> Option<SceneSplit> {
+    if local.reads_directory {
+        directory_split(local)
+    } else {
+        None
+    }
+}
+
 /// The path component that names the release.
 fn release_leaf(directory: &str) -> Option<&str> {
     let trimmed = directory.trim_end_matches(['/', '\\']);
@@ -1144,6 +1156,7 @@ mod tests {
             embedded_evidence: EmbeddedReleaseEvidence::default(),
             is_compilation: false,
             has_album_tag: album.is_some(),
+            reads_directory: true,
             revision: "rev".to_string(),
             tracks: Vec::new(),
         }
@@ -1157,6 +1170,15 @@ mod tests {
 
     fn some(artist: &str, title: &str) -> Option<Reading> {
         Some((Some(artist.to_string()), Some(title.to_string()), false))
+    }
+
+    #[test]
+    fn a_switched_off_directory_reading_is_none() {
+        let mut local = tagged("/mp3/Foo-Bar-2001-GRP", Some("Bar"), Some("Foo"));
+        assert!(directory_reading(&local).is_some());
+        local.reads_directory = false;
+        assert!(directory_split(&local).is_some());
+        assert!(directory_reading(&local).is_none());
     }
 
     #[test]

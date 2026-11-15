@@ -162,7 +162,7 @@ fn compact(text: &str) -> String {
 /// `Various Artists`, and a name with no album title (`Fazed-EP-…`) keeps the
 /// tags' title.
 fn directory_search(local: &LocalRelease, view: &LocalRelease) -> Option<DirectorySearch> {
-    let split = scene::directory_split(local)?;
+    let split = scene::directory_reading(local)?;
     let artist = split.credited_artist()?;
     let tag_title = matcher::search_title(view);
     let artist_differs = view
@@ -841,6 +841,7 @@ mod tests {
             embedded_evidence: EmbeddedReleaseEvidence::default(),
             is_compilation: false,
             has_album_tag: true,
+            reads_directory: true,
             revision: "rev".to_string(),
             tracks: vec![LocalTrack {
                 id: 1,
@@ -1496,6 +1497,36 @@ mod tests {
         assert_eq!(
             title_and_artist(ProviderKind::Discogs, &disc),
             vec![search("title", "Broken", Some("Straight Faced"))]
+        );
+    }
+
+    #[test]
+    fn a_release_that_does_not_read_its_directory_still_fills_missing_tags() {
+        let mut local = untagged();
+        local.reads_directory = false;
+        // The fill is not a second reading: the search uses the directory's text.
+        assert_eq!(
+            title_and_artist(ProviderKind::MusicBrainz, &local),
+            vec![
+                search("title and artist", "Broken", Some("Straight Faced")),
+                search("title only", "Broken", None),
+            ]
+        );
+        // A usable artist tag stays, and the directory adds no search of its own.
+        let mut artist_only = local.clone();
+        artist_only.album_artist = Some("Real Artist".to_string());
+        artist_only.artist_kind = ArtistKind::AlbumArtist;
+        let strategies = strategies_for(ProviderKind::Discogs, &artist_only);
+        assert!(strategies.iter().all(|(label, _)| label != DIRECTORY_LABEL));
+        assert_eq!(
+            title_and_artist(ProviderKind::Discogs, &artist_only),
+            vec![search("title", "Broken", Some("Real Artist"))]
+        );
+        artist_only.reads_directory = true;
+        assert!(
+            strategies_for(ProviderKind::Discogs, &artist_only)
+                .iter()
+                .any(|(label, _)| label == DIRECTORY_LABEL)
         );
     }
 
