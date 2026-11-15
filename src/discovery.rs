@@ -1610,6 +1610,25 @@ mod tests {
     }
 
     #[test]
+    fn the_rank_floor_reads_a_directory_that_disagrees_with_the_tags() {
+        let mut local = local();
+        local.barcode = None;
+        local.album_title = Some("Zzzz Qqqq".to_string());
+        local.album_artist = Some("Someone Else Entirely".to_string());
+        let mut hit = summary("11111111-1111-1111-1111-111111111111");
+        hit.year = None;
+        hit.barcodes.clear();
+        // `Blue` by `Test Artist`: nothing in the tags names it.
+        assert!(matcher::rank_search_summary(&local, &hit) < MIN_DETAIL_RANK);
+        local.directory = "/mp3/Test_Artist-Blue-2001-GRP".to_string();
+        assert!(
+            matcher::rank_search_summary(&local, &hit) >= MIN_DETAIL_RANK,
+            "{}",
+            matcher::rank_search_summary(&local, &hit)
+        );
+    }
+
+    #[test]
     fn the_rank_floor_uses_the_better_of_the_artist_and_the_tag_for_a_placeholder() {
         let mut local = local();
         local.album_title = Some("Self Titled".to_string());

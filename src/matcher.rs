@@ -3487,15 +3487,17 @@ fn artist_credit_score(
 // Candidate ranking and acceptance
 // ---------------------------------------------------------------------------
 
-/// What a local release is ranked as: every album title it may go by, and its
-/// artist. Built once per release by [`rank_identity`].
+/// What a local release is ranked as: every album title and artist it may go
+/// by. Built once per release by [`rank_identity`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RankIdentity {
     /// A self-titled placeholder is two readings, the artist's name and the tag
-    /// as written, since a provider may list the album under either. Junk and
-    /// missing titles have none.
+    /// as written, since a provider may list the album under either. The
+    /// directory name's title is one more. Junk and missing titles have none.
     titles: Vec<String>,
-    artist: Option<String>,
+    /// The artist tag, then the directory name's artist when it differs. Junk
+    /// has none.
+    artists: Vec<String>,
 }
 
 pub(crate) fn rank_identity(local: &LocalRelease) -> RankIdentity {
@@ -3510,24 +3512,50 @@ pub(crate) fn rank_identity(local: &LocalRelease) -> RankIdentity {
     }
     // Not `identity.artist`: a Various Artists release still ranks on its
     // credit, which providers list as `Various Artists`. Only junk is no hint.
-    let artist = local
+    let mut artists: Vec<String> = local
         .album_artist
         .as_deref()
         .filter(|artist| !is_junk_artist(artist))
-        .map(str::to_string);
-    RankIdentity { titles, artist }
+        .map(str::to_string)
+        .into_iter()
+        .collect();
+    // The directory name's reading ranks too, so a hit only it names clears
+    // the detailed-lookup floor.
+    if let Some(directory) = scene::directory_split(local) {
+        if let Some(title) = directory.title
+            && !titles.contains(&title)
+        {
+            titles.push(title);
+        }
+        let artist = if directory.various {
+            Some("Various Artists".to_string())
+        } else {
+            directory.artist
+        };
+        if let Some(artist) = artist
+            && !artists.contains(&artist)
+        {
+            artists.push(artist);
+        }
+    }
+    RankIdentity { titles, artists }
 }
 
 impl RankIdentity {
-    /// The best [`rank_search_summary_with`] over the title readings.
+    /// The best [`rank_search_summary_with`] over the title and artist readings.
     pub(crate) fn rank(&self, local: &LocalRelease, summary: &SearchSummary) -> f64 {
-        let artist = self.artist.as_deref();
-        if self.titles.is_empty() {
-            return rank_search_summary_with(local, None, artist, summary);
+        fn readings(values: &[String]) -> Vec<Option<&str>> {
+            if values.is_empty() {
+                vec![None]
+            } else {
+                values.iter().map(|value| Some(value.as_str())).collect()
+            }
         }
-        self.titles
-            .iter()
-            .map(|title| rank_search_summary_with(local, Some(title), artist, summary))
+        let artists = readings(&self.artists);
+        readings(&self.titles)
+            .into_iter()
+            .flat_map(|title| artists.iter().map(move |artist| (title, *artist)))
+            .map(|(title, artist)| rank_search_summary_with(local, title, artist, summary))
             .fold(0.0, f64::max)
     }
 }
