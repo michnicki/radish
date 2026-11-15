@@ -600,3 +600,78 @@ async fn too_few_files_of_a_longer_musicbrainz_release_stay_in_review() {
     assert!(text.contains("Queued for review: 1"), "{text}");
     assert!(text.contains("track mapping is incomplete"), "{text}");
 }
+
+/// A six-track `Blue` by `Test Artist`, for any MusicBrainz search.
+fn named_artist_handler(target: &str) -> (u16, String) {
+    if target.contains(&format!("/ws/2/release/{MBID}")) {
+        let titles: Vec<String> = (1..=6).map(|number| format!("Track {number}")).collect();
+        let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let durations: Vec<f64> = (0..6).map(|index| 180.0 + index as f64).collect();
+        return (200, musicbrainz_release_json(MBID, &titles, &durations));
+    }
+    if target.contains("/ws/2/release") {
+        let release = serde_json::json!({
+            "id": MBID, "title": "Blue", "date": "2001-05-01",
+            "artist-credit": [{"name": "Test Artist", "joinphrase": ""}]
+        });
+        return (
+            200,
+            serde_json::json!({"count": 1, "offset": 0, "releases": [release]}).to_string(),
+        );
+    }
+    (500, "unexpected Discogs request".to_string())
+}
+
+/// Six files of `Blue` by `Test Artist`, tagged Various Artists, in `directory`.
+async fn seed_various_tag(db: &Path, directory: &str) {
+    let pool = radish::db::connect(db).await.unwrap();
+    let directory = Path::new(directory);
+    let directory_id = store::upsert_directory(&pool, directory).await.unwrap();
+    for number in 1..=6i64 {
+        let track = ScannedTrack {
+            path: directory.join(format!("{number:02}.flac")),
+            title: Some(format!("Track {number}")),
+            artist: Some("Test Artist".to_string()),
+            album: Some("Blue".to_string()),
+            album_artist: Some("Various Artists".to_string()),
+            year: Some(2001),
+            track_number: Some(number),
+            disc_number: None,
+            barcode: None,
+            catalog_number: None,
+            discogs_release_id: None,
+            musicbrainz: ObservedMusicBrainzIds::default(),
+            duration_secs: Some(179.0 + number as f64),
+            modified_at: 1,
+        };
+        store::upsert_track(&pool, &track, directory_id)
+            .await
+            .unwrap();
+    }
+    store::rebuild_local_releases(&pool, None).await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn a_directory_that_names_the_artist_outweighs_a_various_artists_tag() {
+    let server = MockServer::start(named_artist_handler);
+
+    let db = db_path("musicbrainz-directory-artist");
+    seed_various_tag(&db, "/mp3/Test_Artist-Blue-2001-GRP").await;
+    let output = run(&db, &server, &["match"]);
+    let text = stdout(&output);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("Accepted: 1"), "{text}");
+    assert!(
+        text.contains("artist 'Test Artist' read from the directory name"),
+        "{text}"
+    );
+
+    // The same files in a directory that is no scene name stay in review.
+    let db = db_path("musicbrainz-directory-artist-plain");
+    seed_various_tag(&db, "/music/blue").await;
+    let output = run(&db, &server, &["match"]);
+    let text = stdout(&output);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("Accepted: 0"), "{text}");
+}
