@@ -650,11 +650,25 @@ impl SceneName {
     /// Every cut point is tried; the split stands only when exactly one artist
     /// part satisfies `is_artist`. Never searches several splits.
     pub fn split_matching(&self, is_artist: impl Fn(&str) -> bool) -> Option<SceneSplit> {
+        self.split_at_unique_cut(|cut| is_artist(&self.join(0, cut)))
+    }
+
+    /// [`SceneName::split`], resolving an ambiguous name with an album title hint.
+    ///
+    /// Every cut point is tried; the split stands only when exactly one title
+    /// part (everything after the cut) satisfies `is_title`.
+    pub fn split_matching_title(&self, is_title: impl Fn(&str) -> bool) -> Option<SceneSplit> {
+        let count = self.fields.len();
+        self.split_at_unique_cut(|cut| is_title(&self.join(cut, count)))
+    }
+
+    /// The structural split, or else the one cut point that `fits`.
+    fn split_at_unique_cut(&self, fits: impl Fn(usize) -> bool) -> Option<SceneSplit> {
         if let Some(split) = self.split() {
             return Some(split);
         }
         let count = self.fields.len();
-        let mut cuts = (1..count).filter(|cut| is_artist(&self.join(0, *cut)));
+        let mut cuts = (1..count).filter(|cut| fits(*cut));
         let cut = cuts.next()?;
         if cuts.next().is_some() {
             return None;
@@ -666,7 +680,7 @@ impl SceneName {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matcher::local_artist_similarity;
+    use crate::matcher::{album_title_similarity, local_artist_similarity};
 
     fn read(directory: &str) -> Option<(Option<String>, String, bool)> {
         let split = parse_release_directory(directory)?.split()?;
@@ -859,6 +873,44 @@ mod tests {
         // Two cut points that both satisfy the hint are no answer.
         let doubled = parse_release_directory("A-B-C-D-1999-GRP").unwrap();
         assert_eq!(doubled.split_matching(|_| true), None);
+    }
+
+    fn matching_title(directory: &str, hint: &str) -> Option<(Option<String>, String)> {
+        parse_release_directory(directory)?
+            .split_matching_title(|part| album_title_similarity(hint, part) >= 0.90)
+            .and_then(|split| Some((split.artist, split.title?)))
+    }
+
+    #[test]
+    fn an_ambiguous_name_can_be_settled_by_the_album_tag() {
+        let stresmatic = "Stresmatic_and_Droop-E-4005-WEB-2021-RAGEMP3";
+        assert_eq!(read(stresmatic), None);
+        assert_eq!(
+            matching_title(stresmatic, "4005"),
+            Some((
+                Some("Stresmatic and Droop-E".to_string()),
+                "4005".to_string()
+            ))
+        );
+        // A 30-character tag cut off by an ID3v1 writer is the start of the title.
+        let long =
+            "Stresmatic_and_Droop-E-The_Very_Long_Album_Title_That_Goes_On_And_On-WEB-2021-GRP";
+        assert_eq!(
+            matching_title(long, "The Very Long Album Title That"),
+            Some((
+                Some("Stresmatic and Droop-E".to_string()),
+                "The Very Long Album Title That Goes On And On".to_string()
+            ))
+        );
+        assert_eq!(matching_title(stresmatic, "Something Else"), None);
+        // A name its structure decides keeps that split.
+        assert_eq!(
+            matching_title("Hidrology-Asleep-2002-AMRC", "Something Else"),
+            Some((Some("Hidrology".to_string()), "Asleep".to_string()))
+        );
+        // Two cut points that both fit are no answer.
+        let doubled = parse_release_directory("A-B-C-D-1999-GRP").unwrap();
+        assert_eq!(doubled.split_matching_title(|_| true), None);
     }
 
     #[test]
