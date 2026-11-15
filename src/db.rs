@@ -288,7 +288,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(applied, 7);
+        assert_eq!(applied, 8);
     }
 
     /// A database migrated up to and including the album-matching migration.
@@ -632,6 +632,28 @@ mod tests {
                 .await;
             assert!(error.is_err(), "medium_position {invalid} was accepted");
         }
+    }
+
+    #[tokio::test]
+    async fn a_deleted_match_finds_the_reviews_that_expect_it_by_index() {
+        // Deleting a release_matches row sets match_reviews.expected_match_id
+        // to NULL wherever it names that match. Without an index SQLite scans
+        // every review (and its candidate JSON) once per deleted match.
+        let pool = connect_in_memory().await.unwrap();
+        let plan: Vec<String> = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT 1 FROM match_reviews WHERE expected_match_id = 1",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| sqlx::Row::get::<String, _>(row, "detail"))
+        .collect();
+        assert!(!plan.is_empty());
+        assert!(
+            plan.iter().all(|step| !step.starts_with("SCAN")),
+            "{plan:?}"
+        );
     }
 
     #[tokio::test]
