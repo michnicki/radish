@@ -854,6 +854,9 @@ const DIRECTORY_PASS_NOTE: &str =
 
 /// What the provider stages produced for one release, or how it ended early.
 enum Gathered {
+    /// Every stage the policy ran, primary first; none when nothing was tried.
+    ///
+    /// A stage that failed is still an attempt, with its error recorded.
     Attempts(Vec<ProviderAttempt>),
     /// The release is done before any decision: nothing was attempted.
     Ended(Outcome),
@@ -911,6 +914,21 @@ fn settlement(
     )))
 }
 
+/// Matches one release against the providers and records the decision.
+///
+/// An automatic match (no `--review`, no direct release) of a release whose
+/// directory name adds something to its tags runs in two passes. The first
+/// ignores the directory name beyond filling a missing or junk tag, and its
+/// output is held. When its attempts settle the release (see [`settlement`]),
+/// it is accepted from them and the directory name is never read. Otherwise
+/// the first pass is dropped, apart from run-wide notices, the pass note is
+/// written, and the release is gathered again with the directory name and
+/// decided from that. Every other case runs once with the directory name.
+///
+/// # Errors
+///
+/// Only when the release's stored state cannot be written; provider failures
+/// are reported in the transcript and decided as [`Outcome::Failed`].
 #[expect(
     clippy::too_many_arguments,
     reason = "one release's whole decision; the arguments have no natural grouping"
@@ -1146,7 +1164,7 @@ where
 {
     let verdict = settlement(release, &attempts, has_direct);
 
-    // A settled primary result stops discovery and never touches Discogs.
+    // A settled primary result needed no fallback, so Discogs was never asked.
     if let Some(found @ Settlement::Primary) = &verdict {
         if !found.is_automatic(has_direct, options.review) {
             return review_attempts(
