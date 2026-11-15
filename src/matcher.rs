@@ -3291,7 +3291,7 @@ fn directory_artist_score(directory: Option<&SceneSplit>, remote: &RemoteRelease
 /// Ends the warning for an album title or artist read from the directory name.
 const DIRECTORY_NOTE: &str = "read from the directory name";
 
-/// Warnings for the album title or artist score the directory, not the tags, gave.
+/// Warnings naming the album title or artist the directory name decided.
 fn directory_notes(local: &LocalRelease, candidate: &Candidate) -> Vec<String> {
     let Some(directory) = scene::directory_split(local) else {
         return Vec::new();
@@ -3305,8 +3305,7 @@ fn directory_notes(local: &LocalRelease, candidate: &Candidate) -> Vec<String> {
         notes.push(format!("album title '{title}' {DIRECTORY_NOTE}"));
     }
     if let Some(artist) = &directory.artist
-        && directory_artist_score(Some(&directory), remote)
-            > album_artist_score(local, remote) + 1e-9
+        && directory_artist_score(Some(&directory), remote) > tag_artist_score(local, remote) + 1e-9
     {
         notes.push(format!("artist '{artist}' {DIRECTORY_NOTE}"));
     }
@@ -3315,14 +3314,17 @@ fn directory_notes(local: &LocalRelease, candidate: &Candidate) -> Vec<String> {
 
 /// Deterministic ranking score in `0..=1`. Missing components contribute zero;
 /// nothing is renormalized into false confidence.
+///
+/// The album title and artist take the better of the tags and the directory
+/// name's reading.
 pub fn score(local: &LocalRelease, remote: &RemoteRelease, mapping: &Mapping) -> ScoreBreakdown {
     // The tags and the directory name are two readings of the album; the
-    // better one counts. Nothing else reads the directory.
+    // better one counts. No other component reads the directory.
     let directory = scene::directory_split(local);
     let album_title = tag_title_score(local, remote, mapping)
         .max(directory_title_score(directory.as_ref(), remote));
     let album_artist =
-        album_artist_score(local, remote).max(directory_artist_score(directory.as_ref(), remote));
+        tag_artist_score(local, remote).max(directory_artist_score(directory.as_ref(), remote));
 
     let track_titles = if local.tracks.is_empty() {
         0.0
@@ -3387,7 +3389,8 @@ pub fn score(local: &LocalRelease, remote: &RemoteRelease, mapping: &Mapping) ->
     }
 }
 
-fn album_artist_score(local: &LocalRelease, remote: &RemoteRelease) -> f64 {
+/// The album artist component read from the artist tag alone.
+fn tag_artist_score(local: &LocalRelease, remote: &RemoteRelease) -> f64 {
     let Some(artist) = &local.album_artist else {
         return 0.0;
     };
@@ -6619,11 +6622,11 @@ mod tests {
         local.album_artist = Some(cut.to_string());
         let mut remote = remote_release(&["One"]);
         remote.artists = vec!["Alpha Bravo Charlie Delta Fox Trot Band".to_string()];
-        let value = album_artist_score(&local, &remote);
+        let value = tag_artist_score(&local, &remote);
         assert!((0.96..1.0).contains(&value), "{value}");
 
         remote.artists = vec!["Alpha Bravo Charlie Delta Foxes Band".to_string()];
-        assert!(album_artist_score(&local, &remote) < 0.96);
+        assert!(tag_artist_score(&local, &remote) < 0.96);
     }
 
     #[test]
@@ -6653,11 +6656,11 @@ mod tests {
         local.album_artist = Some("Sisters Of Mercy".to_string());
         let mut remote = remote_release(&["One", "Two"]);
         remote.artists = vec!["The Sisters of Mercy".to_string()];
-        let value = album_artist_score(&local, &remote);
+        let value = tag_artist_score(&local, &remote);
         assert!((0.97..1.0).contains(&value), "{value}");
 
         local.album_artist = Some("Different Band".to_string());
-        assert!(album_artist_score(&local, &remote) < 0.6);
+        assert!(tag_artist_score(&local, &remote) < 0.6);
     }
 
     #[test]
@@ -14273,6 +14276,53 @@ mod tests {
                 evaluation.warnings
             );
         }
+    }
+
+    #[test]
+    fn a_tie_between_the_tags_and_the_directory_goes_to_the_tags() {
+        let titles = &TITLES_12[..4];
+        let remote = remote_release(titles);
+        let mut local = in_directory(titles, "/music/album", "Test Album EP", "Test Artist");
+        let tags = Candidate::new(&local, remote.clone()).score.album_title;
+        assert!((tags - (1.0 - ALBUM_TYPE_PENALTY)).abs() < 1e-9, "{tags}");
+
+        local.directory = "/mp3/Test_Artist-Test_Album-2001-GRP".to_string();
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(
+            (candidate.score.album_title - tags).abs() < 1e-9,
+            "{}",
+            candidate.score.album_title
+        );
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(
+            !evaluation
+                .warnings
+                .iter()
+                .any(|warning| warning.ends_with(DIRECTORY_NOTE)),
+            "{:?}",
+            evaluation.warnings
+        );
+    }
+
+    #[test]
+    fn the_directory_does_not_stand_in_for_tracks() {
+        let local = in_directory(
+            &TITLES_12[..4],
+            "/mp3/Test_Artist-Test_Album-2001-GRP",
+            "Zzzz",
+            "Someone Else",
+        );
+        let mut remote = remote_release(&TITLES_12[4..8]);
+        for track in &mut remote.tracklist {
+            track.duration_secs = track.duration_secs.map(|secs| secs + 60.0);
+        }
+        let evaluation = album_evaluation(&local, &remote, &[]);
+        assert!(
+            !evaluation.auto_accept,
+            "{:?} {:?}",
+            Candidate::new(&local, remote).score,
+            evaluation.warnings
+        );
     }
 
     #[test]
