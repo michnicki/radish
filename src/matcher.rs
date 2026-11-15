@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
-pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v42";
-pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v41";
+pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v43";
+pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v42";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -3267,6 +3267,31 @@ fn directory_artist_score(directory: Option<&SceneSplit>, remote: &RemoteRelease
         })
 }
 
+/// Ends the warning for an album title or artist read from the directory name.
+const DIRECTORY_NOTE: &str = "read from the directory name";
+
+/// Warnings for the album title or artist score the directory, not the tags, gave.
+fn directory_notes(local: &LocalRelease, candidate: &Candidate) -> Vec<String> {
+    let Some(directory) = scene::directory_split(local) else {
+        return Vec::new();
+    };
+    let remote = &candidate.release;
+    let mut notes = Vec::new();
+    if let Some(title) = &directory.title
+        && directory_title_score(Some(&directory), remote)
+            > tag_title_score(local, remote, &candidate.mapping) + 1e-9
+    {
+        notes.push(format!("album title '{title}' {DIRECTORY_NOTE}"));
+    }
+    if let Some(artist) = &directory.artist
+        && directory_artist_score(Some(&directory), remote)
+            > album_artist_score(local, remote) + 1e-9
+    {
+        notes.push(format!("artist '{artist}' {DIRECTORY_NOTE}"));
+    }
+    notes
+}
+
 /// Deterministic ranking score in `0..=1`. Missing components contribute zero;
 /// nothing is renormalized into false confidence.
 pub fn score(local: &LocalRelease, remote: &RemoteRelease, mapping: &Mapping) -> ScoreBreakdown {
@@ -5957,6 +5982,7 @@ fn evaluate_with(
     if remote.year.is_none() {
         warnings.push(format!("{provider} release has no year"));
     }
+    warnings.extend(directory_notes(local, candidate));
 
     Evaluation {
         auto_accept: blockers.is_empty(),
@@ -8035,11 +8061,11 @@ mod tests {
     fn algorithm_versions_are_provider_specific() {
         assert_eq!(
             algorithm_version(ProviderKind::Discogs),
-            "discogs-match-v42"
+            "discogs-match-v43"
         );
         assert_eq!(
             algorithm_version(ProviderKind::MusicBrainz),
-            "musicbrainz-match-v41"
+            "musicbrainz-match-v42"
         );
     }
 
@@ -14049,6 +14075,104 @@ mod tests {
         let plain = Candidate::new(&local, remote.clone()).score.album_artist;
         local.directory = "/mp3/VA-Thirteen_Days_OST-2000-RNS".to_string();
         assert_eq!(Candidate::new(&local, remote).score.album_artist, plain);
+    }
+
+    #[test]
+    fn a_directory_title_lets_a_cut_off_tag_pass_the_title_gate() {
+        let titles = &TITLES_12[..4];
+        let remote = fellers_remote(titles);
+        let mut local = in_directory(
+            titles,
+            "/music/album",
+            "The Natural Finger 7 Inch Viny",
+            "Thinking Fellers Union Local 2",
+        );
+        let refused = album_evaluation(&local, &remote, &[]);
+        assert!(!refused.auto_accept, "{:?}", refused.warnings);
+
+        local.directory = FELLERS.to_string();
+        let accepted = album_evaluation(&local, &remote, &[]);
+        assert!(accepted.auto_accept, "{:?}", accepted.blockers);
+        assert!(
+            accepted.warnings.contains(
+                &"album title 'The Natural Finger' read from the directory name".to_string()
+            ),
+            "{:?}",
+            accepted.warnings
+        );
+        // The artist tag scored better than the directory: no artist warning.
+        assert!(
+            !accepted
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("artist '")),
+            "{:?}",
+            accepted.warnings
+        );
+    }
+
+    #[test]
+    fn a_various_artists_tag_on_one_artists_album_takes_the_directory_artist() {
+        let titles = &TITLES_12[..4];
+        let mut remote = remote_release(titles);
+        remote.title = "Life of the Infamous: The Best of Mobb Deep".to_string();
+        remote.artists = vec!["Mobb Deep".to_string()];
+        let mut local = in_directory(
+            titles,
+            "/music/album",
+            "Life of The Infamous...The Best of Mobb Deep",
+            "Various Artists",
+        );
+        local.artist_kind = ArtistKind::VariousArtists;
+        let refused = album_evaluation(&local, &remote, &[]);
+        assert!(!refused.auto_accept);
+
+        local.directory =
+            "/mp3/Mobb_Deep-Life_of_The_Infamous___The_Best_of_Mobb_Deep-2006-CMS".to_string();
+        let candidate = Candidate::new(&local, remote.clone());
+        assert!(
+            (candidate.score.album_artist - (1.0 - DIRECTORY_PENALTY)).abs() < 1e-9,
+            "{}",
+            candidate.score.album_artist
+        );
+        let accepted = album_evaluation(&local, &remote, &[]);
+        assert!(accepted.auto_accept, "{:?}", accepted.blockers);
+        assert!(
+            accepted
+                .warnings
+                .contains(&"artist 'Mobb Deep' read from the directory name".to_string()),
+            "{:?}",
+            accepted.warnings
+        );
+        // The title tag scored as well as the directory's: no title warning.
+        assert!(
+            !accepted
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("album title '")),
+            "{:?}",
+            accepted.warnings
+        );
+    }
+
+    #[test]
+    fn tags_as_good_as_the_directory_carry_no_directory_warning() {
+        let titles = &TITLES_12[..4];
+        let local = in_directory(
+            titles,
+            "/mp3/Test_Artist-Test_Album-2001-GRP",
+            "Test Album",
+            "Test Artist",
+        );
+        let evaluation = album_evaluation(&local, &remote_release(titles), &[]);
+        assert!(
+            !evaluation
+                .warnings
+                .iter()
+                .any(|warning| warning.ends_with(DIRECTORY_NOTE)),
+            "{:?}",
+            evaluation.warnings
+        );
     }
 
     fn tracklist_warning(evaluation: &Evaluation) -> Option<&str> {
