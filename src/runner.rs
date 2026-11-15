@@ -916,14 +916,17 @@ fn settlement(
 
 /// Matches one release against the providers and records the decision.
 ///
-/// An automatic match (no `--review`, no direct release) of a release whose
-/// directory name adds something to its tags runs in two passes. The first
-/// ignores the directory name beyond filling a missing or junk tag, and its
-/// output is held. When its attempts settle the release (see [`settlement`]),
-/// it is accepted from them and the directory name is never read. Otherwise
-/// the first pass is dropped, apart from run-wide notices, the pass note is
-/// written, and the release is gathered again with the directory name and
-/// decided from that. Every other case runs once with the directory name.
+/// An automatic match (no `--review`, no direct release) never reads the
+/// directory name in a single pass. When the name adds something to the tags
+/// (see [`discovery::directory_adds_anything`]), it runs in two passes. The
+/// first ignores the directory name beyond filling a missing or junk tag, and
+/// its output is held. When its attempts settle the release (see
+/// [`settlement`]), it is accepted from them and the name is never read.
+/// Otherwise the first pass is dropped, apart from run-wide notices, the pass
+/// note is written, and the release is gathered again with the directory name
+/// and decided from that. When the name adds nothing, one pass runs on the
+/// tags alone. `--review` and a direct selection run once with the directory
+/// name.
 ///
 /// # Errors
 ///
@@ -952,52 +955,60 @@ where
         .clone()
         .filter(|id| policy.allows(id.provider()));
     let has_direct = direct.is_some();
+    // The release the last pass matches: the one with the directory reading,
+    // unless an automatic match found nothing in the name to read.
+    let mut subject = release;
+    let tags_only = (!options.review && !has_direct).then(|| LocalRelease {
+        reads_directory: false,
+        ..release.clone()
+    });
 
     // The directory name is a second reading, so an automatic match tries the
-    // tags alone first and keeps that result when it settles the release. A
-    // name that is unread, switched off or only repeats the tags has no second
-    // pass to wait for.
-    if !options.review && !has_direct && discovery::directory_adds_anything(release) {
-        let tags_only = LocalRelease {
-            reads_directory: false,
-            ..release.clone()
-        };
-        let mut held = Transcript::held();
-        match gather_attempts(
-            &tags_only,
-            policy,
-            direct.clone(),
-            clients,
-            refreshing,
-            &mut held,
-        )
-        .await
-        {
-            Gathered::Ended(outcome) => {
-                transcript.append(held);
-                return Ok(outcome);
-            }
-            Gathered::Attempts(attempts) => {
-                let settles = settlement(&tags_only, &attempts, has_direct)
-                    .is_some_and(|settlement| settlement.is_automatic(has_direct, options.review));
-                if settles {
+    // tags alone first and keeps that result when it settles the release.
+    if let Some(tags_only) = &tags_only {
+        if !discovery::directory_adds_anything(release) {
+            subject = tags_only;
+        } else {
+            let mut held = Transcript::held();
+            match gather_attempts(
+                tags_only,
+                policy,
+                direct.clone(),
+                clients,
+                refreshing,
+                &mut held,
+            )
+            .await
+            {
+                Gathered::Ended(outcome) => {
                     transcript.append(held);
-                    return act_on_attempts(
-                        pool, &tags_only, options, has_direct, clients, guard, attempts, transcript,
-                    )
-                    .await;
+                    return Ok(outcome);
+                }
+                Gathered::Attempts(attempts) => {
+                    let settles =
+                        settlement(tags_only, &attempts, has_direct).is_some_and(|settlement| {
+                            settlement.is_automatic(has_direct, options.review)
+                        });
+                    if settles {
+                        transcript.append(held);
+                        return act_on_attempts(
+                            pool, tags_only, options, has_direct, clients, guard, attempts,
+                            transcript,
+                        )
+                        .await;
+                    }
                 }
             }
+            transcript.append(held.into_notices());
+            outln_to!(transcript, "  {DIRECTORY_PASS_NOTE}");
         }
-        transcript.append(held.into_notices());
-        outln_to!(transcript, "  {DIRECTORY_PASS_NOTE}");
     }
 
-    match gather_attempts(release, policy, direct, clients, refreshing, transcript).await {
+    match gather_attempts(subject, policy, direct, clients, refreshing, transcript).await {
         Gathered::Ended(outcome) => Ok(outcome),
         Gathered::Attempts(attempts) => {
             act_on_attempts(
-                pool, release, options, has_direct, clients, guard, attempts, transcript,
+                pool, subject, options, has_direct, clients, guard, attempts, transcript,
             )
             .await
         }

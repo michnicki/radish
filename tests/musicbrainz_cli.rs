@@ -758,9 +758,9 @@ async fn a_dry_run_reads_the_directory_name_under_the_same_two_passes() {
 /// Matches six files of `Blue` by `Test Artist` in `directory`, which nothing
 /// in the provider answers to.
 ///
-/// Returns whether the run printed the second-pass note, and how many
-/// MusicBrainz searches it made.
-async fn unmatched_run(directory: &str, name: &str) -> (bool, usize) {
+/// Returns whether the run printed the second-pass note, whether it printed a
+/// directory reading, and how many MusicBrainz searches it made.
+async fn unmatched_run(directory: &str, name: &str) -> (bool, bool, usize) {
     let server = MockServer::start(|target: &str| {
         if target.contains("/ws/2/release") {
             (200, musicbrainz_empty_search())
@@ -780,15 +780,17 @@ async fn unmatched_run(directory: &str, name: &str) -> (bool, usize) {
     assert!(text.contains("Unmatched: 1"), "{text}");
     (
         text.contains(DIRECTORY_PASS_NOTE),
+        text.contains("read from the directory name"),
         server.requests_matching("/ws/2/release?query"),
     )
 }
 
 #[tokio::test]
-async fn a_directory_that_only_repeats_the_tags_gets_no_second_pass() {
-    let (note, repeated) = unmatched_run("/mp3/Test_Artist-Blue-2001-GRP", "mb-repeat").await;
+async fn a_directory_that_only_repeats_the_tags_is_matched_on_the_tags_alone() {
+    let (note, read, repeated) = unmatched_run("/mp3/Test_Artist-Blue-2001-GRP", "mb-repeat").await;
     assert!(!note);
-    let (note, longer) = unmatched_run(
+    assert!(!read);
+    let (note, _, longer) = unmatched_run(
         "/mp3/Test_Artist-Blue_Special_Edition_Box-2001-GRP",
         "mb-longer",
     )

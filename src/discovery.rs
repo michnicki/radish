@@ -170,6 +170,9 @@ struct Disagreement {
 
 /// Compares a directory reading with the tags of `view`, half by half.
 ///
+/// This decides whether a new search would find anything, so it is lenient;
+/// [`directory_adds_anything`] decides whether to read the name at all.
+///
 /// A half agrees when both spell it the same without punctuation, spaces, `&`
 /// or `and`. A self-titled placeholder agrees with the artist's name and with
 /// another placeholder, and a directory title only repeats it then.
@@ -213,14 +216,32 @@ fn directory_disagreement(split: scene::SceneSplit, view: &LocalRelease) -> Disa
     }
 }
 
+/// A text as the tags and a directory name must share it to be the same.
+///
+/// Trimmed, with whitespace runs collapsed and lowercased, and nothing else:
+/// punctuation, brackets, `&` and `and` all count.
+fn plain_text(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 /// Whether reading the directory name could change a release's match.
 ///
 /// False when the name cannot be read, or when the tags name both the album
-/// and the artist and the name only repeats them (`Test_Artist-Blue-2001-GRP`
-/// for `Blue` by `Test Artist`). A missing or junk tag, a cut-off title, a
-/// different artist or a Various Artists tag over a single artist's name all
-/// leave something for the directory to add. Matching uses it to skip a second
-/// pass that could only repeat the first.
+/// and the artist and the name only repeats them: the same text apart from
+/// case and spacing (`Test_Artist-Blue-2001-GRP` for `Blue` by `Test Artist`).
+/// A missing or junk tag, a cut-off title, a different artist, or a Various
+/// Artists tag over a single artist's name leave something for the directory
+/// to add.
+///
+/// Matching reads the directory name only when this is true, so it is strict
+/// where [`directory_search`] is lenient. A name that differs only in
+/// punctuation or brackets (`Cult White Edition` against `Cult (White
+/// Edition)`) searches the same but can still score differently, so it counts
+/// here. The search asks whether a new search would find anything; this asks
+/// whether reading the name could change anything.
 pub(crate) fn directory_adds_anything(local: &LocalRelease) -> bool {
     let Some(split) = scene::directory_reading(local) else {
         return false;
@@ -228,8 +249,19 @@ pub(crate) fn directory_adds_anything(local: &LocalRelease) -> bool {
     if matcher::tag_identity(local).title.is_none() || !artist_tag_usable(local) {
         return true;
     }
-    let disagreement = directory_disagreement(split, local);
-    disagreement.artist_differs || disagreement.title.is_some()
+    let (Some(tag_title), Some(tag_artist)) =
+        (local.album_title.as_deref(), local.album_artist.as_deref())
+    else {
+        return true;
+    };
+    let Some(artist) = split.credited_artist() else {
+        return true;
+    };
+    let same_title = split
+        .title
+        .as_deref()
+        .is_none_or(|title| plain_text(title) == plain_text(tag_title));
+    !(same_title && plain_text(&artist) == plain_text(tag_artist))
 }
 
 /// The extra search the directory name asks for, if it adds anything.
@@ -1566,15 +1598,15 @@ mod tests {
     fn a_directory_that_repeats_the_tags_adds_nothing() {
         let repeats = tagged_in("/mp3/Test_Artist-Blue-2001-GRP", "Blue", "Test Artist");
         assert!(!directory_adds_anything(&repeats));
-        // Spelling the comparison ignores.
-        let spelled = tagged_in(
-            "/mp3/Dont_Look_Back-Dont_Look_Back-2001-GRP",
-            "Don't Look Back",
-            "Dont Look Back",
+        // Case and spacing only.
+        let spaced = tagged_in(
+            "/mp3/test_artist-BLUE-2001-GRP",
+            "  Blue ",
+            "Test Artist     ",
         );
-        assert!(!directory_adds_anything(&spelled));
-        let ampersand = tagged_in("/mp3/Simon_and_Co-Blue-2001-GRP", "Blue", "Simon & Co");
-        assert!(!directory_adds_anything(&ampersand));
+        assert!(!directory_adds_anything(&spaced));
+        let padded = tagged_in("/mp3/Test_Artist-Blue-2001-GRP", "Blue", "Test Artist     ");
+        assert!(!directory_adds_anything(&padded));
         // Various Artists on both sides.
         let mut various = tagged_in("/mp3/VA-Blue-2001-GRP", "Blue", "Various Artists");
         various.artist_kind = ArtistKind::VariousArtists;
@@ -1605,6 +1637,25 @@ mod tests {
         );
         assert!(!directory_adds_anything(&whole));
 
+        // Text the search compares leniently can still score differently.
+        let bracketed = tagged_in(
+            "/mp3/Bayside-Cult_(White_Edition)-2008-GRP",
+            "Cult White Edition",
+            "Bayside",
+        );
+        assert!(
+            directory_adds_anything(&bracketed),
+            "{:?}",
+            scene::directory_split(&bracketed)
+        );
+        let spelled = tagged_in(
+            "/mp3/Dont_Look_Back-Dont_Look_Back-2001-GRP",
+            "Don't Look Back",
+            "Dont Look Back",
+        );
+        assert!(directory_adds_anything(&spelled));
+        let ampersand = tagged_in("/mp3/Simon_and_Co-Blue-2001-GRP", "Blue", "Simon & Co");
+        assert!(directory_adds_anything(&ampersand));
         let other_artist = tagged_in("/mp3/Other_Artist-Blue-2001-GRP", "Blue", "Test Artist");
         assert!(directory_adds_anything(&other_artist));
         let longer = tagged_in(
