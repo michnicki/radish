@@ -3249,8 +3249,15 @@ mod tests {
         eprintln_to!(second, "oops");
         outln_to!(second, "three");
         first.append(second);
-        assert_eq!(out_lines(&first), ["one", "two", "three"]);
-        assert_eq!(first.held.as_ref().map(Vec::len), Some(4));
+        assert_eq!(
+            first.held,
+            Some(vec![
+                Line::Out("one".to_string()),
+                Line::Out("two".to_string()),
+                Line::Err("oops".to_string()),
+                Line::Out("three".to_string()),
+            ])
+        );
     }
 
     #[test]

@@ -676,6 +676,8 @@ async fn a_directory_that_names_the_artist_outweighs_a_various_artists_tag() {
         "{text}"
     );
     assert!(text.contains(DIRECTORY_PASS_NOTE), "{text}");
+    // Pass one's fallback line is dropped with its output.
+    assert!(!text.contains("Discogs fallback:"), "{text}");
 
     // The same files in a directory that is no scene name stay in review.
     let db = db_path("musicbrainz-directory-artist-plain");
@@ -743,6 +745,7 @@ async fn a_dry_run_reads_the_directory_name_under_the_same_two_passes() {
     assert!(output.status.success(), "{output:?}");
     assert!(text.contains("would accept"), "{text}");
     assert!(text.contains(DIRECTORY_PASS_NOTE), "{text}");
+    assert!(!text.contains("Discogs fallback:"), "{text}");
     let pool = radish::db::connect(&db).await.unwrap();
     let matches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_matches")
         .fetch_one(&pool)
@@ -792,4 +795,31 @@ async fn a_directory_that_only_repeats_the_tags_gets_no_second_pass() {
     .await;
     assert!(note);
     assert!(longer > repeated, "{longer} searches against {repeated}");
+}
+
+#[tokio::test]
+async fn a_directly_selected_release_reads_the_directory_in_one_pass() {
+    let server = MockServer::start(named_artist_handler);
+    let db = db_path("musicbrainz-direct-directory");
+    seed_various_tag(&db, "/mp3/Test_Artist-Blue-2001-GRP").await;
+
+    let output = run(
+        &db,
+        &server,
+        &[
+            "match",
+            "--dry-run",
+            "--local-release",
+            "1",
+            "--musicbrainz-release",
+            MBID,
+        ],
+    );
+    let text = stdout(&output);
+    assert!(output.status.success(), "{output:?}");
+    assert!(!text.contains(DIRECTORY_PASS_NOTE), "{text}");
+    assert!(
+        text.contains("artist 'Test Artist' read from the directory name"),
+        "{text}"
+    );
 }
