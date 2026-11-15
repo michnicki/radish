@@ -143,12 +143,26 @@ struct DirectorySearch {
     note: String,
 }
 
-/// The [`DirectorySearch`] for `local`, or `None` when the directory name adds
-/// nothing to what `view` is searched with.
+/// Text for telling whether two names differ: normalized, `&` and `and`
+/// dropped, no spaces.
 ///
-/// Titles and artists are compared as normalized text. A Various Artists name
-/// searches as `Various Artists`, and a name with no album title
-/// (`Fazed-EP-…`) keeps the tags' title.
+/// `Don't` and `Dont`, `AC/DC` and `ACDC`, and `Method Man & Redman` and
+/// `Method Man And Redman` each compare equal.
+fn compact(text: &str) -> String {
+    matcher::normalize_text(&text.replace('&', " and "))
+        .split_whitespace()
+        .filter(|word| *word != "and")
+        .collect()
+}
+
+/// The extra search the directory name asks for, if it adds anything.
+///
+/// A half (album title or artist) the directory reads differently from `view`
+/// is searched with the directory's text. A half it agrees on keeps the tags'
+/// spelling, which is the one a provider's index matches. Without a differing
+/// half there is no search. A Various Artists name searches as
+/// `Various Artists`, and a name with no album title (`Fazed-EP-…`) keeps the
+/// tags' title.
 fn directory_search(local: &LocalRelease, view: &LocalRelease) -> Option<DirectorySearch> {
     let split = scene::directory_split(local)?;
     let artist = if split.various {
@@ -156,24 +170,39 @@ fn directory_search(local: &LocalRelease, view: &LocalRelease) -> Option<Directo
     } else {
         split.artist?
     };
-    let differs = |read: &str, tag: Option<&str>| {
-        tag.is_none_or(|tag| matcher::normalize_text(read) != matcher::normalize_text(tag))
-    };
-    let mut read = Vec::new();
-    if let Some(title) = split
-        .title
+    let tag_title = matcher::search_title(view);
+    // A self-titled placeholder is searched as the artist's name, so the
+    // directory agrees with it too.
+    let title_keys: Vec<String> = view
+        .album_title
         .as_deref()
-        .filter(|title| differs(title, view.album_title.as_deref()))
-    {
+        .into_iter()
+        .chain(tag_title.as_deref())
+        .map(compact)
+        .collect();
+    let read_title = split
+        .title
+        .filter(|title| !title_keys.contains(&compact(title)));
+    let artist_differs = view
+        .album_artist
+        .as_deref()
+        .is_none_or(|tag| compact(tag) != compact(&artist));
+    let mut read = Vec::new();
+    if let Some(title) = &read_title {
         read.push(format!("album '{title}'"));
     }
-    if differs(&artist, view.album_artist.as_deref()) {
+    if artist_differs {
         read.push(format!("artist '{artist}'"));
     }
     if read.is_empty() {
         return None;
     }
-    let title = split.title.or_else(|| matcher::search_title(view))?;
+    let title = read_title.or(tag_title)?;
+    let artist = if artist_differs {
+        artist
+    } else {
+        view.album_artist.clone()?
+    };
     Some(DirectorySearch {
         title,
         artist,
@@ -202,8 +231,10 @@ pub fn strategies_for(
     strategies_for_view(provider, &view, directory.as_ref())
 }
 
+/// The searches for one local release, in the order they run.
+///
 /// `directory` is one more title search, right after the tags' own, so a full
-/// budget drops the optional searches first.
+/// budget drops the optional searches after it first.
 fn strategies_for_view(
     provider: ProviderKind,
     local: &LocalRelease,
@@ -283,8 +314,7 @@ fn strategies_for_view(
                     },
                 ));
             }
-            // The last title search, so a full budget (barcode, catalog number,
-            // title and artist, and title only) drops it and nothing else.
+            // The last title search, so the budget drops it before any other.
             if let Some(tag) = as_tagged {
                 strategies.push((
                     "title as tagged".to_string(),
@@ -341,8 +371,7 @@ fn strategies_for_view(
                     },
                 ));
             }
-            // The last title search, so a full budget (an identifier, title and
-            // relaxed) drops it and nothing else.
+            // The last title search, so the budget drops it before any other.
             if let Some(tag) = as_tagged {
                 strategies.push((
                     "title as tagged".to_string(),
@@ -599,8 +628,8 @@ pub async fn discover<P: MetadataProvider>(
         .sort_by(|(a_rank, a), (b_rank, b)| b_rank.total_cmp(a_rank).then_with(|| a.id.cmp(&b.id)));
     // When nothing clears the floor, the ranking carries no signal (for
     // example, sparse local tags), so every summary stays eligible.
-    // The rank only measures what the local tags provide, so the floor needs
-    // both a title and an artist to be meaningful.
+    // The rank only measures what the local tags and the directory name
+    // provide, so the floor needs both a title and an artist to be meaningful.
     let has_nonempty =
         |value: &Option<String>| value.as_deref().is_some_and(|v| !v.trim().is_empty());
     let skip_weak = has_nonempty(&searched.album_title)
@@ -1699,6 +1728,84 @@ mod tests {
             vec![
                 search("title", "Blue", Some("Various Artists")),
                 search("directory name", "Blue", Some("Test Artist")),
+            ]
+        );
+        // A cut-off title with an artist the directory spells differently: the
+        // search keeps the tag's artist spelling, which the index matches.
+        let mut acdc = local();
+        acdc.barcode = None;
+        acdc.album_title = Some("For Those About To Rock We S..".to_string());
+        acdc.album_artist = Some("AC/DC".to_string());
+        acdc.directory =
+            "/mp3/ACDC-For_Those_About_To_Rock_We_Salute_You-1981-phEAR_INT".to_string();
+        assert_eq!(
+            title_and_artist(ProviderKind::MusicBrainz, &acdc),
+            vec![
+                search(
+                    "title and artist",
+                    "For Those About To Rock We S..",
+                    Some("AC/DC")
+                ),
+                search(
+                    "directory name",
+                    "For Those About To Rock We Salute You",
+                    Some("AC/DC")
+                ),
+            ]
+        );
+        // Spelling differences that are only punctuation, spaces, `&` or `and`
+        // add nothing.
+        let mut apostrophe = local();
+        apostrophe.album_title = Some("Don't Look Back".to_string());
+        apostrophe.directory = "/mp3/Test_Artist-Dont_Look_Back-2001-GRP".to_string();
+        assert_eq!(
+            title_and_artist(ProviderKind::MusicBrainz, &apostrophe),
+            vec![search(
+                "title and artist",
+                "Don't Look Back",
+                Some("Test Artist")
+            )]
+        );
+        let mut ampersand = local();
+        ampersand.album_artist = Some("Method Man & Redman".to_string());
+        ampersand.directory = "/mp3/Method_Man_And_Redman-Blue-2001-GRP".to_string();
+        assert_eq!(
+            title_and_artist(ProviderKind::MusicBrainz, &ampersand),
+            vec![search(
+                "title and artist",
+                "Blue",
+                Some("Method Man & Redman")
+            )]
+        );
+        // A Various Artists directory on one artist's tags is searched as such,
+        // and only the artist is a difference.
+        let mut soundtrack = local();
+        soundtrack.barcode = None;
+        soundtrack.album_title = Some("Thirteen Days".to_string());
+        soundtrack.album_artist = Some("Trevor Jones".to_string());
+        soundtrack.directory = "/mp3/VA-Thirteen_Days_OST-2000-RNS".to_string();
+        assert_eq!(
+            title_and_artist(ProviderKind::Discogs, &soundtrack),
+            vec![
+                search("title", "Thirteen Days", Some("Trevor Jones")),
+                search("directory name", "Thirteen Days", Some("Various Artists")),
+            ]
+        );
+        let (view, _) = search_view(&soundtrack);
+        assert_eq!(
+            directory_search(&soundtrack, &view).unwrap().note,
+            "also searched with artist 'Various Artists' read from the directory name"
+        );
+        // A directory with no album title and another artist keeps the tag's title.
+        let mut no_title = local();
+        no_title.barcode = None;
+        no_title.album_artist = Some("Someone Else".to_string());
+        no_title.directory = "/mp3/Fazed-EP-VLS-DE-2000-GRP".to_string();
+        assert_eq!(
+            title_and_artist(ProviderKind::MusicBrainz, &no_title),
+            vec![
+                search("title and artist", "Blue", Some("Someone Else")),
+                search("directory name", "Blue", Some("Fazed")),
             ]
         );
         // A directory that agrees with the tags adds nothing.
