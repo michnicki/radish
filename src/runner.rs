@@ -14,6 +14,7 @@ use crate::matcher::{
 use crate::musicbrainz::MusicBrainzAdapter;
 use crate::output::Clean;
 use crate::providers::{MetadataProvider, ProviderError, ProviderKind, ProviderPolicy, ReleaseId};
+use crate::scene;
 use crate::store::{self, AcceptanceMethod, MatchGuard, StoredCandidate};
 use crate::{out, outln};
 use anyhow::{Context, Result, bail};
@@ -105,6 +106,16 @@ impl Transcript {
         match &mut self.held {
             None => eprintln!("{args}"),
             Some(lines) => lines.push(Line::Err(args.to_string())),
+        }
+    }
+
+    /// Replays the lines of `other` here, in the order they were written.
+    fn append(&mut self, other: Transcript) {
+        for line in other.held.into_iter().flatten() {
+            match line {
+                Line::Out(text) => self.out(format_args!("{text}")),
+                Line::Err(text) => self.err(format_args!("{text}")),
+            }
         }
     }
 
@@ -799,6 +810,69 @@ async fn load_saved_reviews(
     Ok((!saved.is_empty()).then_some(saved))
 }
 
+/// Says why a release is matched a second time, with the directory name.
+const DIRECTORY_PASS_NOTE: &str =
+    "the tags alone did not settle the release; matched again with the directory name";
+
+/// What the provider stages produced for one release, or how it ended early.
+enum Gathered {
+    Attempts(Vec<ProviderAttempt>),
+    /// The release is done before any decision: nothing was attempted.
+    Ended(Outcome),
+}
+
+/// How gathered attempts settle a release without a person.
+enum Settlement {
+    /// The primary provider's best candidate passed its own gates.
+    Primary,
+    /// The fallback's best candidate passed its own gates and was compared with
+    /// the primary's; any conflicts in the check still stop an automatic accept.
+    Fallback(matcher::FallbackCheck),
+}
+
+impl Settlement {
+    /// Whether the release is accepted at once rather than reviewed or queued.
+    ///
+    /// A fallback is accepted only when nothing conflicts and no person
+    /// selected a release. `--review` accepts nothing on its own.
+    fn is_automatic(&self, has_direct: bool, review: bool) -> bool {
+        !review
+            && match self {
+                Self::Primary => true,
+                Self::Fallback(check) => check.conflicts.is_empty() && !has_direct,
+            }
+    }
+}
+
+/// Whether `attempts` settle `release` through the primary or the fallback.
+///
+/// Pure: the one place the settling conditions are written. A primary settles
+/// when its best candidate auto-accepts. Otherwise a fallback settles when its
+/// best candidate auto-accepts and the primary did not fail transiently, with
+/// the fallback's check against the primary.
+fn settlement(
+    release: &LocalRelease,
+    attempts: &[ProviderAttempt],
+    has_direct: bool,
+) -> Option<Settlement> {
+    let primary = attempts.first()?;
+    if primary.settled(has_direct) {
+        return Some(Settlement::Primary);
+    }
+    let fallback = attempts.get(1)?;
+    let (candidate, evaluation) = (fallback.candidates.first()?, fallback.evaluations.first()?);
+    if !evaluation.auto_accept || primary_failed_transiently(attempts) {
+        return None;
+    }
+    Some(Settlement::Fallback(matcher::fallback_check(
+        release,
+        &primary.candidates,
+        candidate,
+        primary.embedded_release_resolved,
+        evaluation.relies_on_unlisted_lengths(),
+    )))
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "one release's whole decision; the arguments have no natural grouping"
@@ -821,6 +895,76 @@ where
         .direct_release
         .clone()
         .filter(|id| policy.allows(id.provider()));
+    let has_direct = direct.is_some();
+
+    // The directory name is a second reading, so an automatic match tries the
+    // tags alone first and keeps that result when it settles the release.
+    if !options.review
+        && !has_direct
+        && release.reads_directory
+        && scene::directory_split(release).is_some()
+    {
+        let tags_only = LocalRelease {
+            reads_directory: false,
+            ..release.clone()
+        };
+        let mut held = Transcript::held();
+        match gather_attempts(
+            &tags_only,
+            policy,
+            direct.clone(),
+            clients,
+            refreshing,
+            &mut held,
+        )
+        .await
+        {
+            Gathered::Ended(outcome) => {
+                transcript.append(held);
+                return Ok(outcome);
+            }
+            Gathered::Attempts(attempts) => {
+                let settles = settlement(&tags_only, &attempts, has_direct)
+                    .is_some_and(|settlement| settlement.is_automatic(has_direct, options.review));
+                if settles {
+                    transcript.append(held);
+                    return act_on_attempts(
+                        pool, &tags_only, options, has_direct, clients, guard, attempts, transcript,
+                    )
+                    .await;
+                }
+            }
+        }
+        outln_to!(transcript, "  {DIRECTORY_PASS_NOTE}");
+    }
+
+    match gather_attempts(release, policy, direct, clients, refreshing, transcript).await {
+        Gathered::Ended(outcome) => Ok(outcome),
+        Gathered::Attempts(attempts) => {
+            act_on_attempts(
+                pool, release, options, has_direct, clients, guard, attempts, transcript,
+            )
+            .await
+        }
+    }
+}
+
+/// Runs the provider stages for `release` in policy order.
+///
+/// The stages and what they report (promotions, notes, stage errors, skipped
+/// fallbacks) are written to `transcript`.
+async fn gather_attempts<M, D>(
+    release: &LocalRelease,
+    policy: ProviderPolicy,
+    direct: Option<ReleaseId>,
+    clients: &Clients<'_, M, D>,
+    refreshing: bool,
+    transcript: &mut Transcript,
+) -> Gathered
+where
+    M: MetadataProvider,
+    D: MetadataProvider,
+{
     let mut attempts: Vec<ProviderAttempt> = Vec::new();
     let mut fallback_skip: Option<String> = None;
 
@@ -879,7 +1023,7 @@ where
                                 transcript,
                                 "  stale Discogs match needs RADISH_DISCOGS_TOKEN to refresh"
                             );
-                            return Ok(Outcome::Skipped);
+                            return Gathered::Ended(Outcome::Skipped);
                         }
                         if policy.is_explicit() {
                             attempts.push(ProviderAttempt::failed(
@@ -932,14 +1076,35 @@ where
         outln_to!(transcript, "  {}", Clean(reason));
     }
 
-    // A settled primary result stops discovery and never touches Discogs.
-    if let Some(primary) = attempts.first()
-        && primary.settled(direct.is_some())
-    {
-        let candidate = &primary.candidates[0];
-        let evaluation = &primary.evaluations[0];
+    Gathered::Attempts(attempts)
+}
 
-        if options.review {
+/// Accepts, reviews, queues or fails `release` from its gathered `attempts`.
+///
+/// `release` is the one the attempts were gathered for.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one release's whole decision; the arguments have no natural grouping"
+)]
+async fn act_on_attempts<M, D>(
+    pool: &SqlitePool,
+    release: &LocalRelease,
+    options: &MatchOptions,
+    has_direct: bool,
+    clients: &Clients<'_, M, D>,
+    guard: &MatchGuard,
+    mut attempts: Vec<ProviderAttempt>,
+    transcript: &mut Transcript,
+) -> Result<Outcome>
+where
+    M: MetadataProvider,
+    D: MetadataProvider,
+{
+    let verdict = settlement(release, &attempts, has_direct);
+
+    // A settled primary result stops discovery and never touches Discogs.
+    if let Some(found @ Settlement::Primary) = &verdict {
+        if !found.is_automatic(has_direct, options.review) {
             return review_attempts(
                 pool,
                 release,
@@ -955,9 +1120,9 @@ where
         return accept(
             pool,
             release,
-            primary.provider,
-            candidate,
-            evaluation,
+            attempts[0].provider,
+            &attempts[0].candidates[0],
+            &attempts[0].evaluations[0],
             AcceptanceMethod::Automatic,
             options.dry_run,
             guard,
@@ -980,38 +1145,25 @@ where
 
     // A fallback candidate is accepted only when it settles its own gates and
     // does not contradict the local edition or a plausible primary candidate.
-    if attempts.len() > 1
-        && let Some(fallback) = attempts.get(1)
-        && let (Some(candidate), Some(evaluation)) =
-            (fallback.candidates.first(), fallback.evaluations.first())
-        && evaluation.auto_accept
-        && !primary_failed_transiently(&attempts)
-    {
-        let primary = &attempts[0];
-        let matcher::FallbackCheck { conflicts, settled } = matcher::fallback_check(
-            release,
-            &primary.candidates,
-            candidate,
-            primary.embedded_release_resolved,
-            evaluation.relies_on_unlisted_lengths(),
-        );
-        if conflicts.is_empty() && direct.is_none() && !options.review {
-            if let Some(error) = &primary.error {
+    if let Some(found @ Settlement::Fallback(check)) = &verdict {
+        let fallback = &attempts[1];
+        if found.is_automatic(has_direct, options.review) {
+            if let Some(error) = &attempts[0].error {
                 outln_to!(
                     transcript,
                     "  recovered the release from a failed MusicBrainz stage: {}",
                     Clean(&error.to_string())
                 );
             }
-            for line in &settled {
+            for line in &check.settled {
                 outln_to!(transcript, "  {SETTLED_NOTE_PREFIX}{}", Clean(line));
             }
             return accept(
                 pool,
                 release,
                 fallback.provider,
-                candidate,
-                evaluation,
+                &fallback.candidates[0],
+                &fallback.evaluations[0],
                 AcceptanceMethod::Automatic,
                 options.dry_run,
                 guard,
@@ -1021,13 +1173,13 @@ where
         }
         // What the files settled is reported, as in the accept above, but it is
         // no reason for the review, so it stays out of the stored reasons.
-        for line in &settled {
+        for line in &check.settled {
             outln_to!(transcript, "  {SETTLED_NOTE_PREFIX}{}", Clean(line));
         }
-        for conflict in &conflicts {
+        for conflict in &check.conflicts {
             outln_to!(transcript, "  fallback conflict: {}", Clean(conflict));
         }
-        attempts[1].notes.extend(conflicts);
+        attempts[1].notes.extend(check.conflicts.iter().cloned());
     }
 
     let has_candidates = attempts
@@ -3042,6 +3194,34 @@ mod tests {
                 Line::Err(_) => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn an_appended_transcript_replays_its_lines_in_order() {
+        let mut first = Transcript::held();
+        outln_to!(first, "one");
+        let mut second = Transcript::held();
+        outln_to!(second, "two");
+        eprintln_to!(second, "oops");
+        outln_to!(second, "three");
+        first.append(second);
+        assert_eq!(out_lines(&first), ["one", "two", "three"]);
+        assert_eq!(first.held.as_ref().map(Vec::len), Some(4));
+    }
+
+    #[test]
+    fn a_fallback_with_conflicts_or_a_review_run_is_not_automatic() {
+        let clean = Settlement::Fallback(matcher::FallbackCheck::default());
+        assert!(clean.is_automatic(false, false));
+        assert!(!clean.is_automatic(true, false));
+        assert!(!clean.is_automatic(false, true));
+        let conflicted = Settlement::Fallback(matcher::FallbackCheck {
+            conflicts: vec!["edition differs".to_string()],
+            settled: Vec::new(),
+        });
+        assert!(!conflicted.is_automatic(false, false));
+        assert!(Settlement::Primary.is_automatic(false, false));
+        assert!(!Settlement::Primary.is_automatic(false, true));
     }
 
     #[tokio::test]

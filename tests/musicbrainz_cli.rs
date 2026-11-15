@@ -12,6 +12,10 @@ use support::*;
 
 const MBID: &str = "76df3287-6cda-33eb-8e9a-044b5e15ffdd";
 
+/// What a run prints when the tags alone did not settle a release.
+const DIRECTORY_PASS_NOTE: &str =
+    "the tags alone did not settle the release; matched again with the directory name";
+
 fn handler(target: &str) -> (u16, String) {
     if target.contains(&format!("/ws/2/release/{MBID}")) {
         (
@@ -624,6 +628,11 @@ fn named_artist_handler(target: &str) -> (u16, String) {
 
 /// Six files of `Blue` by `Test Artist`, tagged Various Artists, in `directory`.
 async fn seed_various_tag(db: &Path, directory: &str) {
+    seed_blue(db, directory, "Various Artists").await;
+}
+
+/// Six files of `Blue` by `Test Artist` in `directory`, with `album_artist`.
+async fn seed_blue(db: &Path, directory: &str, album_artist: &str) {
     let pool = radish::db::connect(db).await.unwrap();
     let directory = Path::new(directory);
     let directory_id = store::upsert_directory(&pool, directory).await.unwrap();
@@ -633,7 +642,7 @@ async fn seed_various_tag(db: &Path, directory: &str) {
             title: Some(format!("Track {number}")),
             artist: Some("Test Artist".to_string()),
             album: Some("Blue".to_string()),
-            album_artist: Some("Various Artists".to_string()),
+            album_artist: Some(album_artist.to_string()),
             year: Some(2001),
             track_number: Some(number),
             disc_number: None,
@@ -666,6 +675,7 @@ async fn a_directory_that_names_the_artist_outweighs_a_various_artists_tag() {
         text.contains("artist 'Test Artist' read from the directory name"),
         "{text}"
     );
+    assert!(text.contains(DIRECTORY_PASS_NOTE), "{text}");
 
     // The same files in a directory that is no scene name stay in review.
     let db = db_path("musicbrainz-directory-artist-plain");
@@ -674,4 +684,70 @@ async fn a_directory_that_names_the_artist_outweighs_a_various_artists_tag() {
     let text = stdout(&output);
     assert!(output.status.success(), "{output:?}");
     assert!(text.contains("Accepted: 0"), "{text}");
+}
+
+#[tokio::test]
+async fn tags_that_settle_a_release_never_consult_the_directory_name() {
+    // The directory's title differs from the tags, so a directory reading
+    // would add a search for it.
+    let directory = "/mp3/Test_Artist-Blue_Special_Edition_Box-2001-GRP";
+    let server = MockServer::start(named_artist_handler);
+    let db = db_path("musicbrainz-tags-settle");
+    seed_blue(&db, directory, "Test Artist").await;
+
+    let output = run(&db, &server, &["match"]);
+    let text = stdout(&output);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("Accepted: 1"), "{text}");
+    assert!(!text.contains(DIRECTORY_PASS_NOTE), "{text}");
+    assert!(!text.contains("read from the directory name"), "{text}");
+    assert!(server.requests_matching("/ws/2/release") > 0);
+    assert_eq!(
+        server.requests_matching("Special"),
+        0,
+        "{:?}",
+        server.targets()
+    );
+}
+
+#[tokio::test]
+async fn a_dry_run_reads_the_directory_name_under_the_same_two_passes() {
+    // Tags settle the release: no second pass.
+    let server = MockServer::start(named_artist_handler);
+    let db = db_path("musicbrainz-dry-run-tags");
+    seed_blue(
+        &db,
+        "/mp3/Test_Artist-Blue_Special_Edition_Box-2001-GRP",
+        "Test Artist",
+    )
+    .await;
+    let output = run(&db, &server, &["match", "--dry-run"]);
+    let text = stdout(&output);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("would accept"), "{text}");
+    assert!(!text.contains(DIRECTORY_PASS_NOTE), "{text}");
+    assert_eq!(
+        server.requests_matching("Special"),
+        0,
+        "{:?}",
+        server.targets()
+    );
+
+    // Only the directory name settles it: the second pass runs, and nothing is
+    // stored.
+    let server = MockServer::start(named_artist_handler);
+    let db = db_path("musicbrainz-dry-run-directory");
+    seed_various_tag(&db, "/mp3/Test_Artist-Blue-2001-GRP").await;
+    let output = run(&db, &server, &["match", "--dry-run"]);
+    let text = stdout(&output);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("would accept"), "{text}");
+    assert!(text.contains(DIRECTORY_PASS_NOTE), "{text}");
+    let pool = radish::db::connect(&db).await.unwrap();
+    let matches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_matches")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(matches, 0);
+    pool.close().await;
 }
