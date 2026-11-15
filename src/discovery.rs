@@ -86,10 +86,7 @@ impl DiscoveryResult {
 /// [`scene::directory_split`]).
 fn search_view(local: &LocalRelease) -> (Cow<'_, LocalRelease>, Option<String>) {
     let identity = matcher::tag_identity(local);
-    let artist_unusable = local
-        .album_artist
-        .as_deref()
-        .is_none_or(|artist| artist.trim().is_empty() || matcher::is_junk_artist(artist));
+    let artist_unusable = !artist_tag_usable(local);
     if identity.title.is_some() && !artist_unusable {
         return (Cow::Borrowed(local), None);
     }
@@ -153,27 +150,40 @@ fn compact(text: &str) -> String {
         .collect()
 }
 
-/// The extra search the directory name asks for, if it adds anything.
-///
-/// A half (album title or artist) the directory reads differently from `view`
-/// is searched with the directory's text. A half it agrees on keeps the tags'
-/// spelling, which is the one a provider's index matches. Without a differing
-/// half there is no search. A Various Artists name searches as
-/// `Various Artists`, and a name with no album title (`Fazed-EP-…`) keeps the
-/// tags' title.
-fn directory_search(local: &LocalRelease, view: &LocalRelease) -> Option<DirectorySearch> {
-    let split = scene::directory_reading(local)?;
-    let artist = split.credited_artist()?;
-    let tag_title = matcher::search_title(view);
-    let artist_differs = view
+/// Whether the artist tag names an artist: present, not blank and not junk.
+fn artist_tag_usable(local: &LocalRelease) -> bool {
+    local
         .album_artist
         .as_deref()
-        .is_none_or(|tag| compact(tag) != compact(&artist));
+        .is_some_and(|artist| !artist.trim().is_empty() && !matcher::is_junk_artist(artist))
+}
+
+/// Where a directory reading differs from the tags of one view.
+struct Disagreement {
+    /// The artist the directory credits, if it names one.
+    artist: Option<String>,
+    /// Whether that artist differs from the artist tag, which may be missing.
+    artist_differs: bool,
+    /// The directory's album title, unless the tags already say it.
+    title: Option<String>,
+}
+
+/// Compares a directory reading with the tags of `view`, half by half.
+///
+/// A half agrees when both spell it the same without punctuation, spaces, `&`
+/// or `and`. A self-titled placeholder agrees with the artist's name and with
+/// another placeholder, and a directory title only repeats it then.
+fn directory_disagreement(split: scene::SceneSplit, view: &LocalRelease) -> Disagreement {
+    let artist = split.credited_artist();
+    let artist_differs = artist.as_deref().is_some_and(|artist| {
+        view.album_artist
+            .as_deref()
+            .is_none_or(|tag| compact(tag) != compact(artist))
+    });
     // The artist the search uses, for a self-titled directory title to name.
-    let searched_artist = if artist_differs {
-        Some(artist.as_str())
-    } else {
-        view.album_artist.as_deref()
+    let searched_artist = match &artist {
+        Some(artist) if artist_differs => Some(artist.as_str()),
+        _ => view.album_artist.as_deref(),
     };
     // A self-titled placeholder is searched as the artist's name, so the
     // directory agrees with it too.
@@ -181,7 +191,7 @@ fn directory_search(local: &LocalRelease, view: &LocalRelease) -> Option<Directo
         .album_title
         .as_deref()
         .into_iter()
-        .chain(tag_title.as_deref())
+        .chain(matcher::search_title(view).as_deref())
         .map(compact)
         .collect();
     // A self-titled directory title agrees with a placeholder tag, and with a
@@ -193,9 +203,52 @@ fn directory_search(local: &LocalRelease, view: &LocalRelease) -> Option<Directo
                     || searched_artist.is_some_and(|artist| compact(tag) == compact(artist))
             })
     };
-    let read_title = split
+    let title = split
         .title
         .filter(|title| !title_keys.contains(&compact(title)) && !self_titled_agrees(title));
+    Disagreement {
+        artist,
+        artist_differs,
+        title,
+    }
+}
+
+/// Whether reading the directory name could change a release's match.
+///
+/// False when the name cannot be read, or when the tags name both the album
+/// and the artist and the name only repeats them (`Test_Artist-Blue-2001-GRP`
+/// for `Blue` by `Test Artist`). A missing or junk tag, a cut-off title, a
+/// different artist or a Various Artists tag over a single artist's name all
+/// leave something for the directory to add. Matching uses it to skip a second
+/// pass that could only repeat the first.
+pub(crate) fn directory_adds_anything(local: &LocalRelease) -> bool {
+    let Some(split) = scene::directory_reading(local) else {
+        return false;
+    };
+    if matcher::tag_identity(local).title.is_none() || !artist_tag_usable(local) {
+        return true;
+    }
+    let disagreement = directory_disagreement(split, local);
+    disagreement.artist_differs || disagreement.title.is_some()
+}
+
+/// The extra search the directory name asks for, if it adds anything.
+///
+/// A half (album title or artist) the directory reads differently from `view`
+/// is searched with the directory's text. A half it agrees on keeps the tags'
+/// spelling, which is the one a provider's index matches. Without a differing
+/// half there is no search. A Various Artists name searches as
+/// `Various Artists`, and a name with no album title (`Fazed-EP-…`) keeps the
+/// tags' title.
+fn directory_search(local: &LocalRelease, view: &LocalRelease) -> Option<DirectorySearch> {
+    let split = scene::directory_reading(local)?;
+    let Disagreement {
+        artist,
+        artist_differs,
+        title: read_title,
+    } = directory_disagreement(split, view);
+    let artist = artist?;
+    let tag_title = matcher::search_title(view);
     let mut read = Vec::new();
     if let Some(title) = &read_title {
         read.push(format!("album '{title}'"));
@@ -1498,6 +1551,83 @@ mod tests {
             title_and_artist(ProviderKind::Discogs, &disc),
             vec![search("title", "Broken", Some("Straight Faced"))]
         );
+    }
+
+    /// `local()` tagged `album` by `artist`, in `directory`.
+    fn tagged_in(directory: &str, album: &str, artist: &str) -> LocalRelease {
+        let mut local = local();
+        local.directory = directory.to_string();
+        local.album_title = Some(album.to_string());
+        local.album_artist = Some(artist.to_string());
+        local
+    }
+
+    #[test]
+    fn a_directory_that_repeats_the_tags_adds_nothing() {
+        let repeats = tagged_in("/mp3/Test_Artist-Blue-2001-GRP", "Blue", "Test Artist");
+        assert!(!directory_adds_anything(&repeats));
+        // Spelling the comparison ignores.
+        let spelled = tagged_in(
+            "/mp3/Dont_Look_Back-Dont_Look_Back-2001-GRP",
+            "Don't Look Back",
+            "Dont Look Back",
+        );
+        assert!(!directory_adds_anything(&spelled));
+        let ampersand = tagged_in("/mp3/Simon_and_Co-Blue-2001-GRP", "Blue", "Simon & Co");
+        assert!(!directory_adds_anything(&ampersand));
+        // Various Artists on both sides.
+        let mut various = tagged_in("/mp3/VA-Blue-2001-GRP", "Blue", "Various Artists");
+        various.artist_kind = ArtistKind::VariousArtists;
+        assert!(!directory_adds_anything(&various));
+        // A name that is not read, or not allowed to be, adds nothing either.
+        assert!(!directory_adds_anything(&tagged_in(
+            "/music/blue",
+            "Other",
+            "Someone"
+        )));
+        let mut off = tagged_in("/mp3/Other_Artist-Other-2001-GRP", "Blue", "Test Artist");
+        off.reads_directory = false;
+        assert!(!directory_adds_anything(&off));
+    }
+
+    #[test]
+    fn a_directory_that_differs_from_the_tags_adds_something() {
+        let cut_off = tagged_in(
+            "/mp3/Thinking_Fellers_Union_Local_282_-_The_Natural_Finger-7_Inch_Vinyl-1988-NuHS",
+            "The Natural Finger 7 Inch Viny",
+            "Thinking Fellers Union Local 282",
+        );
+        assert!(directory_adds_anything(&cut_off));
+        let whole = tagged_in(
+            &cut_off.directory,
+            "The Natural Finger",
+            "Thinking Fellers Union Local 282",
+        );
+        assert!(!directory_adds_anything(&whole));
+
+        let other_artist = tagged_in("/mp3/Other_Artist-Blue-2001-GRP", "Blue", "Test Artist");
+        assert!(directory_adds_anything(&other_artist));
+        let longer = tagged_in(
+            "/mp3/Test_Artist-Blue_Special_Edition-2001-GRP",
+            "Blue",
+            "Test Artist",
+        );
+        assert!(directory_adds_anything(&longer));
+        let junk_title = tagged_in(
+            "/mp3/Test_Artist-Blue-2001-GRP",
+            "Unknown Title",
+            "Test Artist",
+        );
+        assert!(directory_adds_anything(&junk_title));
+        let junk_artist = tagged_in("/mp3/Test_Artist-Blue-2001-GRP", "Blue", "Unknown Artist");
+        assert!(directory_adds_anything(&junk_artist));
+        let mut missing = tagged_in("/mp3/Test_Artist-Blue-2001-GRP", "Blue", "Test Artist");
+        missing.album_artist = None;
+        assert!(directory_adds_anything(&missing));
+        // A Various Artists tag over one artist's name.
+        let mut various = tagged_in("/mp3/Test_Artist-Blue-2001-GRP", "Blue", "Various Artists");
+        various.artist_kind = ArtistKind::VariousArtists;
+        assert!(directory_adds_anything(&various));
     }
 
     #[test]

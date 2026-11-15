@@ -14,7 +14,6 @@ use crate::matcher::{
 use crate::musicbrainz::MusicBrainzAdapter;
 use crate::output::Clean;
 use crate::providers::{MetadataProvider, ProviderError, ProviderKind, ProviderPolicy, ReleaseId};
-use crate::scene;
 use crate::store::{self, AcceptanceMethod, MatchGuard, StoredCandidate};
 use crate::{out, outln};
 use anyhow::{Context, Result, bail};
@@ -937,12 +936,10 @@ where
     let has_direct = direct.is_some();
 
     // The directory name is a second reading, so an automatic match tries the
-    // tags alone first and keeps that result when it settles the release.
-    if !options.review
-        && !has_direct
-        && release.reads_directory
-        && scene::directory_split(release).is_some()
-    {
+    // tags alone first and keeps that result when it settles the release. A
+    // name that is unread, switched off or only repeats the tags has no second
+    // pass to wait for.
+    if !options.review && !has_direct && discovery::directory_adds_anything(release) {
         let tags_only = LocalRelease {
             reads_directory: false,
             ..release.clone()
