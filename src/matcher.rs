@@ -8,6 +8,7 @@
 
 use crate::providers::{GroupId, Mbid, ProviderKind, ReleaseId};
 use crate::scanner::AUDIO_EXTENSIONS;
+use crate::scene::{self, SceneSplit};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
@@ -1201,6 +1202,14 @@ fn track_title_similarity_with(
 /// Taken off an album-title comparison that needed a leading `The`, `O.S.T.`
 /// marker or trailing release-type word dropped.
 const ALBUM_TYPE_PENALTY: f64 = 0.03;
+
+/// Taken off an album title or artist read from the directory name.
+///
+/// The same small cost as a dropped release-type word: the tags win a tie, so
+/// a directory reading shows only where it does better, and it never scores as
+/// an exact match. A whole-title reading (`1.0 - 0.03`) stays well above the
+/// 0.90 title and artist gate.
+const DIRECTORY_PENALTY: f64 = 0.03;
 
 /// Words a tag or a store appends to an album title to say what kind of release
 /// it is, not which album: `No Distance Left to Run EP`, `... OST`, `... Japan`.
@@ -3203,10 +3212,9 @@ impl ScoreBreakdown {
     }
 }
 
-/// Deterministic ranking score in `0..=1`. Missing components contribute zero;
-/// nothing is renormalized into false confidence.
-pub fn score(local: &LocalRelease, remote: &RemoteRelease, mapping: &Mapping) -> ScoreBreakdown {
-    let album_title = match &local.album_title {
+/// The album title component read from the album tag alone.
+fn tag_title_score(local: &LocalRelease, remote: &RemoteRelease, mapping: &Mapping) -> f64 {
+    match &local.album_title {
         // Filler is not a title, so it is no evidence for or against an album.
         Some(title) if is_junk_title(title) => 0.0,
         Some(title) if !title.trim().is_empty() => {
@@ -3232,9 +3240,43 @@ pub fn score(local: &LocalRelease, remote: &RemoteRelease, mapping: &Mapping) ->
             value
         }
         _ => 0.0,
-    };
+    }
+}
 
-    let album_artist = album_artist_score(local, remote);
+/// The album title component read from the directory name, less the penalty.
+///
+/// Zero without a directory title. The title is never read as a cut-off tag:
+/// directory names are not shortened. See [`DIRECTORY_PENALTY`].
+fn directory_title_score(directory: Option<&SceneSplit>, remote: &RemoteRelease) -> f64 {
+    directory
+        .and_then(|split| split.title.as_deref())
+        .map_or(0.0, |title| {
+            (album_title_similarity_with(title, &remote.title, false) - DIRECTORY_PENALTY).max(0.0)
+        })
+}
+
+/// The artist component read from the directory name, less the penalty.
+///
+/// A Various Artists name scores nothing: that credit is no evidence of the
+/// album, and the gates that allow for it read the tags' artist kind.
+fn directory_artist_score(directory: Option<&SceneSplit>, remote: &RemoteRelease) -> f64 {
+    directory
+        .and_then(|split| split.artist.as_deref())
+        .map_or(0.0, |artist| {
+            (artist_credit_score(artist, false, remote) - DIRECTORY_PENALTY).max(0.0)
+        })
+}
+
+/// Deterministic ranking score in `0..=1`. Missing components contribute zero;
+/// nothing is renormalized into false confidence.
+pub fn score(local: &LocalRelease, remote: &RemoteRelease, mapping: &Mapping) -> ScoreBreakdown {
+    // The tags and the directory name are two readings of the album; the
+    // better one counts. Nothing else reads the directory.
+    let directory = scene::directory_split(local);
+    let album_title = tag_title_score(local, remote, mapping)
+        .max(directory_title_score(directory.as_ref(), remote));
+    let album_artist =
+        album_artist_score(local, remote).max(directory_artist_score(directory.as_ref(), remote));
 
     let track_titles = if local.tracks.is_empty() {
         0.0
@@ -3303,6 +3345,15 @@ fn album_artist_score(local: &LocalRelease, remote: &RemoteRelease) -> f64 {
     let Some(artist) = &local.album_artist else {
         return 0.0;
     };
+    let various = matches!(local.artist_kind, ArtistKind::VariousArtists);
+    artist_credit_score(artist, various, remote)
+}
+
+/// How well `artist` matches the remote release's credits.
+///
+/// `various` says the local release is Various Artists, which a Various
+/// Artists credit matches outright.
+fn artist_credit_score(artist: &str, various: bool, remote: &RemoteRelease) -> f64 {
     if remote.artists.is_empty() || is_junk_artist(artist) {
         return 0.0;
     }
@@ -3325,12 +3376,12 @@ fn album_artist_score(local: &LocalRelease, remote: &RemoteRelease) -> f64 {
         .map(|name| normalize_artist_for(provider, name).chars().collect())
         .collect();
 
-    let various = matches!(local.artist_kind, ArtistKind::VariousArtists)
+    let various_credit = various
         && remote_chars.iter().any(|name| {
             let name: String = name.iter().collect();
             name == "various" || name == "various artists"
         });
-    if various {
+    if various_credit {
         return 1.0;
     }
 
@@ -13905,6 +13956,99 @@ mod tests {
         );
         local.artist_kind = ArtistKind::VariousArtists;
         (local, remote)
+    }
+
+    /// [`local_release`] of `titles` in `directory`, tagged `album` by `artist`.
+    fn in_directory(titles: &[&str], directory: &str, album: &str, artist: &str) -> LocalRelease {
+        let mut local = local_release(titles);
+        local.directory = directory.to_string();
+        local.album_title = Some(album.to_string());
+        local.album_artist = Some(artist.to_string());
+        local
+    }
+
+    /// A cut-off album tag whose directory name holds the whole title.
+    const FELLERS: &str =
+        "/mp3/Thinking_Fellers_Union_Local_282_-_The_Natural_Finger-7_Inch_Vinyl-1988-NuHS";
+
+    /// The release [`FELLERS`] names, with `titles` for tracks.
+    fn fellers_remote(titles: &[&str]) -> RemoteRelease {
+        let mut remote = remote_release(titles);
+        remote.title = "The Natural Finger".to_string();
+        remote.artists = vec!["Thinking Fellers Union Local 282".to_string()];
+        remote
+    }
+
+    #[test]
+    fn a_cut_off_album_tag_scores_the_directory_title() {
+        let titles = &TITLES_12[..4];
+        let remote = fellers_remote(titles);
+        let plain = in_directory(
+            titles,
+            "/music/album",
+            "The Natural Finger 7 Inch Viny",
+            "Thinking Fellers Union Local 2",
+        );
+        let tags = Candidate::new(&plain, remote.clone()).score;
+        assert!(
+            tags.album_title < CORROBORATED_TITLE_FLOOR,
+            "{}",
+            tags.album_title
+        );
+
+        let mut local = plain.clone();
+        local.directory = FELLERS.to_string();
+        let score = Candidate::new(&local, remote).score;
+        assert!(
+            (score.album_title - (1.0 - DIRECTORY_PENALTY)).abs() < 1e-9,
+            "{}",
+            score.album_title
+        );
+        // The cut-off artist tag already reads as the whole credit: the tag wins.
+        assert_eq!(score.album_artist, tags.album_artist);
+    }
+
+    #[test]
+    fn the_directory_changes_only_the_album_title_and_artist() {
+        let titles = &TITLES_12[..4];
+        let mut remote = remote_release(titles);
+        remote.title = "Blue".to_string();
+        let plain = in_directory(titles, "/music/album", "Zzzz Qqqq", "Someone Else Entirely");
+        let mut named = plain.clone();
+        named.directory = "/mp3/Test_Artist-Blue-2001-GRP".to_string();
+        let before = Candidate::new(&plain, remote.clone());
+        let after = Candidate::new(&named, remote);
+        assert_eq!(before.mapping.pairs, after.mapping.pairs);
+        assert_eq!(before.score.track_titles, after.score.track_titles);
+        assert_eq!(before.score.durations, after.score.durations);
+        assert_eq!(before.score.year, after.score.year);
+        assert!(after.score.album_title > before.score.album_title);
+        assert!(after.score.album_artist > before.score.album_artist);
+    }
+
+    #[test]
+    fn tags_that_score_as_well_as_the_directory_win() {
+        let titles = &TITLES_12[..4];
+        let local = in_directory(
+            titles,
+            "/mp3/Test_Artist-Test_Album-2001-GRP",
+            "Test Album",
+            "Test Artist",
+        );
+        let score = Candidate::new(&local, remote_release(titles)).score;
+        assert_eq!((score.album_title, score.album_artist), (1.0, 1.0));
+    }
+
+    #[test]
+    fn a_various_artists_directory_adds_nothing_to_the_artist() {
+        let titles = &TITLES_12[..4];
+        let mut remote = remote_release(titles);
+        remote.title = "Thirteen Days".to_string();
+        remote.artists = vec!["Various Artists".to_string()];
+        let mut local = in_directory(titles, "/music/album", "Thirteen Days", "Trevor Jones");
+        let plain = Candidate::new(&local, remote.clone()).score.album_artist;
+        local.directory = "/mp3/VA-Thirteen_Days_OST-2000-RNS".to_string();
+        assert_eq!(Candidate::new(&local, remote).score.album_artist, plain);
     }
 
     fn tracklist_warning(evaluation: &Evaluation) -> Option<&str> {
