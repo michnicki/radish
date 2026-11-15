@@ -1824,6 +1824,14 @@ pub(crate) fn search_title(local: &LocalRelease) -> Option<String> {
 /// (at the release-type cost), a remote title that names one of its credited
 /// artists or is a placeholder itself, and `Untitled`.
 fn self_titled_score(local: &LocalRelease, remote: &RemoteRelease) -> f64 {
+    self_titled_score_for(tag_identity(local).artist.as_deref(), remote)
+}
+
+/// [`self_titled_score`] for a placeholder whose artist is `artist`.
+///
+/// The artist is the tags' or the directory name's, whichever read the
+/// placeholder.
+fn self_titled_score_for(artist: Option<&str>, remote: &RemoteRelease) -> f64 {
     let remote_title = normalize_text(&remote.title);
     if is_self_titled(&remote.title) {
         return SELF_TITLED_REMOTE_SCORE;
@@ -1833,9 +1841,9 @@ fn self_titled_score(local: &LocalRelease, remote: &RemoteRelease) -> f64 {
     } else {
         0.0
     };
-    if let Some(artist) = tag_identity(local).artist {
-        best = best
-            .max((album_title_similarity(&artist, &remote.title) - ALBUM_TYPE_PENALTY).max(0.0));
+    if let Some(artist) = artist {
+        best =
+            best.max((album_title_similarity(artist, &remote.title) - ALBUM_TYPE_PENALTY).max(0.0));
         // The credit the title names must be the local artist: `Self Titled` by
         // `Band B` is not `Band A`, however many artists that release credits.
         let provider = remote.provider();
@@ -1843,7 +1851,7 @@ fn self_titled_score(local: &LocalRelease, remote: &RemoteRelease) -> f64 {
             && remote.artists.iter().any(|name| {
                 normalize_artist_for(provider, name) == remote_title
                     && local_artist_similarity(
-                        &artist,
+                        artist,
                         &match provider {
                             ProviderKind::Discogs => strip_disambiguator(name),
                             ProviderKind::MusicBrainz => name.clone(),
@@ -3246,18 +3254,40 @@ fn tag_title_score(local: &LocalRelease, remote: &RemoteRelease, mapping: &Mappi
     }
 }
 
+/// The directory title's similarity to the remote title, before its cost and cut.
+///
+/// `None` without a directory title. The title is never read as a cut-off tag,
+/// because directory names are not shortened. A self-titled placeholder reads as
+/// the artist's name, as it would in a tag; the artist is the directory's, else
+/// the tags'.
+fn directory_title_similarity(
+    local: &LocalRelease,
+    directory: &SceneSplit,
+    remote: &RemoteRelease,
+) -> Option<f64> {
+    let title = directory.title.as_deref()?;
+    let mut value = album_title_similarity_with(title, &remote.title, false);
+    if is_self_titled(title) {
+        let tag_artist = tag_identity(local).artist;
+        let artist = directory.artist.as_deref().or(tag_artist.as_deref());
+        value = value.max(self_titled_score_for(artist, remote));
+    }
+    Some(value)
+}
+
 /// The album title component read from the directory name, less the penalty.
 ///
 /// Zero without a directory title, and zero unless the reading reaches
-/// [`TITLE_SIMILARITY_THRESHOLD`]: it counts only when it names the album. The
-/// title is never read as a cut-off tag, because directory names are not
-/// shortened. See [`DIRECTORY_PENALTY`].
-fn directory_title_score(directory: Option<&SceneSplit>, remote: &RemoteRelease) -> f64 {
+/// [`TITLE_SIMILARITY_THRESHOLD`]: it counts only when it names the album. See
+/// [`DIRECTORY_PENALTY`] and [`directory_title_similarity`].
+fn directory_title_score(
+    local: &LocalRelease,
+    directory: Option<&SceneSplit>,
+    remote: &RemoteRelease,
+) -> f64 {
     directory
-        .and_then(|split| split.title.as_deref())
-        .map_or(0.0, |title| {
-            names_outright(album_title_similarity_with(title, &remote.title, false))
-        })
+        .and_then(|split| directory_title_similarity(local, split, remote))
+        .map_or(0.0, names_outright)
 }
 
 /// A directory reading's similarity less [`DIRECTORY_PENALTY`], or zero when
@@ -3301,7 +3331,7 @@ fn directory_notes(local: &LocalRelease, candidate: &Candidate) -> Vec<String> {
     let remote = &candidate.release;
     let mut notes = Vec::new();
     if let Some(title) = &directory.title
-        && directory_title_score(Some(&directory), remote)
+        && directory_title_score(local, Some(&directory), remote)
             > tag_title_score(local, remote, &candidate.mapping) + 1e-9
     {
         notes.push(format!("album title '{title}' {DIRECTORY_NOTE}"));
@@ -3323,8 +3353,11 @@ pub fn score(local: &LocalRelease, remote: &RemoteRelease, mapping: &Mapping) ->
     // The tags and the directory name are two readings of the album; the
     // better one counts. No other component reads the directory.
     let directory = scene::directory_split(local);
-    let album_title = tag_title_score(local, remote, mapping)
-        .max(directory_title_score(directory.as_ref(), remote));
+    let album_title = tag_title_score(local, remote, mapping).max(directory_title_score(
+        local,
+        directory.as_ref(),
+        remote,
+    ));
     let album_artist =
         tag_artist_score(local, remote).max(directory_artist_score(directory.as_ref(), remote));
 
@@ -5432,10 +5465,10 @@ fn equivalent_audio(a: &Candidate, b: &Candidate) -> bool {
 /// A local release with no usable album title (missing or filler, see
 /// [`tag_identity`]) and none in its directory name has no title to weigh, so
 /// the title floor and the title condition do not apply to it; everything else
-/// does. A title read from the directory name does weigh in, and scores only
-/// when it names the album. The artist has to come from the tags or the
-/// directory name: a junk or missing one scores zero and keeps the release in
-/// review.
+/// does. A title read from the directory name does weigh in, at its cost and
+/// whole, as a tag would ([`weak_rule_title`]). The artist has to come from the
+/// tags or the directory name: a junk or missing one scores zero and keeps the
+/// release in review.
 fn corroborated_album(local: &LocalRelease, candidate: &Candidate) -> bool {
     let score = &candidate.score;
     let min_tracks = if matches!(local.artist_kind, ArtistKind::VariousArtists) {
@@ -5443,12 +5476,10 @@ fn corroborated_album(local: &LocalRelease, candidate: &Candidate) -> bool {
     } else {
         CORROBORATED_MIN_TRACKS
     };
-    let title_weighs_in = !lacks_album_title(local)
-        || scene::directory_split(local).is_some_and(|split| split.title.is_some());
     if local.tracks.len() < min_tracks
-        || (title_weighs_in
-            && (score.album_title < CORROBORATED_TITLE_FLOOR
-                || score.album_title >= TITLE_SIMILARITY_THRESHOLD))
+        || weak_rule_title(local, candidate).is_some_and(|title| {
+            title < CORROBORATED_TITLE_FLOOR || title >= TITLE_SIMILARITY_THRESHOLD
+        })
         || score.album_artist < TITLE_SIMILARITY_THRESHOLD
         || score.track_titles < CORROBORATED_MEAN_TITLE
         || score.album_score_without_title() + 1e-9 < CORROBORATED_SCORE
@@ -5462,6 +5493,22 @@ fn corroborated_album(local: &LocalRelease, candidate: &Candidate) -> bool {
     candidate.mapping.assigned_pairs().all(|(l, r)| {
         duration_gap(local, candidate, l, r).is_some_and(|gap| gap <= CORROBORATED_DURATION_SECS)
     })
+}
+
+/// The album title score the weak album title rule weighs, or `None` when it
+/// has no title to weigh.
+///
+/// A usable album tag weighs as [`ScoreBreakdown::album_title`]. Without one, a
+/// title in the directory name weighs at its similarity less
+/// [`DIRECTORY_PENALTY`], partial or not: [`names_outright`] zeroes it for every
+/// other rule, but this one reads the band it zeroes, as it does for a tag.
+fn weak_rule_title(local: &LocalRelease, candidate: &Candidate) -> Option<f64> {
+    if !lacks_album_title(local) {
+        return Some(candidate.score.album_title);
+    }
+    let directory = scene::directory_split(local)?;
+    directory_title_similarity(local, &directory, &candidate.release)
+        .map(|similarity| (similarity - DIRECTORY_PENALTY).max(0.0))
 }
 
 /// Whether the local release has no usable album title: it is missing or
@@ -5629,11 +5676,19 @@ fn evaluate_with(
         ));
     }
 
-    if corroborated_title && lacks_album_title(local) {
+    if corroborated_title && weak_rule_title(local, candidate).is_none() {
         warnings.push(
             "local release has no usable album title, but every track and duration agrees"
                 .to_string(),
         );
+    } else if corroborated_title && lacks_album_title(local) {
+        let title = weak_rule_title(local, candidate).unwrap_or_default();
+        let name = scene::directory_split(local)
+            .and_then(|split| split.title)
+            .unwrap_or_default();
+        warnings.push(format!(
+            "album title '{name}' {DIRECTORY_NOTE} scores {title:.3} but every track and duration agrees"
+        ));
     } else if corroborated_title {
         warnings.push(format!(
             "album title scores {:.3} but every track and duration agrees",
@@ -14260,7 +14315,10 @@ mod tests {
             raw > 0.5 && raw < TITLE_SIMILARITY_THRESHOLD,
             "the directory reading must be partial: {raw}"
         );
-        assert_eq!(directory_title_score(directory.as_ref(), &remote), 0.0);
+        assert_eq!(
+            directory_title_score(&local, directory.as_ref(), &remote),
+            0.0
+        );
         assert_eq!(Candidate::new(&local, remote).score.album_title, tags);
     }
 
@@ -14286,6 +14344,57 @@ mod tests {
             Candidate::new(&local, remote).score,
             evaluation.warnings
         );
+    }
+
+    #[test]
+    fn a_self_titled_directory_reads_as_the_artists_name() {
+        let titles = &TITLES_12[..4];
+        let mut remote = remote_release(titles);
+        remote.title = "Test Artist".to_string();
+        let (mut local, _) = untagged_in("/music/album");
+        local.album_artist = Some("Test Artist".to_string());
+        let plain = album_evaluation(&local, &remote, &[]);
+        assert!(plain.auto_accept, "{:?}", plain.blockers);
+
+        local.directory = "/mp3/Test_Artist-Self-Titled-2001-GRP".to_string();
+        let named = album_evaluation(&local, &remote, &[]);
+        assert!(
+            named.auto_accept,
+            "{:?} {:?}",
+            named.blockers,
+            Candidate::new(&local, remote).score
+        );
+    }
+
+    #[test]
+    fn a_partial_directory_title_still_passes_the_weak_title_rule() {
+        let (mut local, mut remote) = untagged_in("/music/album");
+        remote.title = "Exclusive Metal Radio Sampler".to_string();
+        let tag = in_directory(
+            &TITLES_12[..4],
+            "/music/album",
+            "Exclusive Metal Sampler",
+            "Test Artist",
+        );
+        let as_tag = album_evaluation(&tag, &remote, &[]);
+        assert!(as_tag.auto_accept, "{:?}", as_tag.blockers);
+
+        local.directory = "/mp3/Test_Artist-Exclusive_Metal_Sampler-2001-GRP".to_string();
+        let accepted = album_evaluation(&local, &remote, &[]);
+        assert!(accepted.auto_accept, "{:?}", accepted.blockers);
+        assert!(
+            accepted
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with(
+                    "album title 'Exclusive Metal Sampler' read from the directory name scores 0."
+                ) && warning.ends_with("but every track and duration agrees")),
+            "{:?}",
+            accepted.warnings
+        );
+
+        local.directory = "/mp3/Test_Artist-Something_Unrelated-2001-GRP".to_string();
+        assert!(!album_evaluation(&local, &remote, &[]).auto_accept);
     }
 
     #[test]
