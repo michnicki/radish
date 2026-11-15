@@ -233,6 +233,17 @@ pub struct SceneSplit {
     pub various: bool,
 }
 
+impl SceneSplit {
+    /// The artist to credit: `Various Artists` for a Various Artists name.
+    pub fn credited_artist(&self) -> Option<String> {
+        if self.various {
+            Some("Various Artists".to_string())
+        } else {
+            self.artist.clone()
+        }
+    }
+}
+
 /// Reads a release directory name.
 ///
 /// The last path component names the release; a disc folder (`CD2`) names the

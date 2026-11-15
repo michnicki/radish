@@ -102,17 +102,15 @@ fn search_view(local: &LocalRelease) -> (Cow<'_, LocalRelease>, Option<String>) 
     let mut artist_read = None;
     // `directory_split` already reads a filler title as no title.
     if identity.title.is_none()
-        && let Some(title) = split.title
+        && let Some(title) = &split.title
     {
         title_read = Some(title.clone());
-        view.album_title = Some(title);
+        view.album_title = Some(title.clone());
     }
     if artist_unusable {
+        artist_read = split.credited_artist();
         if split.various {
-            artist_read = Some("Various Artists".to_string());
             view.artist_kind = matcher::ArtistKind::VariousArtists;
-        } else {
-            artist_read = split.artist;
         }
         view.album_artist.clone_from(&artist_read);
     }
@@ -165,12 +163,18 @@ fn compact(text: &str) -> String {
 /// tags' title.
 fn directory_search(local: &LocalRelease, view: &LocalRelease) -> Option<DirectorySearch> {
     let split = scene::directory_split(local)?;
-    let artist = if split.various {
-        "Various Artists".to_string()
-    } else {
-        split.artist?
-    };
+    let artist = split.credited_artist()?;
     let tag_title = matcher::search_title(view);
+    let artist_differs = view
+        .album_artist
+        .as_deref()
+        .is_none_or(|tag| compact(tag) != compact(&artist));
+    // The artist the search uses, for a self-titled directory title to name.
+    let searched_artist = if artist_differs {
+        Some(artist.as_str())
+    } else {
+        view.album_artist.as_deref()
+    };
     // A self-titled placeholder is searched as the artist's name, so the
     // directory agrees with it too.
     let title_keys: Vec<String> = view
@@ -180,13 +184,18 @@ fn directory_search(local: &LocalRelease, view: &LocalRelease) -> Option<Directo
         .chain(tag_title.as_deref())
         .map(compact)
         .collect();
+    // A self-titled directory title agrees with a placeholder tag, and with a
+    // tag that names the artist.
+    let self_titled_agrees = |title: &str| {
+        matcher::is_self_titled(title)
+            && view.album_title.as_deref().is_some_and(|tag| {
+                matcher::is_self_titled(tag)
+                    || searched_artist.is_some_and(|artist| compact(tag) == compact(artist))
+            })
+    };
     let read_title = split
         .title
-        .filter(|title| !title_keys.contains(&compact(title)));
-    let artist_differs = view
-        .album_artist
-        .as_deref()
-        .is_none_or(|tag| compact(tag) != compact(&artist));
+        .filter(|title| !title_keys.contains(&compact(title)) && !self_titled_agrees(title));
     let mut read = Vec::new();
     if let Some(title) = &read_title {
         read.push(format!("album '{title}'"));
@@ -1624,6 +1633,37 @@ mod tests {
                 search("title", "Plasticland", Some("Plasticland")),
                 search("title as tagged", "S/T", Some("Plasticland")),
             ]
+        );
+    }
+
+    #[test]
+    fn a_self_titled_directory_agrees_with_a_placeholder_or_the_artist_named_tag() {
+        // A placeholder tag and a placeholder directory name say the same thing.
+        let mut placeholder = local();
+        placeholder.album_title = Some("S/T".to_string());
+        placeholder.album_artist = Some("Plasticland".to_string());
+        placeholder.directory = "/mp3/Plasticland-Self-Titled-1985-SDR".to_string();
+        assert!(
+            title_and_artist(ProviderKind::MusicBrainz, &placeholder)
+                .iter()
+                .all(|(label, ..)| label != "directory name")
+        );
+        // A tag naming the artist is what a self-titled directory name means.
+        let mut named = local();
+        named.album_title = Some("H2O".to_string());
+        named.album_artist = Some("H2O".to_string());
+        named.directory = "/mp3/H2O-Self-Titled-1996-GRP".to_string();
+        assert!(
+            title_and_artist(ProviderKind::MusicBrainz, &named)
+                .iter()
+                .all(|(label, ..)| label != "directory name")
+        );
+        // Another album title still adds the search.
+        named.album_title = Some("Thicker Than Water".to_string());
+        assert!(
+            title_and_artist(ProviderKind::MusicBrainz, &named)
+                .iter()
+                .any(|(label, ..)| label == "directory name")
         );
     }
 

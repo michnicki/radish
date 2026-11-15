@@ -179,9 +179,10 @@ pub const LEADING_TRACKS_MIN_VARIOUS: usize = 8;
 /// unconfirmed-edition note.
 pub const MORE_TRACKS_NOTE: &str = "lists more tracks after the files' last";
 
-/// The endings that mark a warning as the note of an acceptance rule, or of what
-/// the directory name supplied, which the runner prints under the accept (see
-/// [`Evaluation::rule_notes`]).
+/// Warning endings the runner prints under an accept.
+///
+/// An ending marks a warning as the note of an acceptance rule, or of what the
+/// directory name supplied (see [`Evaluation::rule_notes`]).
 const RULE_NOTES: &[&str] = &[
     UNCONFIRMED_LENGTHS_NOTE,
     LABEL_DIFFERENCE_NOTE,
@@ -3557,20 +3558,15 @@ pub(crate) fn rank_identity(local: &LocalRelease) -> RankIdentity {
     // The directory name's reading ranks too, so a hit only it names clears
     // the detailed-lookup floor.
     if let Some(directory) = scene::directory_split(local) {
+        if let Some(artist) = directory.credited_artist()
+            && !artists.contains(&artist)
+        {
+            artists.push(artist);
+        }
         if let Some(title) = directory.title
             && !titles.contains(&title)
         {
             titles.push(title);
-        }
-        let artist = if directory.various {
-            Some("Various Artists".to_string())
-        } else {
-            directory.artist
-        };
-        if let Some(artist) = artist
-            && !artists.contains(&artist)
-        {
-            artists.push(artist);
         }
     }
     RankIdentity { titles, artists }
@@ -14461,6 +14457,23 @@ mod tests {
             "{:?} {:?}",
             Candidate::new(&local, remote).score,
             evaluation.warnings
+        );
+    }
+
+    #[test]
+    fn a_disc_folder_scores_with_its_parents_reading() {
+        let titles = &TITLES_12[..4];
+        let local = in_directory(
+            titles,
+            "/mp3/Test_Artist-Test_Album-2CD-2001-GRP/CD2",
+            "Zzzz",
+            "Test Artist",
+        );
+        let score = Candidate::new(&local, remote_release(titles)).score;
+        assert!(
+            (score.album_title - (1.0 - DIRECTORY_PENALTY)).abs() < 1e-9,
+            "{}",
+            score.album_title
         );
     }
 
