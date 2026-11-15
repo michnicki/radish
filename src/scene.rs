@@ -3,17 +3,17 @@
 //! Scene releases are named `Artist-Album-(TAGS)-YEAR-GROUP`, with `_` for
 //! spaces (or `.` when the name has no other word break). A release whose tags
 //! are missing or filler still sits in a directory like that, so the name says
-//! what to search for. The text is a search and ranking hint only: it is never
-//! scored and never stored.
+//! what to search for. The text is what discovery searches and ranks with, and a
+//! second reading of the album title and artist in scoring; it is never stored.
 //!
 //! The parser is pure: no IO, no regular expressions, and no guessing. A name
 //! it cannot read with certainty is `None`, and an ambiguous split (`Wu-Tang`
-//! as a band against an album) is decided only by an artist hint the caller
-//! already trusts.
+//! as a band against an album) is decided only by an artist or album tag the
+//! release already carries.
 
 // Rust guideline compliant 2026-08-14
 
-use crate::matcher::folder_disc_number;
+use crate::matcher::{self, LocalRelease, folder_disc_number};
 
 /// Words that name a release type, format or edition rather than an album.
 const TAG_WORDS: &[&str] = &[
@@ -278,6 +278,48 @@ pub fn parse_release_directory(directory: &str) -> Option<SceneName> {
         fields,
         split_release,
     })
+}
+
+/// Lowest similarity at which a tag decides the cut of an ambiguous name.
+///
+/// The artist tag is compared with each cut's artist part, and the album tag
+/// with each cut's title part; a cut stands only when exactly one fits. High
+/// enough that a tag naming a shorter credit (`Stresmatic` against
+/// `Stresmatic and Droop-E`) decides nothing, low enough that spelling
+/// (`Wu-Tang Clan` against `Wu Tang Clan`) still does. Discovery used the same
+/// value for the artist before the album tag could decide.
+const TAG_HINT: f64 = 0.90;
+
+/// The artist and album a release's directory name gives, tags breaking ties.
+///
+/// The cut comes from the name's structure ([`SceneName::split`]), else from
+/// the artist tag ([`SceneName::split_matching`]), else from the album tag
+/// ([`SceneName::split_matching_title`]). A missing, filler or Various Artists
+/// artist tag and a missing or filler album tag decide nothing. A filler title
+/// in the name (`Unknown_Title`) is no title. `None` when the name is not a
+/// scene release name, marks a split release, or no cut can be decided.
+pub(crate) fn directory_split(local: &LocalRelease) -> Option<SceneSplit> {
+    let name = parse_release_directory(&local.directory)?;
+    let artist_tag = matcher::tag_identity(local).artist;
+    let title_tag = local
+        .album_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty() && !matcher::is_junk_title(title));
+    let mut split = name
+        .split()
+        .or_else(|| {
+            let tag = artist_tag.as_deref()?;
+            name.split_matching(|part| matcher::local_artist_similarity(tag, part) >= TAG_HINT)
+        })
+        .or_else(|| {
+            let tag = title_tag?;
+            name.split_matching_title(|part| matcher::album_title_similarity(tag, part) >= TAG_HINT)
+        })?;
+    if split.title.as_deref().is_some_and(matcher::is_junk_title) {
+        split.title = None;
+    }
+    (split.various || split.artist.is_some() || split.title.is_some()).then_some(split)
 }
 
 /// The path component that names the release.
@@ -1067,6 +1109,90 @@ mod tests {
         assert_eq!(read("DdF-Demo-2001-PMS"), pair("DdF", "Demo"));
         assert_eq!(read("Foo-Live-2001-GRP"), pair("Foo", "Live"));
         assert_eq!(read("Foo-EP_Two-2001-GRP"), pair("Foo", "EP Two"));
+    }
+
+    // `LocalRelease` comes in through `super::*`.
+    use crate::matcher::{ArtistKind, EmbeddedReleaseEvidence};
+
+    /// A release with no tracks in `directory`, with the given tags.
+    fn tagged(directory: &str, album: Option<&str>, artist: Option<&str>) -> LocalRelease {
+        LocalRelease {
+            id: 1,
+            directory: directory.to_string(),
+            album_title: album.map(str::to_string),
+            album_artist: artist.map(str::to_string),
+            artist_kind: if artist.is_some() {
+                ArtistKind::AlbumArtist
+            } else {
+                ArtistKind::Unknown
+            },
+            year: None,
+            barcode: None,
+            catalog_number: None,
+            embedded_discogs_id: None,
+            embedded_evidence: EmbeddedReleaseEvidence::default(),
+            is_compilation: false,
+            has_album_tag: album.is_some(),
+            revision: "rev".to_string(),
+            tracks: Vec::new(),
+        }
+    }
+
+    type Reading = (Option<String>, Option<String>, bool);
+
+    fn reading(local: &LocalRelease) -> Option<Reading> {
+        directory_split(local).map(|split| (split.artist, split.title, split.various))
+    }
+
+    fn some(artist: &str, title: &str) -> Option<Reading> {
+        Some((Some(artist.to_string()), Some(title.to_string()), false))
+    }
+
+    #[test]
+    fn the_directory_reading_takes_the_structure_then_the_artist_then_the_album_tag() {
+        // The structure decides, whatever the tags say.
+        let mobb = "/mp3/Mobb_Deep-Life_Of_The_Infamous-2006-CMS";
+        assert_eq!(
+            reading(&tagged(mobb, Some("Whatever"), Some("Various Artists"))),
+            some("Mobb Deep", "Life Of The Infamous")
+        );
+        // Then the artist tag.
+        let wu = "/mp3/Wu-Tang_Clan-Wu-Tang_Forever-1997-KSi_INT";
+        assert_eq!(
+            reading(&tagged(wu, None, Some("Wu-Tang Clan"))),
+            some("Wu-Tang Clan", "Wu-Tang Forever")
+        );
+        // Then the album tag, when the artist tag fits no cut.
+        let stresmatic = "/mp3/Stresmatic_and_Droop-E-4005-WEB-2021-RAGEMP3";
+        assert_eq!(
+            reading(&tagged(stresmatic, Some("4005"), Some("Stresmatic"))),
+            some("Stresmatic and Droop-E", "4005")
+        );
+        // A Various Artists or filler tag decides nothing; nothing decides: no reading.
+        assert_eq!(reading(&tagged(stresmatic, None, Some("Stresmatic"))), None);
+        assert_eq!(
+            reading(&tagged(wu, Some("Unknown Title"), Some("Various Artists"))),
+            None
+        );
+        // A filler title in the name is no title; the artist still reads.
+        assert_eq!(
+            reading(&tagged(
+                "/mp3/Squeezetoy-Unknown_Title-2001-PMS",
+                None,
+                None
+            )),
+            Some((Some("Squeezetoy".to_string()), None, false))
+        );
+        // A Various Artists name.
+        assert_eq!(
+            reading(&tagged("/mp3/VA-Thirteen_Days_OST-2000-RNS", None, None)),
+            Some((None, Some("Thirteen Days".to_string()), true))
+        );
+        // Not a scene name.
+        assert_eq!(
+            reading(&tagged("/music/blue", Some("Blue"), Some("Test Artist"))),
+            None
+        );
     }
 
     #[test]

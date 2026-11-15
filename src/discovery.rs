@@ -29,10 +29,6 @@ use std::collections::{HashMap, HashSet};
 /// or the local release lacks an album title or artist.
 const MIN_DETAIL_RANK: f64 = 0.25;
 
-/// Lowest artist similarity at which an artist tag picks the cut of an ambiguous
-/// directory name (`Wu-Tang_Clan-Wu-Tang_Forever`).
-const DIRECTORY_ARTIST_HINT: f64 = 0.90;
-
 /// Per-provider search and lookup limits. Weak title hits are skipped before
 /// they can use up `detail_attempts`; see [`MIN_DETAIL_RANK`].
 #[derive(Debug, Clone, Copy)]
@@ -85,8 +81,9 @@ impl DiscoveryResult {
 ///
 /// The second value is the note to record when the directory supplied anything.
 /// Real tags are never replaced, and a name that cannot be read with certainty
-/// (see [`scene`]) leaves the release as it is. The directory is only a search
-/// and ranking hint: [`matcher::score`] still sees the release's own tags.
+/// (see [`scene`]) leaves the release as it is. [`matcher::score`] sees the
+/// release's own tags and reads the directory name again on its own (see
+/// [`scene::directory_split`]).
 fn search_view(local: &LocalRelease) -> (Cow<'_, LocalRelease>, Option<String>) {
     let identity = matcher::tag_identity(local);
     let artist_unusable = local
@@ -96,27 +93,16 @@ fn search_view(local: &LocalRelease) -> (Cow<'_, LocalRelease>, Option<String>) 
     if identity.title.is_some() && !artist_unusable {
         return (Cow::Borrowed(local), None);
     }
-    let Some(name) = scene::parse_release_directory(&local.directory) else {
-        return (Cow::Borrowed(local), None);
-    };
-    // A real artist tag settles a name whose structure leaves the cut open.
-    let split = match identity.artist.as_deref() {
-        Some(tag) if !artist_unusable => name.split_matching(|part| {
-            matcher::local_artist_similarity(tag, part) >= DIRECTORY_ARTIST_HINT
-        }),
-        _ => name.split(),
-    };
-    let Some(split) = split else {
+    let Some(split) = scene::directory_split(local) else {
         return (Cow::Borrowed(local), None);
     };
 
     let mut view = local.clone();
     let mut title_read = None;
     let mut artist_read = None;
-    // Filler in the directory is as little use as filler in the tag.
+    // `directory_split` already reads a filler title as no title.
     if identity.title.is_none()
         && let Some(title) = split.title
-        && !matcher::is_junk_title(&title)
     {
         title_read = Some(title.clone());
         view.album_title = Some(title);
@@ -1427,6 +1413,18 @@ mod tests {
         // A tag that fits no cut point leaves the release as it was.
         local.album_artist = Some("Someone Else".to_string());
         assert_eq!(title_and_artist(ProviderKind::Discogs, &local), vec![]);
+    }
+
+    #[test]
+    fn an_album_tag_settles_an_ambiguous_directory_for_a_missing_artist() {
+        let mut local = untagged();
+        local.directory = "/mp3/Stresmatic_and_Droop-E-4005-WEB-2021-RAGEMP3".to_string();
+        local.album_title = Some("4005".to_string());
+        local.has_album_tag = true;
+        assert_eq!(
+            title_and_artist(ProviderKind::Discogs, &local),
+            vec![search("title", "4005", Some("Stresmatic and Droop-E"))]
+        );
     }
 
     #[test]
