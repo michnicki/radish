@@ -179,14 +179,16 @@ pub const LEADING_TRACKS_MIN_VARIOUS: usize = 8;
 /// unconfirmed-edition note.
 pub const MORE_TRACKS_NOTE: &str = "lists more tracks after the files' last";
 
-/// The endings that mark a warning as the note of an acceptance rule, which the
-/// runner prints under the accept (see [`Evaluation::rule_notes`]).
+/// The endings that mark a warning as the note of an acceptance rule, or of what
+/// the directory name supplied, which the runner prints under the accept (see
+/// [`Evaluation::rule_notes`]).
 const RULE_NOTES: &[&str] = &[
     UNCONFIRMED_LENGTHS_NOTE,
     LABEL_DIFFERENCE_NOTE,
     ODD_LENGTH_NOTE,
     TRACKLIST_IDENTITY_NOTE,
     MORE_TRACKS_NOTE,
+    DIRECTORY_NOTE,
 ];
 
 /// The edition qualifiers that a release may carry on one side only without
