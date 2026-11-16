@@ -42,6 +42,12 @@ const VARIOUS_ARTISTS: &str = "Various Artists";
 /// Deezer error code for an exhausted request quota (50 requests per 5 s).
 const QUOTA_EXCEEDED: i64 = 4;
 
+/// Deezer error code for "service busy", retried like a server error.
+const SERVICE_BUSY: i64 = 700;
+
+/// Longest Deezer error message copied into an error, in characters.
+const MAX_MESSAGE_CHARS: usize = 200;
+
 /// Deezer error code for a lookup or barcode that matches nothing.
 const NO_DATA: i64 = 800;
 
@@ -64,8 +70,12 @@ pub struct DeezerConfig {
     pub max_attempts: u8,
     /// Wait after a failed attempt, by retry; the last entry repeats.
     pub backoff: Vec<Duration>,
-    /// Wait after a quota error before the next attempt.
+    /// Pause of every uncached request, shared by the whole adapter, after a
+    /// quota error.
     pub quota_wait: Duration,
+    /// How long uncached requests fail at once after a request ran out of
+    /// retries on a transient failure.
+    pub outage_cooldown: Duration,
 }
 
 impl Default for DeezerConfig {
@@ -77,6 +87,7 @@ impl Default for DeezerConfig {
             max_attempts: 3,
             backoff: vec![Duration::from_secs(2), Duration::from_secs(4)],
             quota_wait: Duration::from_secs(5),
+            outage_cooldown: Duration::from_secs(60),
         }
     }
 }
@@ -86,8 +97,12 @@ impl Default for DeezerConfig {
 pub struct DeezerAdapter {
     client: reqwest::Client,
     config: DeezerConfig,
-    /// When the next request may start; shared by every attempt.
+    /// The earliest start of the next request; shared by every attempt and
+    /// pushed back by a quota error.
     next_slot: Mutex<Option<Instant>>,
+    /// While set and in the future, uncached requests fail with
+    /// [`ProviderError::Unavailable`]. Cache reads bypass it.
+    cooldown_until: Mutex<Option<Instant>>,
     /// When each attempt was released by `schedule`, so tests can measure the
     /// spacing without depending on when the server accepts.
     #[cfg(test)]
@@ -129,11 +144,15 @@ impl DeezerAdapter {
     pub fn with_config(config: DeezerConfig) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(config.request_timeout)
+            // A redirect hop would skip `schedule` and could leave Deezer, so
+            // a 3xx answer is a permanent failure.
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {
             client,
             config,
             next_slot: Mutex::new(None),
+            cooldown_until: Mutex::new(None),
             #[cfg(test)]
             released_at: Mutex::new(Vec::new()),
             release_cache: Mutex::new(BoundedCache::new(RELEASE_CACHE_CAPACITY)),
@@ -151,20 +170,15 @@ impl DeezerAdapter {
             })
     }
 
-    /// Waits for this attempt's slot. Setting the next slot from `now` means no
-    /// burst even when a caller arrives late.
+    /// Waits for this attempt's slot. The slot is never earlier than `now`, so
+    /// there is no burst even when a caller arrives late.
     async fn schedule(&self) {
         let wait = {
             let mut next = lock(&self.next_slot);
             let now = Instant::now();
-            let wait = match *next {
-                Some(previous) => {
-                    (previous + self.config.min_interval).saturating_duration_since(now)
-                }
-                None => Duration::ZERO,
-            };
-            *next = Some(now + wait);
-            wait
+            let slot = next.map_or(now, |earliest| earliest.max(now));
+            *next = Some(slot + self.config.min_interval);
+            slot.saturating_duration_since(now)
         };
         if !wait.is_zero() {
             tokio::time::sleep(wait).await;
@@ -183,12 +197,48 @@ impl DeezerAdapter {
             .unwrap_or_default()
     }
 
+    /// Holds every request of the adapter back for the quota wait, so
+    /// concurrent releases pause too, not only the one that saw the error.
+    fn pause_for_quota(&self) {
+        let resume = Instant::now() + self.config.quota_wait;
+        let mut next = lock(&self.next_slot);
+        *next = Some(next.map_or(resume, |earliest| earliest.max(resume)));
+    }
+
+    /// Starts the outage cooldown after a request ran out of retries.
+    fn start_cooldown(&self) {
+        let deadline = Instant::now() + self.config.outage_cooldown;
+        let mut until = lock(&self.cooldown_until);
+        *until = Some(until.map_or(deadline, |previous| previous.max(deadline)));
+    }
+
+    /// Fails at once while the outage cooldown runs.
+    fn check_cooldown(&self) -> Result<(), ProviderError> {
+        let mut until = lock(&self.cooldown_until);
+        let Some(deadline) = *until else {
+            return Ok(());
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            *until = None;
+            return Ok(());
+        }
+        Err(ProviderError::Unavailable {
+            provider: ProviderKind::Deezer,
+            retry_after: Duration::from_secs(
+                remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0),
+            ),
+        })
+    }
+
     /// One GET, paced and retried, with Deezer's error object read.
     ///
-    /// `Ok(None)` is "no data": Deezer's code 800, or HTTP 404.
+    /// `Ok(None)` is "no data": Deezer's code 800, or HTTP 404. A request that
+    /// runs out of retries on a transient failure starts the outage cooldown.
     async fn get_json(&self, url: Url) -> Result<Option<Value>, ProviderError> {
         let mut attempt: u8 = 0;
         loop {
+            self.check_cooldown()?;
             attempt += 1;
             self.schedule().await;
             let failure = match self.attempt(url.clone()).await {
@@ -196,22 +246,32 @@ impl DeezerAdapter {
                 Err(failure) => failure,
             };
             let last = attempt >= self.config.max_attempts;
-            let wait = match failure {
+            let error = match failure {
                 Failure::Final(error) => return Err(error),
-                Failure::Quota if last => {
-                    return Err(ProviderError::RateLimited {
+                Failure::Quota => {
+                    self.pause_for_quota();
+                    if !last {
+                        // `schedule` waits out the pause on the next attempt.
+                        continue;
+                    }
+                    ProviderError::RateLimited {
                         provider: ProviderKind::Deezer,
                         message: format!(
                             "the request quota stayed exhausted after {attempt} attempts"
                         ),
                         retry_after: Some(self.config.quota_wait),
-                    });
+                    }
                 }
-                Failure::Transient(error) if last => return Err(error),
-                Failure::Quota => self.config.quota_wait,
-                Failure::Transient(_) => self.backoff(usize::from(attempt) - 1),
+                Failure::Transient(error) => {
+                    if !last {
+                        tokio::time::sleep(self.backoff(usize::from(attempt) - 1)).await;
+                        continue;
+                    }
+                    error
+                }
             };
-            tokio::time::sleep(wait).await;
+            self.start_cooldown();
+            return Err(error);
         }
     }
 
@@ -259,6 +319,10 @@ impl DeezerAdapter {
             None => Ok(Some(value)),
             Some((NO_DATA, _)) => Ok(None),
             Some((QUOTA_EXCEEDED, _)) => Err(Failure::Quota),
+            Some((SERVICE_BUSY, message)) => Err(Failure::Transient(ProviderError::Network {
+                provider: ProviderKind::Deezer,
+                message: format!("Deezer is busy: {message}"),
+            })),
             Some((code, message)) => Err(Failure::Final(ProviderError::Permanent {
                 provider: ProviderKind::Deezer,
                 status: None,
@@ -429,7 +493,11 @@ fn transport_error(error: &reqwest::Error) -> ProviderError {
 fn deezer_error(value: &Value) -> Option<(i64, String)> {
     let error = value.get("error")?;
     let code = error.get("code").and_then(Value::as_i64).unwrap_or(-1);
-    let message = text(error, "message").unwrap_or_default();
+    let message = text(error, "message")
+        .unwrap_or_default()
+        .chars()
+        .take(MAX_MESSAGE_CHARS)
+        .collect();
     Some((code, message))
 }
 
@@ -718,8 +786,14 @@ mod tests {
                         .to_string();
                     recorded.lock().unwrap().push((target.clone(), headers));
                     let (status, body) = handler(&target);
+                    // A 3xx answer sends its body as the `Location` header.
+                    let location = if (300..400).contains(&status) {
+                        format!("Location: {body}\r\n")
+                    } else {
+                        String::new()
+                    };
                     let payload = format!(
-                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{location}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
                     let _ = stream.write_all(payload.as_bytes());
@@ -770,6 +844,7 @@ mod tests {
             max_attempts: 3,
             backoff: vec![Duration::ZERO],
             quota_wait: Duration::ZERO,
+            outage_cooldown: Duration::from_secs(60),
         }
     }
 
@@ -1198,6 +1273,355 @@ mod tests {
         );
     }
 
+    /// Serves every album id with that id and one track.
+    fn any_album_handler(target: &str) -> (u16, String) {
+        let path = target.split('?').next().unwrap_or(target);
+        let Some(rest) = path.strip_prefix("/album/") else {
+            return (200, error_json(NO_DATA, "no data"));
+        };
+        let (id, tracks) = match rest.split_once('/') {
+            Some((id, _)) => (id, true),
+            None => (rest, false),
+        };
+        if tracks {
+            (200, page(tracks_json()[..1].to_vec(), None))
+        } else {
+            let mut album = album_json();
+            album["id"] = Value::from(id.parse::<u64>().unwrap_or(0));
+            album["nb_tracks"] = Value::from(1);
+            (200, album.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_refused_and_never_followed() {
+        let elsewhere = MockServer::start(album_handler);
+        let target = format!("{}/album/302127", elsewhere.url);
+        let server = MockServer::start(move |_| (302, target.clone()));
+        let error = adapter(&server)
+            .fetch_release(ReleaseId::Deezer(302127))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ProviderError::Permanent {
+                    status: Some(302),
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert_eq!(server.request_count(), 1);
+        assert_eq!(elsewhere.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_quota_pause_holds_back_requests_of_other_releases() {
+        let quota_wait = Duration::from_millis(300);
+        let calls = Arc::new(Mutex::new(0usize));
+        let counter = calls.clone();
+        let server = MockServer::start(move |target| {
+            if target == "/album/1" {
+                let mut calls = counter.lock().unwrap();
+                *calls += 1;
+                if *calls == 1 {
+                    return (200, error_json(QUOTA_EXCEEDED, "Quota limit exceeded"));
+                }
+            }
+            any_album_handler(target)
+        });
+        let adapter = DeezerAdapter::with_config(DeezerConfig {
+            quota_wait,
+            ..config(&server)
+        })
+        .unwrap();
+        let first = adapter.fetch_release(ReleaseId::Deezer(1));
+        let second = async {
+            // Starts after the first call has seen the quota error.
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            adapter.fetch_release(ReleaseId::Deezer(2)).await
+        };
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.unwrap().id, ReleaseId::Deezer(1));
+        assert_eq!(second.unwrap().id, ReleaseId::Deezer(2));
+
+        // Without a shared pause the second release would start after 60 ms,
+        // second overall. Allow for a timer waking a little early in total.
+        let mut released = lock(&adapter.released_at).clone();
+        released.sort();
+        assert!(
+            released[1].duration_since(released[0]) >= quota_wait - Duration::from_millis(15),
+            "the other release did not wait out the quota pause"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_releases_share_one_pacing_slot() {
+        let interval = Duration::from_millis(80);
+        let server = MockServer::start(any_album_handler);
+        let adapter = DeezerAdapter::with_config(DeezerConfig {
+            min_interval: interval,
+            ..config(&server)
+        })
+        .unwrap();
+        let (first, second) = tokio::join!(
+            adapter.fetch_release(ReleaseId::Deezer(1)),
+            adapter.fetch_release(ReleaseId::Deezer(2)),
+        );
+        first.unwrap();
+        second.unwrap();
+
+        let mut released = lock(&adapter.released_at).clone();
+        released.sort();
+        assert_eq!(released.len(), 4);
+        // A wake-up lands a little after its slot, which can shorten the next
+        // gap by the same amount, so allow a small margin.
+        let margin = Duration::from_millis(20);
+        for pair in released.windows(2) {
+            assert!(
+                pair[1].duration_since(pair[0]) + margin >= interval,
+                "two requests started less than the interval apart"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_busy_service_is_retried_and_ends_as_a_network_failure() {
+        let server = MockServer::start(|_| (200, error_json(SERVICE_BUSY, "Service busy")));
+        let error = adapter(&server)
+            .fetch_release(ReleaseId::Deezer(302127))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::Network { .. }), "{error}");
+        assert!(error.is_transient());
+        assert_eq!(server.request_count(), 3);
+
+        let calls = Arc::new(Mutex::new(0usize));
+        let counter = calls.clone();
+        let server = MockServer::start(move |target| {
+            if target == "/album/302127" {
+                let mut calls = counter.lock().unwrap();
+                *calls += 1;
+                if *calls == 1 {
+                    return (200, error_json(SERVICE_BUSY, "Service busy"));
+                }
+            }
+            album_handler(target)
+        });
+        let release = adapter(&server)
+            .fetch_release(ReleaseId::Deezer(302127))
+            .await
+            .unwrap();
+        assert_eq!(release.title, "Discovery");
+        assert_eq!(*calls.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_request_starts_a_cooldown_that_spares_the_cache() {
+        let server = MockServer::start(|target| {
+            if target.starts_with("/album/9") {
+                (503, "{}".to_string())
+            } else {
+                album_handler(target)
+            }
+        });
+        let adapter = DeezerAdapter::with_config(DeezerConfig {
+            outage_cooldown: Duration::from_millis(400),
+            ..config(&server)
+        })
+        .unwrap();
+        adapter
+            .fetch_release(ReleaseId::Deezer(302127))
+            .await
+            .unwrap();
+        assert_eq!(server.request_count(), 2);
+
+        let error = adapter
+            .fetch_release(ReleaseId::Deezer(9))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::Network { .. }), "{error}");
+        assert_eq!(server.request_count(), 5);
+
+        let blocked = adapter.fetch_release(ReleaseId::Deezer(10)).await;
+        match blocked {
+            Err(ProviderError::Unavailable {
+                provider,
+                retry_after,
+            }) => {
+                assert_eq!(provider, ProviderKind::Deezer);
+                assert!(retry_after >= Duration::from_secs(1));
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+        let search = adapter
+            .search(SearchRequest {
+                strategy: SearchStrategy::Barcode("724384960650".to_string()),
+                offset: 0,
+                limit: 25,
+            })
+            .await;
+        assert!(
+            matches!(search, Err(ProviderError::Unavailable { .. })),
+            "{search:?}"
+        );
+        assert_eq!(server.request_count(), 5, "the cooldown reached the server");
+
+        // A cached album is still served.
+        let cached = adapter
+            .fetch_release(ReleaseId::Deezer(302127))
+            .await
+            .unwrap();
+        assert_eq!(cached.title, "Discovery");
+        assert_eq!(server.request_count(), 5);
+
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert!(matches!(
+            adapter.fetch_release(ReleaseId::Deezer(10)).await,
+            Err(ProviderError::NotFound { .. })
+        ));
+        assert_eq!(server.request_count(), 6);
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_quota_also_starts_the_cooldown() {
+        let server = MockServer::start(|_| (200, error_json(QUOTA_EXCEEDED, "Quota limit")));
+        let adapter = adapter(&server);
+        let error = adapter
+            .fetch_release(ReleaseId::Deezer(1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ProviderError::RateLimited { .. }),
+            "{error}"
+        );
+        assert_eq!(server.request_count(), 3);
+        assert!(matches!(
+            adapter.fetch_release(ReleaseId::Deezer(2)).await,
+            Err(ProviderError::Unavailable { .. })
+        ));
+        assert_eq!(server.request_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn permanent_errors_and_missing_data_do_not_start_a_cooldown() {
+        let server = MockServer::start(|target| {
+            if target.starts_with("/album/1") {
+                (200, error_json(500, "Wrong parameter"))
+            } else {
+                (200, error_json(NO_DATA, "no data"))
+            }
+        });
+        let adapter = adapter(&server);
+        assert!(matches!(
+            adapter.fetch_release(ReleaseId::Deezer(1)).await,
+            Err(ProviderError::Permanent { .. })
+        ));
+        assert!(matches!(
+            adapter.fetch_release(ReleaseId::Deezer(2)).await,
+            Err(ProviderError::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn http_404_is_a_missing_album_and_an_empty_barcode_page() {
+        let server = MockServer::start(|_| (404, "{}".to_string()));
+        let adapter = adapter(&server);
+        assert!(matches!(
+            adapter.fetch_release(ReleaseId::Deezer(1)).await,
+            Err(ProviderError::NotFound { .. })
+        ));
+        let page = adapter
+            .search(SearchRequest {
+                strategy: SearchStrategy::Barcode("5099902987620".to_string()),
+                offset: 0,
+                limit: 25,
+            })
+            .await
+            .unwrap();
+        assert!(page.hits.is_empty());
+        assert_eq!(page.next_offset, None);
+        // Neither answer was retried: one lookup, one barcode request.
+        assert_eq!(server.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn too_many_requests_is_retried() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let counter = calls.clone();
+        let server = MockServer::start(move |target| {
+            if target == "/album/302127" {
+                let mut calls = counter.lock().unwrap();
+                *calls += 1;
+                if *calls == 1 {
+                    return (429, "{}".to_string());
+                }
+            }
+            album_handler(target)
+        });
+        let release = adapter(&server)
+            .fetch_release(ReleaseId::Deezer(302127))
+            .await
+            .unwrap();
+        assert_eq!(release.title, "Discovery");
+        assert_eq!(*calls.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn no_data_on_a_text_search_is_an_empty_page() {
+        let server = MockServer::start(|_| (200, error_json(NO_DATA, "no data")));
+        let page = adapter(&server)
+            .search(SearchRequest {
+                strategy: SearchStrategy::TitleArtist {
+                    title: "Nothing".to_string(),
+                    artist: None,
+                    release_group: None,
+                },
+                offset: 0,
+                limit: 25,
+            })
+            .await
+            .unwrap();
+        assert!(page.hits.is_empty());
+        assert_eq!(page.total, Some(0));
+        assert_eq!(page.next_offset, None);
+        assert_eq!(server.request_count(), 1);
+    }
+
+    #[test]
+    fn a_track_without_a_position_is_a_structure_issue() {
+        let mut unplaced = track_json(2, "Hidden", 0, 1, 100);
+        unplaced.as_object_mut().unwrap().remove("track_position");
+        let tracks = vec![track_json(1, "First", 1, 1, 180), unplaced];
+        let mut album = album_json();
+        album["nb_tracks"] = Value::from(2);
+        let release = decode_album(&album, &tracks).unwrap();
+        assert_eq!(release.structure_issues, ["track 2 has no position"]);
+        assert!(release.has_unsupported_entries());
+        let hidden = release
+            .tracklist
+            .iter()
+            .find(|track| track.title == "Hidden")
+            .unwrap();
+        assert_eq!(hidden.position, None);
+        assert_eq!(hidden.track_position, None);
+        assert_eq!(hidden.medium_position, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_long_error_message_is_capped() {
+        let long = "x".repeat(500);
+        let server = MockServer::start(move |_| (200, error_json(500, &long)));
+        let error = adapter(&server)
+            .fetch_release(ReleaseId::Deezer(1))
+            .await
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains(&"x".repeat(MAX_MESSAGE_CHARS)), "{text}");
+        assert!(!text.contains(&"x".repeat(MAX_MESSAGE_CHARS + 1)), "{text}");
+    }
+
     #[test]
     fn the_production_pace_stays_under_the_quota() {
         let config = DeezerConfig::default();
@@ -1209,5 +1633,6 @@ mod tests {
             [Duration::from_secs(2), Duration::from_secs(4)]
         );
         assert_eq!(config.quota_wait, Duration::from_secs(5));
+        assert_eq!(config.outage_cooldown, Duration::from_secs(60));
     }
 }
