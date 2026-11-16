@@ -84,6 +84,7 @@ fn command(cwd: &Path, db: &Path, server: &MockServer) -> Command {
         // must also remain completely local.
         .env("RADISH_MUSICBRAINZ_BASE_URL", &server.url)
         .env("RADISH_DISCOGS_BASE_URL", &server.url)
+        .env("RADISH_DEEZER_BASE_URL", &server.url)
         .stdin(Stdio::null());
     command
 }
@@ -185,7 +186,7 @@ async fn dotenv_loads_only_allowed_keys() {
 }
 
 #[tokio::test]
-async fn dotenv_cannot_redirect_the_musicbrainz_or_discogs_endpoints() {
+async fn dotenv_cannot_redirect_any_provider_endpoint() {
     for (provider, variable, default_host, origin_path) in [
         (
             "musicbrainz",
@@ -199,6 +200,12 @@ async fn dotenv_cannot_redirect_the_musicbrainz_or_discogs_endpoints() {
             "api.discogs.com",
             "/database/",
         ),
+        (
+            "deezer",
+            "RADISH_DEEZER_BASE_URL",
+            "api.deezer.com",
+            "/search/",
+        ),
     ] {
         let cwd = temp_dir(&format!("dotenv-endpoint-{provider}"));
         let db = cwd.join("library.db");
@@ -211,6 +218,7 @@ async fn dotenv_cannot_redirect_the_musicbrainz_or_discogs_endpoints() {
         let output = command(&cwd, &db, &server)
             .env_remove("RADISH_MUSICBRAINZ_BASE_URL")
             .env_remove("RADISH_DISCOGS_BASE_URL")
+            .env_remove("RADISH_DEEZER_BASE_URL")
             .env("RADISH_DISCOGS_TOKEN", "synthetic-env-token")
             .env("HTTPS_PROXY", &server.url)
             .env("https_proxy", &server.url)

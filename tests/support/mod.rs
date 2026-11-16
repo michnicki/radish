@@ -1,6 +1,6 @@
 //! Shared offline test harness: a loopback HTTP server plus synthetic fixtures.
 //!
-//! Every test points both provider base URLs here. No public service is ever
+//! Every test points the provider base URLs here. No public service is ever
 //! contacted, and no real credential is required.
 
 #![allow(dead_code)]
@@ -149,6 +149,91 @@ pub fn discogs_release_json() -> String {
         ]
     }"#
     .to_string()
+}
+
+/// The Deezer album id the canned Deezer answers use.
+pub const DEEZER_ALBUM_ID: u64 = 302127;
+
+/// `/album/{id}` for `Blue` by `Test Artist`, released 2001-05-01, with
+/// `track_count` tracks, as Deezer sends it (embedded tracks left out).
+pub fn deezer_album_json(id: u64, track_count: usize) -> String {
+    serde_json::json!({
+        "id": id,
+        "title": "Blue",
+        "upc": "724384960650",
+        "link": format!("https://www.deezer.com/album/{id}"),
+        "label": "Label",
+        "nb_tracks": track_count,
+        "release_date": "2001-05-01",
+        "record_type": "album",
+        "explicit_lyrics": false,
+        "contributors": [{"id": 1, "name": "Test Artist", "role": "Main"}],
+        "artist": {"id": 1, "name": "Test Artist"}
+    })
+    .to_string()
+}
+
+/// One `/album/{id}/tracks` page holding every track: `titles` with
+/// whole-second `durations`, on disc 1.
+pub fn deezer_tracks_json(titles: &[&str], durations: &[u64]) -> String {
+    let data: Vec<serde_json::Value> = titles
+        .iter()
+        .zip(durations)
+        .enumerate()
+        .map(|(index, (title, duration))| {
+            serde_json::json!({
+                "id": 1000 + index,
+                "title": title,
+                "title_short": title,
+                "title_version": "",
+                "duration": duration,
+                "track_position": index + 1,
+                "disk_number": 1,
+                "isrc": "",
+                "artist": {"id": 1, "name": "Test Artist"}
+            })
+        })
+        .collect();
+    serde_json::json!({"data": data, "total": titles.len()}).to_string()
+}
+
+/// A `/search/album` page holding album `id`.
+pub fn deezer_search_json(id: u64) -> String {
+    serde_json::json!({
+        "data": [{
+            "id": id,
+            "title": "Blue",
+            "nb_tracks": 2,
+            "record_type": "album",
+            "artist": {"id": 1, "name": "Test Artist"}
+        }],
+        "total": 1
+    })
+    .to_string()
+}
+
+/// Deezer's answer when nothing matches: HTTP 200 with error code 800.
+pub fn deezer_no_data() -> String {
+    r#"{"error":{"type":"DataException","message":"no data","code":800}}"#.to_string()
+}
+
+/// Answers the Deezer requests for album [`DEEZER_ALBUM_ID`] holding
+/// `titles` with `durations`: every search finds it, and its lookup and tracks
+/// are served. Any other album or barcode is no data; any other path is
+/// `None`, left to the caller.
+pub fn deezer_route(target: &str, titles: &[&str], durations: &[u64]) -> Option<(u16, String)> {
+    let id = DEEZER_ALBUM_ID;
+    if target.starts_with("/search/album") {
+        Some((200, deezer_search_json(id)))
+    } else if target.starts_with(&format!("/album/{id}/tracks")) {
+        Some((200, deezer_tracks_json(titles, durations)))
+    } else if target == format!("/album/{id}") {
+        Some((200, deezer_album_json(id, titles.len())))
+    } else if target.starts_with("/album/") {
+        Some((200, deezer_no_data()))
+    } else {
+        None
+    }
 }
 
 /// A complete synthetic MusicBrainz release document. Track titles deliberately

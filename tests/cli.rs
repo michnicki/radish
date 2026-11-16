@@ -1,7 +1,7 @@
 //! End-to-end CLI behavior against a mock Discogs server.
 //!
-//! These tests never touch the network: both provider base URLs point at local
-//! listeners, and Discogs tokens are placeholders supplied only where a test
+//! These tests never touch the network: every provider base URL points at a local
+//! listener, and Discogs tokens are placeholders supplied only where a test
 //! deliberately exercises the fallback or explicit Discogs mode.
 
 mod support;
@@ -100,6 +100,7 @@ fn run(db: &Path, server: &MockServer, args: &[&str], token: Option<&str>) -> Ou
         .args(args)
         .env("RADISH_MUSICBRAINZ_BASE_URL", &server.url)
         .env("RADISH_DISCOGS_BASE_URL", &server.url)
+        .env("RADISH_DEEZER_BASE_URL", &server.url)
         .stdin(Stdio::null());
     match token {
         Some(token) => {
@@ -911,6 +912,7 @@ async fn non_loopback_service_overrides_are_rejected_without_any_request() {
     for (provider, variable) in [
         ("musicbrainz", "RADISH_MUSICBRAINZ_BASE_URL"),
         ("discogs", "RADISH_DISCOGS_BASE_URL"),
+        ("deezer", "RADISH_DEEZER_BASE_URL"),
     ] {
         let db = db_path(&format!("evil-override-{provider}"));
         seed_library(&db).await;
@@ -923,6 +925,7 @@ async fn non_loopback_service_overrides_are_rejected_without_any_request() {
             .args(["match", "--provider", provider])
             .env("RADISH_MUSICBRAINZ_BASE_URL", &server.url)
             .env("RADISH_DISCOGS_BASE_URL", &server.url)
+            .env("RADISH_DEEZER_BASE_URL", &server.url)
             .env(variable, "https://evil.example/secret-path")
             .env("RADISH_DISCOGS_TOKEN", "test-token")
             .env("HTTPS_PROXY", &server.url)
@@ -1039,4 +1042,208 @@ async fn partial_musicbrainz_lookup_failures_queue_a_discogs_fallback() {
             .unwrap();
     pool.close().await;
     assert_eq!(providers, ["discogs", "musicbrainz"]);
+}
+
+const DEEZER_TITLES: [&str; 2] = ["Track 1", "Track 2"];
+const DEEZER_DURATIONS: [u64; 2] = [181, 182];
+
+/// [`handler`], with Deezer holding the library's album.
+fn deezer_handler(target: &str) -> (u16, String) {
+    deezer_route(target, &DEEZER_TITLES, &DEEZER_DURATIONS).unwrap_or_else(|| handler(target))
+}
+
+/// How many requests reached Deezer.
+fn deezer_requests(server: &MockServer) -> usize {
+    server.requests_matching("/search/album") + server.requests_matching("/album/")
+}
+
+#[tokio::test]
+async fn match_with_deezer_accepts_an_album_neither_earlier_stage_has() {
+    let db = db_path("deezer-accepts");
+    seed_library(&db).await;
+    let server = MockServer::start(deezer_handler);
+
+    // Without --deezer, Deezer is never contacted.
+    let plain = run(&db, &server, &["match"], None);
+    assert!(stdout(&plain).contains("Unmatched: 1"), "{plain:?}");
+    assert_eq!(deezer_requests(&server), 0);
+
+    let output = run(&db, &server, &["match", "--deezer"], None);
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("Accepted: 1"), "{text}");
+    // No token: Discogs is skipped and the chain goes on to Deezer.
+    assert!(text.contains("Discogs token is not set"), "{text}");
+    assert!(
+        text.contains("Deezer fallback: primary stage found no candidates"),
+        "{text}"
+    );
+    assert!(
+        text.contains("accepted deezer release deezer 302127"),
+        "{text}"
+    );
+    assert!(
+        text.contains("https://www.deezer.com/album/302127"),
+        "{text}"
+    );
+    assert_eq!(server.requests_matching("/database/search"), 0);
+    assert_eq!(row_count(&db, "release_matches").await, 1);
+
+    let releases = stdout(&run(&db, &server, &["releases"], None));
+    assert!(releases.contains("deezer"), "{releases}");
+}
+
+#[tokio::test]
+async fn a_release_musicbrainz_settles_makes_no_deezer_request() {
+    let db = db_path("deezer-not-needed");
+    seed_library(&db).await;
+    let mbid = "76df3287-6cda-33eb-8e9a-044b5e15ffdd";
+    let server = MockServer::start(move |target| {
+        if target.contains(&format!("/ws/2/release/{mbid}")) {
+            return (
+                200,
+                musicbrainz_release_json(mbid, &["Track 1", "Track 2"], &[181.0, 182.0]),
+            );
+        }
+        if target.contains("/ws/2/release") {
+            let release = serde_json::json!({
+                "id": mbid, "title": "Blue", "date": "2001-05-01",
+                "artist-credit": [{"name": "Test Artist", "joinphrase": ""}]
+            });
+            return (
+                200,
+                serde_json::json!({"count": 1, "offset": 0, "releases": [release]}).to_string(),
+            );
+        }
+        deezer_handler(target)
+    });
+
+    let output = run(&db, &server, &["match", "--deezer"], Some("test-token"));
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("Accepted: 1"), "{text}");
+    assert!(text.contains("accepted musicbrainz release"), "{text}");
+    assert_eq!(deezer_requests(&server), 0);
+    assert_eq!(server.requests_matching("/database/search"), 0);
+}
+
+#[tokio::test]
+async fn a_plausible_contradicting_discogs_candidate_keeps_deezer_in_review() {
+    let db = db_path("deezer-blocked-by-discogs");
+    seed_library(&db).await;
+    // Discogs lists the mono vinyl edition: close enough to guard the chain,
+    // not the files' edition, and a contradiction of Deezer's plain album.
+    let server = MockServer::start(|target| {
+        if target.contains("/releases/42") {
+            let mut release: serde_json::Value =
+                serde_json::from_str(&discogs_release_json()).unwrap();
+            release["formats"] =
+                serde_json::json!([{"name": "Vinyl", "descriptions": ["LP", "Album", "Mono"]}]);
+            return (200, release.to_string());
+        }
+        deezer_handler(target)
+    });
+
+    let output = run(&db, &server, &["match", "--deezer"], Some("test-token"));
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("Queued for review: 1"), "{text}");
+    assert!(
+        text.contains("fallback conflict: primary candidates describe"),
+        "{text}"
+    );
+    assert_eq!(row_count(&db, "release_matches").await, 0);
+    // Both fallbacks' candidates wait for the reviewer.
+    assert_eq!(row_count(&db, "match_reviews").await, 2);
+}
+
+#[tokio::test]
+async fn a_deezer_release_is_a_direct_selection() {
+    let db = db_path("deezer-direct");
+    let release_id = seed_library(&db).await;
+    let server = MockServer::start(deezer_handler);
+
+    let output = run(
+        &db,
+        &server,
+        &[
+            "match",
+            "--local-release",
+            &release_id.to_string(),
+            "--deezer-release",
+            "302127",
+        ],
+        None,
+    );
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    // A person chose the release, so it is reviewed like any direct selection.
+    assert!(text.contains("Queued for review: 1"), "{text}");
+    assert_eq!(server.requests_matching("/album/302127"), 2);
+    assert_eq!(server.requests_matching("/search/album"), 0);
+    assert_eq!(server.requests_matching("/ws/2/"), 0);
+}
+
+#[tokio::test]
+async fn deezer_selections_that_contradict_are_rejected_before_the_database_opens() {
+    let server = MockServer::start(deezer_handler);
+    for (name, args, expected) in [
+        (
+            "offline-provider",
+            &["match", "--offline", "--provider", "deezer"][..],
+            "Deezer has no local index",
+        ),
+        (
+            "deezer-and-provider",
+            &["match", "--deezer", "--provider", "discogs"],
+            "cannot be used with",
+        ),
+    ] {
+        let dir = temp_dir(&format!("deezer-rejected-{name}"));
+        let db = dir.join("radish.db");
+        let output = run(&db, &server, args, None);
+        assert!(!output.status.success(), "{name}: {output:?}");
+        let errors = String::from_utf8_lossy(&output.stderr);
+        assert!(errors.contains(expected), "{name}: {errors}");
+        assert!(!db.exists(), "{name}: the database was opened");
+    }
+    assert_eq!(server.request_count(), 0);
+}
+
+#[tokio::test]
+async fn a_stale_deezer_match_is_refreshed_only_by_a_run_with_deezer() {
+    let db = db_path("deezer-stale");
+    seed_library(&db).await;
+    let server = MockServer::start(deezer_handler);
+    let accepted = run(&db, &server, &["match", "--deezer"], None);
+    assert!(stdout(&accepted).contains("Accepted: 1"), "{accepted:?}");
+    // An observed tag change makes the accepted match stale.
+    seed_library_year(&db, 2002).await;
+    let before = server.request_count();
+
+    let output = run(&db, &server, &["match"], None);
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("Skipped: 1"), "{text}");
+    assert!(
+        text.contains("its stale deezer match needs --deezer to refresh"),
+        "{text}"
+    );
+    assert_eq!(
+        server.request_count(),
+        before,
+        "no provider may be contacted"
+    );
+
+    let refreshed = run(&db, &server, &["match", "--deezer"], None);
+    let text = stdout(&refreshed);
+    assert!(
+        text.contains("refreshing the stale deezer match from its original source"),
+        "{text}"
+    );
+    assert_eq!(
+        server.requests_matching("/ws/2/"),
+        2,
+        "MusicBrainz is not asked again"
+    );
 }

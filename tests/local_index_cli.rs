@@ -5,7 +5,7 @@ mod support;
 
 use std::path::Path;
 use std::process::{Command, Output};
-use support::{db_path, temp_dir, write_mb_archive, write_tagged_wav};
+use support::{MockServer, db_path, deezer_route, temp_dir, write_mb_archive, write_tagged_wav};
 
 const RELEASE_GID: &str = "76df3287-6cda-33eb-8e9a-044b5e15ffdd";
 const GROUP_GID: &str = "4642ee19-7790-3c8d-ab5e-d133de942db6";
@@ -95,6 +95,24 @@ fn radish(db: &Path, index_dir: &Path, args: &[&str]) -> Output {
         .env("RADISH_INDEX_DIR", index_dir)
         .env("RADISH_MUSICBRAINZ_BASE_URL", "http://127.0.0.1:9")
         .env("RADISH_DISCOGS_BASE_URL", "http://127.0.0.1:9")
+        .env("RADISH_DEEZER_BASE_URL", "http://127.0.0.1:9")
+        .env_remove("RADISH_DISCOGS_TOKEN")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// [`radish`] with Deezer at `deezer`, run in the database's directory so no
+/// developer `.env` is read.
+fn radish_with_deezer(db: &Path, index_dir: &Path, deezer: &MockServer, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_radish"))
+        .current_dir(db.parent().unwrap())
+        .arg("--db")
+        .arg(db)
+        .env("RADISH_INDEX_DIR", index_dir)
+        .env("RADISH_MUSICBRAINZ_BASE_URL", "http://127.0.0.1:9")
+        .env("RADISH_DISCOGS_BASE_URL", "http://127.0.0.1:9")
+        .env("RADISH_DEEZER_BASE_URL", &deezer.url)
         .env_remove("RADISH_DISCOGS_TOKEN")
         .args(args)
         .output()
@@ -501,4 +519,56 @@ fn a_stale_discogs_match_missing_from_the_index_stays_stale_while_the_run_contin
         green.contains("matched") && green.contains("discogs 77"),
         "{after}"
     );
+}
+
+#[test]
+fn offline_matching_with_deezer_reads_the_indexes_and_asks_only_deezer() {
+    let db = db_path("offline-deezer");
+    let index_dir = temp_dir("offline-deezer-index");
+    let dumps = temp_dir("offline-deezer-dumps");
+    // Neither dump holds the library's album; Deezer does.
+    let musicbrainz = musicbrainz_archive_for(&dumps, "Unrelated", "Nobody", ["Alpha", "Beta"]);
+    let discogs = discogs_dump(&dumps, &[(42, "Unrelated")]);
+    let music = library("offline-deezer-music");
+    let build = radish(
+        &db,
+        &index_dir,
+        &[
+            "index",
+            "build",
+            "--musicbrainz",
+            musicbrainz.to_str().unwrap(),
+            "--discogs",
+            discogs.to_str().unwrap(),
+        ],
+    );
+    assert!(build.status.success(), "{build:?}");
+    let import = radish(&db, &index_dir, &["import", music.to_str().unwrap()]);
+    assert!(import.status.success(), "{import:?}");
+    let deezer = MockServer::start(|target| {
+        deezer_route(target, &["One", "Two"], &[1, 1])
+            .unwrap_or_else(|| (500, "unexpected request".to_string()))
+    });
+
+    // Plain --offline stays offline.
+    let plain = radish_with_deezer(&db, &index_dir, &deezer, &["match", "--offline"]);
+    assert!(plain.status.success(), "{plain:?}");
+    assert!(stdout_of(&plain).contains("Accepted: 0"), "{plain:?}");
+    assert_eq!(deezer.request_count(), 0);
+
+    let matched = radish_with_deezer(
+        &db,
+        &index_dir,
+        &deezer,
+        &["match", "--offline", "--deezer"],
+    );
+    let (stdout, stderr) = (stdout_of(&matched), stderr_of(&matched));
+    assert!(matched.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("Accepted: 1"), "{stdout}");
+    assert!(stdout.contains("Deezer fallback"), "{stdout}");
+    assert!(
+        stdout.contains("accepted deezer release deezer 302127"),
+        "{stdout}"
+    );
+    assert!(deezer.requests_matching("/search/album") > 0);
 }

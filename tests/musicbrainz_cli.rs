@@ -74,6 +74,7 @@ fn run(db: &Path, server: &MockServer, args: &[&str]) -> Output {
         .args(args)
         .env("RADISH_MUSICBRAINZ_BASE_URL", &server.url)
         .env("RADISH_DISCOGS_BASE_URL", &server.url)
+        .env("RADISH_DEEZER_BASE_URL", &server.url)
         .env_remove("RADISH_DISCOGS_TOKEN")
         .stdin(Stdio::null())
         .output()
