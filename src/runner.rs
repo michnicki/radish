@@ -1,10 +1,12 @@
 //! CLI orchestration: select local releases, run the provider policy, decide,
 //! review, and persist.
 //!
-//! MusicBrainz is attempted first. Discogs is created lazily, only after an
-//! unsatisfactory MusicBrainz stage and only when a token is available. An
-//! explicit provider or direct selector uses one service and no fallback.
+//! The default chain is MusicBrainz, then Discogs, then Deezer when the run
+//! asks for it (`--deezer`). Each later stage runs only when the stages before
+//! it do not settle the release, and Discogs only when a token is available.
+//! An explicit provider or direct selector uses one service and no fallback.
 
+use crate::deezer::DeezerAdapter;
 use crate::discogs::{AdapterError, DiscogsAdapter};
 use crate::discovery::{self, DiscoveryResult};
 use crate::index::{IndexKind, IndexPaths, local::LocalIndex};
@@ -19,6 +21,7 @@ use crate::{out, outln};
 use anyhow::{Context, Result, bail};
 use futures_util::stream::{self, StreamExt};
 use sqlx::SqlitePool;
+use std::borrow::Cow;
 use std::cell::{OnceCell, RefCell};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -170,16 +173,18 @@ impl Transcript {
 
 /// The provider clients of one run, each built when a release first needs it
 /// and shared by every release after that.
-struct Clients<'a, M, D> {
+struct Clients<'a, M, D, Z> {
     musicbrainz: OnceCell<M>,
     discogs: OnceCell<D>,
+    deezer: OnceCell<Z>,
     /// Why Discogs is off for the rest of the run, once it is.
     discogs_disabled: RefCell<Option<ProviderError>>,
     make_musicbrainz: &'a dyn Fn() -> Result<M>,
     make_discogs: &'a dyn Fn() -> Result<D>,
+    make_deezer: &'a dyn Fn() -> Result<Z>,
 }
 
-impl<M, D> Clients<'_, M, D> {
+impl<M, D, Z> Clients<'_, M, D, Z> {
     /// The MusicBrainz client, built now if no release has needed it yet.
     fn musicbrainz(&self) -> Result<&M> {
         if let Some(client) = self.musicbrainz.get() {
@@ -196,6 +201,15 @@ impl<M, D> Clients<'_, M, D> {
         }
         let client = (self.make_discogs)()?;
         Ok(self.discogs.get_or_init(|| client))
+    }
+
+    /// The Deezer client, built now if no release has needed it yet.
+    fn deezer(&self) -> Result<&Z> {
+        if let Some(client) = self.deezer.get() {
+            return Ok(client);
+        }
+        let client = (self.make_deezer)()?;
+        Ok(self.deezer.get_or_init(|| client))
     }
 
     fn discogs_disabled(&self) -> Option<ProviderError> {
@@ -465,18 +479,24 @@ fn is_missing_discogs_token(error: &anyhow::Error) -> bool {
 }
 
 pub async fn run_match(pool: &SqlitePool, options: MatchOptions) -> Result<MatchSummary> {
-    run_with_policy(pool, &options, MusicBrainzAdapter::new, || {
-        DiscogsAdapter::from_env().map_err(anyhow::Error::new)
-    })
+    run_with_policy(
+        pool,
+        &options,
+        MusicBrainzAdapter::new,
+        || DiscogsAdapter::from_env().map_err(anyhow::Error::new),
+        DeezerAdapter::new,
+    )
     .await
 }
 
 /// Matches against locally built dump indexes instead of the network.
 ///
-/// Every provider the active policy may attempt must have an index. That is
-/// checked once, before any release is processed, so a half-built setup fails
-/// up front instead of silently losing its fallback stage. No credential is
-/// read and no request is made on this path.
+/// Every MusicBrainz or Discogs stage the active policy may attempt must have
+/// an index. That is checked once, before any release is processed, so a
+/// half-built setup fails up front instead of silently losing its fallback
+/// stage. No credential is read on this path. Deezer has no index: a policy
+/// that includes it (`--offline --deezer`) reaches it over the network, and
+/// that is the only request such a run makes.
 pub async fn run_match_offline(
     pool: &SqlitePool,
     options: MatchOptions,
@@ -520,19 +540,22 @@ pub async fn run_match_offline(
                 .take()
                 .context("the Discogs index is not part of the selected policy")
         },
+        DeezerAdapter::new,
     )
     .await
 }
 
-pub async fn run_with_policy<M, D>(
+pub async fn run_with_policy<M, D, Z>(
     pool: &SqlitePool,
     options: &MatchOptions,
     make_musicbrainz: impl Fn() -> Result<M>,
     make_discogs: impl Fn() -> Result<D>,
+    make_deezer: impl Fn() -> Result<Z>,
 ) -> Result<MatchSummary>
 where
     M: MetadataProvider,
     D: MetadataProvider,
+    Z: MetadataProvider,
 {
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     if options.review && !interactive {
@@ -587,6 +610,18 @@ where
                         summary.skipped += 1;
                         continue;
                     }
+                    // A stale match is refreshed from the provider that made it,
+                    // and Deezer is contacted only in a run that asks for it.
+                    if accepted == Some(ProviderKind::Deezer)
+                        && !options.policy.allows(ProviderKind::Deezer)
+                    {
+                        outln!(
+                            "\nSkipping local release {}: its stale deezer match needs --deezer to refresh",
+                            release.id
+                        );
+                        summary.skipped += 1;
+                        continue;
+                    }
                 }
                 _ => {
                     summary.skipped += 1;
@@ -606,22 +641,35 @@ where
     let clients = Clients {
         musicbrainz: OnceCell::new(),
         discogs: OnceCell::new(),
+        deezer: OnceCell::new(),
         discogs_disabled: RefCell::new(None),
         make_musicbrainz: &make_musicbrainz,
         make_discogs: &make_discogs,
+        make_deezer: &make_deezer,
     };
     // A MusicBrainz adapter that cannot be built is a configuration error, not
     // an outage: every release would hit it again, and a Discogs fallback would
     // look like a recovery from a stage that never ran. Fail once, up front.
     // Explicit review works offline from saved reviews, so it builds lazily.
-    let needs_musicbrainz = !options.review
-        && selected.iter().any(|release| {
-            refresh_source(options, &statuses, &existing_matches, release.id)
-                .map_or(options.policy, ProviderPolicy::Only)
-                .allows(ProviderKind::MusicBrainz)
-        });
-    if needs_musicbrainz && let Err(error) = clients.musicbrainz() {
+    let needs = |provider| {
+        !options.review
+            && selected.iter().any(|release| {
+                refresh_source(options, &statuses, &existing_matches, release.id)
+                    .map_or(options.policy, ProviderPolicy::Only)
+                    .allows(provider)
+            })
+    };
+    if needs(ProviderKind::MusicBrainz)
+        && let Err(error) = clients.musicbrainz()
+    {
         bail!("MusicBrainz is unusable: {}", Clean(&format!("{error:#}")));
+    }
+    // Deezer needs no credential either, so a client that cannot be built is a
+    // configuration error too.
+    if needs(ProviderKind::Deezer)
+        && let Err(error) = clients.deezer()
+    {
+        bail!("Deezer is unusable: {}", Clean(&format!("{error:#}")));
     }
 
     // Each release waits on SQLite or a provider almost all of the time, so
@@ -677,18 +725,19 @@ where
 ///
 /// Only when the release's stored state cannot be read; every other failure
 /// is reported in the transcript and returned as [`Outcome::Failed`].
-async fn match_release<M, D>(
+async fn match_release<M, D, Z>(
     pool: &SqlitePool,
     release: &LocalRelease,
     options: &MatchOptions,
     statuses: &HashMap<i64, String>,
     existing_matches: &HashMap<i64, Option<ProviderKind>>,
-    clients: &Clients<'_, M, D>,
+    clients: &Clients<'_, M, D, Z>,
     transcript: &mut Transcript,
 ) -> Result<Outcome>
 where
     M: MetadataProvider,
     D: MetadataProvider,
+    Z: MetadataProvider,
 {
     let label = format!(
         "{} — {}",
@@ -810,20 +859,34 @@ fn refresh_source(
         .and_then(|provider| *provider)
 }
 
-/// A primary stage that failed for a reason that says nothing about the
-/// release means a fallback candidate was never compared against what the
-/// primary would have found, so it must be reviewed rather than accepted.
+/// Whether a stage failed for a reason that says nothing about the release.
 ///
-/// Failed lookups that discovery worked around count too: the release that
-/// failed to load may have been the right one.
-fn primary_failed_transiently(attempts: &[ProviderAttempt]) -> bool {
-    attempts.first().is_some_and(|attempt| {
-        attempt
-            .error
-            .iter()
-            .chain(&attempt.partial_failures)
-            .any(ProviderError::is_transient)
-    })
+/// A later candidate was then never compared against what this stage would
+/// have found, so it must be reviewed rather than accepted. Failed lookups
+/// that discovery worked around count too: the release that failed to load may
+/// have been the right one.
+fn failed_transiently(attempt: &ProviderAttempt) -> bool {
+    attempt
+        .error
+        .iter()
+        .chain(&attempt.partial_failures)
+        .any(ProviderError::is_transient)
+}
+
+/// The first later stage whose best candidate passes its own gates.
+///
+/// Returned with the first stage before it that failed transiently, if any:
+/// the stage settles the release only without one (see [`settlement`]), and is
+/// held for review otherwise. Stages are indexes into `attempts`.
+fn first_settling_fallback(attempts: &[ProviderAttempt]) -> Option<(usize, Option<usize>)> {
+    let stage = (1..attempts.len()).find(|&stage| {
+        attempts[stage]
+            .evaluations
+            .first()
+            .is_some_and(|evaluation| evaluation.auto_accept)
+    })?;
+    let failed = attempts[..stage].iter().position(failed_transiently);
+    Some((stage, failed))
 }
 
 /// Starts a line in the transcript about a primary-versus-fallback disagreement
@@ -831,8 +894,14 @@ fn primary_failed_transiently(attempts: &[ProviderAttempt]) -> bool {
 /// accepted, and is never a review reason.
 const SETTLED_NOTE_PREFIX: &str = "fallback conflict settled by the files: ";
 
-const TRANSIENT_PRIMARY_NOTE: &str =
-    "MusicBrainz stage failed transiently; fallback candidates need review";
+/// Says that a fallback which would have settled is held for review, because
+/// the stage `failed` (MusicBrainz, or Discogs before Deezer) failed transiently.
+fn transient_note(failed: ProviderKind) -> String {
+    format!(
+        "{} stage failed transiently; fallback candidates need review",
+        failed.label()
+    )
+}
 
 async fn load_saved_reviews(
     pool: &SqlitePool,
@@ -869,9 +938,14 @@ enum Gathered {
 enum Settlement {
     /// The primary provider's best candidate passed its own gates.
     Primary,
-    /// The fallback's best candidate passed its own gates and was compared with
-    /// the primary's; any conflicts in the check still stop an automatic accept.
-    Fallback(matcher::FallbackCheck),
+    /// The best candidate of the later stage `stage` (an index into the
+    /// attempts) passed its own gates and was compared with the candidates of
+    /// every stage before it; any conflicts in the check still stop an
+    /// automatic accept.
+    Fallback {
+        stage: usize,
+        check: matcher::FallbackCheck,
+    },
 }
 
 impl Settlement {
@@ -883,17 +957,20 @@ impl Settlement {
         !review
             && match self {
                 Self::Primary => true,
-                Self::Fallback(check) => check.conflicts.is_empty() && !has_direct,
+                Self::Fallback { check, .. } => check.conflicts.is_empty() && !has_direct,
             }
     }
 }
 
-/// Whether `attempts` settle `release` through the primary or the fallback.
+/// Whether `attempts` settle `release` through the primary or a later stage.
 ///
 /// Pure: the one place the settling conditions are written. A primary settles
-/// when its best candidate auto-accepts. Otherwise a fallback settles when its
-/// best candidate auto-accepts and the primary did not fail transiently, with
-/// the fallback's check against the primary.
+/// when its best candidate auto-accepts. Otherwise the first later stage whose
+/// best candidate auto-accepts settles when no stage before it failed
+/// transiently ([`first_settling_fallback`]), with its check against the
+/// candidates of every stage before it: Deezer is checked against MusicBrainz
+/// and Discogs. Whether an observed release ID was resolved comes from the
+/// MusicBrainz attempt.
 fn settlement(
     release: &LocalRelease,
     attempts: &[ProviderAttempt],
@@ -903,18 +980,62 @@ fn settlement(
     if primary.settled(has_direct) {
         return Some(Settlement::Primary);
     }
-    let fallback = attempts.get(1)?;
-    let (candidate, evaluation) = (fallback.candidates.first()?, fallback.evaluations.first()?);
-    if !evaluation.auto_accept || primary_failed_transiently(attempts) {
+    let (stage, None) = first_settling_fallback(attempts)? else {
         return None;
+    };
+    let fallback = &attempts[stage];
+    let (candidate, evaluation) = (fallback.candidates.first()?, fallback.evaluations.first()?);
+    // One earlier stage, the usual case, lends its candidates as they are.
+    let earlier: Cow<'_, [Candidate]> = match &attempts[..stage] {
+        [only] => Cow::Borrowed(&only.candidates),
+        several => Cow::Owned(
+            several
+                .iter()
+                .flat_map(|attempt| attempt.candidates.iter().cloned())
+                .collect(),
+        ),
+    };
+    let embedded_release_resolved = attempts
+        .iter()
+        .find(|attempt| attempt.provider == ProviderKind::MusicBrainz)
+        .is_some_and(|attempt| attempt.embedded_release_resolved);
+    Some(Settlement::Fallback {
+        stage,
+        check: matcher::fallback_check(
+            release,
+            &earlier,
+            candidate,
+            embedded_release_resolved,
+            evaluation.relies_on_unlisted_lengths(),
+        ),
+    })
+}
+
+/// Whether the stages so far settle `release` without a person, so no later
+/// stage needs to run. A run with `--review` stops at the same stage.
+fn stages_settle(release: &LocalRelease, attempts: &[ProviderAttempt], has_direct: bool) -> bool {
+    settlement(release, attempts, has_direct)
+        .is_some_and(|settlement| settlement.is_automatic(has_direct, false))
+}
+
+/// Why the next stage runs: what the stage before it left open, with the first
+/// stage called the primary.
+fn fallback_reason(attempts: &[ProviderAttempt]) -> String {
+    let Some(last) = attempts.last() else {
+        return "no earlier stage ran".to_string();
+    };
+    let stage = if attempts.len() == 1 {
+        "primary".to_string()
+    } else {
+        last.provider.to_string()
+    };
+    if let Some(error) = &last.error {
+        format!("{stage} stage failed: {error}")
+    } else if last.candidates.is_empty() {
+        format!("{stage} stage found no candidates")
+    } else {
+        format!("{stage} candidates did not settle the edition")
     }
-    Some(Settlement::Fallback(matcher::fallback_check(
-        release,
-        &primary.candidates,
-        candidate,
-        primary.embedded_release_resolved,
-        evaluation.relies_on_unlisted_lengths(),
-    )))
 }
 
 /// Matches one release against the providers and records the decision.
@@ -943,12 +1064,12 @@ fn settlement(
     clippy::too_many_arguments,
     reason = "one release's whole decision; the arguments have no natural grouping"
 )]
-async fn process_release<M, D>(
+async fn process_release<M, D, Z>(
     pool: &SqlitePool,
     release: &LocalRelease,
     options: &MatchOptions,
     policy: ProviderPolicy,
-    clients: &Clients<'_, M, D>,
+    clients: &Clients<'_, M, D, Z>,
     refreshing: bool,
     guard: &MatchGuard,
     transcript: &mut Transcript,
@@ -956,6 +1077,7 @@ async fn process_release<M, D>(
 where
     M: MetadataProvider,
     D: MetadataProvider,
+    Z: MetadataProvider,
 {
     let direct = options
         .direct_release
@@ -1026,17 +1148,18 @@ where
 ///
 /// The stages and what they report (promotions, notes, stage errors, skipped
 /// fallbacks) are written to `transcript`.
-async fn gather_attempts<M, D>(
+async fn gather_attempts<M, D, Z>(
     release: &LocalRelease,
     policy: ProviderPolicy,
     direct: Option<ReleaseId>,
-    clients: &Clients<'_, M, D>,
+    clients: &Clients<'_, M, D, Z>,
     refreshing: bool,
     transcript: &mut Transcript,
 ) -> Gathered
 where
     M: MetadataProvider,
     D: MetadataProvider,
+    Z: MetadataProvider,
 {
     let mut attempts: Vec<ProviderAttempt> = Vec::new();
     let mut fallback_skip: Option<String> = None;
@@ -1046,18 +1169,15 @@ where
     let order = policy.order();
     for (index, provider) in order.iter().copied().enumerate() {
         if index > 0 {
-            let primary = &attempts[0];
-            if primary.settled(direct.is_some()) {
+            if stages_settle(release, &attempts, direct.is_some()) {
                 break;
             }
-            let reason = if let Some(error) = &primary.error {
-                format!("primary stage failed: {error}")
-            } else if primary.candidates.is_empty() {
-                "primary stage found no candidates".to_string()
-            } else {
-                "primary candidates did not settle the edition".to_string()
-            };
-            outln_to!(transcript, "  Discogs fallback: {}", Clean(&reason));
+            outln_to!(
+                transcript,
+                "  {} fallback: {}",
+                provider.label(),
+                Clean(&fallback_reason(&attempts))
+            );
         }
 
         match provider {
@@ -1085,7 +1205,8 @@ where
                             "Discogs is disabled for the rest of this run: {error}"
                         ));
                     }
-                    break;
+                    // A later stage (Deezer) may still settle the release.
+                    continue;
                 }
                 let client = match clients.discogs() {
                     Ok(client) => client,
@@ -1119,7 +1240,7 @@ where
                                 "  Disabling Discogs fallback for the rest of this run"
                             );
                         }
-                        break;
+                        continue;
                     }
                 };
                 let attempt = attempt_provider(client, release, direct.clone()).await;
@@ -1132,13 +1253,17 @@ where
                 attempts.push(attempt);
             }
             ProviderKind::Deezer => {
-                attempts.push(ProviderAttempt::failed(
-                    ProviderKind::Deezer,
-                    ProviderError::Configuration {
-                        provider: ProviderKind::Deezer,
-                        message: "no Deezer session is available in this run".to_string(),
-                    },
-                ));
+                let client = match clients.deezer() {
+                    Ok(client) => client,
+                    Err(error) => {
+                        attempts.push(ProviderAttempt::failed(
+                            ProviderKind::Deezer,
+                            provider_error_from(ProviderKind::Deezer, error),
+                        ));
+                        continue;
+                    }
+                };
+                attempts.push(attempt_provider(client, release, direct.clone()).await);
             }
         }
     }
@@ -1181,12 +1306,12 @@ where
     clippy::too_many_arguments,
     reason = "one release's whole decision; the arguments have no natural grouping"
 )]
-async fn act_on_attempts<M, D>(
+async fn act_on_attempts<M, D, Z>(
     pool: &SqlitePool,
     release: &LocalRelease,
     options: &MatchOptions,
     has_direct: bool,
-    clients: &Clients<'_, M, D>,
+    clients: &Clients<'_, M, D, Z>,
     guard: &MatchGuard,
     mut attempts: Vec<ProviderAttempt>,
     transcript: &mut Transcript,
@@ -1194,10 +1319,11 @@ async fn act_on_attempts<M, D>(
 where
     M: MetadataProvider,
     D: MetadataProvider,
+    Z: MetadataProvider,
 {
     let verdict = settlement(release, &attempts, has_direct);
 
-    // A settled primary result needed no fallback, so Discogs was never asked.
+    // A settled primary result needed no fallback, so no later stage was asked.
     if let Some(found @ Settlement::Primary) = &verdict {
         if !found.is_automatic(has_direct, options.review) {
             return review_attempts(
@@ -1208,6 +1334,7 @@ where
                 options.dry_run,
                 clients.musicbrainz.get(),
                 clients.discogs.get(),
+                clients.deezer.get(),
             )
             .await;
         }
@@ -1227,32 +1354,31 @@ where
     }
 
     // A fallback that would have settled is held for review, and says why.
-    if attempts.len() > 1
-        && attempts[1]
-            .evaluations
-            .first()
-            .is_some_and(|evaluation| evaluation.auto_accept)
-        && primary_failed_transiently(&attempts)
-    {
-        outln_to!(transcript, "  {TRANSIENT_PRIMARY_NOTE}");
-        attempts[1].notes.push(TRANSIENT_PRIMARY_NOTE.to_string());
+    if let Some((stage, Some(failed))) = first_settling_fallback(&attempts) {
+        let note = transient_note(attempts[failed].provider);
+        outln_to!(transcript, "  {note}");
+        attempts[stage].notes.push(note);
     }
 
     // A fallback candidate is accepted only when it settles its own gates and
-    // does not contradict the local edition or a plausible primary candidate.
-    if let Some(found @ Settlement::Fallback(check)) = &verdict {
-        let fallback = &attempts[1];
+    // does not contradict the local edition or a plausible earlier candidate.
+    if let Some(found @ Settlement::Fallback { stage, check }) = &verdict {
+        let stage = *stage;
         if found.is_automatic(has_direct, options.review) {
-            if let Some(error) = &attempts[0].error {
-                outln_to!(
-                    transcript,
-                    "  recovered the release from a failed MusicBrainz stage: {}",
-                    Clean(&error.to_string())
-                );
+            for earlier in &attempts[..stage] {
+                if let Some(error) = &earlier.error {
+                    outln_to!(
+                        transcript,
+                        "  recovered the release from a failed {} stage: {}",
+                        earlier.provider.label(),
+                        Clean(&error.to_string())
+                    );
+                }
             }
             for line in &check.settled {
                 outln_to!(transcript, "  {SETTLED_NOTE_PREFIX}{}", Clean(line));
             }
+            let fallback = &attempts[stage];
             return accept(
                 pool,
                 release,
@@ -1274,15 +1400,18 @@ where
         for conflict in &check.conflicts {
             outln_to!(transcript, "  fallback conflict: {}", Clean(conflict));
         }
-        attempts[1].notes.extend(check.conflicts.iter().cloned());
+        attempts[stage]
+            .notes
+            .extend(check.conflicts.iter().cloned());
     }
 
     let has_candidates = attempts
         .iter()
         .any(|attempt| !attempt.candidates.is_empty());
     let fallback_failed = attempts
-        .get(1)
-        .is_some_and(|attempt| attempt.error.is_some());
+        .iter()
+        .skip(1)
+        .any(|attempt| attempt.error.is_some());
 
     if has_candidates {
         if options.dry_run {
@@ -1300,6 +1429,7 @@ where
                 options.dry_run,
                 clients.musicbrainz.get(),
                 clients.discogs.get(),
+                clients.deezer.get(),
             )
             .await;
         }
@@ -1560,6 +1690,7 @@ async fn review_saved_release(
         &mut groups,
         Option::<&MusicBrainzAdapter>::None,
         Option::<&DiscogsAdapter>::None,
+        Option::<&DeezerAdapter>::None,
     )
     .await?
     {
@@ -1591,7 +1722,7 @@ async fn review_saved_release(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn review_attempts<M, D>(
+async fn review_attempts<M, D, Z>(
     pool: &SqlitePool,
     release: &LocalRelease,
     attempts: &[ProviderAttempt],
@@ -1599,10 +1730,12 @@ async fn review_attempts<M, D>(
     dry_run: bool,
     musicbrainz: Option<&M>,
     discogs: Option<&D>,
+    deezer: Option<&Z>,
 ) -> Result<Outcome>
 where
     M: MetadataProvider,
     D: MetadataProvider,
+    Z: MetadataProvider,
 {
     let mut groups: Vec<(ProviderKind, Vec<Candidate>, Vec<Evaluation>)> = attempts
         .iter()
@@ -1633,7 +1766,7 @@ where
         }
     }
 
-    match review_prompt(release, &mut groups, musicbrainz, discogs).await? {
+    match review_prompt(release, &mut groups, musicbrainz, discogs, deezer).await? {
         ReviewOutcome::Accept(provider, candidate, evaluation) => {
             if dry_run {
                 outln!(
@@ -1971,6 +2104,42 @@ fn prompt(message: &str) -> Result<String> {
     Ok(line.trim().to_string())
 }
 
+/// The providers of the review groups, in the order they first appear.
+fn group_providers(
+    groups: &[(ProviderKind, Vec<Candidate>, Vec<Evaluation>)],
+) -> Vec<ProviderKind> {
+    let mut providers = Vec::new();
+    for (provider, _, _) in groups {
+        if !providers.contains(provider) {
+            providers.push(*provider);
+        }
+    }
+    providers
+}
+
+/// The `[i]d` question, numbering each provider: `provider [1]=musicbrainz
+/// [2]=discogs > `.
+fn provider_prompt(providers: &[ProviderKind]) -> String {
+    let choices: Vec<String> = providers
+        .iter()
+        .enumerate()
+        .map(|(index, provider)| format!("[{}]={provider}", index + 1))
+        .collect();
+    format!("provider {} > ", choices.join(" "))
+}
+
+/// The provider a reply names by number or by name; the first one otherwise.
+fn chosen_provider(providers: &[ProviderKind], reply: &str) -> ProviderKind {
+    reply
+        .parse::<usize>()
+        .ok()
+        .and_then(|number| number.checked_sub(1))
+        .and_then(|index| providers.get(index).copied())
+        .or_else(|| ProviderKind::parse(reply).filter(|provider| providers.contains(provider)))
+        .or_else(|| providers.first().copied())
+        .unwrap_or(ProviderKind::MusicBrainz)
+}
+
 fn parse_entered_id(provider: ProviderKind, raw: &str) -> Result<ReleaseId> {
     match provider {
         ProviderKind::MusicBrainz => {
@@ -1994,15 +2163,17 @@ fn parse_entered_id(provider: ProviderKind, raw: &str) -> Result<ReleaseId> {
     }
 }
 
-async fn fetch_entered<M, D>(
+async fn fetch_entered<M, D, Z>(
     provider: ProviderKind,
     id: ReleaseId,
     musicbrainz: Option<&M>,
     discogs: Option<&D>,
+    deezer: Option<&Z>,
 ) -> Result<RemoteRelease, ProviderError>
 where
     M: MetadataProvider,
     D: MetadataProvider,
+    Z: MetadataProvider,
 {
     match provider {
         ProviderKind::MusicBrainz => match musicbrainz {
@@ -2019,22 +2190,27 @@ where
                 message: "no Discogs session is available in this run".to_string(),
             }),
         },
-        ProviderKind::Deezer => Err(ProviderError::Configuration {
-            provider,
-            message: "no Deezer session is available in this run".to_string(),
-        }),
+        ProviderKind::Deezer => match deezer {
+            Some(client) => client.fetch_release(id).await,
+            None => Err(ProviderError::Configuration {
+                provider,
+                message: "no Deezer session is available in this run".to_string(),
+            }),
+        },
     }
 }
 
-async fn review_prompt<M, D>(
+async fn review_prompt<M, D, Z>(
     local: &LocalRelease,
     groups: &mut Vec<(ProviderKind, Vec<Candidate>, Vec<Evaluation>)>,
     musicbrainz: Option<&M>,
     discogs: Option<&D>,
+    deezer: Option<&Z>,
 ) -> Result<ReviewOutcome>
 where
     M: MetadataProvider,
     D: MetadataProvider,
+    Z: MetadataProvider,
 {
     loop {
         let action = prompt("\n[a]ccept  [i]d  [s]kip  [q]uit > ")?;
@@ -2084,12 +2260,10 @@ where
                 }
             }
             "i" => {
-                let provider = if groups.len() > 1 {
-                    let choice = prompt("provider [1]=musicbrainz [2]=discogs > ")?;
-                    match choice.as_str() {
-                        "2" | "discogs" => ProviderKind::Discogs,
-                        _ => ProviderKind::MusicBrainz,
-                    }
+                let providers = group_providers(groups);
+                let provider = if providers.len() > 1 {
+                    let choice = prompt(&provider_prompt(&providers))?;
+                    chosen_provider(&providers, &choice)
                 } else {
                     groups[0].0
                 };
@@ -2101,7 +2275,7 @@ where
                         continue;
                     }
                 };
-                match fetch_entered(provider, id, musicbrainz, discogs).await {
+                match fetch_entered(provider, id, musicbrainz, discogs, deezer).await {
                     Ok(release) => {
                         let candidate = Candidate::new(local, release);
                         let evaluation = matcher::evaluate(
@@ -2546,6 +2720,7 @@ mod tests {
                 &options,
                 make_provider,
                 || -> Result<GatedProvider> { bail!("Discogs is not used in this test") },
+                || -> Result<GatedProvider> { bail!("Deezer is not used in this test") },
             ),
         )
         .await
@@ -2591,6 +2766,7 @@ mod tests {
             &options,
             make_provider,
             || -> Result<RetaggingProvider> { bail!("Discogs is not used in this test") },
+            || -> Result<RetaggingProvider> { bail!("Deezer is not used in this test") },
         )
         .await
         .unwrap();
@@ -3040,47 +3216,36 @@ mod tests {
     }
 
     #[test]
-    fn only_outage_failures_count_as_a_transient_primary_failure() {
-        let failed = |error| [ProviderAttempt::failed(ProviderKind::MusicBrainz, error)];
+    fn only_outage_failures_count_as_a_transient_stage_failure() {
+        let failed = |error| ProviderAttempt::failed(ProviderKind::MusicBrainz, error);
         let provider = ProviderKind::MusicBrainz;
-        assert!(primary_failed_transiently(&failed(
-            ProviderError::Network {
-                provider,
-                message: "down".into(),
-            }
-        )));
-        assert!(primary_failed_transiently(&failed(
-            ProviderError::RateLimited {
-                provider,
-                message: "slow down".into(),
-                retry_after: None,
-            }
-        )));
-        assert!(primary_failed_transiently(&failed(
-            ProviderError::Unavailable {
-                provider,
-                retry_after: std::time::Duration::from_secs(5),
-            }
-        )));
+        assert!(failed_transiently(&failed(ProviderError::Network {
+            provider,
+            message: "down".into(),
+        })));
+        assert!(failed_transiently(&failed(ProviderError::RateLimited {
+            provider,
+            message: "slow down".into(),
+            retry_after: None,
+        })));
+        assert!(failed_transiently(&failed(ProviderError::Unavailable {
+            provider,
+            retry_after: std::time::Duration::from_secs(5),
+        })));
         // A malformed response is deterministic for that release, and starts no cooldown.
-        assert!(!primary_failed_transiently(&failed(
-            ProviderError::Malformed {
-                provider,
-                message: "bad json".into(),
-            }
-        )));
-        assert!(!primary_failed_transiently(&failed(
-            ProviderError::Permanent {
-                provider,
-                status: Some(400),
-                message: "bad".into(),
-            }
-        )));
-        assert!(!primary_failed_transiently(&[]));
+        assert!(!failed_transiently(&failed(ProviderError::Malformed {
+            provider,
+            message: "bad json".into(),
+        })));
+        assert!(!failed_transiently(&failed(ProviderError::Permanent {
+            provider,
+            status: Some(400),
+            message: "bad".into(),
+        })));
     }
 
     #[test]
-    fn worked_around_transient_lookup_failures_count_as_a_transient_primary_failure() {
+    fn worked_around_transient_lookup_failures_count_as_a_transient_stage_failure() {
         let provider = ProviderKind::MusicBrainz;
         let mut attempt = ProviderAttempt::failed(
             provider,
@@ -3090,17 +3255,17 @@ mod tests {
             },
         );
         attempt.error = None;
-        assert!(!primary_failed_transiently(std::slice::from_ref(&attempt)));
+        assert!(!failed_transiently(&attempt));
         attempt.partial_failures = vec![ProviderError::Malformed {
             provider,
             message: "bad json".into(),
         }];
-        assert!(!primary_failed_transiently(std::slice::from_ref(&attempt)));
+        assert!(!failed_transiently(&attempt));
         attempt.partial_failures.push(ProviderError::Unavailable {
             provider,
             retry_after: std::time::Duration::from_secs(5),
         });
-        assert!(primary_failed_transiently(std::slice::from_ref(&attempt)));
+        assert!(failed_transiently(&attempt));
     }
 
     #[test]
@@ -3337,17 +3502,381 @@ mod tests {
 
     #[test]
     fn a_fallback_with_conflicts_or_a_review_run_is_not_automatic() {
-        let clean = Settlement::Fallback(matcher::FallbackCheck::default());
+        let clean = Settlement::Fallback {
+            stage: 1,
+            check: matcher::FallbackCheck::default(),
+        };
         assert!(clean.is_automatic(false, false));
         assert!(!clean.is_automatic(true, false));
         assert!(!clean.is_automatic(false, true));
-        let conflicted = Settlement::Fallback(matcher::FallbackCheck {
-            conflicts: vec!["edition differs".to_string()],
-            settled: Vec::new(),
-        });
+        let conflicted = Settlement::Fallback {
+            stage: 1,
+            check: matcher::FallbackCheck {
+                conflicts: vec!["edition differs".to_string()],
+                settled: Vec::new(),
+            },
+        };
         assert!(!conflicted.is_automatic(false, false));
         assert!(Settlement::Primary.is_automatic(false, false));
         assert!(!Settlement::Primary.is_automatic(false, true));
+    }
+
+    /// A provider of one kind that offers `release` to every search (none when
+    /// it is `None`, or `error` when that is set) and counts its searches.
+    struct OneRelease {
+        kind: ProviderKind,
+        release: Option<RemoteRelease>,
+        error: Option<ProviderError>,
+        searches: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl OneRelease {
+        fn new(kind: ProviderKind, release: Option<RemoteRelease>) -> Self {
+            Self {
+                kind,
+                release,
+                error: None,
+                searches: std::sync::Arc::default(),
+            }
+        }
+
+        fn searches(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+            self.searches.clone()
+        }
+    }
+
+    impl MetadataProvider for OneRelease {
+        fn kind(&self) -> ProviderKind {
+            self.kind
+        }
+
+        async fn search(&self, _request: SearchRequest) -> Result<SearchPage, ProviderError> {
+            self.searches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(error) = &self.error {
+                return Err(error.clone());
+            }
+            let hits: Vec<matcher::SearchSummary> = self
+                .release
+                .iter()
+                .map(|release| matcher::SearchSummary {
+                    id: release.id.clone(),
+                    title: release.title.clone(),
+                    artists: release.artists.clone(),
+                    artist_credit: None,
+                    year: release.year,
+                    country: None,
+                    labels: Vec::new(),
+                    catalog_numbers: Vec::new(),
+                    formats: release.formats.clone(),
+                    barcodes: Vec::new(),
+                    result_type: "release".into(),
+                })
+                .collect();
+            Ok(SearchPage {
+                total: Some(hits.len() as u64),
+                hits,
+                next_offset: None,
+            })
+        }
+
+        async fn fetch_release(&self, id: ReleaseId) -> Result<RemoteRelease, ProviderError> {
+            self.release
+                .clone()
+                .filter(|release| release.id == id)
+                .ok_or(ProviderError::NotFound {
+                    provider: self.kind,
+                    id: id.storage_id(),
+                })
+        }
+    }
+
+    /// [`edition`] of the ten files, all ten tracks, under `id`.
+    fn ten_track_edition(id: ReleaseId) -> RemoteRelease {
+        let mut release = edition(10, 10, None);
+        release.id = id;
+        release
+    }
+
+    /// Runs the MusicBrainz, Discogs and Deezer chain over [`ten_files`] and
+    /// returns the attempts, the transcript and each provider's search count.
+    async fn run_chain(
+        providers: [OneRelease; 3],
+    ) -> (Vec<ProviderAttempt>, Transcript, [usize; 3]) {
+        let counts = providers.each_ref().map(OneRelease::searches);
+        let cells = providers.map(|provider| RefCell::new(Some(provider)));
+        let take = |index: usize| {
+            cells[index]
+                .borrow_mut()
+                .take()
+                .context("a client was built twice")
+        };
+        let (make_musicbrainz, make_discogs, make_deezer) = (|| take(0), || take(1), || take(2));
+        let clients = Clients {
+            musicbrainz: OnceCell::new(),
+            discogs: OnceCell::new(),
+            deezer: OnceCell::new(),
+            discogs_disabled: RefCell::new(None),
+            make_musicbrainz: &make_musicbrainz,
+            make_discogs: &make_discogs,
+            make_deezer: &make_deezer,
+        };
+        let mut transcript = Transcript::held();
+        let Gathered::Attempts(attempts) = gather_attempts(
+            &ten_files(),
+            ProviderPolicy::Chain { deezer: true },
+            None,
+            &clients,
+            false,
+            &mut transcript,
+        )
+        .await
+        else {
+            panic!("the chain ended before any stage ran");
+        };
+        let counts = counts.map(|count| count.load(std::sync::atomic::Ordering::SeqCst));
+        (attempts, transcript, counts)
+    }
+
+    fn musicbrainz_id() -> ReleaseId {
+        ReleaseId::MusicBrainz(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"))
+    }
+
+    #[tokio::test]
+    async fn a_settling_musicbrainz_stage_runs_no_later_stage() {
+        let (attempts, _, counts) = run_chain([
+            OneRelease::new(
+                ProviderKind::MusicBrainz,
+                Some(ten_track_edition(musicbrainz_id())),
+            ),
+            OneRelease::new(
+                ProviderKind::Discogs,
+                Some(ten_track_edition(ReleaseId::Discogs(42))),
+            ),
+            OneRelease::new(
+                ProviderKind::Deezer,
+                Some(ten_track_edition(ReleaseId::Deezer(7))),
+            ),
+        ])
+        .await;
+        assert_eq!(attempts.len(), 1);
+        assert!(counts[0] > 0);
+        assert_eq!(counts[1..], [0, 0]);
+        assert!(matches!(
+            settlement(&ten_files(), &attempts, false),
+            Some(Settlement::Primary)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_settling_discogs_stage_keeps_deezer_out() {
+        let (attempts, transcript, counts) = run_chain([
+            OneRelease::new(ProviderKind::MusicBrainz, None),
+            OneRelease::new(
+                ProviderKind::Discogs,
+                Some(ten_track_edition(ReleaseId::Discogs(42))),
+            ),
+            OneRelease::new(
+                ProviderKind::Deezer,
+                Some(ten_track_edition(ReleaseId::Deezer(7))),
+            ),
+        ])
+        .await;
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(counts[2], 0, "Deezer must not be searched");
+        assert!(
+            out_lines(&transcript)
+                .contains(&"  Discogs fallback: primary stage found no candidates"),
+            "{:?}",
+            out_lines(&transcript)
+        );
+        let Some(found @ Settlement::Fallback { stage: 1, .. }) =
+            settlement(&ten_files(), &attempts, false)
+        else {
+            panic!("Discogs did not settle the release");
+        };
+        assert!(found.is_automatic(false, false));
+    }
+
+    #[tokio::test]
+    async fn deezer_settles_a_release_neither_earlier_stage_settles() {
+        let (attempts, transcript, counts) = run_chain([
+            OneRelease::new(ProviderKind::MusicBrainz, None),
+            OneRelease::new(ProviderKind::Discogs, None),
+            OneRelease::new(
+                ProviderKind::Deezer,
+                Some(ten_track_edition(ReleaseId::Deezer(7))),
+            ),
+        ])
+        .await;
+        assert_eq!(attempts.len(), 3);
+        assert!(counts.iter().all(|count| *count > 0), "{counts:?}");
+        assert!(
+            out_lines(&transcript)
+                .contains(&"  Deezer fallback: discogs stage found no candidates"),
+            "{:?}",
+            out_lines(&transcript)
+        );
+        let Some(found @ Settlement::Fallback { stage: 2, .. }) =
+            settlement(&ten_files(), &attempts, false)
+        else {
+            panic!("Deezer did not settle the release");
+        };
+        assert!(found.is_automatic(false, false));
+    }
+
+    #[tokio::test]
+    async fn a_plausible_contradicting_discogs_candidate_blocks_deezer() {
+        // Discogs lists the mono edition: plausible by score, not accepted, and
+        // its edition contradicts Deezer's.
+        let mut mono = ten_track_edition(ReleaseId::Discogs(42));
+        mono.formats = vec!["Vinyl (LP, Album, Mono)".to_string()];
+        let (attempts, _, _) = run_chain([
+            OneRelease::new(ProviderKind::MusicBrainz, None),
+            OneRelease::new(ProviderKind::Discogs, Some(mono)),
+            OneRelease::new(
+                ProviderKind::Deezer,
+                Some(ten_track_edition(ReleaseId::Deezer(7))),
+            ),
+        ])
+        .await;
+        assert_eq!(attempts.len(), 3);
+        assert!(!attempts[1].evaluations[0].auto_accept);
+        let Some(Settlement::Fallback { stage: 2, check }) =
+            settlement(&ten_files(), &attempts, false)
+        else {
+            panic!("Deezer's candidate did not pass its own gates");
+        };
+        // Any conflict stops the automatic accept (`Settlement::is_automatic`).
+        assert!(
+            check
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.contains("primary candidates describe")),
+            "{:?}",
+            check.conflicts
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transient_musicbrainz_failure_sends_deezer_to_review() {
+        let mut down = OneRelease::new(ProviderKind::MusicBrainz, None);
+        down.error = Some(ProviderError::Network {
+            provider: ProviderKind::MusicBrainz,
+            message: "HTTP 503".into(),
+        });
+        let (attempts, _, counts) = run_chain([
+            down,
+            OneRelease::new(ProviderKind::Discogs, None),
+            OneRelease::new(
+                ProviderKind::Deezer,
+                Some(ten_track_edition(ReleaseId::Deezer(7))),
+            ),
+        ])
+        .await;
+        assert_eq!(counts[2], 1, "Deezer still runs");
+        assert!(settlement(&ten_files(), &attempts, false).is_none());
+        assert_eq!(first_settling_fallback(&attempts), Some((2, Some(0))));
+        assert_eq!(
+            transient_note(ProviderKind::MusicBrainz),
+            "MusicBrainz stage failed transiently; fallback candidates need review"
+        );
+        assert_eq!(
+            transient_note(ProviderKind::Discogs),
+            "Discogs stage failed transiently; fallback candidates need review"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_discogs_token_goes_on_to_deezer() {
+        let musicbrainz = OneRelease::new(ProviderKind::MusicBrainz, None);
+        let deezer = OneRelease::new(
+            ProviderKind::Deezer,
+            Some(ten_track_edition(ReleaseId::Deezer(7))),
+        );
+        let searches = deezer.searches();
+        let (musicbrainz, deezer) = (RefCell::new(Some(musicbrainz)), RefCell::new(Some(deezer)));
+        let make_musicbrainz = || musicbrainz.borrow_mut().take().context("built twice");
+        let make_discogs =
+            || -> Result<OneRelease> { Err(anyhow::Error::new(AdapterError::MissingToken)) };
+        let make_deezer = || deezer.borrow_mut().take().context("built twice");
+        let clients = Clients {
+            musicbrainz: OnceCell::new(),
+            discogs: OnceCell::new(),
+            deezer: OnceCell::new(),
+            discogs_disabled: RefCell::new(None),
+            make_musicbrainz: &make_musicbrainz,
+            make_discogs: &make_discogs,
+            make_deezer: &make_deezer,
+        };
+        let mut transcript = Transcript::held();
+        let Gathered::Attempts(attempts) = gather_attempts(
+            &ten_files(),
+            ProviderPolicy::Chain { deezer: true },
+            None,
+            &clients,
+            false,
+            &mut transcript,
+        )
+        .await
+        else {
+            panic!("the chain ended before any stage ran");
+        };
+        let providers: Vec<ProviderKind> =
+            attempts.iter().map(|attempt| attempt.provider).collect();
+        assert_eq!(providers, [ProviderKind::MusicBrainz, ProviderKind::Deezer]);
+        assert_eq!(searches.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            out_lines(&transcript)
+                .contains(&"  Discogs token is not set; optional fallback was skipped"),
+            "{:?}",
+            out_lines(&transcript)
+        );
+        assert!(matches!(
+            settlement(&ten_files(), &attempts, false),
+            Some(Settlement::Fallback { stage: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn the_id_prompt_names_each_provider_of_the_review() {
+        let (local, remote) = album_fixture();
+        let group = |provider| {
+            let candidate = Candidate::new(&local, remote.clone());
+            (provider, vec![candidate], Vec::new())
+        };
+        let groups = vec![
+            group(ProviderKind::MusicBrainz),
+            group(ProviderKind::Discogs),
+            group(ProviderKind::Deezer),
+            group(ProviderKind::Discogs),
+        ];
+        let providers = group_providers(&groups);
+        assert_eq!(
+            providers,
+            [
+                ProviderKind::MusicBrainz,
+                ProviderKind::Discogs,
+                ProviderKind::Deezer
+            ]
+        );
+        assert_eq!(
+            provider_prompt(&providers[..2]),
+            "provider [1]=musicbrainz [2]=discogs > "
+        );
+        assert_eq!(
+            provider_prompt(&providers),
+            "provider [1]=musicbrainz [2]=discogs [3]=deezer > "
+        );
+        assert_eq!(chosen_provider(&providers, "3"), ProviderKind::Deezer);
+        assert_eq!(chosen_provider(&providers, "deezer"), ProviderKind::Deezer);
+        assert_eq!(chosen_provider(&providers, "2"), ProviderKind::Discogs);
+        assert_eq!(chosen_provider(&providers, ""), ProviderKind::MusicBrainz);
+        assert_eq!(chosen_provider(&providers, "9"), ProviderKind::MusicBrainz);
+        assert_eq!(
+            chosen_provider(&providers[..2], "deezer"),
+            ProviderKind::MusicBrainz
+        );
     }
 
     #[tokio::test]
