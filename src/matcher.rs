@@ -15,6 +15,7 @@ use unicode_normalization::UnicodeNormalization;
 
 pub const DISCOGS_ALGORITHM_VERSION: &str = "discogs-match-v43";
 pub const MUSICBRAINZ_ALGORITHM_VERSION: &str = "musicbrainz-match-v42";
+pub const DEEZER_ALGORITHM_VERSION: &str = "deezer-match-v1";
 
 pub const SCORE_THRESHOLD: f64 = 0.95;
 pub const RUNNER_UP_GAP: f64 = 0.05;
@@ -232,6 +233,7 @@ pub fn algorithm_version(provider: ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Discogs => DISCOGS_ALGORITHM_VERSION,
         ProviderKind::MusicBrainz => MUSICBRAINZ_ALGORITHM_VERSION,
+        ProviderKind::Deezer => DEEZER_ALGORITHM_VERSION,
     }
 }
 
@@ -647,12 +649,12 @@ pub fn normalize_artist(input: &str) -> String {
     normalize_text(&strip_disambiguator(input))
 }
 
-/// MusicBrainz credits are compared as written; numeric disambiguation is a
-/// Discogs-only convention.
+/// MusicBrainz and Deezer credits are compared as written; numeric
+/// disambiguation is a Discogs-only convention.
 pub fn normalize_artist_for(provider: ProviderKind, input: &str) -> String {
     match provider {
         ProviderKind::Discogs => normalize_artist(input),
-        ProviderKind::MusicBrainz => normalize_text(input),
+        ProviderKind::MusicBrainz | ProviderKind::Deezer => normalize_text(input),
     }
 }
 
@@ -1861,7 +1863,7 @@ fn self_titled_score_for(artist: Option<&str>, remote: &RemoteRelease) -> f64 {
                         artist,
                         &match provider {
                             ProviderKind::Discogs => strip_disambiguator(name),
-                            ProviderKind::MusicBrainz => name.clone(),
+                            ProviderKind::MusicBrainz | ProviderKind::Deezer => name.clone(),
                         },
                     ) >= TITLE_SIMILARITY_THRESHOLD
             })
@@ -3462,7 +3464,7 @@ fn artist_credit_score(
     // would have done.
     let comparable = |name: &str| match provider {
         ProviderKind::Discogs => strip_disambiguator(name),
-        ProviderKind::MusicBrainz => name.to_string(),
+        ProviderKind::MusicBrainz | ProviderKind::Deezer => name.to_string(),
     };
     let local_original = comparable(artist);
     let local_chars: Vec<char> = normalize_artist_for(provider, artist).chars().collect();
@@ -5558,6 +5560,8 @@ fn evaluate_with(
     let embedded_consistent = match &remote.id {
         ReleaseId::Discogs(id) => local.embedded_discogs_id == Some(*id),
         ReleaseId::MusicBrainz(id) => local.embedded_evidence.release_id == Some(*id),
+        // No tag carries a Deezer album ID.
+        ReleaseId::Deezer(_) => false,
     };
 
     let cleaned = cleaned_track_titles(local);
@@ -5993,6 +5997,7 @@ fn evaluate_with(
                 }
             }
         }
+        ReleaseId::Deezer(_) => {}
     }
 
     let mut identifier_matched = false;
@@ -8190,6 +8195,7 @@ mod tests {
             algorithm_version(ProviderKind::MusicBrainz),
             "musicbrainz-match-v42"
         );
+        assert_eq!(algorithm_version(ProviderKind::Deezer), "deezer-match-v1");
     }
 
     #[test]

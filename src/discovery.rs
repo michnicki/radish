@@ -54,6 +54,14 @@ impl DiscoveryBudget {
                 page_size: 50,
                 detail_attempts: 10,
             },
+            // Every Deezer lookup is two requests (the album and its tracks)
+            // over the network at about ten a second.
+            ProviderKind::Deezer => Self {
+                max_strategies: 3,
+                pages_per_strategy: 1,
+                page_size: 25,
+                detail_attempts: 4,
+            },
         }
     }
 }
@@ -485,6 +493,7 @@ fn strategies_for_view(
                 ));
             }
         }
+        ProviderKind::Deezer => {}
     }
 
     strategies
@@ -497,6 +506,7 @@ fn embedded_release_id(provider: ProviderKind, local: &LocalRelease) -> Option<R
             .embedded_evidence
             .release_id
             .map(ReleaseId::MusicBrainz),
+        ProviderKind::Deezer => None,
     }
 }
 

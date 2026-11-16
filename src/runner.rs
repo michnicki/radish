@@ -262,7 +262,7 @@ pub fn resolve_policy(
     direct: Option<&ReleaseId>,
 ) -> Result<ProviderPolicy> {
     match (explicit, direct) {
-        (None, None) => Ok(ProviderPolicy::MusicBrainzThenDiscogs),
+        (None, None) => Ok(ProviderPolicy::default()),
         (None, Some(id)) => Ok(ProviderPolicy::Only(id.provider())),
         (Some(provider), None) => Ok(ProviderPolicy::Only(provider)),
         (Some(provider), Some(id)) if provider == id.provider() => {
@@ -487,13 +487,16 @@ pub async fn run_match_offline(
     let mut discogs_index: Option<LocalIndex> = None;
 
     for provider in options.policy.order() {
-        let kind = IndexKind::for_provider(provider);
+        // Deezer has no dump, so no index to open.
+        let Some(kind) = IndexKind::for_provider(provider) else {
+            continue;
+        };
         let index = LocalIndex::open(&paths, kind)
             .await
             .with_context(|| format!("offline matching needs the {kind} index"))?;
-        match provider {
-            ProviderKind::MusicBrainz => musicbrainz_index = Some(index),
-            ProviderKind::Discogs => discogs_index = Some(index),
+        match kind {
+            IndexKind::MusicBrainz => musicbrainz_index = Some(index),
+            IndexKind::Discogs => discogs_index = Some(index),
         }
     }
 
@@ -797,7 +800,7 @@ fn refresh_source(
     release_id: i64,
 ) -> Option<ProviderKind> {
     if options.review
-        || options.policy != ProviderPolicy::MusicBrainzThenDiscogs
+        || options.policy.is_explicit()
         || statuses.get(&release_id).map(String::as_str) != Some(store::STATUS_STALE)
     {
         return None;
@@ -1127,6 +1130,15 @@ where
                     notice_to!(transcript, "  Disabling Discogs for the rest of this run");
                 }
                 attempts.push(attempt);
+            }
+            ProviderKind::Deezer => {
+                attempts.push(ProviderAttempt::failed(
+                    ProviderKind::Deezer,
+                    ProviderError::Configuration {
+                        provider: ProviderKind::Deezer,
+                        message: "no Deezer session is available in this run".to_string(),
+                    },
+                ));
             }
         }
     }
@@ -1973,6 +1985,12 @@ fn parse_entered_id(provider: ProviderKind, raw: &str) -> Result<ReleaseId> {
                 .with_context(|| format!("'{raw}' is not a Discogs release ID"))?;
             Ok(ReleaseId::Discogs(id))
         }
+        ProviderKind::Deezer => {
+            let id = raw
+                .parse::<u64>()
+                .with_context(|| format!("'{raw}' is not a Deezer album ID"))?;
+            Ok(ReleaseId::Deezer(id))
+        }
     }
 }
 
@@ -2001,6 +2019,10 @@ where
                 message: "no Discogs session is available in this run".to_string(),
             }),
         },
+        ProviderKind::Deezer => Err(ProviderError::Configuration {
+            provider,
+            message: "no Deezer session is available in this run".to_string(),
+        }),
     }
 }
 
@@ -2243,7 +2265,7 @@ mod tests {
         let id = ReleaseId::MusicBrainz(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"));
         assert_eq!(
             resolve_policy(None, None).unwrap(),
-            ProviderPolicy::MusicBrainzThenDiscogs
+            ProviderPolicy::Chain { deezer: false }
         );
         assert_eq!(
             resolve_policy(None, Some(&id)).unwrap(),
@@ -3262,7 +3284,7 @@ mod tests {
             .iter()
             .map(|candidate| match candidate.release.id {
                 ReleaseId::Discogs(id) => id,
-                ReleaseId::MusicBrainz(_) => unreachable!("a discogs test"),
+                ReleaseId::MusicBrainz(_) | ReleaseId::Deezer(_) => unreachable!("a discogs test"),
             })
             .collect()
     }

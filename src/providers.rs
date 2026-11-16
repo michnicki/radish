@@ -149,6 +149,7 @@ pub enum ProviderKind {
     Discogs,
     #[serde(rename = "musicbrainz")]
     MusicBrainz,
+    Deezer,
 }
 
 impl ProviderKind {
@@ -156,6 +157,16 @@ impl ProviderKind {
         match self {
             Self::Discogs => "discogs",
             Self::MusicBrainz => "musicbrainz",
+            Self::Deezer => "deezer",
+        }
+    }
+
+    /// The service's own name, for prose such as `Deezer fallback:`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Discogs => "Discogs",
+            Self::MusicBrainz => "MusicBrainz",
+            Self::Deezer => "Deezer",
         }
     }
 
@@ -163,6 +174,7 @@ impl ProviderKind {
         match value.trim().to_ascii_lowercase().as_str() {
             "discogs" => Some(Self::Discogs),
             "musicbrainz" => Some(Self::MusicBrainz),
+            "deezer" => Some(Self::Deezer),
             _ => None,
         }
     }
@@ -185,22 +197,34 @@ impl clap::ValueEnum for ProviderKind {
 }
 
 /// Which providers a matching run may contact, and in what order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderPolicy {
-    /// MusicBrainz first, then Discogs only when the primary stage cannot
-    /// settle the release and a token is available.
-    #[default]
-    MusicBrainzThenDiscogs,
-    /// Exactly one service; fallback and the other factory stay unused.
+    /// MusicBrainz first, then Discogs when MusicBrainz does not settle the
+    /// release and a token is available, then Deezer when `deezer` is set and
+    /// neither settled it. Each later stage runs only when the stages before it
+    /// leave the release unsettled.
+    Chain { deezer: bool },
+    /// Exactly one service; fallback and the other factories stay unused.
     Only(ProviderKind),
+}
+
+impl Default for ProviderPolicy {
+    /// MusicBrainz, then Discogs: Deezer is opt-in.
+    fn default() -> Self {
+        Self::Chain { deezer: false }
+    }
 }
 
 impl ProviderPolicy {
     /// Providers in the order they may be attempted.
     pub fn order(self) -> Vec<ProviderKind> {
         match self {
-            Self::MusicBrainzThenDiscogs => {
-                vec![ProviderKind::MusicBrainz, ProviderKind::Discogs]
+            Self::Chain { deezer } => {
+                let mut order = vec![ProviderKind::MusicBrainz, ProviderKind::Discogs];
+                if deezer {
+                    order.push(ProviderKind::Deezer);
+                }
+                order
             }
             Self::Only(provider) => vec![provider],
         }
@@ -212,7 +236,7 @@ impl ProviderPolicy {
 
     pub fn allows(self, provider: ProviderKind) -> bool {
         match self {
-            Self::MusicBrainzThenDiscogs => true,
+            Self::Chain { deezer } => provider != ProviderKind::Deezer || deezer,
             Self::Only(selected) => selected == provider,
         }
     }
@@ -301,6 +325,8 @@ pub enum ReleaseId {
     Discogs(u64),
     #[serde(rename = "musicbrainz")]
     MusicBrainz(Mbid),
+    /// A Deezer album ID.
+    Deezer(u64),
 }
 
 impl ReleaseId {
@@ -308,13 +334,14 @@ impl ReleaseId {
         match self {
             Self::Discogs(_) => ProviderKind::Discogs,
             Self::MusicBrainz(_) => ProviderKind::MusicBrainz,
+            Self::Deezer(_) => ProviderKind::Deezer,
         }
     }
 
     /// The provider-local identifier as stored in SQLite.
     pub fn storage_id(&self) -> String {
         match self {
-            Self::Discogs(id) => id.to_string(),
+            Self::Discogs(id) | Self::Deezer(id) => id.to_string(),
             Self::MusicBrainz(id) => id.to_string(),
         }
     }
@@ -322,14 +349,21 @@ impl ReleaseId {
     pub fn discogs_id(&self) -> Option<u64> {
         match self {
             Self::Discogs(id) => Some(*id),
-            Self::MusicBrainz(_) => None,
+            Self::MusicBrainz(_) | Self::Deezer(_) => None,
         }
     }
 
     pub fn mbid(&self) -> Option<Mbid> {
         match self {
-            Self::Discogs(_) => None,
             Self::MusicBrainz(id) => Some(*id),
+            Self::Discogs(_) | Self::Deezer(_) => None,
+        }
+    }
+
+    pub fn deezer_id(&self) -> Option<u64> {
+        match self {
+            Self::Deezer(id) => Some(*id),
+            Self::Discogs(_) | Self::MusicBrainz(_) => None,
         }
     }
 }
@@ -339,6 +373,7 @@ impl fmt::Display for ReleaseId {
         match self {
             Self::Discogs(id) => write!(f, "discogs {id}"),
             Self::MusicBrainz(id) => write!(f, "musicbrainz {id}"),
+            Self::Deezer(id) => write!(f, "deezer {id}"),
         }
     }
 }
@@ -696,6 +731,30 @@ mod tests {
     }
 
     #[test]
+    fn deezer_album_ids_round_trip_with_their_provider_name() {
+        let deezer = ReleaseId::Deezer(302127);
+        assert_eq!(deezer.provider(), ProviderKind::Deezer);
+        assert_eq!(deezer.storage_id(), "302127");
+        assert_eq!(deezer.to_string(), "deezer 302127");
+        assert_eq!(deezer.deezer_id(), Some(302127));
+        assert_eq!(deezer.discogs_id(), None);
+        assert_eq!(deezer.mbid(), None);
+        assert_eq!(ReleaseId::Discogs(42).deezer_id(), None);
+
+        let json = serde_json::to_string(&deezer).unwrap();
+        assert_eq!(json, r#"{"provider":"deezer","id":302127}"#);
+        assert_eq!(serde_json::from_str::<ReleaseId>(&json).unwrap(), deezer);
+        assert_eq!(ProviderKind::parse(" Deezer "), Some(ProviderKind::Deezer));
+        assert_eq!(ProviderKind::Deezer.as_str(), "deezer");
+        assert_eq!(ProviderKind::Deezer.label(), "Deezer");
+        assert_eq!(ProviderKind::MusicBrainz.label(), "MusicBrainz");
+        assert_eq!(
+            serde_json::to_string(&ProviderKind::Deezer).unwrap(),
+            r#""deezer""#
+        );
+    }
+
+    #[test]
     fn policy_orders_providers_and_explicit_selection_disables_fallback() {
         assert_eq!(
             ProviderPolicy::default().order(),
@@ -703,6 +762,33 @@ mod tests {
         );
         assert!(!ProviderPolicy::Only(ProviderKind::Discogs).allows(ProviderKind::MusicBrainz));
         assert!(ProviderPolicy::default().allows(ProviderKind::MusicBrainz));
+    }
+
+    #[test]
+    fn deezer_joins_the_chain_only_when_asked() {
+        let plain = ProviderPolicy::default();
+        assert_eq!(plain, ProviderPolicy::Chain { deezer: false });
+        assert!(!plain.allows(ProviderKind::Deezer));
+        assert!(plain.allows(ProviderKind::Discogs));
+        assert!(!plain.is_explicit());
+
+        let chain = ProviderPolicy::Chain { deezer: true };
+        assert_eq!(
+            chain.order(),
+            vec![
+                ProviderKind::MusicBrainz,
+                ProviderKind::Discogs,
+                ProviderKind::Deezer
+            ]
+        );
+        assert!(chain.allows(ProviderKind::Deezer));
+        assert!(chain.allows(ProviderKind::MusicBrainz));
+        assert!(!chain.is_explicit());
+
+        let only = ProviderPolicy::Only(ProviderKind::Deezer);
+        assert_eq!(only.order(), vec![ProviderKind::Deezer]);
+        assert!(only.is_explicit());
+        assert!(!only.allows(ProviderKind::MusicBrainz));
     }
 
     #[test]

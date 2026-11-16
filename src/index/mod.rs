@@ -84,10 +84,13 @@ impl IndexKind {
         }
     }
 
-    pub fn for_provider(provider: ProviderKind) -> Self {
+    /// The index that serves `provider`, or `None` for Deezer, which has no
+    /// dump to build one from.
+    pub fn for_provider(provider: ProviderKind) -> Option<Self> {
         match provider {
-            ProviderKind::MusicBrainz => Self::MusicBrainz,
-            ProviderKind::Discogs => Self::Discogs,
+            ProviderKind::MusicBrainz => Some(Self::MusicBrainz),
+            ProviderKind::Discogs => Some(Self::Discogs),
+            ProviderKind::Deezer => None,
         }
     }
 
@@ -348,5 +351,13 @@ mod tests {
             PathBuf::from("/data/indexes/musicbrainz-staging.db")
         );
         assert!(IndexKind::MusicBrainz.build_flag().contains("musicbrainz"));
+    }
+
+    #[test]
+    fn only_musicbrainz_and_discogs_have_an_index() {
+        for kind in IndexKind::ALL {
+            assert_eq!(IndexKind::for_provider(kind.provider()), Some(kind));
+        }
+        assert_eq!(IndexKind::for_provider(ProviderKind::Deezer), None);
     }
 }
