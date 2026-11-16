@@ -1597,7 +1597,7 @@ pub async fn list_local_releases(
     .await?;
 
     let queued = sqlx::query_as::<_, (i64, String)>(
-        "SELECT local_release_id, provider FROM match_reviews ORDER BY local_release_id, provider",
+        "SELECT local_release_id, provider FROM match_reviews ORDER BY local_release_id",
     )
     .fetch_all(pool)
     .await?;
@@ -1609,6 +1609,11 @@ pub async fn list_local_releases(
                 .or_default()
                 .push(provider);
         }
+    }
+    // Provider order is the enum's (Discogs, MusicBrainz, Deezer), not the
+    // alphabetical order of the stored names.
+    for providers in queued_by_release.values_mut() {
+        providers.sort();
     }
 
     Ok(rows
@@ -3449,6 +3454,62 @@ mod tests {
         assert_eq!(review.candidates.len(), 1);
         assert_eq!(review.reasons, vec!["primary uncertain".to_string()]);
         assert_eq!(review.guard.source_revision, release.revision);
+    }
+
+    #[tokio::test]
+    async fn a_queued_deezer_review_is_listed_after_the_others() {
+        let pool = test_pool().await;
+        insert(
+            &pool,
+            "/music/a",
+            &[scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1)],
+        )
+        .await;
+        let release = load_local_releases(&pool, None).await.unwrap().remove(0);
+        let candidate = Candidate::new(&release, remote_release());
+        let stored = StoredCandidate {
+            release: candidate.release.clone(),
+            mapping: candidate.mapping.clone(),
+            score: candidate.score,
+            auto_accept: false,
+            match_scope: MatchScope::Edition,
+            blockers: vec!["review".to_string()],
+            warnings: Vec::new(),
+            evidence: Vec::new(),
+        };
+        // Queued out of order, and `deezer` sorts before `discogs` as text.
+        for provider in [
+            ProviderKind::Deezer,
+            ProviderKind::MusicBrainz,
+            ProviderKind::Discogs,
+        ] {
+            queue_review(
+                &pool,
+                release.id,
+                provider,
+                &release.revision,
+                None,
+                std::slice::from_ref(&stored),
+                &candidate.mapping,
+                &["uncertain".to_string()],
+            )
+            .await
+            .unwrap();
+        }
+
+        let listed = list_local_releases(&pool, None).await.unwrap();
+        assert_eq!(
+            listed[0].queued_providers,
+            vec![
+                ProviderKind::Discogs,
+                ProviderKind::MusicBrainz,
+                ProviderKind::Deezer
+            ]
+        );
+        assert_eq!(
+            listed[0].status_label(),
+            "unmatched, queued (discogs, musicbrainz, deezer)"
+        );
     }
 
     #[tokio::test]
