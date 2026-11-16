@@ -6,6 +6,7 @@
 //! - [`providers`]: typed provider identities and the small adapter interface.
 //! - [`musicbrainz`]: MusicBrainz transport, query escaping, and conversion.
 //! - [`discogs`]: Discogs provider access, credentials, retries, conversion.
+//! - [`deezer`]: Deezer transport, free-text search, and conversion.
 //! - [`discovery`]: bounded provider-neutral candidate discovery.
 //! - [`index`]: local provider indexes built from the official data dumps.
 //! - [`matcher`]: pure normalization, mapping, scoring, and acceptance rules.
@@ -15,6 +16,7 @@
 //! - [`web`]: the read-only web interface behind `radish serve`.
 
 pub mod db;
+pub mod deezer;
 pub mod discogs;
 pub mod discovery;
 pub mod importer;
