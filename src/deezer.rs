@@ -4,11 +4,16 @@
 //! (`/search/album?q=`), a barcode is looked up directly
 //! (`/album/upc:{code}`), and a release is `/album/{id}` plus its paged
 //! `/album/{id}/tracks`. Deezer reports every failure as HTTP 200 with an
-//! `error` object: code 4 is the request quota (50 requests per 5 seconds) and
-//! code 800 is "no data".
+//! `error` object: code 4 is the request quota (50 requests per 5 seconds),
+//! code 700 is "service busy" (retried like a server error) and code 800 is
+//! "no data".
 //!
 //! Every attempt, retries included, passes through one pacing slot that all
-//! releases of a run share, so `--jobs` never multiplies the request rate. No
+//! releases of a run share, so `--jobs` never multiplies the request rate. A
+//! quota error pushes that slot back for every release. A request that runs
+//! out of retries on a transient failure starts an outage cooldown (60 s),
+//! during which uncached requests fail at once with
+//! [`ProviderError::Unavailable`]; cached results stay available. No
 //! credential exists or is read here.
 
 use crate::matcher::{
@@ -241,6 +246,8 @@ impl DeezerAdapter {
             self.check_cooldown()?;
             attempt += 1;
             self.schedule().await;
+            // Another job may have started the cooldown while this one waited.
+            self.check_cooldown()?;
             let failure = match self.attempt(url.clone()).await {
                 Ok(outcome) => return Ok(outcome),
                 Err(failure) => failure,
@@ -1338,21 +1345,77 @@ mod tests {
         .unwrap();
         let first = adapter.fetch_release(ReleaseId::Deezer(1));
         let second = async {
-            // Starts after the first call has seen the quota error.
-            tokio::time::sleep(Duration::from_millis(60)).await;
+            // Starts once the first call's quota error has moved the slot.
+            wait_for_quota_pause(&adapter, quota_wait).await;
             adapter.fetch_release(ReleaseId::Deezer(2)).await
         };
         let (first, second) = tokio::join!(first, second);
         assert_eq!(first.unwrap().id, ReleaseId::Deezer(1));
         assert_eq!(second.unwrap().id, ReleaseId::Deezer(2));
 
-        // Without a shared pause the second release would start after 60 ms,
-        // second overall. Allow for a timer waking a little early in total.
+        // The pause starts after the first request was released, so the next
+        // request of either release is at least `quota_wait` behind it. Without
+        // a shared pause the second release would be released at once.
         let mut released = lock(&adapter.released_at).clone();
         released.sort();
         assert!(
-            released[1].duration_since(released[0]) >= quota_wait - Duration::from_millis(15),
+            released[1].duration_since(released[0]) >= quota_wait,
             "the other release did not wait out the quota pause"
+        );
+    }
+
+    /// Waits until a quota error has pushed the next slot well into the future.
+    async fn wait_for_quota_pause(adapter: &DeezerAdapter, quota_wait: Duration) {
+        for _ in 0..1000 {
+            let paused =
+                lock(&adapter.next_slot).is_some_and(|slot| slot > Instant::now() + quota_wait / 2);
+            if paused {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("the quota pause never started");
+    }
+
+    #[tokio::test]
+    async fn a_release_waiting_behind_a_quota_pause_obeys_a_cooldown_started_meanwhile() {
+        let server = MockServer::start(|target| {
+            if target.starts_with("/album/1") {
+                (200, error_json(QUOTA_EXCEEDED, "Quota limit exceeded"))
+            } else {
+                any_album_handler(target)
+            }
+        });
+        let adapter = DeezerAdapter::with_config(DeezerConfig {
+            min_interval: Duration::from_millis(150),
+            quota_wait: Duration::from_millis(300),
+            ..config(&server)
+        })
+        .unwrap();
+        // The first release spends its three attempts at 0, 300 and 600 ms and
+        // then starts the cooldown. The second asks after the third attempt
+        // has taken its slot, so it waits behind it, past the cooldown's start.
+        let first = adapter.fetch_release(ReleaseId::Deezer(1));
+        let second = async {
+            while server.request_count() < 2 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            adapter.fetch_release(ReleaseId::Deezer(2)).await
+        };
+        let (first, second) = tokio::join!(first, second);
+        assert!(
+            matches!(first, Err(ProviderError::RateLimited { .. })),
+            "{first:?}"
+        );
+        assert!(
+            matches!(second, Err(ProviderError::Unavailable { .. })),
+            "{second:?}"
+        );
+        assert_eq!(
+            server.targets(),
+            ["/album/1", "/album/1", "/album/1"],
+            "the waiting release reached the server"
         );
     }
 
@@ -1375,13 +1438,12 @@ mod tests {
         let mut released = lock(&adapter.released_at).clone();
         released.sort();
         assert_eq!(released.len(), 4);
-        // A wake-up lands a little after its slot, which can shorten the next
-        // gap by the same amount, so allow a small margin.
-        let margin = Duration::from_millis(20);
-        for pair in released.windows(2) {
+        // Measured from the first request, so that a late wake-up cannot
+        // shorten the next gap.
+        for (k, instant) in released.iter().enumerate() {
             assert!(
-                pair[1].duration_since(pair[0]) + margin >= interval,
-                "two requests started less than the interval apart"
+                instant.duration_since(released[0]) >= interval * k as u32,
+                "request {k} started less than {k} intervals after the first"
             );
         }
     }
