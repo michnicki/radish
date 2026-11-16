@@ -30,12 +30,15 @@ enum Command {
     Import {
         path: PathBuf,
         /// Match the imported directory after importing (MusicBrainz first,
-        /// then Discogs when a token is available)
+        /// then Discogs when a token is available, then Deezer with --deezer)
         #[arg(long = "match")]
         match_releases: bool,
         /// Restrict matching to one service and disable fallback
         #[arg(long, value_name = "PROVIDER", requires = "match_releases")]
         provider: Option<ProviderKind>,
+        /// Try Deezer after Discogs, over the network (with --offline too)
+        #[arg(long, requires = "match_releases", conflicts_with = "provider")]
+        deezer: bool,
         /// Read every file again, even when its modification time is unchanged
         #[arg(long)]
         rescan: bool,
@@ -75,7 +78,7 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         path: Option<PathBuf>,
     },
-    /// Match local releases against MusicBrainz, with optional Discogs fallback
+    /// Match local releases against MusicBrainz, with optional Discogs and Deezer fallbacks
     Match {
         /// Restrict matching to this directory tree
         path: Option<PathBuf>,
@@ -85,12 +88,24 @@ enum Command {
         /// Restrict matching to one service and disable fallback
         #[arg(long, value_name = "PROVIDER")]
         provider: Option<ProviderKind>,
+        /// Try Deezer after Discogs, over the network (with --offline too)
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "provider",
+                "musicbrainz_release",
+                "discogs_release",
+                "deezer_release",
+                "clear"
+            ]
+        )]
+        deezer: bool,
         /// Fetch this MusicBrainz release directly, bypassing search
         #[arg(
             long = "musicbrainz-release",
             value_name = "MBID",
             requires = "local_release",
-            conflicts_with = "discogs_release"
+            conflicts_with_all = ["discogs_release", "deezer_release"]
         )]
         musicbrainz_release: Option<String>,
         /// Fetch this Discogs release directly, bypassing search
@@ -98,9 +113,17 @@ enum Command {
             long = "discogs-release",
             value_name = "ID",
             requires = "local_release",
-            conflicts_with = "musicbrainz_release"
+            conflicts_with_all = ["musicbrainz_release", "deezer_release"]
         )]
         discogs_release: Option<u64>,
+        /// Fetch this Deezer album directly, bypassing search
+        #[arg(
+            long = "deezer-release",
+            value_name = "ID",
+            requires = "local_release",
+            conflicts_with_all = ["musicbrainz_release", "discogs_release"]
+        )]
+        deezer_release: Option<u64>,
         /// Review candidates interactively instead of accepting automatically
         #[arg(long, conflicts_with = "clear")]
         review: bool,
@@ -129,6 +152,7 @@ enum Command {
                 "provider",
                 "musicbrainz_release",
                 "discogs_release",
+                "deezer_release",
                 "review",
                 "dry_run"
             ]
@@ -152,18 +176,32 @@ enum IndexAction {
     Status,
 }
 
-fn parse_direct(musicbrainz: Option<&str>, discogs: Option<u64>) -> Result<Option<ReleaseId>> {
-    match (musicbrainz, discogs) {
-        (Some(raw), None) => {
+fn parse_direct(
+    musicbrainz: Option<&str>,
+    discogs: Option<u64>,
+    deezer: Option<u64>,
+) -> Result<Option<ReleaseId>> {
+    match (musicbrainz, discogs, deezer) {
+        (Some(raw), None, None) => {
             let id = raw
                 .parse()
                 .with_context(|| format!("'{raw}' is not a hyphenated MusicBrainz MBID"))?;
             Ok(Some(ReleaseId::MusicBrainz(id)))
         }
-        (None, Some(id)) => Ok(Some(ReleaseId::Discogs(id))),
-        (None, None) => Ok(None),
-        (Some(_), Some(_)) => bail!("choose either a MusicBrainz or a Discogs release selector"),
+        (None, Some(id), None) => Ok(Some(ReleaseId::Discogs(id))),
+        (None, None, Some(id)) => Ok(Some(ReleaseId::Deezer(id))),
+        (None, None, None) => Ok(None),
+        _ => bail!("choose one release selector: MusicBrainz, Discogs or Deezer"),
     }
+}
+
+/// The provider choices of `match` and `import --match`, read before the
+/// database is opened.
+struct Selection {
+    provider: Option<ProviderKind>,
+    direct: Option<ReleaseId>,
+    deezer: bool,
+    offline: bool,
 }
 
 /// The most releases `--offline` matches at once when `--jobs` is not given.
@@ -271,24 +309,53 @@ async fn run() -> Result<()> {
 
     // CLI validation happens before the database is opened or any client is
     // constructed, so invalid combinations never touch storage or the network.
-    let selection: Option<(Option<ProviderKind>, Option<ReleaseId>)> = match &cli.command {
+    let selection = match &cli.command {
         Command::Match {
             provider,
             musicbrainz_release,
             discogs_release,
+            deezer_release,
+            deezer,
+            offline,
             ..
-        } => Some((
-            *provider,
-            parse_direct(musicbrainz_release.as_deref(), *discogs_release)?,
-        )),
-        Command::Import { provider, .. } => Some((*provider, None)),
+        } => Some(Selection {
+            provider: *provider,
+            direct: parse_direct(
+                musicbrainz_release.as_deref(),
+                *discogs_release,
+                *deezer_release,
+            )?,
+            deezer: *deezer,
+            offline: *offline,
+        }),
+        Command::Import {
+            provider,
+            deezer,
+            offline,
+            ..
+        } => Some(Selection {
+            provider: *provider,
+            direct: None,
+            deezer: *deezer,
+            offline: *offline,
+        }),
         _ => None,
     };
     let policy = match &selection {
-        Some((provider, direct)) => Some(runner::resolve_policy(*provider, direct.as_ref())?),
+        Some(selection) => {
+            let policy = runner::resolve_policy(
+                selection.provider,
+                selection.direct.as_ref(),
+                selection.deezer,
+            )?;
+            if selection.offline {
+                runner::check_offline(policy)?;
+            }
+            Some(policy)
+        }
         None => None,
     };
-    let direct = selection.and_then(|(_, direct)| direct);
+    let direct = selection.and_then(|selection| selection.direct);
 
     let pool = db::connect(&cli.db).await?;
 
@@ -297,6 +364,7 @@ async fn run() -> Result<()> {
             path,
             match_releases,
             provider: _,
+            deezer: _,
             rescan,
             offline,
             jobs,
@@ -342,8 +410,10 @@ async fn run() -> Result<()> {
             path,
             local_release,
             provider: _,
+            deezer: _,
             musicbrainz_release: _,
             discogs_release: _,
+            deezer_release: _,
             review,
             dry_run,
             offline,
@@ -622,6 +692,7 @@ mod tests {
         assert!(parse(&["match", "--provider", "spotify"]).is_err());
         assert!(parse(&["match", "--provider", "musicbrainz"]).is_ok());
         assert!(parse(&["match", "--provider", "discogs"]).is_ok());
+        assert!(parse(&["match", "--provider", "deezer"]).is_ok());
     }
 
     #[test]
@@ -740,7 +811,7 @@ mod tests {
                 musicbrainz_release,
                 discogs_release,
                 ..
-            } => parse_direct(musicbrainz_release.as_deref(), discogs_release),
+            } => parse_direct(musicbrainz_release.as_deref(), discogs_release, None),
             _ => panic!("expected match"),
         };
         assert!(selection.is_err());
@@ -896,6 +967,87 @@ mod tests {
     fn contradictory_provider_and_direct_id_is_rejected() {
         let id: ReleaseId =
             ReleaseId::MusicBrainz("76df3287-6cda-33eb-8e9a-044b5e15ffdd".parse().unwrap());
-        assert!(runner::resolve_policy(Some(ProviderKind::Discogs), Some(&id)).is_err());
+        assert!(runner::resolve_policy(Some(ProviderKind::Discogs), Some(&id), false).is_err());
+    }
+
+    #[test]
+    fn deezer_joins_match_and_import_match_but_no_explicit_selection() {
+        let cli = parse(&["match", "--deezer", "--offline"]).unwrap();
+        match cli.command {
+            Command::Match {
+                deezer, offline, ..
+            } => assert!(deezer && offline),
+            _ => panic!("expected match"),
+        }
+        assert!(parse(&["import", "/music", "--match", "--deezer"]).is_ok());
+        assert!(parse(&["import", "/music", "--deezer"]).is_err());
+        for conflict in [
+            &["--provider", "discogs"][..],
+            &["--clear", "3"],
+            &["--local-release", "3", "--discogs-release", "42"],
+            &["--local-release", "3", "--deezer-release", "302127"],
+        ] {
+            let mut args = vec!["match", "--deezer"];
+            args.extend_from_slice(conflict);
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+        assert!(
+            parse(&[
+                "import",
+                "/music",
+                "--match",
+                "--deezer",
+                "--provider",
+                "musicbrainz"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn deezer_release_is_a_direct_selector() {
+        assert!(parse(&["match", "--deezer-release", "302127"]).is_err());
+        assert!(
+            parse(&[
+                "match",
+                "--local-release",
+                "3",
+                "--deezer-release",
+                "302127"
+            ])
+            .is_ok()
+        );
+        assert!(parse(&["match", "--local-release", "3", "--deezer-release", "x"]).is_err());
+        for other in [
+            &["--discogs-release", "42"][..],
+            &[
+                "--musicbrainz-release",
+                "76df3287-6cda-33eb-8e9a-044b5e15ffdd",
+            ],
+        ] {
+            let mut args = vec!["match", "--local-release", "3", "--deezer-release", "1"];
+            args.extend_from_slice(other);
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+        assert!(parse(&["match", "--clear", "3", "--deezer-release", "1"]).is_err());
+        assert_eq!(
+            parse_direct(None, None, Some(302127)).unwrap(),
+            Some(ReleaseId::Deezer(302127))
+        );
+        assert!(parse_direct(None, Some(42), Some(302127)).is_err());
+    }
+
+    #[test]
+    fn deezer_alone_is_a_network_run() {
+        assert!(parse(&["match", "--provider", "deezer"]).is_ok());
+        let only = runner::resolve_policy(Some(ProviderKind::Deezer), None, false).unwrap();
+        assert!(runner::check_offline(only).is_err());
+        let direct = runner::resolve_policy(None, Some(&ReleaseId::Deezer(1)), false).unwrap();
+        assert!(runner::check_offline(direct).is_err());
+        let chain = runner::resolve_policy(None, None, true).unwrap();
+        assert!(runner::check_offline(chain).is_ok());
+        let musicbrainz =
+            runner::resolve_policy(Some(ProviderKind::MusicBrainz), None, false).unwrap();
+        assert!(runner::check_offline(musicbrainz).is_ok());
     }
 }

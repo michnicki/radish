@@ -188,7 +188,7 @@ impl fmt::Display for ProviderKind {
 
 impl clap::ValueEnum for ProviderKind {
     fn value_variants<'a>() -> &'a [Self] {
-        &[Self::Discogs, Self::MusicBrainz]
+        &[Self::Discogs, Self::MusicBrainz, Self::Deezer]
     }
 
     fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {

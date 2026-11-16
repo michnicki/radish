@@ -268,15 +268,28 @@ enum ReviewOutcome {
     Quit,
 }
 
-/// Resolves the CLI selection into a provider policy. A direct release selector
-/// implies its provider; a contradictory explicit provider is rejected before
-/// any database or network work.
+/// Resolves the CLI selection into a provider policy.
+///
+/// A direct release selector implies its provider. `deezer` adds Deezer to the
+/// default chain.
+///
+/// # Errors
+///
+/// When an explicit provider contradicts a direct selector, or `deezer` comes
+/// with either: both select one service. Checked before any database or
+/// network work.
 pub fn resolve_policy(
     explicit: Option<ProviderKind>,
     direct: Option<&ReleaseId>,
+    deezer: bool,
 ) -> Result<ProviderPolicy> {
     match (explicit, direct) {
-        (None, None) => Ok(ProviderPolicy::default()),
+        (None, None) => Ok(ProviderPolicy::Chain { deezer }),
+        _ if deezer => {
+            bail!(
+                "--deezer adds Deezer to the default chain; it cannot be combined with a selected provider or release"
+            )
+        }
         (None, Some(id)) => Ok(ProviderPolicy::Only(id.provider())),
         (Some(provider), None) => Ok(ProviderPolicy::Only(provider)),
         (Some(provider), Some(id)) if provider == id.provider() => {
@@ -287,6 +300,24 @@ pub fn resolve_policy(
             id.provider()
         ),
     }
+}
+
+/// Rejects an `--offline` run whose policy is Deezer alone.
+///
+/// Deezer has no dump index, so `--provider deezer` and `--deezer-release`
+/// always use the network; `--offline --deezer` keeps the indexes for
+/// MusicBrainz and Discogs and adds Deezer after them.
+///
+/// # Errors
+///
+/// For [`ProviderPolicy::Only`] Deezer.
+pub fn check_offline(policy: ProviderPolicy) -> Result<()> {
+    if policy == ProviderPolicy::Only(ProviderKind::Deezer) {
+        bail!(
+            "--offline cannot match with Deezer alone: Deezer has no local index (drop --offline, or use --offline --deezer)"
+        );
+    }
+    Ok(())
 }
 
 /// One provider's discovery and evaluation, with its own evidence and errors.
@@ -2492,26 +2523,32 @@ mod tests {
     fn defaults_to_musicbrainz_then_discogs_and_explicit_selectors_disable_fallback() {
         let id = ReleaseId::MusicBrainz(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"));
         assert_eq!(
-            resolve_policy(None, None).unwrap(),
+            resolve_policy(None, None, false).unwrap(),
             ProviderPolicy::Chain { deezer: false }
         );
         assert_eq!(
-            resolve_policy(None, Some(&id)).unwrap(),
+            resolve_policy(None, Some(&id), false).unwrap(),
             ProviderPolicy::Only(ProviderKind::MusicBrainz)
         );
         assert_eq!(
-            resolve_policy(Some(ProviderKind::Discogs), None).unwrap(),
+            resolve_policy(Some(ProviderKind::Discogs), None, false).unwrap(),
             ProviderPolicy::Only(ProviderKind::Discogs)
         );
         assert_eq!(
-            resolve_policy(Some(ProviderKind::MusicBrainz), None).unwrap(),
+            resolve_policy(Some(ProviderKind::MusicBrainz), None, false).unwrap(),
             ProviderPolicy::Only(ProviderKind::MusicBrainz)
         );
         assert_eq!(
-            resolve_policy(None, Some(&ReleaseId::Discogs(42))).unwrap(),
+            resolve_policy(None, Some(&ReleaseId::Discogs(42)), false).unwrap(),
             ProviderPolicy::Only(ProviderKind::Discogs)
         );
-        assert!(resolve_policy(Some(ProviderKind::Discogs), Some(&id)).is_err());
+        assert!(resolve_policy(Some(ProviderKind::Discogs), Some(&id), false).is_err());
+        assert_eq!(
+            resolve_policy(None, None, true).unwrap(),
+            ProviderPolicy::Chain { deezer: true }
+        );
+        assert!(resolve_policy(Some(ProviderKind::Discogs), None, true).is_err());
+        assert!(resolve_policy(None, Some(&id), true).is_err());
     }
 
     fn album_fixture() -> (LocalRelease, RemoteRelease) {
