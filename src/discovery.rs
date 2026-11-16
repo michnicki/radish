@@ -216,10 +216,10 @@ fn directory_disagreement(split: scene::SceneSplit, view: &LocalRelease) -> Disa
     }
 }
 
-/// A text as the tags and a directory name must share it to be the same.
+/// Lowercases `text` and collapses its whitespace, keeping punctuation.
 ///
-/// Trimmed, with whitespace runs collapsed and lowercased, and nothing else:
-/// punctuation, brackets, `&` and `and` all count.
+/// Two texts are the same for [`directory_adds_anything`] when these are equal:
+/// brackets, `&` and `and` all count.
 fn plain_text(text: &str) -> String {
     text.split_whitespace()
         .collect::<Vec<_>>()
@@ -236,8 +236,8 @@ fn plain_text(text: &str) -> String {
 /// Artists tag over a single artist's name leave something for the directory
 /// to add.
 ///
-/// Matching reads the directory name only when this is true, so it is strict
-/// where [`directory_search`] is lenient. A name that differs only in
+/// An automatic match reads the directory name only when this is true, so it is
+/// strict (`--review` and a direct selection always read it), where [`directory_search`] is lenient. A name that differs only in
 /// punctuation or brackets (`Cult White Edition` against `Cult (White
 /// Edition)`) searches the same but can still score differently, so it counts
 /// here. The search asks whether a new search would find anything; this asks
@@ -249,9 +249,17 @@ pub(crate) fn directory_adds_anything(local: &LocalRelease) -> bool {
     if matcher::tag_identity(local).title.is_none() || !artist_tag_usable(local) {
         return true;
     }
-    let (Some(tag_title), Some(tag_artist)) =
-        (local.album_title.as_deref(), local.album_artist.as_deref())
-    else {
+    let usable = local
+        .album_title
+        .as_deref()
+        .filter(|_| matcher::tag_identity(local).title.is_some())
+        .zip(
+            local
+                .album_artist
+                .as_deref()
+                .filter(|_| artist_tag_usable(local)),
+        );
+    let Some((tag_title, tag_artist)) = usable else {
         return true;
     };
     let Some(artist) = split.credited_artist() else {
@@ -1611,6 +1619,9 @@ mod tests {
         let mut various = tagged_in("/mp3/VA-Blue-2001-GRP", "Blue", "Various Artists");
         various.artist_kind = ArtistKind::VariousArtists;
         assert!(!directory_adds_anything(&various));
+        // A name with no title repeats the artist and has nothing else to add.
+        let titleless = tagged_in("/mp3/Fazed-EP-VLS-DE-2000-GRP", "X", "Fazed");
+        assert!(!directory_adds_anything(&titleless));
         // A name that is not read, or not allowed to be, adds nothing either.
         assert!(!directory_adds_anything(&tagged_in(
             "/music/blue",
@@ -1675,6 +1686,9 @@ mod tests {
         let mut missing = tagged_in("/mp3/Test_Artist-Blue-2001-GRP", "Blue", "Test Artist");
         missing.album_artist = None;
         assert!(directory_adds_anything(&missing));
+        let mut untitled = tagged_in("/mp3/Test_Artist-Blue-2001-GRP", "Blue", "Test Artist");
+        untitled.album_title = None;
+        assert!(directory_adds_anything(&untitled));
         // A Various Artists tag over one artist's name.
         let mut various = tagged_in("/mp3/Test_Artist-Blue-2001-GRP", "Blue", "Various Artists");
         various.artist_kind = ArtistKind::VariousArtists;

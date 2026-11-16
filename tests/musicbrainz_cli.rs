@@ -755,12 +755,11 @@ async fn a_dry_run_reads_the_directory_name_under_the_same_two_passes() {
     pool.close().await;
 }
 
-/// Matches six files of `Blue` by `Test Artist` in `directory`, which nothing
-/// in the provider answers to.
+/// Matches six files of `Blue` by `artist` in `directory`; nothing answers.
 ///
-/// Returns whether the run printed the second-pass note, whether it printed a
-/// directory reading, and how many MusicBrainz searches it made.
-async fn unmatched_run(directory: &str, name: &str) -> (bool, bool, usize) {
+/// Returns whether the run printed the pass note, and how many MusicBrainz
+/// searches it made.
+async fn unmatched_run(directory: &str, artist: &str, name: &str) -> (bool, usize) {
     let server = MockServer::start(|target: &str| {
         if target.contains("/ws/2/release") {
             (200, musicbrainz_empty_search())
@@ -773,30 +772,35 @@ async fn unmatched_run(directory: &str, name: &str) -> (bool, bool, usize) {
         }
     });
     let db = db_path(name);
-    seed_blue(&db, directory, "Test Artist").await;
+    seed_blue(&db, directory, artist).await;
     let output = run(&db, &server, &["match"]);
     let text = stdout(&output);
     assert!(output.status.success(), "{output:?}");
     assert!(text.contains("Unmatched: 1"), "{text}");
     (
         text.contains(DIRECTORY_PASS_NOTE),
-        text.contains("read from the directory name"),
         server.requests_matching("/ws/2/release?query"),
     )
 }
 
 #[tokio::test]
 async fn a_directory_that_only_repeats_the_tags_is_matched_on_the_tags_alone() {
-    let (note, read, repeated) = unmatched_run("/mp3/Test_Artist-Blue-2001-GRP", "mb-repeat").await;
+    let repeats = "/mp3/Test_Artist-Blue-2001-GRP";
+    let (note, repeated) = unmatched_run(repeats, "Test Artist", "mb-repeat").await;
     assert!(!note);
-    assert!(!read);
-    let (note, _, longer) = unmatched_run(
+    let (note, longer) = unmatched_run(
         "/mp3/Test_Artist-Blue_Special_Edition_Box-2001-GRP",
+        "Test Artist",
         "mb-longer",
     )
     .await;
     assert!(note);
     assert!(longer > repeated, "{longer} searches against {repeated}");
+
+    // A hyphen in the tag is punctuation the search ignores but scoring may
+    // not, so the name still gets its second pass.
+    let (note, _) = unmatched_run(repeats, "Test-Artist", "mb-hyphen").await;
+    assert!(note);
 }
 
 #[tokio::test]

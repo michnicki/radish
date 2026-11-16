@@ -928,10 +928,14 @@ fn settlement(
 /// tags alone. `--review` and a direct selection run once with the directory
 /// name.
 ///
+/// A first pass that ends the release early ([`Gathered::Ended`], such as a
+/// stale Discogs match with no token) ends it there, with no second pass.
+///
 /// # Errors
 ///
-/// Only when the release's stored state cannot be written; provider failures
-/// are reported in the transcript and decided as [`Outcome::Failed`].
+/// When the release's stored state cannot be written, or an interactive
+/// `--review` prompt fails to read or write. Provider failures are reported in
+/// the transcript and decided as [`Outcome::Failed`].
 #[expect(
     clippy::too_many_arguments,
     reason = "one release's whole decision; the arguments have no natural grouping"
