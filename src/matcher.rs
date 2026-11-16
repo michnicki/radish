@@ -1728,7 +1728,7 @@ fn reduce_album_title_with(text: &str, keep_companions: bool) -> Option<String> 
 }
 
 /// [`reduce_album_title_with`] dropping every companion word the run allows.
-fn reduce_album_title(text: &str) -> Option<String> {
+pub(crate) fn reduce_album_title(text: &str) -> Option<String> {
     reduce_album_title_with(text, false)
 }
 

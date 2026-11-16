@@ -493,10 +493,73 @@ fn strategies_for_view(
                 ));
             }
         }
-        ProviderKind::Deezer => {}
+        ProviderKind::Deezer => {
+            // Deezer's search is free text, where a decoration word the album
+            // title on Deezer lacks (`EP`, `CDS`, `Vinyl`) pushes the album off
+            // the one page read, so titles are searched without it.
+            let reduce = |title: &str| {
+                matcher::reduce_album_title(title).unwrap_or_else(|| title.to_string())
+            };
+            // No artist for Various Artists or a junk or missing artist tag:
+            // the adapter then searches the title alone.
+            let artist = matcher::tag_identity(local).artist;
+            let searched = title.as_deref().map(reduce);
+            if let Some(barcode) = barcode {
+                strategies.push((
+                    "barcode".to_string(),
+                    SearchStrategy::Barcode(barcode.to_string()),
+                ));
+            }
+            if let Some(title) = &searched {
+                strategies.push((
+                    "title and artist".to_string(),
+                    SearchStrategy::TitleArtist {
+                        title: title.clone(),
+                        artist: artist.clone(),
+                        release_group: None,
+                    },
+                ));
+            }
+            if let Some(directory) = directory {
+                strategies.push((
+                    DIRECTORY_LABEL.to_string(),
+                    SearchStrategy::TitleArtist {
+                        title: reduce(&directory.title),
+                        artist: Some(directory.artist.clone()),
+                        release_group: None,
+                    },
+                ));
+            }
+            // The tag as written, when the search above used something else;
+            // the last search, so the budget drops it first.
+            if let Some(tag) = local
+                .album_title
+                .as_deref()
+                .map(str::trim)
+                .filter(|tag| !tag.is_empty() && searched.as_deref() != Some(*tag))
+            {
+                strategies.push((
+                    "title as tagged".to_string(),
+                    SearchStrategy::TitleArtist {
+                        title: tag.to_string(),
+                        artist,
+                        release_group: None,
+                    },
+                ));
+            }
+        }
     }
 
     strategies
+}
+
+/// Whether `provider` can search by catalog number. Where it cannot, a
+/// catalog number tag is no identifier its searches could complete.
+fn has_catalog_search(provider: ProviderKind) -> bool {
+    match provider {
+        ProviderKind::MusicBrainz | ProviderKind::Discogs => true,
+        ProviderKind::Deezer => false,
+    }
 }
 
 fn embedded_release_id(provider: ProviderKind, local: &LocalRelease) -> Option<ReleaseId> {
@@ -624,7 +687,8 @@ pub async fn discover<P: MetadataProvider>(
 
     let mut summaries: HashMap<ReleaseId, SearchSummary> = HashMap::new();
     let mut identifier_ids: HashSet<ReleaseId> = HashSet::new();
-    let identifier_applicable = local.barcode.is_some() || local.catalog_number.is_some();
+    let identifier_applicable = local.barcode.is_some()
+        || (local.catalog_number.is_some() && has_catalog_search(provider_kind));
     let mut identifier_attempted = false;
     let mut identifier_complete = identifier_applicable;
     let mut outcomes: Vec<StrategyOutcome> = Vec::new();
@@ -2240,5 +2304,105 @@ mod tests {
         // The ranking is made once per release.
         let identity = matcher::rank_identity(&local);
         assert_eq!(identity.rank(&local, &named), rank(&named));
+    }
+
+    #[test]
+    fn deezer_searches_the_barcode_then_the_title_without_its_decoration() {
+        let mut local = local();
+        local.album_title = Some("Strange EP".to_string());
+        local.catalog_number = Some("CAT-1".to_string());
+        let strategies = strategies_for(ProviderKind::Deezer, &local);
+        let labels: Vec<&str> = strategies.iter().map(|(label, _)| label.as_str()).collect();
+        // No catalog number search: Deezer has none.
+        assert_eq!(labels, ["barcode", "title and artist", "title as tagged"]);
+        assert_eq!(
+            strategies[0].1,
+            SearchStrategy::Barcode("0123456789012".to_string())
+        );
+        assert_eq!(
+            title_and_artist(ProviderKind::Deezer, &local),
+            vec![
+                search("title and artist", "Strange", Some("Test Artist")),
+                search("title as tagged", "Strange EP", Some("Test Artist")),
+            ]
+        );
+        // A title with nothing to drop is searched once.
+        assert_eq!(
+            title_and_artist(
+                ProviderKind::Deezer,
+                &tagged_in("/music/blue", "Blue", "Test Artist")
+            ),
+            vec![search("title and artist", "Blue", Some("Test Artist"))]
+        );
+    }
+
+    #[test]
+    fn deezer_searches_a_various_artists_or_unknown_artist_release_by_title_alone() {
+        let mut various = local();
+        various.album_title = Some("Hits 2001".to_string());
+        various.album_artist = Some("Various Artists".to_string());
+        various.artist_kind = ArtistKind::VariousArtists;
+        assert_eq!(
+            title_and_artist(ProviderKind::Deezer, &various),
+            vec![search("title and artist", "Hits 2001", None)]
+        );
+        let mut unknown = local();
+        unknown.album_artist = Some("Unknown Artist".to_string());
+        assert_eq!(
+            title_and_artist(ProviderKind::Deezer, &unknown),
+            vec![search("title and artist", "Blue", None)]
+        );
+    }
+
+    #[test]
+    fn deezer_searches_with_the_directory_name_too() {
+        // An untagged release searches with what the directory reads.
+        assert_eq!(
+            title_and_artist(ProviderKind::Deezer, &untagged()),
+            vec![search("title and artist", "Broken", Some("Straight Faced"))]
+        );
+        // A directory naming another artist adds its own search.
+        let other = tagged_in("/mp3/Other_Artist-Blue-2001-GRP", "Blue", "Test Artist");
+        assert_eq!(
+            title_and_artist(ProviderKind::Deezer, &other),
+            vec![
+                search("title and artist", "Blue", Some("Test Artist")),
+                search("directory name", "Blue", Some("Other Artist")),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_catalog_number_alone_is_no_identifier_for_deezer() {
+        let mut local = local();
+        local.barcode = None;
+        local.catalog_number = Some("CAT-1".to_string());
+        let id = "11111111-1111-1111-1111-111111111111";
+        let mut hit = summary(id);
+        hit.id = ReleaseId::Deezer(302127);
+        hit.barcodes.clear();
+        let mut release = remote(id);
+        release.id = ReleaseId::Deezer(302127);
+        release.barcodes.clear();
+        let provider = FakeProvider::new(
+            ProviderKind::Deezer,
+            vec![Ok(SearchPage {
+                hits: vec![hit],
+                total: Some(1),
+                next_offset: None,
+            })],
+            vec![Ok(release)],
+        );
+
+        let result = discover(&provider, &local, None).await.unwrap();
+        let evidence = &result.evidence[&ReleaseId::Deezer(302127)];
+        assert!(!evidence.identifier_search_truncated);
+        assert!(evidence.blockers.is_empty(), "{:?}", evidence.blockers);
+        assert_eq!(
+            provider.calls.lock().unwrap().first().map(String::as_str),
+            Some(
+                "search:TitleArtist { title: \"Blue\", artist: Some(\"Test Artist\"), release_group: None }@0"
+            )
+        );
     }
 }
