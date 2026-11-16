@@ -2,11 +2,11 @@
 
 ## Project Structure & Module Organization
 
-Radish is a Rust 2024 CLI for music library management. It indexes audio tags into SQLite and, when asked, matches local releases against MusicBrainz, with an optional Discogs fallback. All logic lives in the library crate (`src/lib.rs`); `src/main.rs` holds the Clap commands, `.env` loading, and output formatting. Keep changes in the module that owns the behavior:
+Radish is a Rust 2024 CLI for music library management. It indexes audio tags into SQLite and, when asked, matches local releases against MusicBrainz, with optional Discogs and Deezer fallbacks. All logic lives in the library crate (`src/lib.rs`); `src/main.rs` holds the Clap commands, `.env` loading, and output formatting. Keep changes in the module that owns the behavior:
 
 - `scanner.rs` reads tags with Lofty. `importer.rs` is the one import pipeline, used by both `import` and the watcher. `watcher.rs` handles Notify events.
 - `store.rs` contains all SQL queries. `db.rs` opens connections and applies the baseline `src/schema.sql` and then the SQLx migrations in `migrations/`.
-- `providers.rs` defines the `MetadataProvider` trait and typed IDs. `musicbrainz.rs` and `discogs.rs` are the provider adapters. `discovery.rs` runs bounded candidate searches. `matcher.rs` holds pure mapping, scoring, and acceptance logic. `runner.rs` orchestrates matching and the interactive review.
+- `providers.rs` defines the `MetadataProvider` trait and typed IDs. `musicbrainz.rs`, `discogs.rs` and `deezer.rs` are the provider adapters. `discovery.rs` runs bounded candidate searches. `matcher.rs` holds pure mapping, scoring, and acceptance logic. `runner.rs` orchestrates matching and the interactive review.
 - `index/` builds and reads the local provider indexes used by `--offline`: `copy.rs` reads MusicBrainz dump tables, `musicbrainz.rs` and `discogs.rs` are the builders, `writer.rs` owns the index schema and atomic publish, `local.rs` implements `MetadataProvider` over the index, and `cli.rs` implements `index build` and `index status`.
 - `output.rs` handles stdout writes and text escaping; `progress.rs` shows terminal progress.
 
