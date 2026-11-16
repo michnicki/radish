@@ -56,6 +56,18 @@ async fn seed_tracks(
     titles: &[&str],
     durations: &[f64],
 ) -> i64 {
+    seed_tracks_with_barcode(db, directory, album, year, titles, durations, None).await
+}
+
+async fn seed_tracks_with_barcode(
+    db: &Path,
+    directory: &str,
+    album: &str,
+    year: i64,
+    titles: &[&str],
+    durations: &[f64],
+    barcode: Option<&str>,
+) -> i64 {
     let pool = radish::db::connect(db).await.unwrap();
     let directory = Path::new(directory);
     let directory_id = store::upsert_directory(&pool, directory).await.unwrap();
@@ -71,7 +83,7 @@ async fn seed_tracks(
             year: Some(year),
             track_number: Some(number),
             disc_number: None,
-            barcode: None,
+            barcode: barcode.map(str::to_string),
             catalog_number: None,
             discogs_release_id: None,
             musicbrainz: ObservedMusicBrainzIds::default(),
@@ -1091,6 +1103,39 @@ async fn match_with_deezer_accepts_an_album_neither_earlier_stage_has() {
 
     let releases = stdout(&run(&db, &server, &["releases"], None));
     assert!(releases.contains("deezer"), "{releases}");
+}
+
+#[tokio::test]
+async fn a_junk_barcode_tag_is_a_miss_on_deezer_not_a_failure() {
+    let db = db_path("deezer-junk-barcode");
+    // A barcode tag that reads `ARCODE` has no digits to look up.
+    seed_tracks_with_barcode(
+        &db,
+        "/music/blue",
+        "Blue",
+        2001,
+        &["Track 1", "Track 2"],
+        &[181.0, 182.0],
+        Some("ARCODE"),
+    )
+    .await;
+    let server = MockServer::start(deezer_handler);
+
+    let output = run(&db, &server, &["match", "--deezer"], None);
+    assert!(output.status.success(), "{output:?}");
+    let text = format!(
+        "{}{}",
+        stdout(&output),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!text.contains("failed permanently"), "{text}");
+    assert!(!text.contains("Failed: 1"), "{text}");
+    // No barcode request was made, and the title search still found the album.
+    assert_eq!(server.requests_matching("/album/upc:"), 0);
+    assert!(
+        text.contains("accepted deezer release deezer 302127"),
+        "{text}"
+    );
 }
 
 #[tokio::test]

@@ -341,8 +341,10 @@ impl DeezerAdapter {
     /// `/album/upc:{digits}`, as a page of zero or one hit.
     async fn search_barcode(&self, barcode: &str) -> Result<SearchPage, ProviderError> {
         let digits = normalize_barcode(barcode);
+        // A tag with no digits (`ARCODE`) cannot name an album: a miss, as the
+        // local index reads it, never a failure of the whole stage.
         if digits.is_empty() {
-            return Err(empty_search());
+            return Ok(no_hits());
         }
         let key = format!("upc:{digits}");
         if let Some(cached) = lock(&self.search_cache).get(&key) {
@@ -392,11 +394,7 @@ impl DeezerAdapter {
             .append_pair("index", &request.offset.to_string());
         let page = match self.get_json(url).await? {
             Some(value) => decode_search_page(&value, request.offset),
-            None => SearchPage {
-                hits: Vec::new(),
-                total: Some(0),
-                next_offset: None,
-            },
+            None => no_hits(),
         };
         lock(&self.search_cache).insert(key, page.clone());
         Ok(page)
@@ -451,7 +449,12 @@ impl MetadataProvider for DeezerAdapter {
     async fn search(&self, request: SearchRequest) -> Result<SearchPage, ProviderError> {
         match &request.strategy {
             SearchStrategy::Barcode(barcode) => self.search_barcode(barcode).await,
-            SearchStrategy::TitleArtist { title, artist, .. } if !title.trim().is_empty() => {
+            SearchStrategy::TitleArtist { title, artist, .. } => {
+                // Without a title there is nothing to look for, whatever the
+                // artist says.
+                if title.trim().is_empty() {
+                    return Ok(no_hits());
+                }
                 let query = query_text(title, artist.as_deref());
                 self.search_text(&query, &request).await
             }
@@ -460,7 +463,6 @@ impl MetadataProvider for DeezerAdapter {
                 status: None,
                 message: "Deezer has no catalog number search".to_string(),
             }),
-            SearchStrategy::TitleArtist { .. } => Err(empty_search()),
         }
     }
 
@@ -476,11 +478,12 @@ impl MetadataProvider for DeezerAdapter {
     }
 }
 
-fn empty_search() -> ProviderError {
-    ProviderError::Permanent {
-        provider: ProviderKind::Deezer,
-        status: None,
-        message: "refusing an unusable empty search term".to_string(),
+/// A page with no hits, for a search that cannot match or finds nothing.
+fn no_hits() -> SearchPage {
+    SearchPage {
+        hits: Vec::new(),
+        total: Some(0),
+        next_offset: None,
     }
 }
 
@@ -1175,6 +1178,50 @@ mod tests {
                 ("index".to_string(), "0".to_string()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_barcode_without_digits_is_a_miss_without_a_request() {
+        let server = MockServer::start(album_handler);
+        let adapter = adapter(&server);
+        for barcode in ["ARCODE", "  ", "-"] {
+            let page = adapter
+                .search(SearchRequest {
+                    strategy: SearchStrategy::Barcode(barcode.to_string()),
+                    offset: 0,
+                    limit: 25,
+                })
+                .await
+                .unwrap_or_else(|error| panic!("{barcode:?}: {error}"));
+            assert!(page.hits.is_empty(), "{barcode:?}");
+            assert_eq!(page.total, Some(0));
+            assert_eq!(page.next_offset, None);
+        }
+        assert_eq!(server.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_blank_title_is_a_miss_without_a_request() {
+        let server = MockServer::start(album_handler);
+        let adapter = adapter(&server);
+        for (title, artist) in [("", None), ("   ", Some("Daft Punk")), ("", Some("VA"))] {
+            let page = adapter
+                .search(SearchRequest {
+                    strategy: SearchStrategy::TitleArtist {
+                        title: title.to_string(),
+                        artist: artist.map(str::to_string),
+                        release_group: None,
+                    },
+                    offset: 0,
+                    limit: 25,
+                })
+                .await
+                .unwrap_or_else(|error| panic!("{title:?}: {error}"));
+            assert!(page.hits.is_empty(), "{title:?}");
+            assert_eq!(page.total, Some(0));
+            assert_eq!(page.next_offset, None);
+        }
+        assert_eq!(server.request_count(), 0);
     }
 
     #[tokio::test]
