@@ -1033,6 +1033,8 @@ where
 {
     let mut attempts: Vec<ProviderAttempt> = Vec::new();
     let mut fallback_skip: Option<String> = None;
+    // The attempt whose rejected credential switched Discogs off, if any.
+    let mut switched_off: Option<usize> = None;
 
     let order = policy.order();
     for (index, provider) in order.iter().copied().enumerate() {
@@ -1117,6 +1119,7 @@ where
                 // A rejected credential rejects every later release too.
                 if let Some(error) = attempt.error.as_ref().filter(|error| error.is_auth()) {
                     clients.disable_discogs(error.clone());
+                    switched_off = Some(attempts.len());
                     notice_to!(transcript, "  Disabling Discogs for the rest of this run");
                 }
                 attempts.push(attempt);
@@ -1124,21 +1127,24 @@ where
         }
     }
 
-    for attempt in &attempts {
+    // An explicit Discogs policy records a disabled Discogs as a failed attempt
+    // with the same error, so a later pass reports it again by itself.
+    let reported_again = policy.is_explicit() && !refreshing;
+    for (index, attempt) in attempts.iter().enumerate() {
         print_promotion(attempt, transcript);
         for note in &attempt.notes {
             eprintln_to!(transcript, "  note ({}): {}", attempt.provider, Clean(note));
         }
         if let Some(error) = &attempt.error {
-            // The error that switched Discogs off is not seen again: the next
-            // pass finds Discogs disabled and makes no attempt.
-            let run_wide = attempt.provider == ProviderKind::Discogs && error.is_auth();
+            // Only the error that switched Discogs off can be a notice, so a
+            // discarded pass still owes it to the run. Any other attempt, and
+            // the copy a later pass makes of this one, is an ordinary line.
             let line = format_args!(
                 "  {} stage error: {}",
                 attempt.provider,
                 Clean(&error.to_string())
             );
-            if run_wide {
+            if switched_off == Some(index) && !reported_again {
                 transcript.notice(line);
             } else {
                 transcript.err(line);

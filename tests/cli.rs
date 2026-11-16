@@ -785,6 +785,71 @@ async fn an_explicit_discogs_run_fails_every_release_after_a_rejected_token() {
     assert_eq!(server.requests_matching("/database/search"), 1, "{text}");
 }
 
+/// Two releases tagged `Blue` by `Test Artist` in scene directories that name
+/// another artist, so each is matched in two passes.
+async fn seed_two_scene_directories(db: &Path) {
+    seed_directory(db, "/mp3/Other_Artist-Blue-2001-GRP", 2001).await;
+    seed_directory(db, "/mp3/Another_Artist-Blue-2001-GRP", 2001).await;
+}
+
+fn rejecting_discogs(target: &str) -> (u16, String) {
+    if target.contains("/database/search") || target.contains("/releases/") {
+        return (401, r#"{"message":"Invalid consumer token."}"#.into());
+    }
+    handler(target)
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+#[tokio::test]
+async fn a_rejected_token_is_reported_once_even_when_releases_are_matched_twice() {
+    let db = db_path("discogs-explicit-token-rejected-two-pass");
+    seed_two_scene_directories(&db).await;
+    let server = MockServer::start(rejecting_discogs);
+
+    let output = run(
+        &db,
+        &server,
+        &["match", "--provider", "discogs"],
+        Some("rejected-token"),
+    );
+
+    assert!(!output.status.success(), "{output:?}");
+    let (text, errors) = (stdout(&output), stderr(&output));
+    assert!(text.contains("Failed: 2"), "{text}");
+    assert_eq!(
+        errors
+            .matches("Disabling Discogs for the rest of this run")
+            .count(),
+        1,
+        "{errors}"
+    );
+    assert_eq!(errors.matches("discogs stage error").count(), 2, "{errors}");
+}
+
+#[tokio::test]
+async fn a_rejected_fallback_token_switches_discogs_off_once_across_passes() {
+    let db = db_path("discogs-fallback-token-rejected-two-pass");
+    seed_two_scene_directories(&db).await;
+    let server = MockServer::start(rejecting_discogs);
+
+    let output = run(&db, &server, &["match"], Some("rejected-token"));
+
+    let errors = stderr(&output);
+    assert_eq!(
+        errors
+            .matches("Disabling Discogs for the rest of this run")
+            .count(),
+        1,
+        "{errors}"
+    );
+    assert_eq!(server.requests_matching("/database/search"), 1, "{errors}");
+    // The error that switched Discogs off is kept from the discarded pass.
+    assert_eq!(errors.matches("discogs stage error").count(), 1, "{errors}");
+}
+
 #[tokio::test]
 async fn a_stale_refresh_after_a_rejected_token_is_skipped_not_called_unmatched() {
     let db = db_path("stale-refresh-token-rejected");
