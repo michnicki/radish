@@ -288,7 +288,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(applied, 8);
+        assert_eq!(applied, 9);
     }
 
     /// A database migrated up to and including the album-matching migration.
@@ -654,6 +654,200 @@ mod tests {
             plan.iter().all(|step| !step.starts_with("SCAN")),
             "{plan:?}"
         );
+    }
+
+    /// The migration before Deezer joined the provider CHECKs.
+    const BEFORE_DEEZER: i64 = 20261115000000;
+
+    /// A database migrated up to [`BEFORE_DEEZER`], through sqlx's migrator,
+    /// holding an accepted match with an ALTER-added scope and medium, its track
+    /// overlay, and two reviews, one of which expects that match.
+    async fn populated_pool_before_deezer() -> SqlitePool {
+        let pool = legacy_pool().await;
+        MIGRATOR.run_to(BEFORE_DEEZER, &pool).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO directories (id, path) VALUES (1, '/m');
+             INSERT INTO albums (id, title, artist) VALUES (1, 'Blue', 'Artist');
+             INSERT INTO local_releases (id, directory_path, album_title_norm, source_revision, status, track_count)
+                VALUES (1, '/m/one', 'blue', 'rev', 'matched', 1),
+                       (2, '/m/two', 'blue', 'rev', 'unmatched', 1);
+             INSERT INTO tracks (id, path, album_id, directory_id, track_number, modified_at, local_release_id)
+                VALUES (10, '/m/one/A.flac', 1, 1, 1, 1, 1),
+                       (20, '/m/two/A.flac', 1, 1, 1, 1, 2);
+             INSERT INTO release_matches (
+                id, local_release_id, provider, remote_release_id, release_url, score,
+                algorithm_version, acceptance_method, accepted_at, source_revision,
+                snapshot_version, metadata_json, match_scope, medium_position
+             ) VALUES (
+                7, 1, 'discogs', '42', 'https://www.discogs.com/release/42', 0.98,
+                'discogs-match-v43', 'automatic', '2026-01-02T03:04:05Z', 'rev',
+                2, '{\"id\":42}', 'album', 2
+             );
+             INSERT INTO release_track_matches (id, match_id, track_id, remote_ordinal, remote_title)
+                VALUES (3, 7, 10, 1, 'Remote One');
+             INSERT INTO match_reviews (
+                id, local_release_id, provider, snapshot_version, expected_match_id,
+                candidates_json, proposed_mapping_json, reasons_json, source_revision,
+                created_at, updated_at
+             ) VALUES
+                (5, 1, 'musicbrainz', 2, 7, '[]', '{}', '[\"review me\"]', 'rev',
+                 '2026-01-03T00:00:00Z', '2026-01-04T00:00:00Z'),
+                (6, 2, 'discogs', 2, NULL, '[]', '{}', '[]', 'rev',
+                 '2026-01-03T00:00:00Z', '2026-01-04T00:00:00Z');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn the_deezer_migration_keeps_every_row_and_its_links() {
+        let pool = populated_pool_before_deezer().await;
+        initialize(&pool).await.unwrap();
+
+        let matched: (i64, i64, String, String, String, Option<i64>, String) = sqlx::query_as(
+            "SELECT id, local_release_id, provider, remote_release_id, match_scope,
+                    medium_position, accepted_at
+             FROM release_matches",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            matched,
+            (
+                7,
+                1,
+                "discogs".to_string(),
+                "42".to_string(),
+                "album".to_string(),
+                Some(2),
+                "2026-01-02T03:04:05Z".to_string()
+            )
+        );
+        // The drop of the old table did not cascade to the track overlay.
+        let overlay: (i64, i64, i64) =
+            sqlx::query_as("SELECT id, match_id, track_id FROM release_track_matches")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(overlay, (3, 7, 10));
+        // Nor did it clear the review's link to the match it expects.
+        let reviews: Vec<(i64, String, Option<i64>, String)> = sqlx::query_as(
+            "SELECT id, provider, expected_match_id, reasons_json FROM match_reviews ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            reviews,
+            vec![
+                (
+                    5,
+                    "musicbrainz".to_string(),
+                    Some(7),
+                    r#"["review me"]"#.to_string()
+                ),
+                (6, "discogs".to_string(), None, "[]".to_string()),
+            ]
+        );
+
+        let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(violations, 0);
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            foreign_keys, 1,
+            "the migration must switch foreign keys back on"
+        );
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN (
+                'idx_release_matches_provider', 'idx_release_matches_stale',
+                'idx_match_reviews_expected_match'
+             ) ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            indexes,
+            [
+                "idx_match_reviews_expected_match",
+                "idx_release_matches_provider",
+                "idx_release_matches_stale"
+            ]
+        );
+        let leftovers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%\\_new' ESCAPE '\\'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[tokio::test]
+    async fn deezer_rows_are_accepted_and_other_providers_still_refused() {
+        let pool = populated_pool_before_deezer().await;
+        initialize(&pool).await.unwrap();
+
+        sqlx::raw_sql(
+            "INSERT INTO release_matches (
+                local_release_id, provider, remote_release_id, release_url, score,
+                algorithm_version, acceptance_method, source_revision, snapshot_version,
+                metadata_json
+             ) VALUES (
+                2, 'deezer', '302127', 'https://www.deezer.com/album/302127', 0.97,
+                'deezer-match-v1', 'automatic', 'rev', 2, '{}'
+             );
+             INSERT INTO match_reviews (
+                local_release_id, provider, snapshot_version, candidates_json,
+                proposed_mapping_json, reasons_json, source_revision
+             ) VALUES (1, 'deezer', 2, '[]', '{}', '[]', 'rev');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Ids carry on from the copied rows.
+        let id: i64 =
+            sqlx::query_scalar("SELECT id FROM release_matches WHERE provider = 'deezer'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(id > 7, "{id}");
+
+        for table in ["release_matches", "match_reviews"] {
+            let error = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "UPDATE {table} SET provider = 'spotify' WHERE local_release_id = 1"
+            )))
+            .execute(&pool)
+            .await;
+            assert!(error.is_err(), "{table} accepted an unknown provider");
+        }
+
+        // Deleting the match still cascades to its overlay and clears the
+        // review's expectation, so the foreign keys point at the new table.
+        sqlx::query("DELETE FROM release_matches WHERE id = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let overlays: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_track_matches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(overlays, 0);
+        let expected: Option<i64> =
+            sqlx::query_scalar("SELECT expected_match_id FROM match_reviews WHERE id = 5")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(expected, None);
     }
 
     #[tokio::test]
