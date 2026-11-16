@@ -62,7 +62,7 @@ Layering rules:
 - Write to stdout with the `outln!` / `out!` macros, not `println!`, so `radish list | head` exits cleanly. Wrap any path, tag value, or provider response, on stdout or stderr, in `output::Clean` / `output::clean_path` so control and bidirectional characters are escaped.
 - In `runner.rs`, a release's progress goes through its `Transcript` with `outln_to!` / `eprintln_to!`, not `outln!` / `eprintln!`: releases matched at once hold their lines and print them together when they finish.
 - `.cargo/config.toml` builds the bundled SQLite without `SQLITE_ENABLE_MEMORY_MANAGEMENT` (via `LIBSQLITE3_FLAGS`). That option puts every connection's page cache behind one global mutex, which kept parallel offline matching from scaling past four jobs.
-- Reject invalid flag combinations before the database is opened or any client is built: Clap constraints, `parse_direct`, and `runner::resolve_policy` in `main.rs::run`.
+- Reject invalid flag combinations before the database is opened or any client is built: Clap constraints, `parse_direct`, `runner::resolve_policy` and `runner::check_offline` in `main.rs::run`.
 - `.env` is read from the current directory only, and only for the keys in `DOTENV_KEYS` (`src/main.rs`); add new config keys there. The `RADISH_*_BASE_URL` overrides are for tests only, accept loopback hosts only (`providers::loopback_override`), and are never read from `.env`.
 - Decisions are versioned. `matcher::MUSICBRAINZ_ALGORITHM_VERSION` / `DISCOGS_ALGORITHM_VERSION` are stored with accepted matches.
 

@@ -1,5 +1,5 @@
-//! Radish: local music library indexing with MusicBrainz-first matching and an
-//! optional Discogs fallback.
+//! Radish: local music library indexing with MusicBrainz-first matching, an
+//! optional Discogs fallback and an opt-in Deezer stage.
 //!
 //! Modules follow the provider boundary:
 //!

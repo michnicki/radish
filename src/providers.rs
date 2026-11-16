@@ -202,7 +202,10 @@ pub enum ProviderPolicy {
     /// MusicBrainz first, then Discogs when MusicBrainz does not settle the
     /// release and a token is available, then Deezer when `deezer` is set and
     /// neither settled it. Each later stage runs only when the stages before it
-    /// leave the release unsettled.
+    /// leave the release unsettled. Deezer, the optional last stage, is also
+    /// skipped when it could not change the outcome: an earlier stage already
+    /// has a candidate that passes its gates, or failed transiently (see
+    /// `runner::deezer_skip_reason`).
     Chain { deezer: bool },
     /// Exactly one service; fallback and the other factories stay unused.
     Only(ProviderKind),

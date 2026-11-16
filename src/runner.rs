@@ -171,8 +171,11 @@ impl Transcript {
     }
 }
 
-/// The provider clients of one run, each built when a release first needs it
-/// and shared by every release after that.
+/// The provider clients of one run, shared by every release.
+///
+/// MusicBrainz and Deezer are built up front when a selected release may attempt
+/// them, so that a client that cannot be built fails the run once. Discogs is
+/// built when a release first needs it, since a missing token only skips it.
 struct Clients<'a, M, D, Z> {
     musicbrainz: OnceCell<M>,
     discogs: OnceCell<D>,
@@ -1061,6 +1064,20 @@ fn stages_settle(release: &LocalRelease, attempts: &[ProviderAttempt], has_direc
         .is_some_and(|settlement| settlement.is_automatic(has_direct, false))
 }
 
+/// The line that says a later stage failed too. With only MusicBrainz and
+/// Discogs, the later stage is just "the fallback stage"; once Deezer can be
+/// in the chain, the stage is named.
+fn fallback_failure_line(failed: ProviderKind, attempts: usize) -> String {
+    if failed == ProviderKind::Discogs && attempts == 2 {
+        "the fallback stage also failed; the release outcome is a failure".to_string()
+    } else {
+        format!(
+            "the {} stage also failed; the release outcome is a failure",
+            failed.label()
+        )
+    }
+}
+
 /// Why the Deezer stage cannot change the outcome, when it cannot.
 ///
 /// Settlement takes the first later stage that auto-accepts, conflicted or not,
@@ -1483,10 +1500,10 @@ where
     let has_candidates = attempts
         .iter()
         .any(|attempt| !attempt.candidates.is_empty());
-    let fallback_failed = attempts
+    let failed_fallback = attempts
         .iter()
         .skip(1)
-        .any(|attempt| attempt.error.is_some());
+        .find(|attempt| attempt.error.is_some());
 
     if has_candidates {
         if options.dry_run {
@@ -1516,10 +1533,11 @@ where
     // unrecovered attempted-stage failure must not be disguised as one.
     if let Some(error) = attempts.iter().find_map(|attempt| attempt.error.clone()) {
         eprintln_to!(transcript, "  {}", Clean(&error.to_string()));
-        if fallback_failed {
+        if let Some(failed) = failed_fallback {
             eprintln_to!(
                 transcript,
-                "  the fallback stage also failed; the release outcome is a failure"
+                "  {}",
+                fallback_failure_line(failed.provider, attempts.len())
             );
         }
         return Ok(Outcome::Failed);
@@ -2213,6 +2231,26 @@ fn group_prompt(groups: &[(ProviderKind, Vec<Candidate>, Vec<Evaluation>)]) -> S
     provider_prompt(&providers)
 }
 
+/// The review group a reply to the `[a]ccept` question picks, if it picks one.
+///
+/// Two groups keep the long-standing reading: a number, clamped, with the first
+/// group for anything else. With more groups a number picks that group and a
+/// provider name (any case) picks that provider's first group; any other reply
+/// picks none.
+fn chosen_group(
+    groups: &[(ProviderKind, Vec<Candidate>, Vec<Evaluation>)],
+    reply: &str,
+) -> Option<usize> {
+    if groups.len() == 2 {
+        return Some(reply.parse::<usize>().unwrap_or(1).clamp(1, groups.len()) - 1);
+    }
+    if let Ok(number) = reply.parse::<usize>() {
+        return (1..=groups.len()).contains(&number).then(|| number - 1);
+    }
+    let provider = ProviderKind::parse(reply)?;
+    groups.iter().position(|(group, _, _)| *group == provider)
+}
+
 /// The provider a reply names by number or by name; the first one otherwise.
 fn chosen_provider(providers: &[ProviderKind], reply: &str) -> ProviderKind {
     reply
@@ -2303,7 +2341,11 @@ where
             "a" | "" => {
                 let group_index = if groups.len() > 1 {
                     let choice = prompt(&group_prompt(groups))?;
-                    choice.parse::<usize>().unwrap_or(1).clamp(1, groups.len()) - 1
+                    let Some(group_index) = chosen_group(groups, &choice) else {
+                        outln!("invalid provider choice: {}", Clean(&choice));
+                        continue;
+                    };
+                    group_index
                 } else {
                     0
                 };
@@ -2335,6 +2377,11 @@ where
                     outln!("  warning: {}", Clean(warning));
                 }
 
+                // With more than two groups the providers were chosen by name,
+                // so say which release is about to be accepted.
+                if groups.len() > 2 {
+                    outln!("{provider} {}", Clean(&candidate.release.id.storage_id()));
+                }
                 let confirm = prompt("accept this release? [y/N] > ")?;
                 if matches!(confirm.as_str(), "y" | "yes") {
                     return Ok(ReviewOutcome::Accept(
@@ -4260,6 +4307,109 @@ mod tests {
                 failed
             ])
             .starts_with("Discogs stage failed: ")
+        );
+    }
+
+    #[test]
+    fn the_accept_prompt_reads_a_number_or_a_provider_name() {
+        let (local, remote) = album_fixture();
+        let group = |provider| {
+            let candidate = Candidate::new(&local, remote.clone());
+            (provider, vec![candidate], Vec::new())
+        };
+        let three = [
+            group(ProviderKind::MusicBrainz),
+            group(ProviderKind::Discogs),
+            group(ProviderKind::Deezer),
+        ];
+        assert_eq!(chosen_group(&three, "3"), Some(2));
+        assert_eq!(chosen_group(&three, "1"), Some(0));
+        assert_eq!(chosen_group(&three, "deezer"), Some(2));
+        assert_eq!(chosen_group(&three, "Discogs"), Some(1));
+        assert_eq!(chosen_group(&three, "MUSICBRAINZ"), Some(0));
+        // Nothing else picks a group, so nothing is silently accepted.
+        assert_eq!(chosen_group(&three, ""), None);
+        assert_eq!(chosen_group(&three, "0"), None);
+        assert_eq!(chosen_group(&three, "4"), None);
+        assert_eq!(chosen_group(&three, "second"), None);
+        // A provider with no group of its own is not one to pick.
+        let two_providers = [
+            group(ProviderKind::MusicBrainz),
+            group(ProviderKind::Discogs),
+            group(ProviderKind::Discogs),
+        ];
+        assert_eq!(chosen_group(&two_providers, "deezer"), None);
+        assert_eq!(chosen_group(&two_providers, "discogs"), Some(1));
+        // Two groups read as they always did: clamped, the first otherwise.
+        let two = [
+            group(ProviderKind::MusicBrainz),
+            group(ProviderKind::Discogs),
+        ];
+        assert_eq!(chosen_group(&two, "2"), Some(1));
+        assert_eq!(chosen_group(&two, "9"), Some(1));
+        assert_eq!(chosen_group(&two, "0"), Some(0));
+        assert_eq!(chosen_group(&two, ""), Some(0));
+        assert_eq!(chosen_group(&two, "discogs"), Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_failed_deezer_stage_is_named_in_the_outcome() {
+        let (pool, release, guard) = stored_ten_files().await;
+        let failure = |provider| ProviderError::Network {
+            provider,
+            message: "HTTP 503".into(),
+        };
+        for (attempts, expected) in [
+            (
+                vec![
+                    attempt_of(ProviderKind::MusicBrainz, &release, Vec::new()),
+                    attempt_of(ProviderKind::Discogs, &release, Vec::new()),
+                    ProviderAttempt::failed(ProviderKind::Deezer, failure(ProviderKind::Deezer)),
+                ],
+                "  the Deezer stage also failed; the release outcome is a failure",
+            ),
+            (
+                vec![
+                    attempt_of(ProviderKind::MusicBrainz, &release, Vec::new()),
+                    ProviderAttempt::failed(ProviderKind::Discogs, failure(ProviderKind::Discogs)),
+                ],
+                "  the fallback stage also failed; the release outcome is a failure",
+            ),
+        ] {
+            let (outcome, transcript) = decide(&pool, &release, &guard, attempts, true).await;
+            assert!(matches!(outcome, Outcome::Failed), "{outcome:?}");
+            let errors: Vec<&str> = transcript
+                .held
+                .iter()
+                .flatten()
+                .filter_map(|line| match line {
+                    Line::Err(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(errors.contains(&expected), "{errors:?}");
+        }
+    }
+
+    #[test]
+    fn a_failed_later_stage_is_named_once_the_chain_has_three_stages() {
+        // MusicBrainz then Discogs: the long-standing text.
+        assert_eq!(
+            fallback_failure_line(ProviderKind::Discogs, 2),
+            "the fallback stage also failed; the release outcome is a failure"
+        );
+        // Deezer, after Discogs or after a Discogs that was skipped.
+        assert_eq!(
+            fallback_failure_line(ProviderKind::Deezer, 3),
+            "the Deezer stage also failed; the release outcome is a failure"
+        );
+        assert_eq!(
+            fallback_failure_line(ProviderKind::Deezer, 2),
+            "the Deezer stage also failed; the release outcome is a failure"
+        );
+        assert_eq!(
+            fallback_failure_line(ProviderKind::Discogs, 3),
+            "the Discogs stage also failed; the release outcome is a failure"
         );
     }
 
