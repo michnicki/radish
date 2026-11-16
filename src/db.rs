@@ -814,21 +814,17 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        // Ids carry on from the copied rows.
-        let id: i64 =
-            sqlx::query_scalar("SELECT id FROM release_matches WHERE provider = 'deezer'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(id > 7, "{id}");
-
         for table in ["release_matches", "match_reviews"] {
             let error = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
                 "UPDATE {table} SET provider = 'spotify' WHERE local_release_id = 1"
             )))
             .execute(&pool)
             .await;
-            assert!(error.is_err(), "{table} accepted an unknown provider");
+            let error = error.expect_err(&format!("{table} accepted an unknown provider"));
+            assert!(
+                error.to_string().contains("CHECK constraint failed"),
+                "{table}: {error}"
+            );
         }
 
         // Deleting the match still cascades to its overlay and clears the
@@ -848,6 +844,143 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(expected, None);
+    }
+
+    #[tokio::test]
+    async fn the_deezer_migration_keeps_the_autoincrement_counters() {
+        let pool = populated_pool_before_deezer().await;
+        // The highest ids ever handed out belonged to rows that are gone, so
+        // the counters are above every id still present.
+        sqlx::raw_sql(
+            "INSERT INTO release_matches (
+                id, local_release_id, provider, remote_release_id, release_url, score,
+                algorithm_version, acceptance_method, source_revision, snapshot_version,
+                metadata_json
+             ) VALUES (9, 2, 'discogs', '9', 'https://www.discogs.com/release/9', 0.9,
+                       'discogs-match-v43', 'automatic', 'rev', 2, '{}');
+             INSERT INTO match_reviews (
+                id, local_release_id, provider, snapshot_version, candidates_json,
+                proposed_mapping_json, reasons_json, source_revision
+             ) VALUES (8, 2, 'musicbrainz', 2, '[]', '{}', '[]', 'rev');
+             DELETE FROM match_reviews WHERE id = 8;
+             DELETE FROM release_matches WHERE id = 9;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        initialize(&pool).await.unwrap();
+
+        let counters: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT name, seq FROM sqlite_sequence
+             WHERE name IN ('release_matches', 'match_reviews') ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            counters,
+            [
+                ("match_reviews".to_string(), 8),
+                ("release_matches".to_string(), 9)
+            ]
+        );
+
+        sqlx::raw_sql(
+            "INSERT INTO release_matches (
+                local_release_id, provider, remote_release_id, release_url, score,
+                algorithm_version, acceptance_method, source_revision, snapshot_version,
+                metadata_json
+             ) VALUES (2, 'deezer', '1', 'https://www.deezer.com/album/1', 0.97,
+                       'deezer-match-v1', 'automatic', 'rev', 2, '{}');
+             INSERT INTO match_reviews (
+                local_release_id, provider, snapshot_version, candidates_json,
+                proposed_mapping_json, reasons_json, source_revision
+             ) VALUES (2, 'deezer', 2, '[]', '{}', '[]', 'rev');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let match_id: i64 = sqlx::query_scalar("SELECT id FROM release_matches WHERE id > 7")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let review_id: i64 = sqlx::query_scalar("SELECT id FROM match_reviews WHERE id > 6")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(match_id, 10, "ids of deleted matches were handed out again");
+        assert_eq!(review_id, 9, "ids of deleted reviews were handed out again");
+    }
+
+    /// A file database in WAL mode, migrated up to [`BEFORE_DEEZER`], with a
+    /// short busy timeout so a blocked checkpoint reports busy quickly.
+    async fn file_pool_before_deezer(dir: &ScratchDir) -> SqlitePool {
+        let options = SqliteConnectOptions::new()
+            .filename(dir.join("library.db"))
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_millis(100));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::raw_sql(LEGACY_SCHEMA).execute(&pool).await.unwrap();
+        MIGRATOR.run_to(BEFORE_DEEZER, &pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn the_deezer_migration_truncates_the_wal() {
+        let dir = scratch_dir("deezer-wal");
+        let pool = file_pool_before_deezer(&dir).await;
+        sqlx::raw_sql(
+            "INSERT INTO directories (id, path) VALUES (1, '/m');
+             INSERT INTO local_releases (id, directory_path, album_title_norm, source_revision, status, track_count)
+                VALUES (1, '/m/one', 'blue', 'rev', 'unmatched', 1);
+             INSERT INTO match_reviews (
+                local_release_id, provider, snapshot_version, candidates_json,
+                proposed_mapping_json, reasons_json, source_revision
+             ) VALUES (1, 'discogs', 2, hex(randomblob(1000000)), '{}', '[]', 'rev');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        initialize(&pool).await.unwrap();
+
+        // The copy wrote about 2 MB; only sqlx's bookkeeping row follows the
+        // checkpoint, so the WAL holds a few pages.
+        let wal = std::fs::metadata(dir.join("library.db-wal")).map_or(0, |meta| meta.len());
+        assert!(wal < 64 * 1024, "the WAL still holds {wal} bytes");
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_reader_blocking_the_checkpoint_does_not_fail_the_migration() {
+        let dir = scratch_dir("deezer-wal-reader");
+        let pool = file_pool_before_deezer(&dir).await;
+
+        // A read transaction on a second connection pins the WAL, so the
+        // truncating checkpoint at the end of the migration reports busy.
+        let mut reader = pool.acquire().await.unwrap();
+        sqlx::query("BEGIN").execute(&mut *reader).await.unwrap();
+        let _: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_matches")
+            .fetch_one(&mut *reader)
+            .await
+            .unwrap();
+
+        initialize(&pool).await.unwrap();
+
+        sqlx::query("COMMIT").execute(&mut *reader).await.unwrap();
+        drop(reader);
+        let applied: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE success = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(applied, 9);
+        pool.close().await;
     }
 
     #[tokio::test]

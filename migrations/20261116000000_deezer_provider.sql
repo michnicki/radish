@@ -84,6 +84,15 @@ SELECT
     created_at, updated_at
 FROM match_reviews;
 
+-- Dropping a table deletes its sqlite_sequence row, which would let the ids of
+-- deleted matches and reviews be handed out again. Both new tables are filled
+-- now (each copy moved their counters), so give them the old tables' counters,
+-- which RENAME then carries over.
+DELETE FROM sqlite_sequence WHERE name IN ('release_matches_new', 'match_reviews_new');
+INSERT INTO sqlite_sequence (name, seq)
+SELECT name || '_new', seq FROM sqlite_sequence
+WHERE name IN ('release_matches', 'match_reviews');
+
 DROP TABLE match_reviews;
 DROP TABLE release_matches;
 ALTER TABLE release_matches_new RENAME TO release_matches;
@@ -96,3 +105,9 @@ CREATE INDEX idx_match_reviews_expected_match ON match_reviews(expected_match_id
 COMMIT;
 
 PRAGMA foreign_keys = ON;
+
+-- The copy leaves a WAL as large as the tables it copied. Radish never closes
+-- its pool, so SQLite would not delete it; truncate it now. A reader that
+-- blocks the checkpoint only makes it report busy, which does not fail the
+-- migration.
+PRAGMA wal_checkpoint(TRUNCATE);
