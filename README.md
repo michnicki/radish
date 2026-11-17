@@ -94,6 +94,12 @@ Variables already set in the environment always win over the file. Only a regula
 radish releases
 radish releases --path ~/Music/SomeArtist
 
+# Folders whose releases are merged, or could be
+radish folder list
+radish folder merge 5586                     # by release ID or folder path
+radish folder split ~/Music/Box-5CD
+radish folder auto ~/Music/Box-5CD           # drop the decision again
+
 # Default: MusicBrainz first, optional Discogs fallback
 radish match
 radish match ~/Music/SomeAlbum
@@ -318,7 +324,7 @@ Actions are: accept a candidate, choose another provider group, enter a release 
 
 ### Known limits
 
-- **Splits, moves and folder renames drop accepted matches.** A local release is identified by its containing folder plus its album title. Splitting a release across new album titles, renaming or moving its folder, or moving its files to another folder therefore creates different releases, so the accepted match is dropped (the import output reports it) and the release must be matched again. Renaming files within the same folder keeps the release; its membership changed, so the match is marked stale.
+- **Splits, moves and folder renames drop accepted matches.** A local release is identified by its containing folder plus its album title. Splitting a release across new album titles, renaming or moving its folder, or moving its files to another folder therefore creates different releases, so the accepted match is dropped (the import output reports it) and the release must be matched again. Renaming files within the same folder keeps the release; its membership changed, so the match is marked stale. Merging a folder keeps one accepted match (stale) and drops the others; splitting a merged folder drops its match (see Merged folders).
 - **Retagging an album title keeps the match.** Changing the album title of a whole release keeps its accepted match and marks it stale, because the files are the same; review or refresh it.
 - **Directory names are read only in the `Artist-Title-…-GROUP` form.** Names without dashes, with fewer than three fields, or with other shapes (`Artist_Title_1999_GRP`, `Test Artist - Blue`) are not read. A name whose split is ambiguous (a dash inside the artist or the album) needs an artist or album tag to settle it, and without one the name is not read.
 - **A name with the scene shape that is not a scene name is misread.** A directory such as `/music/AC-DC/Back-In-Black` has the same dash shape and is read as an artist and an album; the extra `directory name` search then looks for that misreading, which is harmless but wasted.
@@ -381,13 +387,35 @@ Track and directory paths use SQLite's `NOCASE` collation, which ignores ASCII l
 
 Radish groups files into **local releases**:
 
-- Files group by canonical containing directory plus normalized album title.
-- Separate directories stay separate even when their tags are identical, so compilations and duplicate copies do not merge.
+- Files group by canonical containing directory plus normalized album title, unless their folder is merged (below).
+- Separate directories stay separate even when their tags are identical, so compilations and duplicate copies do not merge, except for the disc subfolders of one merged folder.
 - The release artist comes from the album-artist tag; otherwise the common track artist; otherwise `Various Artists`.
 - A missing album title still forms a directory-based group. Its directory name, when it is a scene release name, says what to search for and, when the tags alone do not settle the release, is scored as its album title (see Candidate discovery); the name is never stored. The directory's title is weighed like a tag's: it is scored when it reaches `0.90` after its `0.03` cost, and by the weak album title rule when it falls between `0.70` and `0.90` (see Score and automatic acceptance). A release whose name gives no title at all is accepted through the same rule without one: every track and length agreeing, and an artist from the tags or the directory name.
-- Disc subdirectories stay separate local releases. Each one can be matched to its own disc of a multi-disc release when its folder name, album title or disc tags give the disc number (see Track mapping); otherwise a group containing one disc of a multi-disc release can be suggested but cannot be accepted as a complete release.
+- Disc subdirectories are separate local releases unless their folder is merged. Each one can be matched to its own disc of a multi-disc release when its folder name, album title or disc tags give the disc number (see Track mapping); otherwise a group containing one disc of a multi-disc release can be suggested but cannot be accepted as a complete release.
 - Multi-disc releases whose files share one directory are supported through disc and track numbers.
 - Grouping is refreshed by import, watch events, and `match`; it never scans files or reaches the network on its own.
+
+### Merged folders
+
+A *unit* is a folder, or a folder together with its disc subfolders (`CD1`, `Disc_2`, `Disk 2`) when it has two or more of them. A unit can be **merged** into one local release, which lives at the unit's folder. Merging changes grouping only: a merged release is matched like any other, and files and tags are never touched.
+
+- **By hand.** `radish folder merge TARGET...` merges each target's unit, `radish folder split TARGET...` keeps it split by album title, and `radish folder auto TARGET...` drops the decision. The decision is stored per unit and survives retags, re-imports and new files. The web interface's folder page does the same. Every target is resolved before anything is written; one that names nothing fails the command.
+  - A target made only of digits is a local release ID, so a folder named only by digits needs a path form such as `./2001`.
+  - A path that exists on this machine is canonicalized first; if that names nothing, the path as written is tried, which helps with symlinked mounts. A path that does not exist is used as written, so a database copied from another machine works.
+  - A path is compared without case and without a trailing slash. A disc subfolder names the unit above it, but only when files of that unit are really under it, so a made-up `.../cd9` names nothing.
+- **Automatically.** A unit without a decision is merged when today's grouping splits it into two or more releases with a usable album title (present and not junk), and all of these hold:
+  - every such title names the same album as the main title (the title most files carry, counted across the unit's folders, ignoring case and punctuation), or both name the same album as the title in the folder's scene name. Two titles name the same album when, without a trailing disc marker (`CD2`) and trailing release-type and format words (`CDM`, `12-inch`), their album-title similarity is at least `0.85`, their numbers agree, and they carry the same edition and version words. So `augmented` and `augmentes` merge, while `12-29-96 ...` and `12-26-96 ...`, `Shine 6` and `Shine 7`, or `SOVAZ` and `SOVAZ (Deluxe Edition)` do not;
+  - no two files share a disc and track number;
+  - the discs run from 1 with no gap, and disc subfolders name different discs;
+  - a disc count in the folder name (`2CD`, `3DVD`) is met exactly;
+  - no release of the unit holds an accepted match. A unit that holds one keeps its shape: it counts as merged when any of its releases is a merged release, so a matched merged `CD1` keeps its match, marked stale, when a `CD2` appears, and both merge. A matched unit that is split stays split.
+
+  Files with no album tag or a junk one (`.`, `Unknown Album`) never merge automatically; they keep their own release until the unit is merged by hand.
+- **The merged release.** Its album title is the title most files carry (on a tie, the one whose first file sorts first), without a trailing disc marker; artist, year and identifiers come from all its files by the usual rules. Inside it, each file's disc is its disc subfolder's number, else the disc marker ending its own album tag, else its disc tag; a folder or title number wins over a conflicting tag, since per-disc rips often tag every disc as disc 1. Its files are then mapped across the release's media as a whole. A merge of discs 1 and 2 of a three-disc release can therefore not be accepted: the automatic rule never does this (the count and gap checks), and a manual merge of it stays in review. When a merged release is accepted at album scope, each file keeps that disc in the overlay, so `list` shows `2-01` and so on, as a disc matched on its own keeps its folder's disc.
+- **Matches.** Merging keeps the release with an accepted match (otherwise the one with more files) under its ID, with its match marked stale; the others are removed with their queued reviews. Splitting a merged release drops its match. Changing a unit between merged and split always changes its source revision. `radish match` handles the result like any stale or unmatched release.
+- **Scopes.** An `import` whose path is itself a disc subfolder regroups the whole folder above it: the rebuild widens by one level, by the path's last component only, so `/mnt/disk1/music` never widens. `watch` always regroups from its watched root. `match PATH` and `releases --path` do not widen: given a disc subfolder, they also include the merged release of the folder above it, but only if that release holds files under the given path. Both require the path to exist on this machine.
+
+`radish folder list` prints one block per unit that holds two or more releases, a merged release or a decision: its path, its state (`merged by you`, `kept separate by you`, `merged automatically`, `automatic: separate`) and its releases. `--path PATH` restricts it to a directory tree; unlike `releases --path`, the path need not exist on this machine (it is used as written), and a disc subfolder widens to its unit. `radish releases` adds a `merged:` line to a merged release: `merged: 2 album titles, 1 folder (automatic)`, or `(manual)` when you merged it.
 
 ### Legacy albums
 
@@ -438,17 +466,25 @@ Current synchronization limits:
 
 ## Web interface
 
-`radish serve` starts a small read-only web server over the library database and prints the address it listens on (default `http://127.0.0.1:8787`; change it with `--bind ADDR`, for example `--bind 127.0.0.1:0` for any free port). It uses the database given by `--db`, so it can run alongside `import`, `watch` and `match`. Stop it with `Ctrl+C`.
+`radish serve` starts a small web server over the library database and prints the address it listens on (default `http://127.0.0.1:8787`; change it with `--bind ADDR`, for example `--bind 127.0.0.1:0` for any free port). It uses the database given by `--db`, so it can run alongside `import`, `watch` and `match`. Stop it with `Ctrl+C`.
 
 | Page | Shows |
 | --- | --- |
 | `/` Status | Directory, track and local-release totals, releases by status (`matched`, `unmatched`, `stale`), how many unmatched releases have a queued review, the newest file modification time stored, and each imported directory with its track count. |
 | `/tracks` | The `list` columns. `?q=TEXT` searches title, artist and album exactly like `search`, and `?page=N` pages through the results, 100 per page. |
-| `/releases` | The `releases` data: ID, artist, album, track count, status, accepted match (linked when the provider URL is `http` or `https`, with `disc N` after the title when the files are one disc of the release) and folder, 100 per page. |
+| `/releases` | The `releases` data: ID, artist, album, track count, status, accepted match (linked when the provider URL is `http` or `https`, with `disc N` after the title when the files are one disc of the release) and folder, 100 per page. Each folder links to its unit's folder page, and a merged release shows its `merged:` line under the album. |
+| `/folders` | The `folder list` data, 100 units per page, each linked to its folder page. The Status page links here with a count (`Folders with several releases, a merged release or a grouping decision: N`). |
+| `/folder?path=...` | One unit: its state, its releases (as on `/releases`), its files with the disc each would have in a merged release, and the folder form: **Merge into one release**, **Keep separate**, **Let Radish decide** (the ones the unit is not in), each with what it does to accepted matches (`1 accepted match becomes stale`; a match that is already stale is not counted). Any path that names a unit works, including a `cd1` subfolder, but the form, its links and the redirect always use the unit's own path. Only files already assigned to a release are listed, so the files of an import that stopped before its regroup appear after the next regroup. |
 
 Status is a snapshot of what the database holds, not a history: Radish does not record when an import ran, so the page cannot say when the last one was.
 
-The interface has no authentication and no way to change anything: every request is a `GET` and no JavaScript is served. Keep these defaults in mind:
+The interface has no authentication and serves no JavaScript. Its one write is the folder form (`POST /folder`), and these defaults guard it:
+
+- Only a server bound to a loopback address takes writes. On any other address the folder page shows the equivalent `radish folder ...` commands instead of the form, and every `POST` gets `403`, because anyone who can load the page could use it.
+- Each server process makes a random 128-bit form token at start. A `POST` without it gets `403`, and so does one whose `Sec-Fetch-Site` header is present and is not `same-origin`. Together with the `Host` check below, another web page can neither read the token nor send it.
+- A `POST` takes only a form body of at most 16 KiB. An unknown action gets `400`, and a path that is not a unit's own path `404`. A success answers `303 See Other` back to the folder page.
+
+Other defaults to keep in mind:
 
 - It listens on loopback only. Binding any other address works but prints a warning, because the pages show the library's file paths to anyone who can connect.
 - Requests whose `Host` header is not `localhost`, a loopback address, or the bind address get `403`, which stops a web page from reaching the server through DNS rebinding. A wildcard bind (`0.0.0.0`) accepts any host.
@@ -461,10 +497,11 @@ The SQLite database contains these tables:
 - `directories` — imported roots.
 - `albums` — scanned album metadata.
 - `tracks` — file paths, observed tag metadata, observed MusicBrainz identifier JSON, and local-release association.
-- `local_releases` — grouping identity, observed release metadata, embedded MusicBrainz evidence and problems, source revision, and status.
+- `local_releases` — grouping identity (`directory_path` and `album_title_norm`, which is `*` for a merged release), the unit it belongs to (`unit_path`), observed release metadata, embedded MusicBrainz evidence and problems, source revision, and status.
 - `release_matches` — the single accepted overlay per local release, qualified by `provider` (`musicbrainz`, `discogs` or `deezer`) and provider-local TEXT release ID (a Deezer album ID is its number), with `match_scope` (`album` or `edition`), `medium_position` (the disc of the release that the files are, absent when they match the whole release), snapshot version and normalized metadata snapshot. Existing accepted decisions retain edition scope on upgrade.
 - `release_track_matches` — one-to-one file-to-track mapping with remote ordinals, medium/track positions, and MusicBrainz track/recording IDs.
 - `match_reviews` — candidate summaries, proposed mappings, and reasons keyed by `(local_release_id, provider)`.
+- `folder_groupings` — the user's grouping decision per unit (`merge` or `separate`), keyed by the unit's path without case. A unit without a row is left to the automatic rule.
 
 The base schema is embedded in the binary and initialized on connection; additive changes are applied through versioned SQLx migrations in [`migrations/`](migrations). The MusicBrainz migration copies existing Discogs accepted rows, track mappings, timestamps, scores, revisions, and review reasons into the provider-qualified tables before retiring the old ones. Historical snapshots stay version 1 and decode through the legacy Discogs codec. The Deezer migration rebuilds `release_matches` and `match_reviews` so their provider check allows `deezer`, keeping every row, ID and link between them. Existing databases keep their rows and IDs. The upgrade itself never reads files, so new observed fields start empty; it resets each track's stored modification time, which makes the next `import` or `watch` read every file once and fill them from the real tags. See [the schema](src/schema.sql) and [storage queries](src/store.rs) for exact matching rules.
 
@@ -492,7 +529,7 @@ Test Artist       A Much Longer Title  Live in Tokyo  2-1  12:10  stale match
 1 local release.
 ```
 
-The heading has the ID, artist, and title. The next line has the track count and status (`unmatched`, `matched`, `stale`, plus queued providers, listed as `discogs, musicbrainz, deezer`, in the web `/releases` page too). The `match:` line shows the accepted provider, the full release ID, and the title, and appears only when a match exists. When the files are one disc of the matched release, the line ends `(Sandinista!, disc 2)`. The `path:` line shows the folder. Releases without an artist or album tag show `(unknown artist)` and `(no album tag)`.
+The heading has the ID, artist, and title. The next line has the track count and status (`unmatched`, `matched`, `stale`, plus queued providers, listed as `discogs, musicbrainz, deezer`, in the web `/releases` page too). The `match:` line shows the accepted provider, the full release ID, and the title, and appears only when a match exists. When the files are one disc of the matched release, the line ends `(Sandinista!, disc 2)`. The `path:` line shows the folder. A merged release has a `merged:` line after the status line. Releases without an artist or album tag show `(unknown artist)` and `(no album tag)`.
 
 File databases use SQLite's WAL journal mode, so `<db>-wal` and `<db>-shm` files appear next to the database while it is open. They are part of the database: keep them with it when you move or back it up, and do not delete them while Radish is running.
 
@@ -502,6 +539,7 @@ File databases use SQLite's WAL journal mode, so `<db>-wal` and `<db>-shm` files
 - A migration marks previously accepted multi-track matches stale when their file order differs from their track order. Older versions could apply remote track metadata to the wrong files in that case. The overlay stays visible; the next `radish match` run re-evaluates those releases.
 - The year used to be stored on an album row shared by every folder with the same title and artist, and now lives on each track. The upgrade copies each track's old (possibly wrong) year, then forces the next `import` or `watch` to read every file once, which replaces it with the file's own tag. Releases affected by the shared year may go stale at that first re-read. Review or refresh them as usual.
 - The Deezer migration copies `release_matches` and `match_reviews` once, on the first open by the new version, keeping every row, link and id counter. On an 8.2 GB library (a 5.2 GB review table) it took about 2.5 minutes and needs about 12 GB of free disk while it runs; run it with no other Radish process using the database. Afterwards the file keeps the old tables' space as free pages (8.2 GB became 14.6 GB), which SQLite reuses for later writes; `sqlite3 radish.db VACUUM` gives it back (about 3 minutes there, and as much free disk again as the database). Older versions then refuse to open the database, since they do not know the migration, so update every machine that opens it, such as the one that imports.
+- Folder merging adds `folder_groupings` and `local_releases.unit_path`. The first regroup after the upgrade (`import`, `watch` or `match`) merges the folders the automatic rule picks. None of them holds an accepted match, but the queued reviews of their merged-away releases are dropped, and the next `radish match` matches the merged releases. Older binaries cannot open the migrated database.
 
 ## Development
 
