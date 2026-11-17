@@ -1654,7 +1654,7 @@ fn is_subsequence(short: &[String], long: &[String]) -> bool {
 /// ID3v1 field and reads as a cut-off copy of `remote` may also lack the numbers
 /// at the end of it, as long as the numbers it has are the start of the
 /// remote's.
-fn album_numbers_agree(local: &str, remote: &str) -> bool {
+pub(crate) fn album_numbers_agree(local: &str, remote: &str) -> bool {
     let (local_numbers, remote_numbers) = (title_numbers(local), title_numbers(remote));
     if is_subsequence(&local_numbers, &remote_numbers)
         || is_subsequence(&remote_numbers, &local_numbers)
@@ -4018,7 +4018,7 @@ fn spells_a_cappella(previous: &str, token: &str) -> bool {
 /// [`title_version_words`] for the set without them. Language words are not
 /// version words, so `(Spanish version)` and `(English Version)` both carry just
 /// `version`.
-fn version_words(text: &str) -> BTreeSet<&'static str> {
+pub(crate) fn version_words(text: &str) -> BTreeSet<&'static str> {
     let normalized = normalize_text(text);
     let mut words = BTreeSet::new();
     let mut tokens = normalized.split_whitespace().peekable();
