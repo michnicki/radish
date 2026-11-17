@@ -28,6 +28,7 @@ use crate::output::Clean;
 use crate::{outln, store};
 use anyhow::{Context, Result};
 use axum::Router;
+use axum::extract::rejection::FormRejection;
 use axum::extract::{DefaultBodyLimit, Form, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -67,8 +68,12 @@ const RELEASE_HEADER: &str = "<tr><th class=\"num\">ID</th><th>Artist</th><th>Al
      <th class=\"num\">Tracks</th><th>Status</th><th>Match</th><th>Folder</th></tr>";
 
 /// What the browser may load: nothing, except this page's own inline style.
+///
+/// `frame-ancestors` does not fall back to `default-src`, so it is named: with
+/// it, no other site can frame a folder page and trick a click on its button
+/// (`X-Frame-Options` says the same to browsers that predate it).
 const CONTENT_SECURITY_POLICY: &str =
-    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'";
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'";
 
 /// The page stylesheet, inlined so the server never serves a second file.
 const STYLE: &str = "\
@@ -130,9 +135,9 @@ pub async fn serve(pool: SqlitePool, bind: SocketAddr) -> Result<()> {
         .await
         .with_context(|| format!("cannot listen on {bind}"))?;
     let bind = listener.local_addr()?;
+    let token = new_token()?;
 
     outln!("Serving http://{bind} (Ctrl+C to stop)");
-    let token = new_token()?;
     axum::serve(listener, router(pool, bind, token))
         .with_graceful_shutdown(async {
             // A failed signal handler leaves Ctrl+C to the default action.
@@ -221,6 +226,7 @@ async fn guard(State(state): State<AppState>, request: Request, next: Next) -> R
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     headers.insert(
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
@@ -371,6 +377,18 @@ async fn folder_page(
     Ok(Html(page("Folder", Nav::Folders, &render_folder(&view, token))).into_response())
 }
 
+/// The `403` for a form that is from another site or carries the wrong token.
+///
+/// A tab left open across a server restart holds the old process's token, so
+/// the body says what to do.
+fn stale_form() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        "forbidden: reload the folder page and try again",
+    )
+        .into_response()
+}
+
 /// The folder form's fields.
 #[derive(Debug, Deserialize)]
 struct FolderForm {
@@ -383,14 +401,26 @@ struct FolderForm {
 ///
 /// Refused with `403` off loopback, from another site, or without this
 /// process's token; `400` for an unknown action; `404` for a path that names
-/// no unit.
+/// no unit. The checks that need no body come first, so a server that takes no
+/// writes answers `403` whatever the body holds, and a bad body gets its own
+/// rejection (`413`, `415` or `422`) only on a server that could use it.
 async fn folder_action(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Form(form): Form<FolderForm>,
+    form: Result<Form<FolderForm>, FormRejection>,
 ) -> Result<Response, AppError> {
-    if !state.writable || cross_site(&headers) || !same_token(&state.token, &form.token) {
+    if !state.writable {
         return Ok((StatusCode::FORBIDDEN, "forbidden").into_response());
+    }
+    if cross_site(&headers) {
+        return Ok(stale_form());
+    }
+    let Form(form) = match form {
+        Ok(form) => form,
+        Err(rejection) => return Ok(rejection.into_response()),
+    };
+    if !same_token(&state.token, &form.token) {
+        return Ok(stale_form());
     }
     let Some(action) = FolderAction::parse(&form.action) else {
         return Ok((StatusCode::BAD_REQUEST, "unknown action").into_response());
@@ -792,7 +822,8 @@ fn render_choices(view: &store::FolderView, token: Option<&str>) -> String {
                 .collect();
             format!(
                 "<p class=\"muted\">This server listens on a non-loopback address, so it \
-                 changes nothing. Run one of these instead:</p><ul>{commands}</ul>{notes}"
+                 changes nothing. Run one of these with the same <code>--db</code> as this \
+                 server:</p><ul>{commands}</ul>{notes}"
             )
         }
     }
@@ -1148,10 +1179,44 @@ mod tests {
             action: "merge".into(),
             token: "t".into(),
         };
-        let Ok(response) = folder_action(State(state), HeaderMap::new(), Form(form)).await else {
+        let Ok(response) = folder_action(State(state), HeaderMap::new(), Ok(Form(form))).await
+        else {
             panic!("the handler failed");
         };
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_stale_token_or_another_site_is_told_to_reload() {
+        let state = AppState {
+            pool: crate::db::connect_in_memory().await.unwrap(),
+            bind: addr("127.0.0.1:8787"),
+            token: "t".into(),
+            writable: true,
+        };
+        let form = |token: &str| {
+            Ok(Form(FolderForm {
+                path: "/m/x".into(),
+                action: "merge".into(),
+                token: token.into(),
+            }))
+        };
+        let mut foreign = HeaderMap::new();
+        foreign.insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
+        for (headers, token) in [(foreign, "t"), (HeaderMap::new(), "old")] {
+            let Ok(response) = folder_action(State(state.clone()), headers, form(token)).await
+            else {
+                panic!("the handler failed");
+            };
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                &body[..],
+                b"forbidden: reload the folder page and try again"
+            );
+        }
     }
 
     fn folder_view() -> store::FolderView {

@@ -62,7 +62,8 @@ enum Command {
     },
     /// Watch a music directory and keep the library in sync in real time
     Watch { path: PathBuf },
-    /// Serve a read-only web interface: status, tracks (with search) and releases
+    /// Serve a web interface: status, tracks (with search), releases and folders,
+    /// with a form to merge or split a folder (loopback only)
     Serve {
         /// Address to listen on. Anything but a loopback address exposes the
         /// library paths to the network without authentication.

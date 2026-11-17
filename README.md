@@ -49,7 +49,7 @@ radish search "pierce the veil"
 # Import, then watch for file changes until Ctrl+C
 radish watch ~/Music
 
-# Browse the library in a web browser (read-only), at http://127.0.0.1:8787
+# Browse the library in a web browser, at http://127.0.0.1:8787 (merge folders from its Folders page)
 radish serve
 ```
 
@@ -481,8 +481,9 @@ Status is a snapshot of what the database holds, not a history: Radish does not 
 The interface has no authentication and serves no JavaScript. Its one write is the folder form (`POST /folder`), and these defaults guard it:
 
 - Only a server bound to a loopback address takes writes. On any other address the folder page shows the equivalent `radish folder ...` commands instead of the form, and every `POST` gets `403`, because anyone who can load the page could use it.
-- Each server process makes a random 128-bit form token at start. A `POST` without it gets `403`, and so does one whose `Sec-Fetch-Site` header is present and is not `same-origin`. Together with the `Host` check below, another web page can neither read the token nor send it.
-- A `POST` takes only a form body of at most 16 KiB. An unknown action gets `400`, and a path that is not a unit's own path `404`. A success answers `303 See Other` back to the folder page.
+- Each server process makes a random 128-bit form token at start. A `POST` without it gets `403`, and so does one whose `Sec-Fetch-Site` header is present and is not `same-origin`. Together with the `Host` check below and the frame defense that follows, another web page can neither read the token nor send it. A `403` for a wrong token or another site says to reload the folder page, since a tab left open across a server restart holds the old token.
+- Pages refuse to be shown inside a frame (`frame-ancestors 'none'`, `X-Frame-Options: DENY`), so another site cannot trick a click on a folder button.
+- A `POST` takes only a form body of at most 16 KiB (`413` above that). On a server that takes no writes the `403` comes before the body is read. An unknown action gets `400`, and a path that is not a unit's own path `404`. A success answers `303 See Other` back to the folder page.
 
 Other defaults to keep in mind:
 

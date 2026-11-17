@@ -187,6 +187,17 @@ fn status_page_shows_library_counts_and_security_headers() {
     );
     assert!(reply.headers.contains("x-content-type-options: nosniff"));
     assert!(reply.headers.contains("referrer-policy: no-referrer"));
+    // Nothing may frame a page: `frame-ancestors` has no `default-src` fallback.
+    assert!(
+        reply.headers.contains("frame-ancestors 'none'"),
+        "{}",
+        reply.headers
+    );
+    assert!(
+        reply.headers.contains("x-frame-options: deny"),
+        "{}",
+        reply.headers
+    );
     assert!(
         reply.body.contains("<b>3</b><span>Tracks</span>"),
         "{}",
@@ -342,6 +353,8 @@ fn foreign_hosts_unknown_paths_and_writes_are_refused() {
     let missing = server.get("/nope");
     assert_eq!(missing.status, 404);
     assert!(missing.headers.contains("x-content-type-options: nosniff"));
+    assert!(missing.headers.contains("x-frame-options: deny"));
+    assert!(rebound.headers.contains("x-frame-options: deny"));
 
     let post = server.request("POST", "/", None);
     assert_eq!(post.status, 405);
@@ -397,6 +410,15 @@ fn between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
     &rest[..rest.find(end).unwrap()]
 }
 
+/// The text of an HTML attribute value, with the entities `escape_html` writes undone.
+fn unescape_html(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
 fn form_encode(text: &str) -> String {
     text.bytes()
         .map(|byte| match byte {
@@ -428,7 +450,7 @@ fn a_folder_form_merges_only_with_the_token_from_this_site() {
     let page = server.get(&link);
     assert_eq!(page.status, 200);
     let token = between(&page.body, "name=\"token\" value=\"", "\"").to_string();
-    let path = between(&page.body, "name=\"path\" value=\"", "\"").to_string();
+    let path = unescape_html(between(&page.body, "name=\"path\" value=\"", "\""));
     let body = |action: &str, token: &str, path: &str| {
         format!("path={}&action={action}&token={token}", form_encode(path))
     };
@@ -457,6 +479,30 @@ fn a_folder_form_merges_only_with_the_token_from_this_site() {
         &["Sec-Fetch-Site: same-origin"],
     );
     assert_eq!(missing.status, 404);
+    // Only the unit's own path is one: a subfolder that holds no disc is not.
+    let subfolder = server.post(
+        "/folder",
+        &body("merge", &token, &format!("{path}/cd1")),
+        &["Sec-Fetch-Site: same-origin"],
+    );
+    assert_eq!(subfolder.status, 404);
+    // A body over the limit is refused before it is read in full.
+    let huge = server.post(
+        "/folder",
+        &format!("path={}&action=merge&token={token}", "x".repeat(1 << 20)),
+        &["Sec-Fetch-Site: same-origin"],
+    );
+    assert_eq!(huge.status, 413);
+
+    // A GET with the right fields changes nothing.
+    let get = server.get(&format!(
+        "/folder?path={}&action=merge&token={token}",
+        form_encode(&path)
+    ));
+    assert_eq!(get.status, 200);
+    assert!(server.get("/folders").body.contains("automatic: separate"));
+    // Nor did any of the refusals.
+    assert!(!server.get("/folders").body.contains("merged by you"));
 
     let merged = server.post(
         "/folder",
@@ -469,6 +515,40 @@ fn a_folder_form_merges_only_with_the_token_from_this_site() {
         "{}",
         merged.headers
     );
+    assert!(server.get("/folders").body.contains("merged by you"));
+}
+
+#[test]
+fn a_browser_that_sends_no_fetch_metadata_still_posts_with_the_token() {
+    let db = mixed_folder_library("web-folder-token-only");
+    let server = Server::start(&db);
+    let folders = server.get("/folders");
+    let link = format!(
+        "/folder?path={}",
+        between(&folders.body, "href=\"/folder?path=", "\"")
+    );
+    let page = server.get(&link);
+    let token = between(&page.body, "name=\"token\" value=\"", "\"");
+    let path = unescape_html(between(&page.body, "name=\"path\" value=\"", "\""));
+
+    let wrong = server.post(
+        "/folder",
+        &format!("path={}&action=merge&token=nope", form_encode(&path)),
+        &[],
+    );
+    assert_eq!(wrong.status, 403);
+    assert!(
+        wrong.body.contains("reload the folder page"),
+        "{}",
+        wrong.body
+    );
+
+    let merged = server.post(
+        "/folder",
+        &format!("path={}&action=merge&token={token}", form_encode(&path)),
+        &[],
+    );
+    assert_eq!(merged.status, 303, "{}", merged.body);
     assert!(server.get("/folders").body.contains("merged by you"));
 }
 
