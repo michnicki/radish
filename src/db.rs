@@ -288,7 +288,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(applied, 9);
+        assert_eq!(applied, 10);
     }
 
     /// A database migrated up to and including the album-matching migration.
@@ -979,7 +979,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(applied, 9);
+        assert_eq!(applied, 10);
         pool.close().await;
     }
 
