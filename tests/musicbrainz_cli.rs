@@ -513,6 +513,20 @@ async fn disc_folders_merged_automatically_match_the_whole_two_disc_release() {
         .await
         .unwrap();
     assert_eq!(directory, "/music/Set-2CD");
+    let tracks = store::list_tracks(&pool).await.unwrap();
+    let shown: Vec<(String, Option<i64>, Option<i64>)> = tracks
+        .iter()
+        .map(|track| (track.display_title(), track.disc_number, track.track_number))
+        .collect();
+    assert_eq!(
+        shown,
+        vec![
+            ("Track 1!".to_string(), Some(1), Some(1)),
+            ("Track 2!".to_string(), Some(1), Some(2)),
+            ("Track 3!".to_string(), Some(2), Some(1)),
+            ("Track 4!".to_string(), Some(2), Some(2)),
+        ]
+    );
     pool.close().await;
 }
 

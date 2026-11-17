@@ -57,15 +57,21 @@ pub async fn resolve_folder(pool: &SqlitePool, target: &FolderTarget) -> Result<
     if found.is_some() {
         return Ok(found);
     }
-    if matcher::folder_disc_number(path).is_some()
-        && let Some(parent) = Path::new(path).parent()
-    {
+    if let Some(parent) = grouping::disc_parent_of(Path::new(path)) {
+        // The folder must hold files of the merged release: a disc folder that
+        // does not exist names nothing.
         return Ok(sqlx::query_scalar(
             "SELECT unit_path FROM local_releases
-             WHERE unit_path = ?1 AND album_title_norm = ?2 LIMIT 1",
+             WHERE unit_path = ?1 AND album_title_norm = ?2
+               AND EXISTS (SELECT 1 FROM tracks t
+                           WHERE t.local_release_id = local_releases.id
+                             AND substr(replace(t.path, '\\', '/'), 1, length(?3) + 1)
+                                 = (?3 || '/') COLLATE NOCASE)
+             LIMIT 1",
         )
         .bind(parent.to_string_lossy().as_ref())
         .bind(MERGED_KEY)
+        .bind(path.replace('\\', "/"))
         .fetch_optional(pool)
         .await?);
     }
@@ -90,6 +96,7 @@ pub async fn set_folder_mode(
     unit: &str,
     mode: Option<FolderMode>,
 ) -> Result<FolderOutcome> {
+    let unit = unit.trim_end_matches(['/', '\\']);
     let mut tx = begin_write(pool).await?;
     match mode {
         Some(mode) => {

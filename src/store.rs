@@ -1621,7 +1621,9 @@ pub async fn load_local_releases(
 
 /// Loads local releases with their tracks, filtered in SQL: only releases whose
 /// directory is `scope` or under it, and only the release with ID `id`. Either
-/// filter may be absent. Tracks come back in `order_release_tracks` order.
+/// filter may be absent. A scope that is a disc subfolder also takes the merged
+/// release in the folder above it, when that release holds files under the
+/// scope. Tracks come back in `order_release_tracks` order.
 pub async fn load_selected_releases(
     pool: &SqlitePool,
     scope: Option<&Path>,
@@ -1651,7 +1653,11 @@ pub async fn load_selected_releases(
                  OR substr(replace(lr.directory_path, '\\', '/'), 1, length(?1) + 1)
                      = (?1 || '/') COLLATE NOCASE)
                 OR (lr.album_title_norm = '*'
-                    AND replace(lr.directory_path, '\\', '/') = ?3 COLLATE NOCASE))
+                    AND replace(lr.directory_path, '\\', '/') = ?3 COLLATE NOCASE
+                    AND EXISTS (SELECT 1 FROM tracks m
+                                WHERE m.local_release_id = lr.id
+                                  AND substr(replace(m.path, '\\', '/'), 1, length(?1) + 1)
+                                      = (?1 || '/') COLLATE NOCASE)))
            AND (?2 IS NULL OR lr.id = ?2)
          ORDER BY lr.directory_path, lr.album_title_norm",
     )
@@ -1672,7 +1678,11 @@ pub async fn load_selected_releases(
                  OR substr(replace(lr.directory_path, '\\', '/'), 1, length(?1) + 1)
                      = (?1 || '/') COLLATE NOCASE)
                 OR (lr.album_title_norm = '*'
-                    AND replace(lr.directory_path, '\\', '/') = ?3 COLLATE NOCASE))
+                    AND replace(lr.directory_path, '\\', '/') = ?3 COLLATE NOCASE
+                    AND EXISTS (SELECT 1 FROM tracks m
+                                WHERE m.local_release_id = lr.id
+                                  AND substr(replace(m.path, '\\', '/'), 1, length(?1) + 1)
+                                      = (?1 || '/') COLLATE NOCASE)))
            AND (?2 IS NULL OR lr.id = ?2)
          ORDER BY t.path",
     )
@@ -1837,7 +1847,24 @@ pub async fn list_local_releases(
     pool: &SqlitePool,
     scope: Option<&Path>,
 ) -> Result<Vec<LocalReleaseStatus>> {
-    let merged_parent = scope.and_then(grouping::disc_parent_of);
+    // A disc-subfolder scope also lists the merged release above it, when that
+    // release holds files under the scope.
+    let merged_parent = scope
+        .and_then(grouping::disc_parent_of)
+        .map(|parent| path_key(&parent));
+    let scope_members: HashSet<i64> = match (&merged_parent, scope.and_then(scope_param)) {
+        (Some(_), Some(scope)) => sqlx::query_scalar(
+            "SELECT DISTINCT t.local_release_id FROM tracks t
+             WHERE substr(replace(t.path, '\\', '/'), 1, length(?1) + 1)
+                   = (?1 || '/') COLLATE NOCASE",
+        )
+        .bind(scope)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .collect(),
+        _ => HashSet::new(),
+    };
     let rows = sqlx::query_as::<_, StatusRow>(
         "SELECT lr.id, lr.directory_path, lr.album_title_norm, lr.album_title, lr.album_artist,
                 lr.track_count,
@@ -1877,10 +1904,9 @@ pub async fn list_local_releases(
             Some(scope) => {
                 path_within(&row.directory_path, scope)
                     || (row.album_title_norm == MERGED_KEY
-                        && merged_parent.as_deref().is_some_and(|parent| {
-                            row.directory_path
-                                .eq_ignore_ascii_case(&parent.to_string_lossy())
-                        }))
+                        && scope_members.contains(&row.id)
+                        && merged_parent.as_deref()
+                            == Some(path_key(Path::new(&row.directory_path)).as_str()))
             }
             None => true,
         })
@@ -2308,16 +2334,17 @@ pub async fn accept_match(
 
     let mut tx = begin_write(pool).await?;
 
-    let current: Option<(String, Option<i64>)> = sqlx::query_as(
+    let current: Option<(String, Option<i64>, String)> = sqlx::query_as(
         "SELECT lr.source_revision,
-                (SELECT id FROM release_matches m WHERE m.local_release_id = lr.id)
+                (SELECT id FROM release_matches m WHERE m.local_release_id = lr.id),
+                lr.album_title_norm
          FROM local_releases lr WHERE lr.id = ?1",
     )
     .bind(local_release_id)
     .fetch_optional(&mut *tx)
     .await?;
 
-    let Some((current_revision, current_match_id)) = current else {
+    let Some((current_revision, current_match_id, album_title_norm)) = current else {
         return Err(snapshot_changed(
             local_release_id,
             format!("local release {local_release_id} no longer exists"),
@@ -2432,6 +2459,7 @@ pub async fn accept_match(
     .fetch_one(&mut *tx)
     .await?;
 
+    let merged = album_title_norm == MERGED_KEY;
     let tracks = &release.tracks;
     let mut ordinals: HashMap<usize, i64> = HashMap::new();
     let playable = remote.playable_tracks();
@@ -2473,13 +2501,21 @@ pub async fn accept_match(
         .bind(non_empty(&track_artist))
         .bind(remote_track.duration_secs)
         // A disc matched on its own keeps its disc number at album scope too: the
-        // folder said which disc it is. Its track number at edition scope comes
-        // from the disc's own position, which a Discogs release only spells in
-        // its position string.
+        // folder said which disc it is. A file of a merged release keeps the
+        // disc its folder or title gave it. Its track number at edition scope
+        // comes from the disc's own position, which a Discogs release only
+        // spells in its position string.
         .bind(
             medium
                 .or_else(|| edition_track.and_then(|track| track.medium_position))
-                .map(i64::from),
+                .map(i64::from)
+                .or_else(|| {
+                    if merged {
+                        tracks.get(local_index).and_then(|track| track.disc)
+                    } else {
+                        None
+                    }
+                }),
         )
         .bind(
             edition_track
@@ -5981,6 +6017,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_second_decision_in_another_case_updates_the_stored_mode() {
+        let pool = test_pool().await;
+        insert(&pool, "/music", &augmented_files()).await;
+        set_folder_mode(&pool, AUGMENTED, Some(FolderMode::Separate))
+            .await
+            .unwrap();
+        let outcome = set_folder_mode(
+            &pool,
+            &format!("{}/", AUGMENTED.to_ascii_uppercase()),
+            Some(FolderMode::Merge),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.releases.len(), 1);
+        let decisions: Vec<(String, String)> =
+            sqlx::query_as("SELECT directory_path, mode FROM folder_groupings")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(decisions[0].1, "merge");
+    }
+
+    #[tokio::test]
     async fn an_untagged_file_joins_under_a_manual_merge() {
         let pool = test_pool().await;
         let mut files = augmented_files();
@@ -6078,6 +6138,49 @@ mod tests {
             None
         );
         assert_eq!(resolve(FolderTarget::Release(999_999)).await, None);
+        // A disc folder that holds none of the merged release's files names nothing.
+        assert_eq!(
+            resolve(FolderTarget::Path(format!("{BROADCAST}/cd9"))).await,
+            None
+        );
+    }
+
+    /// Two discs of two tracks each, titled to match `broadcast_files`.
+    fn two_disc_remote() -> RemoteRelease {
+        let mut remote = remote_with(&["Track 1", "Track 2", "Track 1", "Track 2"]);
+        for (index, track) in remote.tracklist.iter_mut().enumerate() {
+            track.medium_position = Some(index as u32 / 2 + 1);
+            track.track_position = Some(index as u32 % 2 + 1);
+            track.position = Some(format!("{}-{}", index / 2 + 1, index % 2 + 1));
+        }
+        remote
+    }
+
+    #[tokio::test]
+    async fn a_merged_release_keeps_its_discs_in_the_overlay_at_album_scope() {
+        let pool = test_pool().await;
+        insert(&pool, "/music", &broadcast_files()).await;
+        let release = load_local_releases(&pool, None).await.unwrap().remove(0);
+        let candidate = Candidate::new(&release, two_disc_remote());
+        let guard = load_match_guard(&pool, release.id).await.unwrap();
+        accept_match(
+            &pool,
+            &release,
+            &candidate,
+            AcceptanceMethod::Automatic,
+            MatchScope::Album,
+            &guard,
+        )
+        .await
+        .unwrap();
+        let media: Vec<Option<i64>> = sqlx::query_scalar(
+            "SELECT tm.medium_position FROM release_track_matches tm
+             JOIN tracks t ON t.id = tm.track_id ORDER BY t.path",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(media, vec![Some(1), Some(1), Some(2), Some(2)]);
     }
 
     #[tokio::test]
@@ -6107,13 +6210,7 @@ mod tests {
         assert!(matcher::local_disc_hint(&release).is_none());
 
         // A two-disc release maps onto the files as a whole.
-        let mut remote = remote_with(&["Track 1", "Track 2", "Track 1", "Track 2"]);
-        for (index, track) in remote.tracklist.iter_mut().enumerate() {
-            track.medium_position = Some(index as u32 / 2 + 1);
-            track.track_position = Some(index as u32 % 2 + 1);
-            track.position = Some(format!("{}-{}", index / 2 + 1, index % 2 + 1));
-        }
-        let candidate = Candidate::new(&release, remote);
+        let candidate = Candidate::new(&release, two_disc_remote());
         assert_eq!(candidate.mapping.medium, None);
         let pairs: Vec<(usize, usize)> = candidate.mapping.assigned_pairs().collect();
         assert_eq!(pairs, vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
@@ -6122,15 +6219,31 @@ mod tests {
     #[tokio::test]
     async fn a_disc_subfolder_scope_finds_its_merged_release() {
         let pool = test_pool().await;
-        insert(&pool, "/music", &broadcast_files()).await;
+        let mut files = broadcast_files();
+        // An untagged file stays its own release, and holds no cd1 file.
+        files.push(scanned(
+            &format!("{BROADCAST}/extra.mp3"),
+            None,
+            Some("Depeche Mode"),
+            9,
+        ));
+        insert(&pool, "/music", &files).await;
+        assert_eq!(release_ids(&pool).await.len(), 2);
         let cd1 = format!("{BROADCAST}/cd1");
         let loaded = load_selected_releases(&pool, Some(Path::new(&cd1)), None)
             .await
             .unwrap();
         assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].album_title.as_deref(),
+            Some("Broadcast Singles Tour")
+        );
+        assert_eq!(loaded[0].tracks.len(), 4);
         let listed = list_local_releases(&pool, Some(Path::new(&cd1)))
             .await
             .unwrap();
         assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, loaded[0].id);
+        assert_eq!(listed[0].track_count, 4);
     }
 }
