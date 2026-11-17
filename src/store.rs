@@ -1,3 +1,4 @@
+use crate::grouping::directory_of;
 use crate::matcher::{
     self, ArtistKind, Candidate, EmbeddedReleaseEvidence, LocalRelease, LocalTrack, Mapping,
     MatchScope, RemoteRelease, RemoteTrack,
@@ -475,13 +476,6 @@ pub struct GroupedRelease {
     pub track_count: i64,
     pub revision: String,
     pub track_ids: Vec<i64>,
-}
-
-fn directory_of(path: &str) -> String {
-    Path::new(path)
-        .parent()
-        .map(|parent| parent.to_string_lossy().to_string())
-        .unwrap_or_default()
 }
 
 /// The key two album titles or artist names are compared by.
