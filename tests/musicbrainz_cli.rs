@@ -431,6 +431,16 @@ async fn seed_folders(db: &Path, folders: &[(&str, i64)]) {
 #[tokio::test]
 async fn disc_folders_match_their_own_disc_of_a_two_disc_release() {
     let db = db_path("disc-folders");
+    // Kept apart, each folder matches its own disc. The decision is stored
+    // first, so the seeding rebuild already honors it.
+    let pool = radish::db::connect(&db).await.unwrap();
+    sqlx::query(
+        "INSERT INTO folder_groupings (directory_path, mode) VALUES ('/music/Set-2CD', 'separate')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
     seed_folders(&db, &[("/music/Set-2CD/CD1", 1), ("/music/Set-2CD/CD2", 3)]).await;
     let server = MockServer::start(two_disc_handler);
 

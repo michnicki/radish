@@ -1,4 +1,4 @@
-use crate::grouping::directory_of;
+use crate::grouping::{self, FolderMode, MERGED_KEY, RuleFile, TitleGroup, Units, directory_of};
 use crate::matcher::{
     self, ArtistKind, Candidate, EmbeddedReleaseEvidence, LocalRelease, LocalTrack, Mapping,
     MatchScope, RemoteRelease, RemoteTrack,
@@ -7,8 +7,13 @@ use crate::providers::{GroupId, Mbid, ProviderKind, ReleaseId};
 use crate::scanner::{ObservedMusicBrainzIds, ScannedTrack};
 use anyhow::{Result, bail};
 use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+
+mod folders;
+// `folders` has no public items until the folder commands arrive.
+#[allow(unused_imports, reason = "the folder commands add public items")]
+pub use folders::*;
 
 pub const STATUS_UNMATCHED: &str = "unmatched";
 pub const STATUS_MATCHED: &str = "matched";
@@ -460,6 +465,7 @@ impl ObservedTrack {
 #[derive(Debug, Clone)]
 pub struct GroupedRelease {
     pub directory: String,
+    pub unit: String,
     pub album_title: Option<String>,
     pub album_title_norm: String,
     pub album_artist: Option<String>,
@@ -600,14 +606,82 @@ fn revision_of(tracks: &[&ObservedTrack], merged: bool) -> String {
     format!("release-input-v2:{:016x}", fnv1a64(payload.as_bytes()))
 }
 
+/// What `group_tracks` needs besides the files.
+#[derive(Debug, Clone, Default)]
+pub struct GroupingContext {
+    /// Folder decisions by lowercased unit path.
+    pub decisions: HashMap<String, FolderMode>,
+    /// The stored releases in scope before this regroup.
+    pub prior: Vec<PriorRelease>,
+}
+
+/// A stored release as grouping sees it.
+#[derive(Debug, Clone)]
+pub struct PriorRelease {
+    pub directory: String,
+    /// Whether it is a merged release (`album_title_norm` is [`MERGED_KEY`]).
+    pub merged: bool,
+    pub has_match: bool,
+}
+
+/// How one unit is grouped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// By folder and album title.
+    Separate,
+    /// Every file forms one release: a `merge` decision.
+    MergeAll,
+    /// Every file with a usable album title forms one release; untagged and
+    /// junk-tagged files keep their own groups. The automatic rule's merge.
+    MergeTitled,
+}
+
+/// How a group came about.
+enum GroupKind {
+    /// One album title in one folder.
+    Title,
+    /// A merged unit, with the album title it shows.
+    Merged(Option<String>),
+}
+
+/// The album title of one of today's groups when it is usable: present and
+/// not junk.
+fn usable_title<'a>(album_title_norm: &str, members: &[&'a ObservedTrack]) -> Option<&'a str> {
+    if album_title_norm.is_empty() {
+        return None;
+    }
+    let first: &'a ObservedTrack = members.first()?;
+    let title = first.album.as_deref()?.trim();
+    (!matcher::is_junk_title(title)).then_some(title)
+}
+
+/// One of today's groups as the automatic rule sees it.
+fn title_group<'a>(title: &'a str, members: &[&'a ObservedTrack]) -> TitleGroup<'a> {
+    TitleGroup {
+        title,
+        files: members
+            .iter()
+            .map(|&track| RuleFile {
+                path: &track.path,
+                album: track.album.as_deref(),
+                disc_tag: track.disc_number,
+                track_number: track.track_number,
+            })
+            .collect(),
+    }
+}
+
 /// Groups observed tracks into local releases.
 ///
-/// Files group by directory plus normalized album title. Separate directories
-/// never merge, even with identical tags, so compilations and copies in
-/// different folders stay distinct. Disc subdirectories stay separate too.
-pub fn group_tracks(tracks: &[ObservedTrack]) -> Vec<GroupedRelease> {
-    let mut groups: BTreeMap<(String, String), Vec<&ObservedTrack>> = BTreeMap::new();
-
+/// Today's grouping is by directory plus normalized album title, so separate
+/// directories never merge by themselves. A unit (a folder, or a folder with
+/// two or more disc subfolders, see [`grouping::Units`]) may instead become one
+/// merged release, keyed [`MERGED_KEY`] at the unit's path: by the user's
+/// decision in `context`, or by [`grouping::auto_merges`] when no release of
+/// the unit holds an accepted match. A unit that holds one keeps the shape it
+/// had.
+pub fn group_tracks(tracks: &[ObservedTrack], context: &GroupingContext) -> Vec<GroupedRelease> {
+    let mut by_title: BTreeMap<(String, String), Vec<&ObservedTrack>> = BTreeMap::new();
     for track in tracks {
         let directory = directory_of(&track.path);
         let album_title = track
@@ -616,140 +690,232 @@ pub fn group_tracks(tracks: &[ObservedTrack]) -> Vec<GroupedRelease> {
             .map(str::trim)
             .filter(|title| !title.is_empty());
         let album_title_norm = album_title.and_then(identity_key).unwrap_or_default();
-
-        groups
+        by_title
             .entry((directory.to_ascii_lowercase(), album_title_norm))
             .or_default()
             .push(track);
     }
 
-    groups
-        .into_iter()
-        .map(|((directory_key, album_title_norm), members)| {
-            let directory = members
-                .first()
-                .map(|track| directory_of(&track.path))
-                .unwrap_or(directory_key);
+    let directories: Vec<String> = by_title
+        .values()
+        .map(|members| directory_of(&members[0].path))
+        .collect();
+    let units = Units::new(directories.iter().map(String::as_str));
 
-            let album_title = members
+    // Per lowercased unit path: (held an accepted match, was merged).
+    let mut prior: HashMap<String, (bool, bool)> = HashMap::new();
+    for release in &context.prior {
+        let shape = prior
+            .entry(units.unit_of(&release.directory).to_ascii_lowercase())
+            .or_default();
+        shape.0 |= release.has_match;
+        shape.1 |= release.merged;
+    }
+
+    type TitleGroups<'t> = Vec<(String, Vec<&'t ObservedTrack>)>;
+    let mut by_unit: BTreeMap<String, (String, TitleGroups<'_>)> = BTreeMap::new();
+    for ((_, album_title_norm), members) in by_title {
+        let unit = units.unit_of(&directory_of(&members[0].path));
+        by_unit
+            .entry(unit.to_ascii_lowercase())
+            .or_insert_with(|| (unit, Vec::new()))
+            .1
+            .push((album_title_norm, members));
+    }
+
+    let mut groups = Vec::new();
+    for (unit_key, (unit, title_groups)) in by_unit {
+        let mut titled = HashSet::new();
+        let mut rule_groups = Vec::new();
+        for (index, (norm, members)) in title_groups.iter().enumerate() {
+            if let Some(title) = usable_title(norm, members) {
+                titled.insert(index);
+                rule_groups.push(title_group(title, members));
+            }
+        }
+        let shape = match context.decisions.get(&unit_key) {
+            Some(FolderMode::Merge) => Shape::MergeAll,
+            Some(FolderMode::Separate) => Shape::Separate,
+            None => match prior.get(&unit_key) {
+                Some(&(true, true)) => Shape::MergeTitled,
+                Some(&(true, false)) => Shape::Separate,
+                _ if grouping::auto_merges(&unit, &rule_groups) => Shape::MergeTitled,
+                _ => Shape::Separate,
+            },
+        };
+
+        let title = grouping::merged_title(&rule_groups);
+        let mut merged: Vec<&ObservedTrack> = Vec::new();
+        for (index, (norm, members)) in title_groups.into_iter().enumerate() {
+            let joins = match shape {
+                Shape::Separate => false,
+                Shape::MergeAll => true,
+                Shape::MergeTitled => titled.contains(&index),
+            };
+            if joins {
+                merged.extend(members);
+            } else {
+                let directory = directory_of(&members[0].path);
+                groups.push(release_of(
+                    directory,
+                    unit.clone(),
+                    norm,
+                    members,
+                    GroupKind::Title,
+                ));
+            }
+        }
+        if !merged.is_empty() {
+            merged.sort_by_key(|track| track.path.to_ascii_lowercase());
+            groups.push(release_of(
+                unit.clone(),
+                unit,
+                MERGED_KEY.to_string(),
+                merged,
+                GroupKind::Merged(title),
+            ));
+        }
+    }
+    groups.sort_by(|a, b| {
+        release_key(&a.directory, &a.album_title_norm)
+            .cmp(&release_key(&b.directory, &b.album_title_norm))
+    });
+    groups
+}
+
+/// The release a group of files forms.
+fn release_of(
+    directory: String,
+    unit: String,
+    album_title_norm: String,
+    members: Vec<&ObservedTrack>,
+    kind: GroupKind,
+) -> GroupedRelease {
+    let (album_title, merged) = match kind {
+        GroupKind::Title => (
+            members
                 .iter()
                 .filter_map(|track| track.album.as_deref())
                 .map(str::trim)
                 .find(|title| identity_key(title).as_deref() == Some(album_title_norm.as_str()))
-                .map(str::to_string);
+                .map(str::to_string),
+            false,
+        ),
+        GroupKind::Merged(title) => (title, true),
+    };
 
-            let album_artist_tag = most_common_value(
-                members
-                    .iter()
-                    .filter_map(|track| track.album_artist.clone()),
-            );
+    let album_artist_tag = most_common_value(
+        members
+            .iter()
+            .filter_map(|track| track.album_artist.clone()),
+    );
 
-            let track_artists: Vec<String> = members
-                .iter()
-                .filter_map(|track| track.artist.clone())
-                .filter(|artist| !artist.trim().is_empty())
-                .collect();
-            let distinct_track_artists: Vec<String> = {
-                let mut distinct: Vec<String> = track_artists
-                    .iter()
-                    .filter_map(|artist| identity_key(artist))
-                    .collect();
-                distinct.sort();
-                distinct.dedup();
-                distinct
-            };
+    let track_artists: Vec<String> = members
+        .iter()
+        .filter_map(|track| track.artist.clone())
+        .filter(|artist| !artist.trim().is_empty())
+        .collect();
+    let distinct_track_artists: Vec<String> = {
+        let mut distinct: Vec<String> = track_artists
+            .iter()
+            .filter_map(|artist| identity_key(artist))
+            .collect();
+        distinct.sort();
+        distinct.dedup();
+        distinct
+    };
 
-            let (album_artist, artist_kind, is_compilation) = match album_artist_tag {
-                Some((normalized, original)) => {
-                    let compilation =
-                        normalized.starts_with("various artist") || normalized == "various";
-                    (
-                        Some(original),
-                        if compilation {
-                            ArtistKind::VariousArtists
-                        } else {
-                            ArtistKind::AlbumArtist
-                        },
-                        compilation,
-                    )
-                }
-                None => match distinct_track_artists.len() {
-                    0 => (None, ArtistKind::Unknown, false),
-                    1 => (
-                        most_common_value(track_artists.iter().cloned())
-                            .map(|(_, original)| original),
-                        ArtistKind::CommonArtist,
-                        false,
-                    ),
-                    _ => (
-                        Some("Various Artists".to_string()),
-                        ArtistKind::VariousArtists,
-                        true,
-                    ),
+    let (album_artist, artist_kind, is_compilation) = match album_artist_tag {
+        Some((normalized, original)) => {
+            let compilation = normalized.starts_with("various artist") || normalized == "various";
+            (
+                Some(original),
+                if compilation {
+                    ArtistKind::VariousArtists
+                } else {
+                    ArtistKind::AlbumArtist
                 },
-            };
+                compilation,
+            )
+        }
+        None => match distinct_track_artists.len() {
+            0 => (None, ArtistKind::Unknown, false),
+            1 => (
+                most_common_value(track_artists.iter().cloned()).map(|(_, original)| original),
+                ArtistKind::CommonArtist,
+                false,
+            ),
+            _ => (
+                Some("Various Artists".to_string()),
+                ArtistKind::VariousArtists,
+                true,
+            ),
+        },
+    };
 
-            let year = members
-                .iter()
-                .filter_map(|track| track.year)
-                .fold(HashMap::<i64, usize>::new(), |mut counts, year| {
-                    *counts.entry(year).or_default() += 1;
-                    counts
-                })
-                .into_iter()
-                .max_by(|(year_a, count_a), (year_b, count_b)| {
-                    count_a.cmp(count_b).then_with(|| year_b.cmp(year_a))
-                })
-                .map(|(year, _)| year);
-
-            let barcode =
-                consistent_value(members.iter().filter_map(|track| track.barcode.as_deref()));
-            let catalog_number = consistent_value(
-                members
-                    .iter()
-                    .filter_map(|track| track.catalog_number.as_deref()),
-            );
-            let embedded_values: Vec<String> = members
-                .iter()
-                .filter_map(|track| track.discogs_release_id)
-                .map(|id| id.to_string())
-                .collect();
-            let embedded_discogs_id = consistent_value(embedded_values.iter().map(String::as_str))
-                .and_then(|value| value.parse::<u64>().ok());
-
-            let (
-                embedded_musicbrainz_release_id,
-                embedded_musicbrainz_release_group_id,
-                musicbrainz_problems,
-            ) = release_musicbrainz_evidence(&members);
-
-            let revision = revision_of(&members, false);
-            let has_album_tag = !album_title_norm.is_empty();
-
-            let mut track_ids: Vec<i64> = members.iter().map(|track| track.id).collect();
-            track_ids.sort_unstable();
-
-            GroupedRelease {
-                directory,
-                album_title,
-                album_title_norm,
-                album_artist,
-                artist_kind,
-                year,
-                barcode,
-                catalog_number,
-                embedded_discogs_id,
-                embedded_musicbrainz_release_id,
-                embedded_musicbrainz_release_group_id,
-                musicbrainz_problems,
-                is_compilation,
-                has_album_tag,
-                track_count: members.len() as i64,
-                revision,
-                track_ids,
-            }
+    let year = members
+        .iter()
+        .filter_map(|track| track.year)
+        .fold(HashMap::<i64, usize>::new(), |mut counts, year| {
+            *counts.entry(year).or_default() += 1;
+            counts
         })
-        .collect()
+        .into_iter()
+        .max_by(|(year_a, count_a), (year_b, count_b)| {
+            count_a.cmp(count_b).then_with(|| year_b.cmp(year_a))
+        })
+        .map(|(year, _)| year);
+
+    let barcode = consistent_value(members.iter().filter_map(|track| track.barcode.as_deref()));
+    let catalog_number = consistent_value(
+        members
+            .iter()
+            .filter_map(|track| track.catalog_number.as_deref()),
+    );
+    let embedded_values: Vec<String> = members
+        .iter()
+        .filter_map(|track| track.discogs_release_id)
+        .map(|id| id.to_string())
+        .collect();
+    let embedded_discogs_id = consistent_value(embedded_values.iter().map(String::as_str))
+        .and_then(|value| value.parse::<u64>().ok());
+
+    let (
+        embedded_musicbrainz_release_id,
+        embedded_musicbrainz_release_group_id,
+        musicbrainz_problems,
+    ) = release_musicbrainz_evidence(&members);
+
+    let revision = revision_of(&members, merged);
+    let has_album_tag = if merged {
+        album_title.is_some()
+    } else {
+        !album_title_norm.is_empty()
+    };
+
+    let mut track_ids: Vec<i64> = members.iter().map(|track| track.id).collect();
+    track_ids.sort_unstable();
+
+    GroupedRelease {
+        directory,
+        unit,
+        album_title,
+        album_title_norm,
+        album_artist,
+        artist_kind,
+        year,
+        barcode,
+        catalog_number,
+        embedded_discogs_id,
+        embedded_musicbrainz_release_id,
+        embedded_musicbrainz_release_group_id,
+        musicbrainz_problems,
+        is_compilation,
+        has_album_tag,
+        track_count: members.len() as i64,
+        revision,
+        track_ids,
+    }
 }
 
 /// Normalizes a scope root for the SQL path filters: forward slashes, no
@@ -848,6 +1014,7 @@ impl RebuildSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReleaseFields {
     directory: String,
+    unit: String,
     album_title_norm: String,
     album_title: Option<String>,
     album_artist: Option<String>,
@@ -869,6 +1036,7 @@ impl ReleaseFields {
     fn of_group(group: &GroupedRelease) -> Result<Self> {
         Ok(Self {
             directory: group.directory.clone(),
+            unit: group.unit.clone(),
             album_title_norm: group.album_title_norm.clone(),
             album_title: group.album_title.clone(),
             album_artist: group.album_artist.clone(),
@@ -896,6 +1064,7 @@ impl ReleaseFields {
 struct StoredReleaseRow {
     id: i64,
     directory_path: String,
+    unit_path: String,
     album_title_norm: String,
     album_title: Option<String>,
     album_artist: Option<String>,
@@ -929,6 +1098,7 @@ impl From<StoredReleaseRow> for StoredRelease {
             has_match: row.has_match,
             fields: ReleaseFields {
                 directory: row.directory_path,
+                unit: row.unit_path,
                 album_title_norm: row.album_title_norm,
                 album_title: row.album_title,
                 album_artist: row.album_artist,
@@ -955,7 +1125,7 @@ async fn existing_releases(
     scope: Option<&str>,
 ) -> Result<Vec<StoredRelease>> {
     let rows = sqlx::query_as::<_, StoredReleaseRow>(
-        "SELECT lr.id, lr.directory_path, lr.album_title_norm, lr.album_title, lr.album_artist,
+        "SELECT lr.id, lr.directory_path, lr.unit_path, lr.album_title_norm, lr.album_title, lr.album_artist,
                 lr.artist_kind, lr.year, lr.barcode, lr.catalog_number, lr.embedded_discogs_id,
                 lr.is_compilation, lr.has_album_tag, lr.track_count, lr.source_revision,
                 lr.embedded_musicbrainz_release_id, lr.embedded_musicbrainz_release_group_id,
@@ -1099,22 +1269,25 @@ fn plan_rebuild(
 /// album title keeps its ID and accepted match, marked stale. Splitting a
 /// release across several new titles still drops its match; the summary
 /// reports it in `dropped_matches`.
+///
+/// A scope root inside a disc subfolder widens to the folder above it
+/// ([`grouping::unit_scope`]), so a unit is always regrouped whole.
 pub async fn rebuild_local_releases(
     pool: &SqlitePool,
     scope: Option<&Path>,
 ) -> Result<RebuildSummary> {
-    let scope = scope.and_then(scope_param);
-    let scope = scope.as_deref();
-
     // Observe and write inside one write transaction, so a concurrent writer
     // can never leave this rebuild grouping stale data.
     let mut tx = begin_write(pool).await?;
-    let tracks = observed_tracks(&mut tx, scope).await?;
-    let groups = group_tracks(&tracks);
-    let stored = existing_releases(&mut tx, scope).await?;
+    let summary = rebuild_in(&mut tx, scope).await?;
+    tx.commit().await?;
+    Ok(summary)
+}
 
+/// The members of each stored release, by release ID, in ID order.
+fn release_members(tracks: &[ObservedTrack]) -> HashMap<i64, Vec<i64>> {
     let mut members: HashMap<i64, Vec<i64>> = HashMap::new();
-    for track in &tracks {
+    for track in tracks {
         if let Some(release_id) = track.local_release_id {
             members.entry(release_id).or_default().push(track.id);
         }
@@ -1122,6 +1295,35 @@ pub async fn rebuild_local_releases(
     for ids in members.values_mut() {
         ids.sort_unstable();
     }
+    members
+}
+
+/// The stored releases as grouping sees them.
+fn prior_releases(stored: &[StoredRelease]) -> Vec<PriorRelease> {
+    stored
+        .iter()
+        .map(|row| PriorRelease {
+            directory: row.fields.directory.clone(),
+            merged: row.fields.album_title_norm == MERGED_KEY,
+            has_match: row.has_match,
+        })
+        .collect()
+}
+
+/// [`rebuild_local_releases`] inside the caller's write transaction.
+async fn rebuild_in(conn: &mut SqliteConnection, scope: Option<&Path>) -> Result<RebuildSummary> {
+    let widened = scope.map(grouping::unit_scope);
+    let scope = widened.as_deref().and_then(scope_param);
+    let scope = scope.as_deref();
+
+    let tracks = observed_tracks(conn, scope).await?;
+    let stored = existing_releases(conn, scope).await?;
+    let context = GroupingContext {
+        decisions: folder_decisions(conn).await?,
+        prior: prior_releases(&stored),
+    };
+    let groups = group_tracks(&tracks, &context);
+    let members = release_members(&tracks);
 
     let plan = plan_rebuild(&groups, &stored, &members);
     let stored_by_id: HashMap<i64, &StoredRelease> =
@@ -1144,7 +1346,7 @@ pub async fn rebuild_local_releases(
                     summary.unchanged += 1;
                     continue;
                 }
-                update_release(&mut tx, id, &fields).await?;
+                update_release(conn, id, &fields).await?;
                 summary.updated += 1;
                 // The revision hashes tag values and paths, not track IDs. A
                 // file removed and re-added keeps the revision but loses its
@@ -1153,12 +1355,12 @@ pub async fn rebuild_local_releases(
                 (id, Some(row.fields.revision.as_str()))
             }
             Target::Rekey(id) => {
-                update_release(&mut tx, id, &fields).await?;
+                update_release(conn, id, &fields).await?;
                 summary.rekeyed += 1;
                 (id, Some(stored_by_id[&id].fields.revision.as_str()))
             }
             Target::New => {
-                let id = insert_release(&mut tx, &fields).await?;
+                let id = insert_release(conn, &fields).await?;
                 summary.created += 1;
                 (id, None)
             }
@@ -1169,7 +1371,7 @@ pub async fn rebuild_local_releases(
                 "UPDATE local_releases SET status = 'stale' WHERE id = ?1 AND status = 'matched'",
             )
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
         }
         if membership_changed
@@ -1180,7 +1382,7 @@ pub async fn rebuild_local_releases(
                  WHERE local_release_id = ?1 AND stale = 0",
             )
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
             summary.newly_stale += marked.rows_affected() as usize;
         }
@@ -1192,7 +1394,7 @@ pub async fn rebuild_local_releases(
         )
         .bind(id)
         .bind(&track_ids)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
         // A file that moved here may still carry an overlay row from the match
         // of the release it left.
@@ -1203,7 +1405,7 @@ pub async fn rebuild_local_releases(
         )
         .bind(id)
         .bind(&track_ids)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     }
 
@@ -1216,11 +1418,9 @@ pub async fn rebuild_local_releases(
             .count();
         sqlx::query("DELETE FROM local_releases WHERE id IN (SELECT value FROM json_each(?1))")
             .bind(serde_json::to_string(&plan.removed)?)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
     }
-
-    tx.commit().await?;
 
     Ok(summary)
 }
@@ -1231,9 +1431,9 @@ async fn insert_release(conn: &mut SqliteConnection, fields: &ReleaseFields) -> 
             directory_path, album_title_norm, album_title, album_artist, artist_kind, year,
             barcode, catalog_number, embedded_discogs_id, is_compilation, has_album_tag,
             track_count, source_revision, status, embedded_musicbrainz_release_id,
-            embedded_musicbrainz_release_group_id, musicbrainz_problems_json
+            embedded_musicbrainz_release_group_id, musicbrainz_problems_json, unit_path
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
          RETURNING id",
     )
     .bind(&fields.directory)
@@ -1253,6 +1453,7 @@ async fn insert_release(conn: &mut SqliteConnection, fields: &ReleaseFields) -> 
     .bind(&fields.embedded_musicbrainz_release_id)
     .bind(&fields.embedded_musicbrainz_release_group_id)
     .bind(&fields.musicbrainz_problems_json)
+    .bind(&fields.unit)
     .fetch_one(conn)
     .await?;
     Ok(id)
@@ -1283,6 +1484,7 @@ async fn update_release(
             embedded_musicbrainz_release_id = ?15,
             embedded_musicbrainz_release_group_id = ?16,
             musicbrainz_problems_json = ?17,
+            unit_path = ?18,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
             status = CASE
                 WHEN source_revision <> ?14 AND status IN ('matched', 'stale') THEN 'stale'
@@ -1308,6 +1510,7 @@ async fn update_release(
     .bind(&fields.embedded_musicbrainz_release_id)
     .bind(&fields.embedded_musicbrainz_release_group_id)
     .bind(&fields.musicbrainz_problems_json)
+    .bind(&fields.unit)
     .execute(conn)
     .await?;
     Ok(())
@@ -4617,9 +4820,246 @@ mod tests {
         assert_eq!(summary.unchanged, 1);
     }
 
+    const AUGMENTED: &str = "/music/Chemical_brothers-augmented-1999-apc";
+    const BROADCAST: &str = "/music/Depeche_Mode-Broadcast_Singles_Tour-2CD-1999-RNS";
+
+    /// 18 + 1 files in real life: two with the right title, one with a typo.
+    fn augmented_files() -> Vec<ScannedTrack> {
+        vec![
+            scanned(
+                &format!("{AUGMENTED}/01.mp3"),
+                Some("augmented"),
+                Some("Chemical Brothers"),
+                1,
+            ),
+            scanned(
+                &format!("{AUGMENTED}/02.mp3"),
+                Some("augmented"),
+                Some("Chemical Brothers"),
+                2,
+            ),
+            scanned(
+                &format!("{AUGMENTED}/03.mp3"),
+                Some("augmentes"),
+                Some("Chemical Brothers"),
+                3,
+            ),
+        ]
+    }
+
+    /// Two disc folders whose titles differ only by underscores, every file
+    /// tagged disc 1 as per-disc rips are.
+    fn broadcast_files() -> Vec<ScannedTrack> {
+        let mut files = Vec::new();
+        for (disc, album) in [(1, "Broadcast Singles Tour"), (2, "Broadcast_Singles_Tour")] {
+            for track in 1..=2 {
+                let mut file = scanned(
+                    &format!("{BROADCAST}/cd{disc}/0{track}.mp3"),
+                    Some(album),
+                    Some("Depeche Mode"),
+                    track,
+                );
+                file.disc_number = Some(1);
+                files.push(file);
+            }
+        }
+        files
+    }
+
+    /// Two albums in one folder, numbered from 1 each, as in a box set.
+    fn box_files() -> Vec<ScannedTrack> {
+        vec![
+            scanned("/music/box/01.flac", Some("Floodland"), Some("Sisters"), 1),
+            scanned("/music/box/02.flac", Some("Floodland"), Some("Sisters"), 2),
+            scanned(
+                "/music/box/03.flac",
+                Some("Vision Thing"),
+                Some("Sisters"),
+                1,
+            ),
+            scanned(
+                "/music/box/04.flac",
+                Some("Vision Thing"),
+                Some("Sisters"),
+                2,
+            ),
+        ]
+    }
+
+    /// `(directory, key, track count, unit)` of every release, in key order.
+    async fn release_shapes(pool: &SqlitePool) -> Vec<(String, String, i64, String)> {
+        sqlx::query_as(
+            "SELECT directory_path, album_title_norm, track_count, unit_path
+             FROM local_releases ORDER BY directory_path, album_title_norm",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_typo_in_one_album_tag_merges_the_folder_automatically() {
+        let pool = test_pool().await;
+        insert(&pool, "/music", &augmented_files()).await;
+        assert_eq!(
+            release_shapes(&pool).await,
+            vec![(AUGMENTED.into(), "*".into(), 3, AUGMENTED.into())]
+        );
+        let release = load_local_releases(&pool, None).await.unwrap().remove(0);
+        assert_eq!(release.album_title.as_deref(), Some("augmented"));
+    }
+
+    #[tokio::test]
+    async fn untagged_files_never_merge_automatically() {
+        let pool = test_pool().await;
+        let mut files = augmented_files();
+        files.push(scanned(
+            &format!("{AUGMENTED}/04.mp3"),
+            None,
+            Some("Chemical Brothers"),
+            4,
+        ));
+        insert(&pool, "/music", &files).await;
+        assert_eq!(
+            release_shapes(&pool).await,
+            vec![
+                (AUGMENTED.into(), "".into(), 1, AUGMENTED.into()),
+                (AUGMENTED.into(), "*".into(), 3, AUGMENTED.into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn different_albums_in_one_folder_stay_apart() {
+        let pool = test_pool().await;
+        insert(&pool, "/music", &box_files()).await;
+        let keys: Vec<String> = release_shapes(&pool)
+            .await
+            .into_iter()
+            .map(|row| row.1)
+            .collect();
+        assert_eq!(keys, vec!["floodland", "vision thing"]);
+    }
+
+    #[tokio::test]
+    async fn disc_folders_merge_into_the_folder_above() {
+        let pool = test_pool().await;
+        insert(&pool, "/music", &broadcast_files()).await;
+        assert_eq!(
+            release_shapes(&pool).await,
+            vec![(BROADCAST.into(), "*".into(), 4, BROADCAST.into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn disc_folders_with_a_gap_stay_apart_in_one_unit() {
+        let pool = test_pool().await;
+        let files: Vec<ScannedTrack> = broadcast_files()
+            .into_iter()
+            .map(|mut file| {
+                let path = file.path.to_string_lossy().replace("/cd2/", "/cd3/");
+                file.path = PathBuf::from(path);
+                file
+            })
+            .collect();
+        insert(&pool, "/music", &files).await;
+        assert_eq!(
+            release_shapes(&pool).await,
+            vec![
+                (
+                    format!("{BROADCAST}/cd1"),
+                    "broadcast singles tour".into(),
+                    2,
+                    BROADCAST.into()
+                ),
+                (
+                    format!("{BROADCAST}/cd3"),
+                    "broadcast singles tour".into(),
+                    2,
+                    BROADCAST.into()
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_matched_folder_keeps_its_releases_apart() {
+        let pool = test_pool().await;
+        let files = augmented_files();
+        insert(&pool, "/music", &files[..2]).await;
+        let id = accept_manually(&pool, "augmented", &["R1", "R2"]).await;
+
+        insert(&pool, "/music", &files).await;
+        let keys: Vec<String> = release_shapes(&pool)
+            .await
+            .into_iter()
+            .map(|row| row.1)
+            .collect();
+        assert_eq!(keys, vec!["augmented", "augmentes"]);
+        let (status, stale): (String, bool) = sqlx::query_as(
+            "SELECT lr.status, m.stale FROM local_releases lr
+             JOIN release_matches m ON m.local_release_id = lr.id WHERE lr.id = ?1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((status.as_str(), stale), (STATUS_MATCHED, false));
+    }
+
+    #[tokio::test]
+    async fn a_matched_merged_folder_stays_merged_and_takes_new_files() {
+        let pool = test_pool().await;
+        let mut files = augmented_files();
+        insert(&pool, "/music", &files).await;
+        let id = accept_manually(&pool, "augmented", &["R1", "R2", "R3"]).await;
+
+        files.push(scanned(
+            &format!("{AUGMENTED}/04.mp3"),
+            Some("Remixes"),
+            Some("Chemical Brothers"),
+            4,
+        ));
+        insert(&pool, "/music", &files).await;
+        assert_eq!(
+            release_shapes(&pool).await,
+            vec![(AUGMENTED.into(), "*".into(), 4, AUGMENTED.into())]
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM local_releases WHERE id = ?1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, STATUS_STALE);
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_scoped_to_a_disc_folder_regroups_the_whole_unit() {
+        let pool = test_pool().await;
+        insert(&pool, "/music", &broadcast_files()).await;
+        // A new file lands in cd2, and only cd1's tree is regrouped.
+        let directory_id = upsert_directory(&pool, Path::new("/music")).await.unwrap();
+        let mut new_file = scanned(
+            &format!("{BROADCAST}/cd2/03.mp3"),
+            Some("Broadcast Singles Tour"),
+            Some("Depeche Mode"),
+            3,
+        );
+        new_file.disc_number = Some(1);
+        upsert_track(&pool, &new_file, directory_id).await.unwrap();
+        rebuild_local_releases(&pool, Some(Path::new(&format!("{BROADCAST}/cd1"))))
+            .await
+            .unwrap();
+        assert_eq!(
+            release_shapes(&pool).await,
+            vec![(BROADCAST.into(), "*".into(), 5, BROADCAST.into())]
+        );
+    }
+
     fn planned_group(directory: &str, norm: &str, track_ids: &[i64]) -> GroupedRelease {
         GroupedRelease {
             directory: directory.to_string(),
+            unit: directory.to_string(),
             album_title: Some(norm.to_string()),
             album_title_norm: norm.to_string(),
             album_artist: None,
@@ -5090,7 +5530,16 @@ mod tests {
         release
     }
 
+    /// Two disc folders, both tagged `Blue`, kept apart by a `separate`
+    /// decision: they would merge automatically, and these tests are about
+    /// each folder matching its own disc.
     async fn insert_disc_folders(pool: &SqlitePool) -> Vec<LocalRelease> {
+        sqlx::query(
+            "INSERT INTO folder_groupings (directory_path, mode) VALUES ('/music/Set-2CD', 'separate')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
         for disc in 1..=2 {
             let root = format!("/music/Set-2CD/CD{disc}");
             insert(
