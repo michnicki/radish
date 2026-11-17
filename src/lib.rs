@@ -14,7 +14,7 @@
 //! - [`grouping`]: which files of a folder form one local release (merging).
 //! - [`store`]: grouping, revisions, review queue, and transactional overlay.
 //! - [`runner`]: CLI orchestration and the interactive review screen.
-//! - [`web`]: the read-only web interface behind `radish serve`.
+//! - [`web`]: the web interface behind `radish serve`.
 
 pub mod db;
 pub mod deezer;

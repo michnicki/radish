@@ -82,20 +82,43 @@ impl Server {
             "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
         )
         .unwrap();
-        let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).unwrap();
-        let raw = String::from_utf8_lossy(&raw).into_owned();
-        let (head, body) = raw.split_once("\r\n\r\n").unwrap();
-        let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
-        Reply {
-            status,
-            headers: head.to_ascii_lowercase(),
-            body: body.to_string(),
-        }
+        read_reply(stream)
+    }
+
+    /// Sends a form `POST`, with extra header lines such as `Sec-Fetch-Site: same-origin`.
+    fn post(&self, path: &str, body: &str, headers: &[&str]) -> Reply {
+        let mut stream = TcpStream::connect(&self.addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let extra: String = headers.iter().map(|line| format!("{line}\r\n")).collect();
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: {}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+             {extra}Connection: close\r\n\r\n{body}",
+            self.addr,
+            body.len()
+        )
+        .unwrap();
+        read_reply(stream)
     }
 
     fn get(&self, path: &str) -> Reply {
         self.request("GET", path, None)
+    }
+}
+
+fn read_reply(mut stream: TcpStream) -> Reply {
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).unwrap();
+    let raw = String::from_utf8_lossy(&raw).into_owned();
+    let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    Reply {
+        status,
+        headers: head.to_ascii_lowercase(),
+        body: body.to_string(),
     }
 }
 
@@ -332,4 +355,127 @@ fn a_bad_bind_address_is_rejected_before_the_database_opens() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--bind"), "{stderr}");
     assert!(!db.exists(), "the database must not be created");
+}
+
+/// One folder whose two files carry unrelated album tags: two releases.
+fn mixed_folder_library(name: &str) -> std::path::PathBuf {
+    let db = db_path(name);
+    let music = temp_dir(&format!("{name}-music"));
+    let mixed = music.join("Mixed");
+    std::fs::create_dir_all(&mixed).unwrap();
+    write_tagged_wav(
+        &mixed.join("1.wav"),
+        "Blue",
+        "Test Artist",
+        "Blue Moon",
+        1,
+        2001,
+    );
+    write_tagged_wav(
+        &mixed.join("2.wav"),
+        "Rouge",
+        "Test Artist",
+        "Red Sky",
+        2,
+        2001,
+    );
+    let output = radish(&db, &["import", music.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    db
+}
+
+/// The text between `start` and the next `end`.
+fn between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
+    let rest = &text[text
+        .find(start)
+        .unwrap_or_else(|| panic!("no {start} in {text}"))
+        + start.len()..];
+    &rest[..rest.find(end).unwrap()]
+}
+
+fn form_encode(text: &str) -> String {
+    text.bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                char::from(byte).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+#[test]
+fn a_folder_form_merges_only_with_the_token_from_this_site() {
+    let db = mixed_folder_library("web-folder");
+    let server = Server::start(&db);
+
+    let folders = server.get("/folders");
+    assert_eq!(folders.status, 200);
+    assert!(
+        folders.body.contains("automatic: separate"),
+        "{}",
+        folders.body
+    );
+    let link = format!(
+        "/folder?path={}",
+        between(&folders.body, "href=\"/folder?path=", "\"")
+    );
+
+    let page = server.get(&link);
+    assert_eq!(page.status, 200);
+    let token = between(&page.body, "name=\"token\" value=\"", "\"").to_string();
+    let path = between(&page.body, "name=\"path\" value=\"", "\"").to_string();
+    let body = |action: &str, token: &str, path: &str| {
+        format!("path={}&action={action}&token={token}", form_encode(path))
+    };
+
+    let wrong = server.post(
+        "/folder",
+        &body("merge", "nope", &path),
+        &["Sec-Fetch-Site: same-origin"],
+    );
+    assert_eq!(wrong.status, 403);
+    let foreign = server.post(
+        "/folder",
+        &body("merge", &token, &path),
+        &["Sec-Fetch-Site: cross-site"],
+    );
+    assert_eq!(foreign.status, 403);
+    let bogus = server.post(
+        "/folder",
+        &body("bogus", &token, &path),
+        &["Sec-Fetch-Site: same-origin"],
+    );
+    assert_eq!(bogus.status, 400);
+    let missing = server.post(
+        "/folder",
+        &body("merge", &token, "/nowhere/at/all"),
+        &["Sec-Fetch-Site: same-origin"],
+    );
+    assert_eq!(missing.status, 404);
+
+    let merged = server.post(
+        "/folder",
+        &body("merge", &token, &path),
+        &["Sec-Fetch-Site: same-origin"],
+    );
+    assert_eq!(merged.status, 303, "{}", merged.body);
+    assert!(
+        merged.headers.contains("location: /folder?path="),
+        "{}",
+        merged.headers
+    );
+    assert!(server.get("/folders").body.contains("merged by you"));
+}
+
+#[test]
+fn an_unknown_folder_page_is_not_found() {
+    let (db, _music) = seeded_library("web-folder-404");
+    let server = Server::start(&db);
+    assert_eq!(server.get("/folder?path=%2Fnowhere").status, 404);
+    assert_eq!(server.get("/folder").status, 404);
 }

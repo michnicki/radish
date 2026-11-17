@@ -1,15 +1,20 @@
-//! A small read-only web interface over the library database.
+//! A small web interface over the library database.
 //!
-//! `radish serve` shows three server-rendered HTML pages: **Status** (what the
-//! library holds), **Tracks** (the `list` and `search` data) and **Releases**
-//! (the `releases` data). Every request is a `GET`, nothing is written, and no
+//! `radish serve` shows server-rendered HTML pages: **Status** (what the
+//! library holds), **Tracks** (the `list` and `search` data), **Releases**
+//! (the `releases` data) and **Folders** (the `folder list` data, with a page
+//! per folder). The one write is the folder form, which merges a folder's
+//! releases, keeps them apart or leaves them to the automatic rule. No
 //! JavaScript is served.
 //!
 //! The server has no authentication, so safety rests on its defaults:
 //!
-//! - It binds to loopback unless told otherwise.
+//! - It binds to loopback unless told otherwise, and only a loopback server
+//!   takes writes.
 //! - A request whose `Host` header is not a loopback name or the bind address
 //!   gets `403`, which stops DNS-rebinding pages from reading the library.
+//! - A `POST` needs this process's random form token and must not come from
+//!   another site (`Sec-Fetch-Site`).
 //! - Tags, paths and provider titles are untrusted. Each value goes through
 //!   [`Clean`](crate::output::Clean) and then HTML escaping before it is
 //!   written into a page.
@@ -17,19 +22,21 @@
 
 // Rust guideline compliant 2026-08-14
 
+use crate::grouping::FolderAction;
 use crate::layout::{format_duration, plural, track_number};
 use crate::output::Clean;
 use crate::{outln, store};
 use anyhow::{Context, Result};
 use axum::Router;
-use axum::extract::{Query, Request, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::extract::{DefaultBodyLimit, Form, Query, Request, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 
 /// Rows on one page of tracks or releases.
@@ -50,6 +57,14 @@ const MAX_QUERY_CHARS: usize = 200;
 /// Keeps `page * PAGE_SIZE` far from overflow, whatever the URL says. A real
 /// library never has a million pages.
 const MAX_PAGE: u64 = 1_000_000;
+
+/// The largest form body accepted, in bytes. A folder form holds a path, an
+/// action and a token.
+const MAX_FORM_BYTES: usize = 16 * 1024;
+
+/// The column headings of a release table.
+const RELEASE_HEADER: &str = "<tr><th class=\"num\">ID</th><th>Artist</th><th>Album</th>\
+     <th class=\"num\">Tracks</th><th>Status</th><th>Match</th><th>Folder</th></tr>";
 
 /// What the browser may load: nothing, except this page's own inline style.
 const CONTENT_SECURITY_POLICY: &str =
@@ -88,6 +103,11 @@ struct AppState {
     pool: SqlitePool,
     /// The address actually bound, which decides which `Host` values are fine.
     bind: SocketAddr,
+    /// This server process's form token: every form carries it, and a `POST`
+    /// without it is refused.
+    token: Arc<str>,
+    /// Whether forms may change anything: only on a loopback bind.
+    writable: bool,
 }
 
 /// Serves the web interface on `bind` until Ctrl+C.
@@ -112,7 +132,8 @@ pub async fn serve(pool: SqlitePool, bind: SocketAddr) -> Result<()> {
     let bind = listener.local_addr()?;
 
     outln!("Serving http://{bind} (Ctrl+C to stop)");
-    axum::serve(listener, router(pool, bind))
+    let token = new_token()?;
+    axum::serve(listener, router(pool, bind, token))
         .with_graceful_shutdown(async {
             // A failed signal handler leaves Ctrl+C to the default action.
             let _ = tokio::signal::ctrl_c().await;
@@ -121,14 +142,61 @@ pub async fn serve(pool: SqlitePool, bind: SocketAddr) -> Result<()> {
         .context("web server failed")
 }
 
-fn router(pool: SqlitePool, bind: SocketAddr) -> Router {
-    let state = AppState { pool, bind };
+fn router(pool: SqlitePool, bind: SocketAddr, token: String) -> Router {
+    let state = AppState {
+        pool,
+        bind,
+        token: token.into(),
+        writable: writes_allowed(bind),
+    };
     Router::new()
         .route("/", get(status_page))
         .route("/tracks", get(tracks_page))
         .route("/releases", get(releases_page))
+        .route("/folders", get(folders_page))
+        .route(
+            "/folder",
+            get(folder_page)
+                .post(folder_action)
+                .layer(DefaultBodyLimit::max(MAX_FORM_BYTES)),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
+}
+
+/// Whether a server bound to `bind` may change anything. Anyone who can load a
+/// page can read its token, so only a loopback bind takes writes.
+fn writes_allowed(bind: SocketAddr) -> bool {
+    bind.ip().is_loopback()
+}
+
+/// A fresh random form token: 128 bits as 32 hex digits.
+fn new_token() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("cannot create a form token: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Compares tokens in time that does not depend on where they differ.
+fn same_token(expected: &str, given: &str) -> bool {
+    let (expected, given) = (expected.as_bytes(), given.as_bytes());
+    expected.len() == given.len()
+        && expected
+            .iter()
+            .zip(given)
+            .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+            == 0
+}
+
+/// Whether the browser says the request came from elsewhere. Browsers send
+/// `Sec-Fetch-Site` with every request; a client that sends none still needs
+/// the token. `Origin` is no help here: with `Referrer-Policy: no-referrer`,
+/// browsers send `Origin: null` on a `POST`.
+fn cross_site(headers: &HeaderMap) -> bool {
+    headers
+        .get("sec-fetch-site")
+        .is_some_and(|value| value.as_bytes() != b"same-origin")
 }
 
 /// Rejects foreign `Host` headers and adds the security headers to every
@@ -263,12 +331,88 @@ async fn releases_page(
     Ok(Html(page("Releases", Nav::Releases, &body)))
 }
 
+async fn folders_page(
+    State(state): State<AppState>,
+    Query(params): Query<ListParams>,
+) -> Result<Html<String>, AppError> {
+    let page_number = params.page();
+    let all = store::list_folder_units(&state.pool, None).await?;
+    let start = usize::try_from((page_number - 1) * PAGE_SIZE as u64).unwrap_or(usize::MAX);
+    let end = start.saturating_add(PAGE_SIZE);
+    let units = all
+        .get(start.min(all.len())..end.min(all.len()))
+        .unwrap_or(&[]);
+    let body = render_folders(units, page_number, all.len() > end);
+    Ok(Html(page("Folders", Nav::Folders, &body)))
+}
+
+/// The `/folder` query: which unit.
+#[derive(Debug, Default, Deserialize)]
+struct FolderParams {
+    path: Option<String>,
+}
+
+async fn folder_page(
+    State(state): State<AppState>,
+    Query(params): Query<FolderParams>,
+) -> Result<Response, AppError> {
+    let Some(path) = params
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    else {
+        return Ok((StatusCode::NOT_FOUND, "no such folder").into_response());
+    };
+    let Some(view) = store::folder_view(&state.pool, path).await? else {
+        return Ok((StatusCode::NOT_FOUND, "no such folder").into_response());
+    };
+    let token = state.writable.then_some(&*state.token);
+    Ok(Html(page("Folder", Nav::Folders, &render_folder(&view, token))).into_response())
+}
+
+/// The folder form's fields.
+#[derive(Debug, Deserialize)]
+struct FolderForm {
+    path: String,
+    action: String,
+    token: String,
+}
+
+/// Records a folder decision from the form, then shows the folder again.
+///
+/// Refused with `403` off loopback, from another site, or without this
+/// process's token; `400` for an unknown action; `404` for a path that names
+/// no unit.
+async fn folder_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<FolderForm>,
+) -> Result<Response, AppError> {
+    if !state.writable || cross_site(&headers) || !same_token(&state.token, &form.token) {
+        return Ok((StatusCode::FORBIDDEN, "forbidden").into_response());
+    }
+    let Some(action) = FolderAction::parse(&form.action) else {
+        return Ok((StatusCode::BAD_REQUEST, "unknown action").into_response());
+    };
+    let path = form.path.trim().trim_end_matches(['/', '\\']);
+    let unit = store::resolve_folder(&state.pool, &store::FolderTarget::Path(path.to_string()))
+        .await?
+        .filter(|unit| unit.eq_ignore_ascii_case(path));
+    let Some(unit) = unit else {
+        return Ok((StatusCode::NOT_FOUND, "no such folder").into_response());
+    };
+    store::set_folder_mode(&state.pool, &unit, action.mode()).await?;
+    Ok(Redirect::to(&folder_href(&unit)).into_response())
+}
+
 /// The page a link in the header points to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Nav {
     Status,
     Tracks,
     Releases,
+    Folders,
 }
 
 /// Wraps `body` in the document shell with the header navigation.
@@ -287,10 +431,11 @@ fn page(title: &str, active: Nav, body: &str) -> String {
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
          <title>{title} · Radish</title><style>{STYLE}</style></head><body>\
-         <header><b>Radish</b><nav>{}{}{}</nav></header><main>{body}</main></body></html>\n",
+         <header><b>Radish</b><nav>{}{}{}{}</nav></header><main>{body}</main></body></html>\n",
         link(Nav::Status, "/", "Status"),
         link(Nav::Tracks, "/tracks", "Tracks"),
         link(Nav::Releases, "/releases", "Releases"),
+        link(Nav::Folders, "/folders", "Folders"),
     )
 }
 
@@ -373,6 +518,16 @@ fn render_status(status: &store::LibraryStatus) -> String {
     ]
     .concat();
 
+    let folders = if status.folders > 0 {
+        format!(
+            "<p>Folders with several releases, a merged release or a grouping decision: \
+             <a href=\"/folders\">{}</a></p>",
+            status.folders
+        )
+    } else {
+        String::new()
+    };
+
     let newest = match status.newest_modified {
         Some(secs) => format!(
             "<p class=\"muted\">Newest file change seen: {}</p>",
@@ -402,7 +557,7 @@ fn render_status(status: &store::LibraryStatus) -> String {
     };
 
     format!(
-        "<h1>Library status</h1><div class=\"stats\">{tiles}</div>{newest}\
+        "<h1>Library status</h1><div class=\"stats\">{tiles}</div>{folders}{newest}\
          <h1>Imported directories</h1>{directories}"
     )
 }
@@ -456,30 +611,191 @@ fn render_releases(rows: &[store::LocalReleaseStatus], page_number: u64, has_nex
     if rows.is_empty() {
         return "<h1>Releases</h1><p>No local releases found.</p>".to_string();
     }
-    let body: String = rows
-        .iter()
-        .map(|row| {
+    let body: String = rows.iter().map(release_row).collect();
+    format!(
+        "<h1>Releases</h1><p class=\"muted\">{} on this page.</p>\
+         <div class=\"table\"><table><thead>{RELEASE_HEADER}</thead><tbody>{body}</tbody>\
+         </table></div>{}",
+        plural(rows.len() as u64, "release", "releases"),
+        pager("/releases", None, page_number, has_next)
+    )
+}
+
+/// One release as a table row; its folder links to its unit's page.
+fn release_row(row: &store::LocalReleaseStatus) -> String {
+    let merged = row
+        .merged
+        .as_ref()
+        .map(|merged| {
             format!(
-                "<tr><td class=\"num\">{}</td><td>{}</td><td>{}</td><td class=\"num\">{}</td>\
-                 <td>{}</td><td>{}</td><td class=\"path\">{}</td></tr>",
-                row.id,
-                escape_html(row.album_artist.as_deref().unwrap_or("(unknown artist)")),
-                escape_html(row.album_title.as_deref().unwrap_or("(no album tag)")),
-                row.track_count,
-                escape_html(&row.status_label()),
-                render_match(row),
-                escape_html(&row.directory),
+                "<br><span class=\"muted\">merged: {}</span>",
+                escape_html(&merged.label())
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "<tr><td class=\"num\">{}</td><td>{}</td><td>{}{merged}</td><td class=\"num\">{}</td>\
+         <td>{}</td><td>{}</td><td class=\"path\"><a href=\"{}\">{}</a></td></tr>",
+        row.id,
+        escape_html(row.album_artist.as_deref().unwrap_or("(unknown artist)")),
+        escape_html(row.album_title.as_deref().unwrap_or("(no album tag)")),
+        row.track_count,
+        escape_html(&row.status_label()),
+        render_match(row),
+        escape_html(&folder_href(&row.unit)),
+        escape_html(&row.directory),
+    )
+}
+
+/// The page of the unit at `unit`.
+fn folder_href(unit: &str) -> String {
+    format!("/folder?path={}", percent_encode(unit))
+}
+
+/// `text` quoted for a POSIX shell, so a shown command can be pasted.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// `path` relative to the folder `unit`, or all of it when it is elsewhere.
+fn relative_path<'a>(unit: &str, path: &'a str) -> &'a str {
+    path.get(..unit.len())
+        .filter(|head| head.eq_ignore_ascii_case(unit))
+        .and_then(|_| path[unit.len()..].strip_prefix(['/', '\\']))
+        .unwrap_or(path)
+}
+
+fn render_folders(units: &[store::FolderUnit], page_number: u64, has_next: bool) -> String {
+    if units.is_empty() {
+        return "<h1>Folders</h1><p>No folder holds several releases, a merged release or a \
+                grouping decision.</p>"
+            .to_string();
+    }
+    let body: String = units
+        .iter()
+        .map(|unit| {
+            let tracks: i64 = unit
+                .releases
+                .iter()
+                .map(|release| release.track_count)
+                .sum();
+            let matched = unit
+                .releases
+                .iter()
+                .filter(|release| release.status == store::STATUS_MATCHED)
+                .count();
+            format!(
+                "<tr><td class=\"path\"><a href=\"{}\">{}</a></td><td>{}</td>\
+                 <td class=\"num\">{}</td><td class=\"num\">{tracks}</td>\
+                 <td class=\"num\">{matched}</td></tr>",
+                escape_html(&folder_href(&unit.path)),
+                escape_html(&unit.path),
+                unit.state.label(),
+                unit.releases.len(),
             )
         })
         .collect();
     format!(
-        "<h1>Releases</h1><p class=\"muted\">{} on this page.</p>\
-         <div class=\"table\"><table><thead><tr><th class=\"num\">ID</th><th>Artist</th>\
-         <th>Album</th><th class=\"num\">Tracks</th><th>Status</th><th>Match</th>\
-         <th>Folder</th></tr></thead><tbody>{body}</tbody></table></div>{}",
-        plural(rows.len() as u64, "release", "releases"),
-        pager("/releases", None, page_number, has_next)
+        "<h1>Folders</h1><p class=\"muted\">{} on this page.</p>\
+         <div class=\"table\"><table><thead><tr><th>Folder</th><th>Grouping</th>\
+         <th class=\"num\">Releases</th><th class=\"num\">Tracks</th>\
+         <th class=\"num\">Matched</th></tr></thead><tbody>{body}</tbody></table></div>{}",
+        plural(units.len() as u64, "folder", "folders"),
+        pager("/folders", None, page_number, has_next)
     )
+}
+
+/// One unit: its state, the choices, its releases and its files. `token` is
+/// `None` on a server that takes no writes, which shows commands instead.
+fn render_folder(view: &store::FolderView, token: Option<&str>) -> String {
+    let unit = &view.unit;
+    let releases: String = unit.releases.iter().map(release_row).collect();
+    let files: String = view
+        .files
+        .iter()
+        .map(|file| {
+            format!(
+                "<tr><td class=\"path\">{}</td><td class=\"num\">{}</td><td>{}</td><td>{}</td>\
+                 <td class=\"num\">{}</td></tr>",
+                escape_html(relative_path(&unit.path, &file.path)),
+                track_number(file.disc, file.track_number),
+                escape_html(file.album.as_deref().unwrap_or("(no album tag)")),
+                escape_html(file.title.as_deref().unwrap_or("")),
+                format_duration(file.duration_secs),
+            )
+        })
+        .collect();
+    format!(
+        "<h1>Folder</h1><p class=\"path\">{}</p><p>Grouping: {}</p>{}\
+         <h1>Releases</h1><div class=\"table\"><table><thead>{RELEASE_HEADER}</thead>\
+         <tbody>{releases}</tbody></table></div>\
+         <h1>Files</h1><div class=\"table\"><table><thead><tr><th>File</th>\
+         <th class=\"num\">#</th><th>Album tag</th><th>Title</th><th class=\"num\">Time</th>\
+         </tr></thead><tbody>{files}</tbody></table></div>",
+        escape_html(&unit.path),
+        unit.state.label(),
+        render_choices(view, token),
+    )
+}
+
+/// The decision buttons, or the equivalent commands, with their effects.
+fn render_choices(view: &store::FolderView, token: Option<&str>) -> String {
+    if view.choices.is_empty() {
+        return String::new();
+    }
+    let notes: String = view
+        .choices
+        .iter()
+        .filter_map(|(action, effects)| {
+            effects
+                .describe()
+                .map(|text| format!("<li>{}: {text}.</li>", action.label()))
+        })
+        .collect();
+    let notes = if notes.is_empty() {
+        String::new()
+    } else {
+        format!("<ul class=\"muted\">{notes}</ul>")
+    };
+    match token {
+        Some(token) => {
+            let buttons: String = view
+                .choices
+                .iter()
+                .map(|(action, _)| {
+                    format!(
+                        "<button name=\"action\" value=\"{}\">{}</button>",
+                        action.as_str(),
+                        action.label()
+                    )
+                })
+                .collect();
+            format!(
+                "<form method=\"post\" action=\"/folder\">\
+                 <input type=\"hidden\" name=\"path\" value=\"{}\">\
+                 <input type=\"hidden\" name=\"token\" value=\"{}\">{buttons}</form>{notes}",
+                escape_html(&view.unit.path),
+                escape_html(token)
+            )
+        }
+        None => {
+            let commands: String = view
+                .choices
+                .iter()
+                .map(|(action, _)| {
+                    format!(
+                        "<li><code>radish folder {} {}</code></li>",
+                        action.cli_verb(),
+                        escape_html(&shell_quote(&view.unit.path))
+                    )
+                })
+                .collect();
+            format!(
+                "<p class=\"muted\">This server listens on a non-loopback address, so it \
+                 changes nothing. Run one of these instead:</p><ul>{commands}</ul>{notes}"
+            )
+        }
+    }
 }
 
 /// The accepted match as provider, release ID and title, linked when the
@@ -773,7 +1089,7 @@ mod tests {
             matched: 1,
             unmatched: 1,
             stale: 0,
-            folders: 0,
+            folders: 3,
             queued: 1,
             newest_modified: Some(1_700_000_000),
         };
@@ -785,5 +1101,150 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("2023-11-14 22:13 UTC"), "{html}");
+        assert!(html.contains("<a href=\"/folders\">3</a>"), "{html}");
+    }
+
+    #[test]
+    fn tokens_are_random_hex_and_compare_exactly() {
+        let (a, b) = (new_token().unwrap(), new_token().unwrap());
+        assert_eq!(a.len(), 32);
+        assert!(a.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+        assert!(same_token(&a, &a.clone()));
+        assert!(!same_token(&a, &b));
+        assert!(!same_token(&a, ""));
+    }
+
+    #[test]
+    fn only_same_origin_or_silent_browsers_may_post() {
+        let mut headers = HeaderMap::new();
+        assert!(!cross_site(&headers));
+        headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        assert!(!cross_site(&headers));
+        for value in ["cross-site", "same-site", "none"] {
+            headers.insert("sec-fetch-site", HeaderValue::from_static(value));
+            assert!(cross_site(&headers), "{value}");
+        }
+    }
+
+    #[test]
+    fn only_a_loopback_server_takes_writes() {
+        assert!(writes_allowed(addr("127.0.0.1:8787")));
+        assert!(writes_allowed(addr("[::1]:8787")));
+        assert!(!writes_allowed(addr("0.0.0.0:8787")));
+        assert!(!writes_allowed(addr("192.168.1.5:8787")));
+    }
+
+    #[tokio::test]
+    async fn a_server_off_loopback_refuses_every_post() {
+        let state = AppState {
+            pool: crate::db::connect_in_memory().await.unwrap(),
+            bind: addr("0.0.0.0:8787"),
+            token: "t".into(),
+            writable: false,
+        };
+        let form = FolderForm {
+            path: "/m/x".into(),
+            action: "merge".into(),
+            token: "t".into(),
+        };
+        let Ok(response) = folder_action(State(state), HeaderMap::new(), Form(form)).await else {
+            panic!("the handler failed");
+        };
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    fn folder_view() -> store::FolderView {
+        let mut first = release(12);
+        first.unit = "/music/<b>".into();
+        store::FolderView {
+            unit: store::FolderUnit {
+                path: "/music/<b>".into(),
+                state: store::FolderState::Automatic,
+                releases: vec![first],
+            },
+            files: vec![store::FolderFile {
+                path: "/music/<b>/cd2/01.wav".into(),
+                disc: Some(2),
+                track_number: Some(1),
+                album: Some("<i>Blue</i>".into()),
+                title: None,
+                duration_secs: Some(61.0),
+            }],
+            choices: vec![
+                (
+                    FolderAction::Merge,
+                    store::MatchEffects {
+                        stale: 1,
+                        dropped: 0,
+                    },
+                ),
+                (FolderAction::Separate, store::MatchEffects::default()),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_loopback_folder_page_has_a_form_with_the_token() {
+        let html = render_folder(&folder_view(), Some("abc123"));
+        assert!(
+            html.contains("<form method=\"post\" action=\"/folder\">"),
+            "{html}"
+        );
+        assert!(html.contains("name=\"token\" value=\"abc123\""), "{html}");
+        assert!(
+            html.contains("name=\"path\" value=\"/music/&lt;b&gt;\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("value=\"merge\">Merge into one release</button>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("value=\"separate\">Keep separate</button>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("Merge into one release: 1 accepted match becomes stale."),
+            "{html}"
+        );
+        assert!(html.contains("cd2/01.wav"), "{html}");
+        assert!(html.contains("&lt;i&gt;Blue&lt;/i&gt;"), "{html}");
+        assert!(!html.contains("<i>"), "{html}");
+    }
+
+    #[test]
+    fn a_folder_page_off_loopback_shows_commands_instead() {
+        let html = render_folder(&folder_view(), None);
+        assert!(!html.contains("<form"), "{html}");
+        assert!(
+            html.contains("radish folder merge &#39;/music/&lt;b&gt;&#39;"),
+            "{html}"
+        );
+        assert!(html.contains("radish folder split"), "{html}");
+    }
+
+    #[test]
+    fn release_rows_link_their_folder() {
+        let html = render_releases(&[release(12)], 1, false);
+        assert!(
+            html.contains("href=\"/folder?path=%2Fmusic%2F%3Cb%3E\""),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn the_folders_page_lists_units_and_their_state() {
+        let mut first = release(12);
+        first.unit = "/music/<b>".into();
+        let unit = store::FolderUnit {
+            path: "/music/<b>".into(),
+            state: store::FolderState::MergedByUser,
+            releases: vec![first],
+        };
+        let html = render_folders(&[unit], 1, false);
+        assert!(html.contains("merged by you"), "{html}");
+        assert!(html.contains("/music/&lt;b&gt;</a>"), "{html}");
+        assert!(render_folders(&[], 1, false).contains("No folder holds"));
     }
 }
