@@ -552,8 +552,10 @@ pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
 /// matching-relevant field, including the year and all four MusicBrainz
 /// identifier lists. Modification time and accepted overlay values are
 /// excluded. The `release-input-v2:` prefix makes the one-time revision
-/// upgrade explicit.
-fn revision_of(tracks: &[&ObservedTrack]) -> String {
+/// upgrade explicit. A merged release (`merged`) hashes a marker as well, so
+/// merging or splitting a unit always changes the revision, while every
+/// unmerged revision stays exactly what it was.
+fn revision_of(tracks: &[&ObservedTrack], merged: bool) -> String {
     let mut rows: Vec<&ObservedTrack> = tracks.to_vec();
     rows.sort_by(|a, b| {
         a.path
@@ -562,6 +564,9 @@ fn revision_of(tracks: &[&ObservedTrack]) -> String {
     });
 
     let mut payload = String::from("release-input-v2:");
+    if merged {
+        payload.push_str("merged:");
+    }
     for track in rows {
         let ids = track.musicbrainz();
         let fields = [
@@ -718,7 +723,7 @@ pub fn group_tracks(tracks: &[ObservedTrack]) -> Vec<GroupedRelease> {
                 musicbrainz_problems,
             ) = release_musicbrainz_evidence(&members);
 
-            let revision = revision_of(&members);
+            let revision = revision_of(&members, false);
             let has_album_tag = !album_title_norm.is_empty();
 
             let mut track_ids: Vec<i64> = members.iter().map(|track| track.id).collect();
@@ -2531,6 +2536,38 @@ mod tests {
 
     async fn test_pool() -> SqlitePool {
         crate::db::connect_in_memory().await.unwrap()
+    }
+
+    fn observed(path: &str, album: &str) -> ObservedTrack {
+        ObservedTrack {
+            id: 1,
+            path: path.to_string(),
+            title: Some("One".to_string()),
+            artist: Some("Artist".to_string()),
+            album: Some(album.to_string()),
+            album_artist: None,
+            year: Some(2001),
+            track_number: Some(1),
+            disc_number: None,
+            duration_secs: Some(180.0),
+            barcode: None,
+            catalog_number: None,
+            discogs_release_id: None,
+            musicbrainz_ids_json: "{}".to_string(),
+            local_release_id: None,
+            musicbrainz_ids: ObservedMusicBrainzIds::default(),
+        }
+    }
+
+    #[test]
+    fn unmerged_revisions_are_unchanged_by_folder_merging() {
+        let track = observed("/music/a/01.flac", "Blue");
+        assert_eq!(
+            revision_of(&[&track], false),
+            "release-input-v2:7be3de220539888a"
+        );
+        assert_ne!(revision_of(&[&track], true), revision_of(&[&track], false));
+        assert!(revision_of(&[&track], true).starts_with("release-input-v2:"));
     }
 
     #[tokio::test]
