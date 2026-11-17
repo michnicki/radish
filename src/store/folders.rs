@@ -132,3 +132,83 @@ pub async fn set_folder_mode(
         releases,
     })
 }
+
+/// How a unit is grouped and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderState {
+    MergedByUser,
+    SeparateByUser,
+    MergedAutomatically,
+    /// No decision, and the automatic rule keeps the releases apart.
+    Automatic,
+}
+
+impl FolderState {
+    pub(crate) fn of(decision: Option<FolderMode>, merged: bool) -> Self {
+        match (decision, merged) {
+            (Some(FolderMode::Merge), _) => Self::MergedByUser,
+            (Some(FolderMode::Separate), _) => Self::SeparateByUser,
+            (None, true) => Self::MergedAutomatically,
+            (None, false) => Self::Automatic,
+        }
+    }
+
+    /// How `folder list` and the web interface say it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::MergedByUser => "merged by you",
+            Self::SeparateByUser => "kept separate by you",
+            Self::MergedAutomatically => "merged automatically",
+            Self::Automatic => "automatic: separate",
+        }
+    }
+}
+
+/// A unit with its releases.
+#[derive(Debug, Clone)]
+pub struct FolderUnit {
+    pub path: String,
+    pub state: FolderState,
+    /// In `list_local_releases` order.
+    pub releases: Vec<LocalReleaseStatus>,
+}
+
+/// The units under `scope` that hold two or more releases, a merged release or
+/// a decision, in path order.
+pub async fn list_folder_units(pool: &SqlitePool, scope: Option<&Path>) -> Result<Vec<FolderUnit>> {
+    let releases = list_local_releases(pool, scope).await?;
+    let decisions = {
+        let mut conn = pool.acquire().await?;
+        folder_decisions(&mut conn).await?
+    };
+    Ok(folder_units(releases, &decisions))
+}
+
+fn folder_units(
+    releases: Vec<LocalReleaseStatus>,
+    decisions: &HashMap<String, FolderMode>,
+) -> Vec<FolderUnit> {
+    let mut by_unit: BTreeMap<String, (String, Vec<LocalReleaseStatus>)> = BTreeMap::new();
+    for release in releases {
+        by_unit
+            .entry(release.unit.to_ascii_lowercase())
+            .or_insert_with(|| (release.unit.clone(), Vec::new()))
+            .1
+            .push(release);
+    }
+    by_unit
+        .into_iter()
+        .filter_map(|(key, (path, releases))| {
+            let decision = decisions.get(&key).copied();
+            let merged = releases.iter().any(|release| release.merged.is_some());
+            if releases.len() < 2 && !merged && decision.is_none() {
+                return None;
+            }
+            Some(FolderUnit {
+                path,
+                state: FolderState::of(decision, merged),
+                releases,
+            })
+        })
+        .collect()
+}

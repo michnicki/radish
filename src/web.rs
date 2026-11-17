@@ -682,6 +682,7 @@ mod tests {
         store::LocalReleaseStatus {
             id,
             directory: "/music/<b>".into(),
+            unit: "/music/<b>".into(),
             album_title: Some("Blue".into()),
             album_artist: Some("Test Artist".into()),
             track_count: 2,
@@ -694,6 +695,7 @@ mod tests {
             medium: None,
             stale: false,
             queued_providers: Vec::new(),
+            merged: None,
         }
     }
 
@@ -771,6 +773,7 @@ mod tests {
             matched: 1,
             unmatched: 1,
             stale: 0,
+            folders: 0,
             queued: 1,
             newest_modified: Some(1_700_000_000),
         };

@@ -1782,6 +1782,8 @@ pub async fn status_by_id(pool: &SqlitePool) -> Result<HashMap<i64, String>> {
 pub struct LocalReleaseStatus {
     pub id: i64,
     pub directory: String,
+    /// The unit the release belongs to (see [`grouping::Units`]).
+    pub unit: String,
     pub album_title: Option<String>,
     pub album_artist: Option<String>,
     pub track_count: i64,
@@ -1796,6 +1798,31 @@ pub struct LocalReleaseStatus {
     pub medium: Option<i64>,
     pub stale: bool,
     pub queued_providers: Vec<ProviderKind>,
+    /// How the release was merged, when it is a merged release.
+    pub merged: Option<MergeInfo>,
+}
+
+/// What a merged release joined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeInfo {
+    /// Distinct album titles among its files; untagged files are not counted.
+    pub titles: usize,
+    /// Distinct folders its files are in.
+    pub folders: usize,
+    /// Whether the user merged the unit, rather than the automatic rule.
+    pub manual: bool,
+}
+
+impl MergeInfo {
+    /// `2 album titles, 1 folder (automatic)`.
+    pub fn label(&self) -> String {
+        format!(
+            "{}, {} ({})",
+            crate::layout::plural(self.titles as u64, "album title", "album titles"),
+            crate::layout::plural(self.folders as u64, "folder", "folders"),
+            if self.manual { "manual" } else { "automatic" }
+        )
+    }
 }
 
 impl LocalReleaseStatus {
@@ -1829,6 +1856,7 @@ impl LocalReleaseStatus {
 struct StatusRow {
     id: i64,
     directory_path: String,
+    unit_path: String,
     album_title_norm: String,
     album_title: Option<String>,
     album_artist: Option<String>,
@@ -1852,22 +1880,27 @@ pub async fn list_local_releases(
     let merged_parent = scope
         .and_then(grouping::disc_parent_of)
         .map(|parent| path_key(&parent));
-    let scope_members: HashSet<i64> = match (&merged_parent, scope.and_then(scope_param)) {
-        (Some(_), Some(scope)) => sqlx::query_scalar(
-            "SELECT DISTINCT t.local_release_id FROM tracks t
-             WHERE substr(replace(t.path, '\\', '/'), 1, length(?1) + 1)
-                   = (?1 || '/') COLLATE NOCASE",
-        )
-        .bind(scope)
-        .fetch_all(pool)
-        .await?
-        .into_iter()
-        .collect(),
-        _ => HashSet::new(),
+    let merged_id: Option<i64> = match (&merged_parent, scope.and_then(scope_param)) {
+        (Some(parent), Some(scope)) => {
+            sqlx::query_scalar(
+                "SELECT lr.id FROM local_releases lr
+                 WHERE lr.album_title_norm = ?3
+                   AND replace(lr.directory_path, '\\', '/') = ?2 COLLATE NOCASE
+                   AND EXISTS (SELECT 1 FROM tracks t WHERE t.local_release_id = lr.id
+                               AND substr(replace(t.path, '\\', '/'), 1, length(?1) + 1)
+                                   = (?1 || '/') COLLATE NOCASE)",
+            )
+            .bind(scope)
+            .bind(parent)
+            .bind(MERGED_KEY)
+            .fetch_optional(pool)
+            .await?
+        }
+        _ => None,
     };
     let rows = sqlx::query_as::<_, StatusRow>(
-        "SELECT lr.id, lr.directory_path, lr.album_title_norm, lr.album_title, lr.album_artist,
-                lr.track_count,
+        "SELECT lr.id, lr.directory_path, lr.unit_path, lr.album_title_norm, lr.album_title,
+                lr.album_artist, lr.track_count,
                 lr.status, m.provider AS provider, m.remote_release_id AS remote_release_id,
                 m.release_url AS remote_url, m.title AS remote_title, m.stale AS stale, m.match_scope,
                 m.medium_position AS medium
@@ -1898,33 +1931,63 @@ pub async fn list_local_releases(
         providers.sort();
     }
 
+    let decisions = {
+        let mut conn = pool.acquire().await?;
+        folder_decisions(&mut conn).await?
+    };
+    let merged_files: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT t.local_release_id, t.path, a.title
+         FROM tracks t
+         JOIN local_releases lr ON lr.id = t.local_release_id
+         LEFT JOIN albums a ON a.id = t.album_id
+         WHERE lr.album_title_norm = ?1",
+    )
+    .bind(MERGED_KEY)
+    .fetch_all(pool)
+    .await?;
+    let mut merged_parts: HashMap<i64, (HashSet<String>, HashSet<String>)> = HashMap::new();
+    for (release_id, path, album) in merged_files {
+        let parts = merged_parts.entry(release_id).or_default();
+        if let Some(key) = album.as_deref().and_then(identity_key) {
+            parts.0.insert(key);
+        }
+        parts.1.insert(directory_of(&path).to_ascii_lowercase());
+    }
+
     Ok(rows
         .into_iter()
         .filter(|row| match scope {
-            Some(scope) => {
-                path_within(&row.directory_path, scope)
-                    || (row.album_title_norm == MERGED_KEY
-                        && scope_members.contains(&row.id)
-                        && merged_parent.as_deref()
-                            == Some(path_key(Path::new(&row.directory_path)).as_str()))
-            }
+            Some(scope) => path_within(&row.directory_path, scope) || Some(row.id) == merged_id,
             None => true,
         })
-        .map(|row| LocalReleaseStatus {
-            id: row.id,
-            directory: row.directory_path,
-            album_title: row.album_title,
-            album_artist: row.album_artist,
-            track_count: row.track_count,
-            status: row.status,
-            provider: row.provider.as_deref().and_then(ProviderKind::parse),
-            remote_release_id: row.remote_release_id,
-            remote_url: row.remote_url,
-            remote_title: row.remote_title,
-            match_scope: row.match_scope,
-            medium: row.medium,
-            stale: row.stale.unwrap_or(0) != 0,
-            queued_providers: queued_by_release.remove(&row.id).unwrap_or_default(),
+        .map(|row| {
+            let merged = (row.album_title_norm == MERGED_KEY).then(|| {
+                let (titles, folders) = merged_parts.remove(&row.id).unwrap_or_default();
+                MergeInfo {
+                    titles: titles.len(),
+                    folders: folders.len(),
+                    manual: decisions.get(&row.unit_path.to_ascii_lowercase())
+                        == Some(&FolderMode::Merge),
+                }
+            });
+            LocalReleaseStatus {
+                id: row.id,
+                directory: row.directory_path,
+                unit: row.unit_path,
+                album_title: row.album_title,
+                album_artist: row.album_artist,
+                track_count: row.track_count,
+                status: row.status,
+                provider: row.provider.as_deref().and_then(ProviderKind::parse),
+                remote_release_id: row.remote_release_id,
+                remote_url: row.remote_url,
+                remote_title: row.remote_title,
+                match_scope: row.match_scope,
+                medium: row.medium,
+                stale: row.stale.unwrap_or(0) != 0,
+                queued_providers: queued_by_release.remove(&row.id).unwrap_or_default(),
+                merged,
+            }
         })
         .collect())
 }
@@ -1948,6 +2011,8 @@ pub struct LibraryStatus {
     pub matched: i64,
     pub unmatched: i64,
     pub stale: i64,
+    /// Units holding two or more releases, a merged release or a decision.
+    pub folders: i64,
     /// Releases with a queued review that are not already matched.
     pub queued: i64,
     /// The newest file modification time stored, in seconds since the epoch.
@@ -1987,9 +2052,21 @@ pub async fn library_status(pool: &SqlitePool) -> Result<LibraryStatus> {
     .fetch_one(pool)
     .await?;
 
+    let folders: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM (
+             SELECT unit_path FROM local_releases GROUP BY unit_path
+             HAVING COUNT(*) >= 2 OR MAX(album_title_norm = ?1)
+                 OR unit_path IN (SELECT directory_path FROM folder_groupings)
+         )",
+    )
+    .bind(MERGED_KEY)
+    .fetch_one(pool)
+    .await?;
+
     let mut status = LibraryStatus {
         directories,
         tracks,
+        folders,
         queued,
         newest_modified,
         ..LibraryStatus::default()
@@ -6245,5 +6322,48 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, loaded[0].id);
         assert_eq!(listed[0].track_count, 4);
+    }
+
+    #[tokio::test]
+    async fn folder_list_shows_units_with_several_releases_a_merge_or_a_decision() {
+        let pool = test_pool().await;
+        let mut files = box_files();
+        files.extend(augmented_files());
+        files.push(scanned(
+            "/music/single/01.flac",
+            Some("Alone"),
+            Some("A"),
+            1,
+        ));
+        insert(&pool, "/music", &files).await;
+        set_folder_mode(&pool, "/music/single", Some(FolderMode::Separate))
+            .await
+            .unwrap();
+
+        let units = list_folder_units(&pool, None).await.unwrap();
+        let summary: Vec<(String, FolderState, usize)> = units
+            .iter()
+            .map(|unit| (unit.path.clone(), unit.state, unit.releases.len()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("/music/box".into(), FolderState::Automatic, 2),
+                (AUGMENTED.into(), FolderState::MergedAutomatically, 1),
+                ("/music/single".into(), FolderState::SeparateByUser, 1),
+            ]
+        );
+        let merged = units[1].releases[0].merged.clone().unwrap();
+        assert_eq!(
+            merged,
+            MergeInfo {
+                titles: 2,
+                folders: 1,
+                manual: false
+            }
+        );
+        assert_eq!(merged.label(), "2 album titles, 1 folder (automatic)");
+        assert!(units[0].releases[0].merged.is_none());
+        assert_eq!(library_status(&pool).await.unwrap().folders, 3);
     }
 }
