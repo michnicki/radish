@@ -5,7 +5,6 @@
 
 use super::*;
 use crate::grouping::FolderAction;
-use crate::layout::plural;
 
 /// Every folder decision, by lowercased unit path.
 pub(super) async fn folder_decisions(
@@ -270,33 +269,27 @@ pub struct FolderView {
     pub choices: Vec<(FolderAction, MatchEffects)>,
 }
 
-/// The unit at `unit`, or `None` when no release belongs to it.
+/// The unit that `path` names (see [`resolve_folder`]), or `None` when it names
+/// none.
 ///
 /// Each choice is previewed by grouping and planning the unit's files under
-/// that decision, without writing anything.
-pub async fn folder_view(pool: &SqlitePool, unit: &str) -> Result<Option<FolderView>> {
-    let unit = unit.trim_end_matches(['/', '\\']);
-    let releases: Vec<LocalReleaseStatus> = list_local_releases(pool, Some(Path::new(unit)))
-        .await?
-        .into_iter()
-        .filter(|release| release.unit.eq_ignore_ascii_case(unit))
-        .collect();
-    let Some(first) = releases.first() else {
+/// that decision, without writing anything. Only the unit is read, in one read
+/// transaction. Files not yet assigned to a release (an interrupted import) are
+/// not shown until the next regroup.
+pub async fn folder_view(pool: &SqlitePool, path: &str) -> Result<Option<FolderView>> {
+    let Some(unit) = resolve_folder(pool, &FolderTarget::Path(path.to_string())).await? else {
         return Ok(None);
     };
-    let unit = first.unit.clone();
-    let ids: Vec<i64> = releases.iter().map(|release| release.id).collect();
 
-    let mut conn = pool.acquire().await?;
-    let decisions = folder_decisions(&mut conn).await?;
-    let tracks = observed_tracks_of(&mut conn, &ids).await?;
-    let scope = scope_param(Path::new(&unit));
-    let stored: Vec<StoredRelease> = existing_releases(&mut conn, scope.as_deref())
-        .await?
-        .into_iter()
-        .filter(|row| ids.contains(&row.id))
-        .collect();
-    drop(conn);
+    let mut tx = pool.begin().await?;
+    let (releases, decisions) = status_listing(&mut tx, Some(&unit)).await?;
+    let ids: Vec<i64> = releases.iter().map(|release| release.id).collect();
+    let tracks = observed_tracks_of(&mut tx, &ids).await?;
+    let stored = stored_releases_by_id(&mut tx, &ids).await?;
+    tx.commit().await?;
+    if releases.is_empty() {
+        return Ok(None);
+    }
 
     let unit_key = unit.to_ascii_lowercase();
     let decision = decisions.get(&unit_key).copied();
@@ -369,7 +362,11 @@ fn preview_effects(
         let row = stored_by_id[&id];
         let same_members =
             members.get(&id).map(Vec::as_slice).unwrap_or_default() == group.track_ids.as_slice();
-        if row.has_match && (!same_members || row.fields.revision != group.revision) {
+        // A re-keyed release goes stale on a changed revision alone; a kept
+        // one also when its files changed. Only fresh matches are marked.
+        let changed = row.fields.revision != group.revision
+            || (matches!(target, Target::Existing(_)) && !same_members);
+        if row.has_fresh_match && changed {
             effects.stale += 1;
         }
     }
