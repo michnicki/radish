@@ -1541,6 +1541,7 @@ async fn update_release(
 struct LocalReleaseRow {
     id: i64,
     directory_path: String,
+    album_title_norm: String,
     album_title: Option<String>,
     album_artist: Option<String>,
     artist_kind: String,
@@ -1566,6 +1567,7 @@ struct LocalTrackRow {
     duration_secs: Option<f64>,
     local_release_id: i64,
     musicbrainz_ids_json: String,
+    album: Option<String>,
 }
 
 impl LocalTrackRow {
@@ -1625,6 +1627,11 @@ pub async fn load_selected_releases(
     scope: Option<&Path>,
     id: Option<i64>,
 ) -> Result<Vec<LocalRelease>> {
+    // A merged release lives at its unit's folder, above the disc subfolder
+    // the scope may name; take that release too, and nothing else from there.
+    let merged_parent = scope
+        .and_then(grouping::disc_parent_of)
+        .and_then(|parent| scope_param(&parent));
     let scope = scope.and_then(scope_param);
     let scope = scope.as_deref();
 
@@ -1633,45 +1640,67 @@ pub async fn load_selected_releases(
     let mut tx = pool.begin().await?;
 
     let release_rows = sqlx::query_as::<_, LocalReleaseRow>(
-        "SELECT lr.id, lr.directory_path, lr.album_title, lr.album_artist, lr.artist_kind,
-                lr.year, lr.barcode, lr.catalog_number, lr.embedded_discogs_id,
+        "SELECT lr.id, lr.directory_path, lr.album_title_norm, lr.album_title, lr.album_artist,
+                lr.artist_kind, lr.year, lr.barcode, lr.catalog_number, lr.embedded_discogs_id,
                 lr.embedded_musicbrainz_release_id, lr.embedded_musicbrainz_release_group_id,
                 lr.musicbrainz_problems_json, lr.is_compilation, lr.has_album_tag,
                 lr.source_revision
          FROM local_releases lr
-         WHERE (?1 IS NULL
-                OR replace(lr.directory_path, '\\', '/') = ?1 COLLATE NOCASE
-                OR substr(replace(lr.directory_path, '\\', '/'), 1, length(?1) + 1)
-                    = (?1 || '/') COLLATE NOCASE)
+         WHERE ((?1 IS NULL
+                 OR replace(lr.directory_path, '\\', '/') = ?1 COLLATE NOCASE
+                 OR substr(replace(lr.directory_path, '\\', '/'), 1, length(?1) + 1)
+                     = (?1 || '/') COLLATE NOCASE)
+                OR (lr.album_title_norm = '*'
+                    AND replace(lr.directory_path, '\\', '/') = ?3 COLLATE NOCASE))
            AND (?2 IS NULL OR lr.id = ?2)
          ORDER BY lr.directory_path, lr.album_title_norm",
     )
     .bind(scope)
     .bind(id)
+    .bind(merged_parent.as_deref())
     .fetch_all(&mut *tx)
     .await?;
 
     let track_rows = sqlx::query_as::<_, LocalTrackRow>(
         "SELECT t.id, t.path, t.title, t.disc_number, t.track_number, t.duration_secs,
-                t.local_release_id, t.musicbrainz_ids_json
+                t.local_release_id, t.musicbrainz_ids_json, a.title AS album
          FROM tracks t
          JOIN local_releases lr ON lr.id = t.local_release_id
-         WHERE (?1 IS NULL
-                OR replace(lr.directory_path, '\\', '/') = ?1 COLLATE NOCASE
-                OR substr(replace(lr.directory_path, '\\', '/'), 1, length(?1) + 1)
-                    = (?1 || '/') COLLATE NOCASE)
+         LEFT JOIN albums a ON a.id = t.album_id
+         WHERE ((?1 IS NULL
+                 OR replace(lr.directory_path, '\\', '/') = ?1 COLLATE NOCASE
+                 OR substr(replace(lr.directory_path, '\\', '/'), 1, length(?1) + 1)
+                     = (?1 || '/') COLLATE NOCASE)
+                OR (lr.album_title_norm = '*'
+                    AND replace(lr.directory_path, '\\', '/') = ?3 COLLATE NOCASE))
            AND (?2 IS NULL OR lr.id = ?2)
          ORDER BY t.path",
     )
     .bind(scope)
     .bind(id)
+    .bind(merged_parent.as_deref())
     .fetch_all(&mut *tx)
     .await?;
 
     tx.commit().await?;
 
+    // Inside a merged release, a file's disc comes from its disc subfolder or
+    // the disc marker ending its own album tag, before its disc tag.
+    let merged_units: HashMap<i64, &str> = release_rows
+        .iter()
+        .filter(|row| row.album_title_norm == MERGED_KEY)
+        .map(|row| (row.id, row.directory_path.as_str()))
+        .collect();
     let mut tracks_by_release: HashMap<i64, Vec<LocalTrack>> = HashMap::new();
-    for row in track_rows {
+    for mut row in track_rows {
+        if let Some(unit) = merged_units.get(&row.local_release_id) {
+            row.disc_number = grouping::effective_disc(
+                unit,
+                &directory_of(&row.path),
+                row.album.as_deref(),
+                row.disc_number,
+            );
+        }
         tracks_by_release
             .entry(row.local_release_id)
             .or_default()
@@ -1790,6 +1819,7 @@ impl LocalReleaseStatus {
 struct StatusRow {
     id: i64,
     directory_path: String,
+    album_title_norm: String,
     album_title: Option<String>,
     album_artist: Option<String>,
     track_count: i64,
@@ -1807,8 +1837,10 @@ pub async fn list_local_releases(
     pool: &SqlitePool,
     scope: Option<&Path>,
 ) -> Result<Vec<LocalReleaseStatus>> {
+    let merged_parent = scope.and_then(grouping::disc_parent_of);
     let rows = sqlx::query_as::<_, StatusRow>(
-        "SELECT lr.id, lr.directory_path, lr.album_title, lr.album_artist, lr.track_count,
+        "SELECT lr.id, lr.directory_path, lr.album_title_norm, lr.album_title, lr.album_artist,
+                lr.track_count,
                 lr.status, m.provider AS provider, m.remote_release_id AS remote_release_id,
                 m.release_url AS remote_url, m.title AS remote_title, m.stale AS stale, m.match_scope,
                 m.medium_position AS medium
@@ -1842,7 +1874,14 @@ pub async fn list_local_releases(
     Ok(rows
         .into_iter()
         .filter(|row| match scope {
-            Some(scope) => path_within(&row.directory_path, scope),
+            Some(scope) => {
+                path_within(&row.directory_path, scope)
+                    || (row.album_title_norm == MERGED_KEY
+                        && merged_parent.as_deref().is_some_and(|parent| {
+                            row.directory_path
+                                .eq_ignore_ascii_case(&parent.to_string_lossy())
+                        }))
+            }
             None => true,
         })
         .map(|row| LocalReleaseStatus {
@@ -6039,5 +6078,59 @@ mod tests {
             None
         );
         assert_eq!(resolve(FolderTarget::Release(999_999)).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_merged_release_numbers_discs_from_its_subfolders() {
+        let pool = test_pool().await;
+        insert(&pool, "/music", &broadcast_files()).await;
+        let release = load_local_releases(&pool, None).await.unwrap().remove(0);
+        assert_eq!(release.directory, BROADCAST);
+        assert_eq!(
+            release.album_title.as_deref(),
+            Some("Broadcast Singles Tour")
+        );
+        let order: Vec<(Option<i64>, String)> = release
+            .tracks
+            .iter()
+            .map(|track| (track.disc, track.path.replace(BROADCAST, "")))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (Some(1), "/cd1/01.mp3".to_string()),
+                (Some(1), "/cd1/02.mp3".to_string()),
+                (Some(2), "/cd2/01.mp3".to_string()),
+                (Some(2), "/cd2/02.mp3".to_string()),
+            ]
+        );
+        assert!(matcher::local_disc_hint(&release).is_none());
+
+        // A two-disc release maps onto the files as a whole.
+        let mut remote = remote_with(&["Track 1", "Track 2", "Track 1", "Track 2"]);
+        for (index, track) in remote.tracklist.iter_mut().enumerate() {
+            track.medium_position = Some(index as u32 / 2 + 1);
+            track.track_position = Some(index as u32 % 2 + 1);
+            track.position = Some(format!("{}-{}", index / 2 + 1, index % 2 + 1));
+        }
+        let candidate = Candidate::new(&release, remote);
+        assert_eq!(candidate.mapping.medium, None);
+        let pairs: Vec<(usize, usize)> = candidate.mapping.assigned_pairs().collect();
+        assert_eq!(pairs, vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
+    }
+
+    #[tokio::test]
+    async fn a_disc_subfolder_scope_finds_its_merged_release() {
+        let pool = test_pool().await;
+        insert(&pool, "/music", &broadcast_files()).await;
+        let cd1 = format!("{BROADCAST}/cd1");
+        let loaded = load_selected_releases(&pool, Some(Path::new(&cd1)), None)
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
+        let listed = list_local_releases(&pool, Some(Path::new(&cd1)))
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
     }
 }

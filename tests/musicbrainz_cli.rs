@@ -491,6 +491,32 @@ async fn disc_folders_match_their_own_disc_of_a_two_disc_release() {
 }
 
 #[tokio::test]
+async fn disc_folders_merged_automatically_match_the_whole_two_disc_release() {
+    let db = db_path("disc-folders-merged");
+    seed_folders(&db, &[("/music/Set-2CD/CD1", 1), ("/music/Set-2CD/CD2", 3)]).await;
+    let server = MockServer::start(two_disc_handler);
+
+    let output = run(&db, &server, &["match"]);
+    let text = stdout(&output);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("Accepted: 1"), "{text}");
+
+    let pool = radish::db::connect(&db).await.unwrap();
+    let rows: Vec<(String, Option<i64>)> =
+        sqlx::query_as("SELECT remote_release_id, medium_position FROM release_matches")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, vec![(MBID.to_string(), None)]);
+    let directory: String = sqlx::query_scalar("SELECT directory_path FROM local_releases")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(directory, "/music/Set-2CD");
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn a_folder_without_a_disc_number_is_not_matched_to_one_disc() {
     let db = db_path("disc-folder-unnumbered");
     seed_folders(&db, &[("/music/Set-2CD/Bonus", 3)]).await;
