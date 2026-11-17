@@ -676,6 +676,8 @@ fn title_group<'a>(title: &'a str, members: &[&'a ObservedTrack]) -> TitleGroup<
                 album: track.album.as_deref(),
                 disc_tag: track.disc_number,
                 track_number: track.track_number,
+                title: track.title.as_deref(),
+                duration_secs: track.duration_secs,
             })
             .collect(),
     }
@@ -5136,6 +5138,7 @@ mod tests {
                     track,
                 );
                 file.disc_number = Some(1);
+                file.title = Some(format!("Disc {disc} track {track}"));
                 files.push(file);
             }
         }
@@ -5203,6 +5206,45 @@ mod tests {
                 (AUGMENTED.into(), "*".into(), 3, AUGMENTED.into()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn two_copies_of_one_file_keep_a_unit_from_merging_automatically() {
+        const LIVE: &str = "/music/Rammstein-Live_In_NY_(07-18-01)_Bootleg-2001-PMS";
+        let pool = test_pool().await;
+        let mut files = Vec::new();
+        for track in 1..=2 {
+            files.push(scanned(
+                &format!("{LIVE}/CD1/0{track}.mp3"),
+                Some("Live In NY"),
+                Some("Rammstein"),
+                track,
+            ));
+        }
+        // CD2 carries no track numbers, and its files are copied into the
+        // unit folder itself.
+        for dir in ["CD2", ""] {
+            for (name, title, secs) in [("a", "encore (live)", 226.0), ("b", "sonne (live)", 305.0)]
+            {
+                let mut file = scanned(
+                    &format!("{LIVE}/{dir}/{name}.mp3").replace("//", "/"),
+                    Some("Live In NY"),
+                    Some("Rammstein"),
+                    1,
+                );
+                file.track_number = None;
+                file.title = Some(title.to_string());
+                file.duration_secs = Some(secs);
+                files.push(file);
+            }
+        }
+        insert(&pool, "/music", &files).await;
+        let shapes = release_shapes(&pool).await;
+        assert!(
+            shapes.iter().all(|row| row.1 != "*"),
+            "no merged release: {shapes:?}"
+        );
+        assert_eq!(shapes.len(), 3);
     }
 
     #[tokio::test]

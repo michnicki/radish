@@ -257,6 +257,10 @@ pub struct RuleFile<'a> {
     pub disc_tag: Option<i64>,
     /// The track number tag.
     pub track_number: Option<i64>,
+    /// The track title tag.
+    pub title: Option<&'a str>,
+    /// The length in seconds, when known.
+    pub duration_secs: Option<f64>,
 }
 
 /// The files of a unit that today's grouping puts in one release (one folder,
@@ -352,6 +356,36 @@ pub fn same_album(a: &str, b: &str) -> bool {
         && matcher::version_words(&a) == matcher::version_words(&b)
 }
 
+/// The longest two lengths may differ by, in seconds, for two files with one
+/// track title to count as copies of each other.
+const COPY_DURATION_TOLERANCE_SECS: f64 = 1.0;
+
+/// Whether two files share a normalized track title and a length within
+/// [`COPY_DURATION_TOLERANCE_SECS`]. Files without a title, with a title that
+/// normalizes to nothing, or without a known length never count. Different mixes
+/// of one title differ in length and are no copies.
+fn has_copies<'f, 'a: 'f>(files: impl Iterator<Item = &'f RuleFile<'a>>) -> bool {
+    let mut lengths: HashMap<String, Vec<f64>> = HashMap::new();
+    for file in files {
+        let (Some(title), Some(secs)) = (file.title, file.duration_secs) else {
+            continue;
+        };
+        let key = matcher::normalize_text(title);
+        if key.is_empty() {
+            continue;
+        }
+        let seen = lengths.entry(key).or_default();
+        if seen
+            .iter()
+            .any(|other| (other - secs).abs() <= COPY_DURATION_TOLERANCE_SECS)
+        {
+            return true;
+        }
+        seen.push(secs);
+    }
+    false
+}
+
 /// Whether the automatic rule merges a unit, given its groups with a usable
 /// album title (untagged and junk-tagged files are not passed: they never
 /// merge automatically). The caller has already checked that no release of
@@ -360,7 +394,8 @@ pub fn same_album(a: &str, b: &str) -> bool {
 /// The unit merges when there are at least two groups and:
 /// 1. every title names the same album as the main title, or both name the
 ///    same album as the title in the unit folder's scene name;
-/// 2. no two files share an effective disc and track number;
+/// 2. no two files share an effective disc and track number, or the same
+///    track title and length (within a second): two copies of one file;
 /// 3. when the files span more than one disc, the effective discs run from 1
 ///    with no gap; disc subfolders always name different discs;
 /// 4. a disc count in the folder name (`2CD`) is met exactly.
@@ -401,6 +436,10 @@ pub fn auto_merges(unit: &str, groups: &[TitleGroup<'_>]) -> bool {
         {
             return false;
         }
+    }
+
+    if has_copies(files.iter().map(|(file, _)| *file)) {
+        return false;
     }
 
     let discs: BTreeSet<i64> = files.iter().map(|(_, disc)| *disc).collect();
@@ -558,6 +597,18 @@ mod tests {
             album: Some(album),
             disc_tag: None,
             track_number: Some(track),
+            title: None,
+            duration_secs: None,
+        }
+    }
+
+    /// A file with a track title and a length, and no track number.
+    fn timed<'a>(path: &'a str, album: &'a str, title: &'a str, secs: f64) -> RuleFile<'a> {
+        RuleFile {
+            track_number: None,
+            title: Some(title),
+            duration_secs: Some(secs),
+            ..file(path, album, 1)
         }
     }
 
@@ -790,6 +841,49 @@ mod tests {
         let groups = [
             group("Shine 6 CD1", vec![file(&one, "Shine 6 CD1", 1)]),
             group("Shine 6 CD2", vec![file(&two, "Shine 6 CD2", 1)]),
+        ];
+        assert!(auto_merges(unit, &groups));
+    }
+
+    #[test]
+    fn two_copies_of_one_file_stay_apart_without_track_numbers() {
+        let unit = "/m/Rammstein-Live_In_NY_(07-18-01)_Bootleg-2001-PMS";
+        let album = "Live In NY";
+        let path = |name: &str| format!("{unit}/{name}");
+        let (cd1a, cd1b) = (path("CD1/01.mp3"), path("CD1/02.mp3"));
+        let (cd2a, cd2b) = (path("CD2/a.mp3"), path("CD2/b.mp3"));
+        let (copy_a, copy_b) = (path("a.mp3"), path("b.mp3"));
+        let groups = [
+            group(album, vec![file(&cd1a, album, 1), file(&cd1b, album, 2)]),
+            group(
+                album,
+                vec![
+                    timed(&cd2a, album, "encore (live)", 226.0),
+                    timed(&cd2b, album, "sonne (live)", 305.0),
+                ],
+            ),
+            group(
+                album,
+                vec![
+                    timed(&copy_a, album, "encore (live)", 226.0),
+                    timed(&copy_b, album, "sonne (live)", 305.4),
+                ],
+            ),
+        ];
+        assert!(!auto_merges(unit, &groups));
+        // Without the copies in the unit folder the same discs merge.
+        assert!(auto_merges(unit, &groups[..2]));
+    }
+
+    #[test]
+    fn one_title_on_two_discs_with_different_lengths_still_merges() {
+        let unit = "/m/Album-Remixes-2CD-2001-GRP";
+        let album = "Remixes";
+        let one = format!("{unit}/CD1/a.mp3");
+        let two = format!("{unit}/CD2/a.mp3");
+        let groups = [
+            group(album, vec![timed(&one, album, "Intro Mix", 180.0)]),
+            group(album, vec![timed(&two, album, "Intro Mix", 240.0)]),
         ];
         assert!(auto_merges(unit, &groups));
     }
