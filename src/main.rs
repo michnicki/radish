@@ -1337,12 +1337,21 @@ mod tests {
 
     #[test]
     fn an_existing_folder_is_tried_canonical_first_then_as_written() {
-        let request = parse_folder_target("/tmp/../tmp").unwrap();
-        assert_eq!(request.given, "/tmp/../tmp");
-        assert_eq!(request.candidates.len(), 2);
+        // The current directory always exists, whatever the platform.
+        let canonical = std::env::current_dir()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let request = parse_folder_target(".").unwrap();
+        assert_eq!(request.given, ".");
         assert_eq!(
-            request.candidates[1],
-            store::FolderTarget::Path("/tmp/../tmp".into())
+            request.candidates,
+            vec![
+                store::FolderTarget::Path(canonical),
+                store::FolderTarget::Path(".".into()),
+            ]
         );
     }
 
