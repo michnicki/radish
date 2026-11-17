@@ -4,6 +4,8 @@
 // Rust guideline compliant 2026-08-14
 
 use super::*;
+use crate::grouping::FolderAction;
+use crate::layout::plural;
 
 /// Every folder decision, by lowercased unit path.
 pub(super) async fn folder_decisions(
@@ -211,4 +213,197 @@ fn folder_units(
             })
         })
         .collect()
+}
+
+/// What a folder decision would do to accepted matches.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MatchEffects {
+    /// Accepted matches that would be marked stale.
+    pub stale: usize,
+    /// Accepted matches that would be deleted with their release.
+    pub dropped: usize,
+}
+
+impl MatchEffects {
+    /// `1 accepted match becomes stale, 2 accepted matches are dropped`, or
+    /// `None` when no match changes.
+    pub fn describe(self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.stale > 0 {
+            parts.push(format!(
+                "{} {} stale",
+                plural(self.stale as u64, "accepted match", "accepted matches"),
+                if self.stale == 1 { "becomes" } else { "become" }
+            ));
+        }
+        if self.dropped > 0 {
+            parts.push(format!(
+                "{} {} dropped",
+                plural(self.dropped as u64, "accepted match", "accepted matches"),
+                if self.dropped == 1 { "is" } else { "are" }
+            ));
+        }
+        (!parts.is_empty()).then(|| parts.join(", "))
+    }
+}
+
+/// A file of a unit as the folder page lists it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FolderFile {
+    pub path: String,
+    /// The disc the file is on in a merged release of the unit.
+    pub disc: Option<i64>,
+    pub track_number: Option<i64>,
+    pub album: Option<String>,
+    pub title: Option<String>,
+    pub duration_secs: Option<f64>,
+}
+
+/// One unit as the web interface shows it.
+#[derive(Debug, Clone)]
+pub struct FolderView {
+    pub unit: FolderUnit,
+    /// The unit's files, in path order.
+    pub files: Vec<FolderFile>,
+    /// Each action that would change the unit's decision, with what it would
+    /// do to accepted matches.
+    pub choices: Vec<(FolderAction, MatchEffects)>,
+}
+
+/// The unit at `unit`, or `None` when no release belongs to it.
+///
+/// Each choice is previewed by grouping and planning the unit's files under
+/// that decision, without writing anything.
+pub async fn folder_view(pool: &SqlitePool, unit: &str) -> Result<Option<FolderView>> {
+    let unit = unit.trim_end_matches(['/', '\\']);
+    let releases: Vec<LocalReleaseStatus> = list_local_releases(pool, Some(Path::new(unit)))
+        .await?
+        .into_iter()
+        .filter(|release| release.unit.eq_ignore_ascii_case(unit))
+        .collect();
+    let Some(first) = releases.first() else {
+        return Ok(None);
+    };
+    let unit = first.unit.clone();
+    let ids: Vec<i64> = releases.iter().map(|release| release.id).collect();
+
+    let mut conn = pool.acquire().await?;
+    let decisions = folder_decisions(&mut conn).await?;
+    let tracks = observed_tracks_of(&mut conn, &ids).await?;
+    let scope = scope_param(Path::new(&unit));
+    let stored: Vec<StoredRelease> = existing_releases(&mut conn, scope.as_deref())
+        .await?
+        .into_iter()
+        .filter(|row| ids.contains(&row.id))
+        .collect();
+    drop(conn);
+
+    let unit_key = unit.to_ascii_lowercase();
+    let decision = decisions.get(&unit_key).copied();
+    let choices = FolderAction::ALL
+        .into_iter()
+        .filter(|action| action.mode() != decision)
+        .map(|action| {
+            let mut decisions = decisions.clone();
+            match action.mode() {
+                Some(mode) => {
+                    decisions.insert(unit_key.clone(), mode);
+                }
+                None => {
+                    decisions.remove(&unit_key);
+                }
+            }
+            (action, preview_effects(&tracks, &stored, decisions))
+        })
+        .collect();
+    let files = tracks
+        .iter()
+        .map(|track| FolderFile {
+            path: track.path.clone(),
+            disc: grouping::effective_disc(
+                &unit,
+                &directory_of(&track.path),
+                track.album.as_deref(),
+                track.disc_number,
+            ),
+            track_number: track.track_number,
+            album: track.album.clone(),
+            title: track.title.clone(),
+            duration_secs: track.duration_secs,
+        })
+        .collect();
+    let merged = releases.iter().any(|release| release.merged.is_some());
+    Ok(Some(FolderView {
+        unit: FolderUnit {
+            path: unit,
+            state: FolderState::of(decision, merged),
+            releases,
+        },
+        files,
+        choices,
+    }))
+}
+
+/// What regrouping `tracks` under `decisions` would do to the accepted matches
+/// of `stored`, by the same grouping and plan a rebuild runs.
+fn preview_effects(
+    tracks: &[ObservedTrack],
+    stored: &[StoredRelease],
+    decisions: HashMap<String, FolderMode>,
+) -> MatchEffects {
+    let context = GroupingContext {
+        decisions,
+        prior: prior_releases(stored),
+    };
+    let groups = group_tracks(tracks, &context);
+    let members = release_members(tracks);
+    let plan = plan_rebuild(&groups, stored, &members);
+    let stored_by_id: HashMap<i64, &StoredRelease> =
+        stored.iter().map(|row| (row.id, row)).collect();
+
+    let mut effects = MatchEffects::default();
+    for (group, target) in groups.iter().zip(&plan.targets) {
+        let (Target::Existing(id) | Target::Rekey(id)) = *target else {
+            continue;
+        };
+        let row = stored_by_id[&id];
+        let same_members =
+            members.get(&id).map(Vec::as_slice).unwrap_or_default() == group.track_ids.as_slice();
+        if row.has_match && (!same_members || row.fields.revision != group.revision) {
+            effects.stale += 1;
+        }
+    }
+    effects.dropped = plan
+        .removed
+        .iter()
+        .filter(|id| stored_by_id.get(*id).is_some_and(|row| row.has_match))
+        .count();
+    effects
+}
+
+/// The observed tracks of the given releases, in path order.
+async fn observed_tracks_of(
+    conn: &mut SqliteConnection,
+    release_ids: &[i64],
+) -> Result<Vec<ObservedTrack>> {
+    let mut rows = sqlx::query_as::<_, ObservedTrack>(
+        "SELECT t.id AS id, t.path AS path, t.title AS title, t.artist AS artist,
+                a.title AS album, t.album_artist AS album_artist, t.year AS year,
+                t.track_number AS track_number, t.disc_number AS disc_number,
+                t.duration_secs AS duration_secs, t.barcode AS barcode,
+                t.catalog_number AS catalog_number, t.discogs_release_id AS discogs_release_id,
+                t.musicbrainz_ids_json AS musicbrainz_ids_json,
+                t.local_release_id AS local_release_id
+         FROM tracks t
+         LEFT JOIN albums a ON a.id = t.album_id
+         WHERE t.local_release_id IN (SELECT value FROM json_each(?1))
+         ORDER BY t.path",
+    )
+    .bind(serde_json::to_string(release_ids)?)
+    .fetch_all(&mut *conn)
+    .await?;
+    for row in &mut rows {
+        row.musicbrainz_ids = serde_json::from_str(&row.musicbrainz_ids_json).unwrap_or_default();
+    }
+    Ok(rows)
 }

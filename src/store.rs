@@ -2870,6 +2870,7 @@ pub async fn search_tracks(pool: &SqlitePool, query: &str) -> Result<Vec<TrackRo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grouping::FolderAction;
     use crate::matcher::{RemoteTrack, ScoreBreakdown, TrackEntryType};
     use crate::scanner;
     use std::path::PathBuf;
@@ -6365,5 +6366,58 @@ mod tests {
         assert_eq!(merged.label(), "2 album titles, 1 folder (automatic)");
         assert!(units[0].releases[0].merged.is_none());
         assert_eq!(library_status(&pool).await.unwrap().folders, 3);
+    }
+
+    #[tokio::test]
+    async fn a_folder_view_previews_what_each_choice_does_to_matches() {
+        let pool = test_pool().await;
+        insert(&pool, "/music", &box_files()).await;
+        accept_manually(&pool, "Floodland", &["R1", "R2"]).await;
+
+        let view = folder_view(&pool, "/music/box/").await.unwrap().unwrap();
+        assert_eq!(view.unit.path, "/music/box");
+        assert_eq!(view.unit.state, FolderState::Automatic);
+        assert_eq!(view.unit.releases.len(), 2);
+        assert_eq!(
+            view.choices,
+            vec![
+                (
+                    FolderAction::Merge,
+                    MatchEffects {
+                        stale: 1,
+                        dropped: 0
+                    }
+                ),
+                (FolderAction::Separate, MatchEffects::default()),
+            ]
+        );
+        let files: Vec<&str> = view.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(
+            files,
+            [
+                "/music/box/01.flac",
+                "/music/box/02.flac",
+                "/music/box/03.flac",
+                "/music/box/04.flac"
+            ]
+        );
+        assert_eq!(
+            MatchEffects {
+                stale: 1,
+                dropped: 2
+            }
+            .describe()
+            .as_deref(),
+            Some("1 accepted match becomes stale, 2 accepted matches are dropped")
+        );
+        assert_eq!(MatchEffects::default().describe(), None);
+        // The preview wrote nothing.
+        assert_eq!(release_shapes(&pool).await.len(), 2);
+        assert!(
+            folder_view(&pool, "/music/nowhere")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }
