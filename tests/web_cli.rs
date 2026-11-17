@@ -372,6 +372,13 @@ fn a_bad_bind_address_is_rejected_before_the_database_opens() {
 
 /// One folder whose two files carry unrelated album tags: two releases.
 fn mixed_folder_library(name: &str) -> std::path::PathBuf {
+    folder_library(name, false)
+}
+
+/// [`mixed_folder_library`], and with `discs` also real `CD1` and `CD2`
+/// subfolders under it, each with its own album title, so they stay apart in
+/// the same unit.
+fn folder_library(name: &str, discs: bool) -> std::path::PathBuf {
     let db = db_path(name);
     let music = temp_dir(&format!("{name}-music"));
     let mixed = music.join("Mixed");
@@ -392,6 +399,13 @@ fn mixed_folder_library(name: &str) -> std::path::PathBuf {
         2,
         2001,
     );
+    if discs {
+        for (folder, album) in [("CD1", "Alpha"), ("CD2", "Beta")] {
+            let disc = mixed.join(folder);
+            std::fs::create_dir_all(&disc).unwrap();
+            write_tagged_wav(&disc.join("1.wav"), album, "Test Artist", "Song", 1, 2001);
+        }
+    }
     let output = radish(&db, &["import", music.to_str().unwrap()]);
     assert!(
         output.status.success(),
@@ -432,7 +446,7 @@ fn form_encode(text: &str) -> String {
 
 #[test]
 fn a_folder_form_merges_only_with_the_token_from_this_site() {
-    let db = mixed_folder_library("web-folder");
+    let db = folder_library("web-folder", true);
     let server = Server::start(&db);
 
     let folders = server.get("/folders");
@@ -479,10 +493,10 @@ fn a_folder_form_merges_only_with_the_token_from_this_site() {
         &["Sec-Fetch-Site: same-origin"],
     );
     assert_eq!(missing.status, 404);
-    // Only the unit's own path is one: a subfolder that holds no disc is not.
+    // Only the unit's own path is one: a real disc subfolder of it is not.
     let subfolder = server.post(
         "/folder",
-        &body("merge", &token, &format!("{path}/cd1")),
+        &body("merge", &token, &format!("{path}/CD1")),
         &["Sec-Fetch-Site: same-origin"],
     );
     assert_eq!(subfolder.status, 404);

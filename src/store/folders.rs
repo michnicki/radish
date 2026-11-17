@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::grouping::FolderAction;
+use crate::output::Clean;
 
 /// Every folder decision, by lowercased unit path.
 pub(super) async fn folder_decisions(
@@ -34,16 +35,31 @@ pub enum FolderTarget {
 /// A release names its unit. A path names the unit of the releases in that
 /// folder, or the unit at that path, so a disc subfolder names the unit
 /// above it. A disc subfolder whose files all went into a merged release still
-/// names that release's unit.
+/// names that release's unit. A folder with two or more disc subfolders that
+/// hold releases is a unit even when no row says so yet, as in a database
+/// copied from before the folder rules ran.
 pub async fn resolve_folder(pool: &SqlitePool, target: &FolderTarget) -> Result<Option<String>> {
+    let mut conn = pool.acquire().await?;
+    resolve_in(&mut conn, target).await
+}
+
+/// [`resolve_folder`] on the caller's connection, so a write transaction can
+/// resolve what it has just regrouped.
+pub(super) async fn resolve_in(
+    conn: &mut SqliteConnection,
+    target: &FolderTarget,
+) -> Result<Option<String>> {
     let path = match target {
         FolderTarget::Release(id) => {
-            return Ok(
+            let unit: Option<String> =
                 sqlx::query_scalar("SELECT unit_path FROM local_releases WHERE id = ?1")
                     .bind(id)
-                    .fetch_optional(pool)
-                    .await?,
-            );
+                    .fetch_optional(&mut *conn)
+                    .await?;
+            return Ok(match unit {
+                Some(unit) => Some(disc_parent_unit(conn, &unit).await?.unwrap_or(unit)),
+                None => None,
+            });
         }
         FolderTarget::Path(path) => path.trim_end_matches(['/', '\\']),
     };
@@ -53,10 +69,10 @@ pub async fn resolve_folder(pool: &SqlitePool, target: &FolderTarget) -> Result<
          ORDER BY unit_path = ?1 DESC LIMIT 1",
     )
     .bind(path)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
-    if found.is_some() {
-        return Ok(found);
+    if let Some(found) = found {
+        return Ok(Some(disc_parent_unit(conn, &found).await?.unwrap_or(found)));
     }
     if let Some(parent) = grouping::disc_parent_of(Path::new(path)) {
         // The folder must hold files of the merged release: a disc folder that
@@ -73,18 +89,63 @@ pub async fn resolve_folder(pool: &SqlitePool, target: &FolderTarget) -> Result<
         .bind(parent.to_string_lossy().as_ref())
         .bind(MERGED_KEY)
         .bind(path.replace('\\', "/"))
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await?);
     }
-    Ok(None)
+    disc_unit_at(conn, path).await
+}
+
+/// The unit above `directory` when it is a disc subfolder of one by its
+/// structure: a stored `unit_path` can still be the disc folder itself until
+/// the folder is regrouped.
+async fn disc_parent_unit(conn: &mut SqliteConnection, directory: &str) -> Result<Option<String>> {
+    match grouping::disc_parent_of(Path::new(directory)) {
+        Some(parent) => disc_unit_at(conn, &parent.to_string_lossy()).await,
+        None => Ok(None),
+    }
+}
+
+/// `folder`, spelled as the stored releases spell it, when two or more of them
+/// sit in distinct disc subfolders directly under it.
+async fn disc_unit_at(conn: &mut SqliteConnection, folder: &str) -> Result<Option<String>> {
+    let folder = folder.replace('\\', "/");
+    let directories: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT directory_path FROM local_releases
+         WHERE substr(replace(directory_path, '\\', '/'), 1, length(?1) + 1)
+               = (?1 || '/') COLLATE NOCASE",
+    )
+    .bind(&folder)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut discs: HashSet<String> = HashSet::new();
+    let mut spelling: Option<String> = None;
+    for directory in directories {
+        let normalized = directory.replace('\\', "/");
+        let Some(rest) = normalized.get(folder.len() + 1..) else {
+            continue;
+        };
+        if rest.is_empty()
+            || rest.contains('/')
+            || matcher::folder_disc_number(&directory).is_none()
+        {
+            continue;
+        }
+        if spelling.is_none() {
+            spelling = directory.get(..folder.len()).map(str::to_string);
+        }
+        discs.insert(rest.to_ascii_lowercase());
+    }
+    Ok(if discs.len() >= 2 { spelling } else { None })
 }
 
 /// What a folder decision did to its unit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderOutcome {
-    /// The unit's path.
+    /// The unit's path, as stored.
     pub unit: String,
-    /// The regroup's counts, including matches marked stale or dropped.
+    /// The counts of everything the command regrouped: bringing the folder up
+    /// to date, then applying the decision. Matches marked stale or dropped are
+    /// included.
     pub summary: RebuildSummary,
     /// The unit's releases afterwards: ID and track count, in ID order.
     pub releases: Vec<(i64, i64)>,
@@ -92,6 +153,15 @@ pub struct FolderOutcome {
 
 /// Records `mode` for `unit` (`None` removes the decision, which leaves the
 /// unit to the automatic rule) and regroups the unit, in one transaction.
+///
+/// The folder is regrouped first, so a database copied from before the folder
+/// rules ran names its unit by structure. The decision is stored for the unit
+/// the folder resolves to, which can be the folder above a disc subfolder.
+///
+/// # Errors
+///
+/// Fails, and changes nothing, when `unit` names no folder with local
+/// releases.
 pub async fn set_folder_mode(
     pool: &SqlitePool,
     unit: &str,
@@ -99,6 +169,10 @@ pub async fn set_folder_mode(
 ) -> Result<FolderOutcome> {
     let unit = unit.trim_end_matches(['/', '\\']);
     let mut tx = begin_write(pool).await?;
+    let current = rebuild_in(&mut tx, Some(&grouping::unit_scope(Path::new(unit)))).await?;
+    let Some(unit) = resolve_in(&mut tx, &FolderTarget::Path(unit.to_string())).await? else {
+        bail!("'{}' is not a folder with local releases", Clean(unit));
+    };
     match mode {
         Some(mode) => {
             sqlx::query(
@@ -107,28 +181,40 @@ pub async fn set_folder_mode(
                      mode = excluded.mode,
                      decided_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
             )
-            .bind(unit)
+            .bind(&unit)
             .bind(mode.as_str())
             .execute(&mut *tx)
             .await?;
         }
         None => {
             sqlx::query("DELETE FROM folder_groupings WHERE directory_path = ?1")
-                .bind(unit)
+                .bind(&unit)
                 .execute(&mut *tx)
                 .await?;
         }
     }
-    let summary = rebuild_in(&mut tx, Some(Path::new(unit))).await?;
+    let mut summary = rebuild_in(&mut tx, Some(Path::new(&unit))).await?;
     let releases: Vec<(i64, i64)> = sqlx::query_as(
         "SELECT id, track_count FROM local_releases WHERE unit_path = ?1 ORDER BY id",
     )
-    .bind(unit)
+    .bind(&unit)
     .fetch_all(&mut *tx)
     .await?;
+    if releases.is_empty() {
+        bail!(
+            "'{}' holds no local releases after regrouping",
+            Clean(&unit)
+        );
+    }
+    summary.created += current.created;
+    summary.updated += current.updated;
+    summary.rekeyed += current.rekeyed;
+    summary.removed += current.removed;
+    summary.newly_stale += current.newly_stale;
+    summary.dropped_matches += current.dropped_matches;
     tx.commit().await?;
     Ok(FolderOutcome {
-        unit: unit.to_string(),
+        unit,
         summary,
         releases,
     })

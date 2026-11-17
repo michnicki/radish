@@ -6264,6 +6264,111 @@ mod tests {
         assert_eq!(decisions[0].1, "merge");
     }
 
+    /// Two disc folders of one album, in the state of a database copied from
+    /// before the folder rules ran: no decision, and every `unit_path` still
+    /// the release's own folder.
+    async fn copied_disc_folders(pool: &SqlitePool) {
+        sqlx::query(
+            "INSERT INTO folder_groupings (directory_path, mode) VALUES ('/music/Set-2CD', 'separate')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        for disc in 1..=2 {
+            let root = format!("/music/Set-2CD/CD{disc}");
+            insert(
+                pool,
+                &root,
+                &[scanned(
+                    &format!("{root}/01.flac"),
+                    Some("Blue"),
+                    Some("Artist"),
+                    1,
+                )],
+            )
+            .await;
+        }
+        sqlx::query("DELETE FROM folder_groupings")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE local_releases SET unit_path = directory_path")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn disc_folders_resolve_by_structure_before_they_are_regrouped() {
+        let pool = test_pool().await;
+        copied_disc_folders(&pool).await;
+        for path in [
+            "/music/Set-2CD",
+            "/music/Set-2CD/CD1",
+            "/MUSIC/set-2cd/cd2/",
+        ] {
+            let found = resolve_folder(&pool, &FolderTarget::Path(path.into()))
+                .await
+                .unwrap();
+            assert_eq!(found.as_deref(), Some("/music/Set-2CD"), "{path}");
+        }
+        let id: i64 = sqlx::query_scalar(
+            "SELECT id FROM local_releases WHERE directory_path = '/music/Set-2CD/CD1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let found = resolve_folder(&pool, &FolderTarget::Release(id))
+            .await
+            .unwrap();
+        assert_eq!(found.as_deref(), Some("/music/Set-2CD"));
+    }
+
+    #[tokio::test]
+    async fn a_decision_on_an_ungrouped_disc_folder_lands_on_its_unit() {
+        let pool = test_pool().await;
+        copied_disc_folders(&pool).await;
+
+        let outcome = set_folder_mode(&pool, "/music/Set-2CD/CD1", Some(FolderMode::Merge))
+            .await
+            .unwrap();
+        assert_eq!(outcome.unit, "/music/Set-2CD");
+        assert_eq!(outcome.releases.len(), 1);
+        assert_eq!(
+            release_shapes(&pool).await,
+            vec![(
+                "/music/Set-2CD".into(),
+                "*".into(),
+                2,
+                "/music/Set-2CD".into()
+            )]
+        );
+        let decisions: Vec<(String, String)> =
+            sqlx::query_as("SELECT directory_path, mode FROM folder_groupings")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            decisions,
+            vec![("/music/Set-2CD".to_string(), "merge".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_decision_on_no_folder_is_an_error_and_writes_nothing() {
+        let pool = test_pool().await;
+        insert(&pool, "/music", &box_files()).await;
+        let error = set_folder_mode(&pool, "/music/nowhere", Some(FolderMode::Merge))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("/music/nowhere"), "{error:#}");
+        let decisions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM folder_groupings")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(decisions, 0);
+    }
+
     #[tokio::test]
     async fn an_untagged_file_joins_under_a_manual_merge() {
         let pool = test_pool().await;
