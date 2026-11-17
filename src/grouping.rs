@@ -376,7 +376,8 @@ fn copy_key(text: &str) -> String {
 /// Whether two files share a normalized track title and track artist and have
 /// lengths within [`COPY_DURATION_TOLERANCE_SECS`]. A missing artist matches
 /// only a missing artist. Files without a usable title or without a known
-/// length never count. Different mixes of one title differ in length, and
+/// length (positive and finite; the scanner stores 0.0 for an unmeasured file)
+/// never count. Different mixes of one title differ in length, and
 /// different artists who happen to share a title and length (`Freestyle`) are
 /// no copies.
 fn has_copies<'f, 'a: 'f>(files: impl Iterator<Item = &'f RuleFile<'a>>) -> bool {
@@ -385,6 +386,10 @@ fn has_copies<'f, 'a: 'f>(files: impl Iterator<Item = &'f RuleFile<'a>>) -> bool
         let (Some(title), Some(secs)) = (file.title, file.duration_secs) else {
             continue;
         };
+        // The scanner stores 0.0 for a length it could not measure.
+        if !(secs.is_finite() && secs > 0.0) {
+            continue;
+        }
         let title = copy_key(title);
         if title.is_empty() {
             continue;
@@ -945,5 +950,24 @@ mod tests {
             ),
         ];
         assert!(!auto_merges(unit, &same));
+    }
+
+    #[test]
+    fn unmeasured_lengths_never_make_copies() {
+        let unit = "/m/Album-Singles-2CD-2001-GRP";
+        let album = "Singles";
+        let one = format!("{unit}/CD1/a.mp3");
+        let two = format!("{unit}/CD2/a.mp3");
+        let groups = [
+            group(album, vec![timed(&one, album, "Intro", "DJ A", 0.0)]),
+            group(album, vec![timed(&two, album, "Intro", "DJ A", 0.0)]),
+        ];
+        assert!(auto_merges(unit, &groups));
+        // A measured pair of the same title and artist is still a pair of copies.
+        let measured = [
+            group(album, vec![timed(&one, album, "Intro", "DJ A", 90.0)]),
+            group(album, vec![timed(&two, album, "Intro", "DJ A", 90.0)]),
+        ];
+        assert!(!auto_merges(unit, &measured));
     }
 }
