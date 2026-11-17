@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use radish::grouping::FolderAction;
 use radish::layout::{Column, Table, format_duration, plural, track_number};
 use radish::output::{Clean, clean_path};
 use radish::progress::ImportProgress;
@@ -77,6 +78,11 @@ enum Command {
         /// Restrict output to this directory tree
         #[arg(long, value_name = "PATH")]
         path: Option<PathBuf>,
+    },
+    /// Merge a folder's releases into one, keep them apart, or let Radish decide
+    Folder {
+        #[command(subcommand)]
+        action: FolderCommand,
     },
     /// Match local releases against MusicBrainz, with optional Discogs and Deezer fallbacks
     Match {
@@ -174,6 +180,169 @@ enum IndexAction {
     },
     /// Show each index's dump date, size, and release count
     Status,
+}
+
+#[derive(Subcommand)]
+enum FolderCommand {
+    /// Merge each target's folder into one local release
+    Merge {
+        /// Local release IDs or folder paths
+        #[arg(required = true, value_name = "TARGET")]
+        targets: Vec<String>,
+    },
+    /// Keep each target's folder split by album title
+    Split {
+        /// Local release IDs or folder paths
+        #[arg(required = true, value_name = "TARGET")]
+        targets: Vec<String>,
+    },
+    /// Drop the decision for each target's folder; the automatic rule decides again
+    Auto {
+        /// Local release IDs or folder paths
+        #[arg(required = true, value_name = "TARGET")]
+        targets: Vec<String>,
+    },
+    /// List folders with several releases, a merged release, or a decision
+    List {
+        /// Restrict output to this directory tree
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
+}
+
+/// Reads a folder target: all ASCII digits name a local release, anything
+/// else a folder. A folder that exists here is canonicalized; one that does
+/// not is kept as written, since the library may be imported on another
+/// machine.
+fn parse_folder_target(raw: &str) -> Result<store::FolderTarget> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("an empty folder target names nothing");
+    }
+    if trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        let id = trimmed
+            .parse::<i64>()
+            .with_context(|| format!("'{}' is not a local release ID", Clean(trimmed)))?;
+        return Ok(store::FolderTarget::Release(id));
+    }
+    let path = Path::new(trimmed);
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    Ok(store::FolderTarget::Path(
+        resolved.to_string_lossy().into_owned(),
+    ))
+}
+
+/// Resolves every target first, then records `action` for each distinct unit.
+async fn apply_folder_action(
+    pool: &sqlx::SqlitePool,
+    targets: &[store::FolderTarget],
+    action: FolderAction,
+) -> Result<()> {
+    let mut units: Vec<String> = Vec::new();
+    for target in targets {
+        let Some(unit) = store::resolve_folder(pool, target).await? else {
+            match target {
+                store::FolderTarget::Release(id) => bail!("local release {id} was not found"),
+                store::FolderTarget::Path(path) => {
+                    bail!("'{}' is not a folder with local releases", Clean(path))
+                }
+            }
+        };
+        if !units.iter().any(|known| known.eq_ignore_ascii_case(&unit)) {
+            units.push(unit);
+        }
+    }
+    for unit in units {
+        let outcome = store::set_folder_mode(pool, &unit, action.mode()).await?;
+        for line in render_folder_outcome(action, &outcome) {
+            outln!("{line}");
+        }
+    }
+    Ok(())
+}
+
+/// What one folder decision did, for the terminal.
+fn render_folder_outcome(action: FolderAction, outcome: &store::FolderOutcome) -> Vec<String> {
+    let verb = match action {
+        FolderAction::Merge => "Merged",
+        FolderAction::Separate => "Kept separate",
+        FolderAction::Auto => "Left to the automatic rule",
+    };
+    let mut lines = vec![format!("{verb}: {}", Clean(&outcome.unit))];
+    let releases: Vec<String> = outcome
+        .releases
+        .iter()
+        .map(|(id, tracks)| format!("#{id} ({})", plural(*tracks as u64, "track", "tracks")))
+        .collect();
+    lines.push(match releases.as_slice() {
+        [] => "  no releases".to_string(),
+        [one] => format!("  release {one}"),
+        many => format!("  releases {}", many.join(", ")),
+    });
+    let summary = &outcome.summary;
+    if summary.newly_stale > 0 {
+        lines.push(format!(
+            "  {} marked stale",
+            plural(
+                summary.newly_stale as u64,
+                "accepted match",
+                "accepted matches"
+            )
+        ));
+    }
+    if summary.dropped_matches > 0 {
+        lines.push(format!(
+            "  {} dropped",
+            plural(
+                summary.dropped_matches as u64,
+                "accepted match",
+                "accepted matches"
+            )
+        ));
+    }
+    if summary.changed()
+        && let [(id, _)] = outcome.releases.as_slice()
+    {
+        lines.push(format!(
+            "  run `radish match --local-release {id}` to match it"
+        ));
+    }
+    lines
+}
+
+fn print_folder_units(units: &[store::FolderUnit]) {
+    if units.is_empty() {
+        outln!("No folder holds several releases, a merged release or a grouping decision.");
+        return;
+    }
+    for line in render_folder_units(units) {
+        outln!("{line}");
+    }
+}
+
+/// One block per unit: path, state, releases; then the total.
+fn render_folder_units(units: &[store::FolderUnit]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for unit in units {
+        lines.push(Clean(&unit.path).to_string());
+        lines.push(format!("  {}", unit.state.label()));
+        for row in &unit.releases {
+            lines.push(format!(
+                "  #{}  {} — {} · {} · {}",
+                row.id,
+                Clean(row.album_artist.as_deref().unwrap_or("(unknown artist)")),
+                Clean(row.album_title.as_deref().unwrap_or("(no album tag)")),
+                plural(row.track_count.max(0) as u64, "track", "tracks"),
+                row.status_label()
+            ));
+        }
+        lines.push(String::new());
+    }
+    lines.push(format!(
+        "{}.",
+        plural(units.len() as u64, "folder", "folders")
+    ));
+    lines
 }
 
 fn parse_direct(
@@ -357,6 +526,21 @@ async fn run() -> Result<()> {
     };
     let direct = selection.and_then(|selection| selection.direct);
 
+    // Folder targets are parsed before the database is opened, and resolved
+    // against it before anything is written.
+    let folder_targets = match &cli.command {
+        Command::Folder {
+            action:
+                FolderCommand::Merge { targets }
+                | FolderCommand::Split { targets }
+                | FolderCommand::Auto { targets },
+        } => targets
+            .iter()
+            .map(|target| parse_folder_target(target))
+            .collect::<Result<Vec<_>>>()?,
+        _ => Vec::new(),
+    };
+
     let pool = db::connect(&cli.db).await?;
 
     match cli.command {
@@ -406,6 +590,21 @@ async fn run() -> Result<()> {
             let scope = canonical_scope(path.as_deref())?;
             print_releases(&store::list_local_releases(&pool, scope.as_deref()).await?);
         }
+        Command::Folder { action } => match action {
+            FolderCommand::List { path } => {
+                let scope = canonical_scope(path.as_deref())?;
+                print_folder_units(&store::list_folder_units(&pool, scope.as_deref()).await?);
+            }
+            FolderCommand::Merge { .. } => {
+                apply_folder_action(&pool, &folder_targets, FolderAction::Merge).await?;
+            }
+            FolderCommand::Split { .. } => {
+                apply_folder_action(&pool, &folder_targets, FolderAction::Separate).await?;
+            }
+            FolderCommand::Auto { .. } => {
+                apply_folder_action(&pool, &folder_targets, FolderAction::Auto).await?;
+            }
+        },
         Command::Match {
             path,
             local_release,
@@ -506,6 +705,9 @@ fn render_releases(rows: &[store::LocalReleaseStatus]) -> Vec<String> {
             Clean(title)
         ));
         lines.push(format!("{indent}{tracks} · {status}"));
+        if let Some(merged) = &row.merged {
+            lines.push(format!("{indent}merged: {}", merged.label()));
+        }
         if let (Some(provider), Some(id)) = (&row.provider, &row.remote_release_id) {
             // The title, then the disc when the files are one disc of the release.
             let mut detail: Vec<String> = row
@@ -1051,5 +1253,109 @@ mod tests {
         let musicbrainz =
             runner::resolve_policy(Some(ProviderKind::MusicBrainz), None, false).unwrap();
         assert!(runner::check_offline(musicbrainz).is_ok());
+    }
+
+    #[test]
+    fn folder_commands_parse_targets_and_need_one() {
+        let cli = parse(&["folder", "merge", "12", "/music/x"]).unwrap();
+        match cli.command {
+            Command::Folder {
+                action: FolderCommand::Merge { targets },
+            } => assert_eq!(targets, ["12", "/music/x"]),
+            _ => panic!("expected folder merge"),
+        }
+        assert!(parse(&["folder", "split"]).is_err());
+        assert!(parse(&["folder", "list", "--path", "/music"]).is_ok());
+    }
+
+    #[test]
+    fn folder_targets_are_release_ids_or_paths() {
+        assert_eq!(
+            parse_folder_target("5586").unwrap(),
+            store::FolderTarget::Release(5586)
+        );
+        assert_eq!(
+            parse_folder_target("/nowhere/radish-test/x").unwrap(),
+            store::FolderTarget::Path("/nowhere/radish-test/x".into())
+        );
+        assert!(parse_folder_target("99999999999999999999").is_err());
+        assert!(parse_folder_target("  ").is_err());
+    }
+
+    #[test]
+    fn folder_outcomes_name_the_releases_and_the_matches_they_touched() {
+        let merged = store::FolderOutcome {
+            unit: "/music/box".into(),
+            summary: store::RebuildSummary {
+                rekeyed: 1,
+                removed: 1,
+                newly_stale: 1,
+                dropped_matches: 1,
+                ..store::RebuildSummary::default()
+            },
+            releases: vec![(7, 4)],
+        };
+        assert_eq!(
+            render_folder_outcome(FolderAction::Merge, &merged),
+            vec![
+                "Merged: /music/box",
+                "  release #7 (4 tracks)",
+                "  1 accepted match marked stale",
+                "  1 accepted match dropped",
+                "  run `radish match --local-release 7` to match it",
+            ]
+        );
+        let unchanged = store::FolderOutcome {
+            unit: "/music/box".into(),
+            summary: store::RebuildSummary::default(),
+            releases: vec![(7, 2), (8, 2)],
+        };
+        assert_eq!(
+            render_folder_outcome(FolderAction::Separate, &unchanged),
+            vec![
+                "Kept separate: /music/box",
+                "  releases #7 (2 tracks), #8 (2 tracks)"
+            ]
+        );
+    }
+
+    #[test]
+    fn folder_units_render_as_blocks() {
+        let mut first = release(12);
+        first.unit = "/music/box".into();
+        let mut second = release(13);
+        second.unit = "/music/box".into();
+        second.album_title = Some("Vision Thing".into());
+        let unit = store::FolderUnit {
+            path: "/music/box".into(),
+            state: store::FolderState::Automatic,
+            releases: vec![first, second],
+        };
+        assert_eq!(
+            render_folder_units(&[unit]),
+            vec![
+                "/music/box",
+                "  automatic: separate",
+                "  #12  Test Artist — Blue · 2 tracks · unmatched",
+                "  #13  Test Artist — Vision Thing · 2 tracks · unmatched",
+                "",
+                "1 folder.",
+            ]
+        );
+    }
+
+    #[test]
+    fn merged_releases_show_how_they_were_merged() {
+        let mut row = release(12);
+        row.merged = Some(store::MergeInfo {
+            titles: 2,
+            folders: 2,
+            manual: true,
+        });
+        let lines = render_releases(&[row]);
+        assert!(
+            lines.contains(&"     merged: 2 album titles, 2 folders (manual)".to_string()),
+            "{lines:?}"
+        );
     }
 }
