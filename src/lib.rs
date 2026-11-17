@@ -11,6 +11,7 @@
 //! - [`index`]: local provider indexes built from the official data dumps.
 //! - [`matcher`]: pure normalization, mapping, scoring, and acceptance rules.
 //! - [`scene`]: artist and album read from a scene release directory name.
+//! - [`grouping`]: which files of a folder form one local release (merging).
 //! - [`store`]: grouping, revisions, review queue, and transactional overlay.
 //! - [`runner`]: CLI orchestration and the interactive review screen.
 //! - [`web`]: the read-only web interface behind `radish serve`.
@@ -19,6 +20,7 @@ pub mod db;
 pub mod deezer;
 pub mod discogs;
 pub mod discovery;
+pub mod grouping;
 pub mod importer;
 pub mod index;
 pub mod layout;

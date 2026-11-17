@@ -2539,6 +2539,31 @@ mod tests {
         crate::db::connect_in_memory().await.unwrap()
     }
 
+    #[tokio::test]
+    async fn folder_groupings_accept_one_known_mode_per_folder() {
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO folder_groupings (directory_path, mode) VALUES ('/m/a', 'merge')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let same_folder = sqlx::query(
+            "INSERT INTO folder_groupings (directory_path, mode) VALUES ('/M/A', 'separate')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(same_folder.is_err(), "folder paths compare without case");
+        let unknown = sqlx::query(
+            "INSERT INTO folder_groupings (directory_path, mode) VALUES ('/m/b', 'maybe')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(unknown.is_err());
+        sqlx::query("SELECT unit_path FROM local_releases")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    }
+
     async fn insert(pool: &SqlitePool, root: &str, tracks: &[ScannedTrack]) {
         insert_summary(pool, root, tracks).await;
     }
