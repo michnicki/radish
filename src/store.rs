@@ -11,8 +11,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 mod folders;
-// `folders` has no public items until the folder commands arrive.
-#[expect(unused_imports, reason = "the folder commands add public items")]
 pub use folders::*;
 
 pub const STATUS_UNMATCHED: &str = "unmatched";
@@ -5860,5 +5858,186 @@ mod tests {
         let statuses = status_by_id(&pool).await.unwrap();
         assert_eq!(statuses[&releases[0].id], STATUS_UNMATCHED);
         assert_eq!(statuses[&releases[1].id], STATUS_MATCHED);
+    }
+
+    async fn matches(pool: &SqlitePool) -> Vec<(i64, bool)> {
+        sqlx::query_as(
+            "SELECT local_release_id, stale FROM release_matches ORDER BY local_release_id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn merging_a_folder_keeps_one_match_stale_and_drops_the_others() {
+        let pool = test_pool().await;
+        insert(&pool, "/music", &box_files()).await;
+        let floodland = accept_manually(&pool, "Floodland", &["R1", "R2"]).await;
+        accept_manually(&pool, "Vision Thing", &["R3", "R4"]).await;
+
+        let outcome = set_folder_mode(&pool, "/music/box", Some(FolderMode::Merge))
+            .await
+            .unwrap();
+        assert_eq!(outcome.unit, "/music/box");
+        assert_eq!(outcome.releases, vec![(floodland, 4)]);
+        assert_eq!(outcome.summary.newly_stale, 1);
+        assert_eq!(outcome.summary.dropped_matches, 1);
+        assert_eq!(matches(&pool).await, vec![(floodland, true)]);
+        let mode: String = sqlx::query_scalar("SELECT mode FROM folder_groupings")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mode, "merge");
+    }
+
+    #[tokio::test]
+    async fn splitting_a_merged_folder_drops_its_match() {
+        let pool = test_pool().await;
+        insert(&pool, "/music", &augmented_files()).await;
+        accept_manually(&pool, "augmented", &["R1", "R2", "R3"]).await;
+
+        let outcome = set_folder_mode(&pool, AUGMENTED, Some(FolderMode::Separate))
+            .await
+            .unwrap();
+        assert_eq!(outcome.summary.dropped_matches, 1);
+        assert_eq!(outcome.releases.len(), 2);
+        assert!(matches(&pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn letting_the_rule_decide_again_removes_the_decision() {
+        let pool = test_pool().await;
+        insert(&pool, "/music", &augmented_files()).await;
+        set_folder_mode(&pool, AUGMENTED, Some(FolderMode::Separate))
+            .await
+            .unwrap();
+        assert_eq!(release_shapes(&pool).await.len(), 2);
+
+        let outcome = set_folder_mode(&pool, AUGMENTED, None).await.unwrap();
+        assert_eq!(outcome.releases.len(), 1);
+        let decisions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM folder_groupings")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(decisions, 0);
+    }
+
+    #[tokio::test]
+    async fn a_merge_decision_survives_retagging() {
+        let pool = test_pool().await;
+        let files = box_files();
+        insert(&pool, "/music", &files).await;
+        set_folder_mode(&pool, "/music/box", Some(FolderMode::Merge))
+            .await
+            .unwrap();
+
+        let mut retagged = files.clone();
+        retagged[3] = retitled(&files[3], "Something Else");
+        insert(&pool, "/music", &retagged).await;
+        assert_eq!(
+            release_shapes(&pool).await,
+            vec![("/music/box".into(), "*".into(), 4, "/music/box".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_untagged_file_joins_under_a_manual_merge() {
+        let pool = test_pool().await;
+        let mut files = augmented_files();
+        files.push(scanned(
+            &format!("{AUGMENTED}/04.mp3"),
+            None,
+            Some("Chemical Brothers"),
+            4,
+        ));
+        insert(&pool, "/music", &files).await;
+        assert_eq!(release_shapes(&pool).await.len(), 2);
+
+        let outcome = set_folder_mode(&pool, AUGMENTED, Some(FolderMode::Merge))
+            .await
+            .unwrap();
+        assert_eq!(outcome.releases.len(), 1);
+        assert_eq!(
+            release_shapes(&pool).await,
+            vec![(AUGMENTED.into(), "*".into(), 4, AUGMENTED.into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_release_folder_with_a_merge_decision_uses_the_reserved_key() {
+        let pool = test_pool().await;
+        let files = [
+            scanned("/music/solo/01.flac", Some("Solo"), Some("Artist"), 1),
+            scanned("/music/solo/02.flac", Some("Solo"), Some("Artist"), 2),
+        ];
+        insert(&pool, "/music", &files).await;
+        assert_eq!(
+            release_shapes(&pool).await,
+            vec![("/music/solo".into(), "solo".into(), 2, "/music/solo".into())]
+        );
+
+        set_folder_mode(&pool, "/music/solo", Some(FolderMode::Merge))
+            .await
+            .unwrap();
+        assert_eq!(
+            release_shapes(&pool).await,
+            vec![("/music/solo".into(), "*".into(), 2, "/music/solo".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn folder_targets_resolve_to_their_unit() {
+        let pool = test_pool().await;
+        let mut files = box_files();
+        files.extend(broadcast_files());
+        // A second disc unit with a gap, which stays apart.
+        files.push(scanned("/music/gap/cd1/01.mp3", Some("Gap"), Some("A"), 1));
+        files.push(scanned("/music/gap/cd3/01.mp3", Some("Gap"), Some("A"), 1));
+        insert(&pool, "/music", &files).await;
+        let box_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM local_releases WHERE directory_path = '/music/box' LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let resolve = |target: FolderTarget| {
+            let pool = pool.clone();
+            async move { resolve_folder(&pool, &target).await.unwrap() }
+        };
+        assert_eq!(
+            resolve(FolderTarget::Release(box_id)).await.as_deref(),
+            Some("/music/box")
+        );
+        assert_eq!(
+            resolve(FolderTarget::Path("/MUSIC/box/".into()))
+                .await
+                .as_deref(),
+            Some("/music/box")
+        );
+        assert_eq!(
+            resolve(FolderTarget::Path(format!("{BROADCAST}/cd2")))
+                .await
+                .as_deref(),
+            Some(BROADCAST)
+        );
+        assert_eq!(
+            resolve(FolderTarget::Path(BROADCAST.into()))
+                .await
+                .as_deref(),
+            Some(BROADCAST)
+        );
+        assert_eq!(
+            resolve(FolderTarget::Path("/music/gap/cd3".into()))
+                .await
+                .as_deref(),
+            Some("/music/gap")
+        );
+        assert_eq!(
+            resolve(FolderTarget::Path("/music/nowhere".into())).await,
+            None
+        );
+        assert_eq!(resolve(FolderTarget::Release(999_999)).await, None);
     }
 }
