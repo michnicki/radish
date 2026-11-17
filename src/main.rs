@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use radish::grouping::FolderAction;
+use radish::grouping::{self, FolderAction};
 use radish::layout::{Column, Table, format_duration, plural, track_number};
 use radish::output::{Clean, clean_path};
 use radish::progress::ImportProgress;
@@ -186,19 +186,22 @@ enum IndexAction {
 enum FolderCommand {
     /// Merge each target's folder into one local release
     Merge {
-        /// Local release IDs or folder paths
+        /// Local release IDs or folder paths (a folder named only by digits needs a path
+        /// form such as ./2001)
         #[arg(required = true, value_name = "TARGET")]
         targets: Vec<String>,
     },
     /// Keep each target's folder split by album title
     Split {
-        /// Local release IDs or folder paths
+        /// Local release IDs or folder paths (a folder named only by digits needs a path
+        /// form such as ./2001)
         #[arg(required = true, value_name = "TARGET")]
         targets: Vec<String>,
     },
     /// Drop the decision for each target's folder; the automatic rule decides again
     Auto {
-        /// Local release IDs or folder paths
+        /// Local release IDs or folder paths (a folder named only by digits needs a path
+        /// form such as ./2001)
         #[arg(required = true, value_name = "TARGET")]
         targets: Vec<String>,
     },
@@ -210,11 +213,26 @@ enum FolderCommand {
     },
 }
 
+/// One folder target as typed: what to look up, in order, and how to name it
+/// in an error.
+#[derive(Debug, PartialEq, Eq)]
+struct FolderRequest {
+    candidates: Vec<store::FolderTarget>,
+    given: String,
+}
+
+/// A path as this machine sees it, else as written: the library may be
+/// imported on another machine, so a path that does not exist here is still
+/// a valid name.
+fn existing_or_as_written(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Reads a folder target: all ASCII digits name a local release, anything
-/// else a folder. A folder that exists here is canonicalized; one that does
-/// not is kept as written, since the library may be imported on another
-/// machine.
-fn parse_folder_target(raw: &str) -> Result<store::FolderTarget> {
+/// else a folder. A folder is looked up by its canonical path first, then by
+/// the path as written, since a symlinked mount here may differ from the form
+/// stored on the machine that imported it.
+fn parse_folder_target(raw: &str) -> Result<FolderRequest> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         bail!("an empty folder target names nothing");
@@ -223,29 +241,48 @@ fn parse_folder_target(raw: &str) -> Result<store::FolderTarget> {
         let id = trimmed
             .parse::<i64>()
             .with_context(|| format!("'{}' is not a local release ID", Clean(trimmed)))?;
-        return Ok(store::FolderTarget::Release(id));
+        return Ok(FolderRequest {
+            candidates: vec![store::FolderTarget::Release(id)],
+            given: trimmed.to_string(),
+        });
     }
-    let path = Path::new(trimmed);
-    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    Ok(store::FolderTarget::Path(
-        resolved.to_string_lossy().into_owned(),
-    ))
+    let canonical = existing_or_as_written(Path::new(raw))
+        .to_string_lossy()
+        .into_owned();
+    let mut candidates = vec![store::FolderTarget::Path(canonical.clone())];
+    if canonical != raw {
+        candidates.push(store::FolderTarget::Path(raw.to_string()));
+    }
+    Ok(FolderRequest {
+        candidates,
+        given: raw.to_string(),
+    })
 }
 
 /// Resolves every target first, then records `action` for each distinct unit.
 async fn apply_folder_action(
     pool: &sqlx::SqlitePool,
-    targets: &[store::FolderTarget],
+    requests: &[FolderRequest],
     action: FolderAction,
 ) -> Result<()> {
     let mut units: Vec<String> = Vec::new();
-    for target in targets {
-        let Some(unit) = store::resolve_folder(pool, target).await? else {
-            match target {
-                store::FolderTarget::Release(id) => bail!("local release {id} was not found"),
-                store::FolderTarget::Path(path) => {
-                    bail!("'{}' is not a folder with local releases", Clean(path))
+    for request in requests {
+        let mut found = None;
+        for candidate in &request.candidates {
+            found = store::resolve_folder(pool, candidate).await?;
+            if found.is_some() {
+                break;
+            }
+        }
+        let Some(unit) = found else {
+            match request.candidates.first() {
+                Some(store::FolderTarget::Release(id)) => {
+                    bail!("local release {id} was not found")
                 }
+                _ => bail!(
+                    "'{}' is not a folder with local releases",
+                    Clean(&request.given)
+                ),
             }
         };
         if !units.iter().any(|known| known.eq_ignore_ascii_case(&unit)) {
@@ -272,7 +309,12 @@ fn render_folder_outcome(action: FolderAction, outcome: &store::FolderOutcome) -
     let releases: Vec<String> = outcome
         .releases
         .iter()
-        .map(|(id, tracks)| format!("#{id} ({})", plural(*tracks as u64, "track", "tracks")))
+        .map(|(id, tracks)| {
+            format!(
+                "#{id} ({})",
+                plural((*tracks).max(0) as u64, "track", "tracks")
+            )
+        })
         .collect();
     lines.push(match releases.as_slice() {
         [] => "  no releases".to_string(),
@@ -310,6 +352,7 @@ fn render_folder_outcome(action: FolderAction, outcome: &store::FolderOutcome) -
     lines
 }
 
+/// Prints the folder blocks, or a note when no folder qualifies.
 fn print_folder_units(units: &[store::FolderUnit]) {
     if units.is_empty() {
         outln!("No folder holds several releases, a merged release or a grouping decision.");
@@ -592,7 +635,10 @@ async fn run() -> Result<()> {
         }
         Command::Folder { action } => match action {
             FolderCommand::List { path } => {
-                let scope = canonical_scope(path.as_deref())?;
+                // Resolved like a target path, then widened to whole units.
+                let scope = path
+                    .as_deref()
+                    .map(|path| grouping::unit_scope(&existing_or_as_written(path)));
                 print_folder_units(&store::list_folder_units(&pool, scope.as_deref()).await?);
             }
             FolderCommand::Merge { .. } => {
@@ -1271,15 +1317,33 @@ mod tests {
     #[test]
     fn folder_targets_are_release_ids_or_paths() {
         assert_eq!(
-            parse_folder_target("5586").unwrap(),
-            store::FolderTarget::Release(5586)
+            parse_folder_target(" 5586 ").unwrap(),
+            FolderRequest {
+                candidates: vec![store::FolderTarget::Release(5586)],
+                given: "5586".into(),
+            }
         );
+        // A path that does not exist here is tried as written, spaces kept.
         assert_eq!(
-            parse_folder_target("/nowhere/radish-test/x").unwrap(),
-            store::FolderTarget::Path("/nowhere/radish-test/x".into())
+            parse_folder_target("/nowhere/radish-test/x ").unwrap(),
+            FolderRequest {
+                candidates: vec![store::FolderTarget::Path("/nowhere/radish-test/x ".into())],
+                given: "/nowhere/radish-test/x ".into(),
+            }
         );
         assert!(parse_folder_target("99999999999999999999").is_err());
         assert!(parse_folder_target("  ").is_err());
+    }
+
+    #[test]
+    fn an_existing_folder_is_tried_canonical_first_then_as_written() {
+        let request = parse_folder_target("/tmp/../tmp").unwrap();
+        assert_eq!(request.given, "/tmp/../tmp");
+        assert_eq!(request.candidates.len(), 2);
+        assert_eq!(
+            request.candidates[1],
+            store::FolderTarget::Path("/tmp/../tmp".into())
+        );
     }
 
     #[test]
