@@ -702,6 +702,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_folder_groupings_migration_puts_every_release_in_its_own_folder_unit() {
+        let pool = legacy_pool().await;
+        MIGRATOR.run_to(20261116000000, &pool).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO local_releases (id, directory_path, album_title_norm, source_revision, status, track_count)
+                VALUES (1, '/m/One', 'blue', 'rev', 'unmatched', 1),
+                       (2, '/m/Two/CD1', 'red', 'rev', 'unmatched', 1);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        initialize(&pool).await.unwrap();
+
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT directory_path, unit_path FROM local_releases ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("/m/One".to_string(), "/m/One".to_string()),
+                ("/m/Two/CD1".to_string(), "/m/Two/CD1".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn the_deezer_migration_keeps_every_row_and_its_links() {
         let pool = populated_pool_before_deezer().await;
         initialize(&pool).await.unwrap();

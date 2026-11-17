@@ -49,8 +49,11 @@ impl FolderMode {
 /// What the user asks for a unit: a decision, or none (the automatic rule).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FolderAction {
+    /// Store a decision to merge the unit into one release.
     Merge,
+    /// Store a decision to keep the unit's releases apart.
     Separate,
+    /// Remove the decision, so the automatic rule applies.
     Auto,
 }
 
@@ -167,18 +170,22 @@ impl Units {
     }
 }
 
-/// The root a regroup or a load must cover to see whole units: a root inside
-/// a disc subfolder widens to the folder above that subfolder.
+/// The folder above `root` when `root` itself is a disc subfolder (`CD1`).
+///
+/// Loads and listings use it to add the merged release of the folder above a
+/// disc-subfolder scope without widening the scope itself. `None` when the last
+/// component of `root` names no disc, or the parent is empty.
+pub fn disc_parent_of(root: &Path) -> Option<PathBuf> {
+    matcher::folder_disc_number(&root.to_string_lossy())?;
+    root.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+}
+
+/// The root a regroup or a load must cover to see whole units: a root that is
+/// a disc subfolder widens, one level, to the folder above it.
 pub fn unit_scope(root: &Path) -> PathBuf {
-    for ancestor in root.ancestors() {
-        if matcher::folder_disc_number(&ancestor.to_string_lossy()).is_some()
-            && let Some(parent) = ancestor.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            return parent.to_path_buf();
-        }
-    }
-    root.to_path_buf()
+    disc_parent_of(root).unwrap_or_else(|| root.to_path_buf())
 }
 
 /// The disc a file is on inside a merged release of `unit`: its disc
@@ -242,9 +249,13 @@ const SAME_ALBUM_SIMILARITY: f64 = 0.85;
 /// A file as the automatic rule sees it.
 #[derive(Debug, Clone)]
 pub struct RuleFile<'a> {
+    /// The file's path.
     pub path: &'a str,
+    /// The album tag as read.
     pub album: Option<&'a str>,
+    /// The disc number tag.
     pub disc_tag: Option<i64>,
+    /// The track number tag.
     pub track_number: Option<i64>,
 }
 
@@ -257,28 +268,61 @@ pub struct TitleGroup<'a> {
     pub files: Vec<RuleFile<'a>>,
 }
 
-/// The group whose title a merged release shows: the one with the most files;
-/// on a tie, the one whose first file sorts first by case-insensitive path.
-pub fn main_group<'g, 'a>(groups: &'g [TitleGroup<'a>]) -> Option<&'g TitleGroup<'a>> {
-    let first_path = |group: &TitleGroup<'_>| {
-        group
+/// The title a merged release shows: the one held by the most files across
+/// all groups, comparing titles by their normalized form. On a tie, the title
+/// whose earliest file path (case-insensitive) sorts first wins. Returns the
+/// spelling of the first group carrying the winning title.
+pub fn main_title<'a>(groups: &[TitleGroup<'a>]) -> Option<&'a str> {
+    struct Tally<'a> {
+        key: String,
+        title: &'a str,
+        files: usize,
+        first_path: String,
+    }
+
+    let mut tallies: Vec<Tally<'a>> = Vec::new();
+    for group in groups {
+        let mut key = matcher::normalize_text(group.title);
+        if key.is_empty() {
+            key = group.title.trim().to_lowercase();
+        }
+        let first_path = group
             .files
-            .first()
+            .iter()
             .map(|file| file.path.to_ascii_lowercase())
-            .unwrap_or_default()
-    };
-    groups.iter().max_by(|a, b| {
-        a.files
-            .len()
-            .cmp(&b.files.len())
-            .then_with(|| first_path(b).cmp(&first_path(a)))
-    })
+            .min()
+            .unwrap_or_default();
+        match tallies.iter_mut().find(|tally| tally.key == key) {
+            Some(tally) => {
+                tally.files += group.files.len();
+                tally.first_path = tally.first_path.clone().min(first_path);
+            }
+            None => tallies.push(Tally {
+                key,
+                title: group.title,
+                files: group.files.len(),
+                first_path,
+            }),
+        }
+    }
+
+    let mut best: Option<&Tally<'a>> = None;
+    for tally in &tallies {
+        let better = best.is_none_or(|current| {
+            tally.files > current.files
+                || (tally.files == current.files && tally.first_path < current.first_path)
+        });
+        if better {
+            best = Some(tally);
+        }
+    }
+    best.map(|tally| tally.title)
 }
 
-/// The album title of a merged release: the main group's title without a
-/// trailing disc marker. `None` when no group has a title.
+/// The album title of a merged release: the main title ([`main_title`])
+/// without a trailing disc marker. `None` only when `groups` is empty.
 pub fn merged_title(groups: &[TitleGroup<'_>]) -> Option<String> {
-    let title = main_group(groups)?.title;
+    let title = main_title(groups)?;
     Some(
         matcher::title_disc_suffix(title)
             .map_or_else(|| title.trim().to_string(), |(album, _)| album),
@@ -315,50 +359,55 @@ pub fn same_album(a: &str, b: &str) -> bool {
 /// 1. every title names the same album as the main title, or both name the
 ///    same album as the title in the unit folder's scene name;
 /// 2. no two files share an effective disc and track number;
-/// 3. the effective discs run from 1 with no gap, and disc subfolders name
-///    different discs;
+/// 3. when the files span more than one disc, the effective discs run from 1
+///    with no gap; disc subfolders always name different discs;
 /// 4. a disc count in the folder name (`2CD`) is met exactly.
 pub fn auto_merges(unit: &str, groups: &[TitleGroup<'_>]) -> bool {
     if groups.len() < 2 {
         return false;
     }
-    let Some(main) = main_group(groups) else {
+    let Some(main) = main_title(groups) else {
         return false;
     };
     let folder_title = scene::parse_release_directory(unit)
         .and_then(|name| name.split())
         .and_then(|split| split.title);
     let names_main = |title: &str| {
-        same_album(title, main.title)
+        same_album(title, main)
             || folder_title
                 .as_deref()
-                .is_some_and(|folder| same_album(title, folder) && same_album(main.title, folder))
+                .is_some_and(|folder| same_album(title, folder) && same_album(main, folder))
     };
     if !groups.iter().all(|group| names_main(group.title)) {
         return false;
     }
 
-    let files: Vec<&RuleFile<'_>> = groups.iter().flat_map(|group| &group.files).collect();
-    let disc_of = |file: &RuleFile<'_>| {
-        effective_disc(unit, &directory_of(file.path), file.album, file.disc_tag).unwrap_or(1)
-    };
+    let files: Vec<(&RuleFile<'_>, i64)> = groups
+        .iter()
+        .flat_map(|group| &group.files)
+        .map(|file| {
+            let disc = effective_disc(unit, &directory_of(file.path), file.album, file.disc_tag)
+                .unwrap_or(1);
+            (file, disc)
+        })
+        .collect();
 
     let mut positions = HashSet::new();
-    for file in &files {
+    for (file, disc) in &files {
         if let Some(track) = file.track_number
-            && !positions.insert((disc_of(file), track))
+            && !positions.insert((*disc, track))
         {
             return false;
         }
     }
 
-    let discs: BTreeSet<i64> = files.iter().map(|file| disc_of(file)).collect();
+    let discs: BTreeSet<i64> = files.iter().map(|(_, disc)| *disc).collect();
     if discs.len() > 1 && discs.iter().copied().ne(1..=discs.len() as i64) {
         return false;
     }
     let subfolders: HashSet<String> = files
         .iter()
-        .map(|file| directory_of(file.path))
+        .map(|(file, _)| directory_of(file.path))
         .filter(|directory| !directory.eq_ignore_ascii_case(unit))
         .map(|directory| directory.to_ascii_lowercase())
         .collect();
@@ -381,6 +430,7 @@ pub fn auto_merges(unit: &str, groups: &[TitleGroup<'_>]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn modes_and_actions_round_trip_their_names() {
@@ -395,8 +445,6 @@ mod tests {
         assert_eq!(FolderAction::Auto.mode(), None);
         assert_eq!(FolderAction::Separate.cli_verb(), "split");
     }
-
-    use std::path::{Path, PathBuf};
 
     #[test]
     fn disc_subfolders_form_a_unit_only_in_pairs() {
@@ -418,19 +466,38 @@ mod tests {
     }
 
     #[test]
-    fn a_scope_inside_a_disc_folder_widens_to_the_folder_above() {
+    fn only_a_disc_folder_scope_widens_and_only_one_level() {
         assert_eq!(
             unit_scope(Path::new("/m/X-2CD/cd1")),
             PathBuf::from("/m/X-2CD")
         );
         assert_eq!(
             unit_scope(Path::new("/m/X-2CD/Disc 2/extra")),
-            PathBuf::from("/m/X-2CD")
+            PathBuf::from("/m/X-2CD/Disc 2/extra")
+        );
+        assert_eq!(
+            unit_scope(Path::new("/mnt/disk1/music/A")),
+            PathBuf::from("/mnt/disk1/music/A")
         );
         assert_eq!(unit_scope(Path::new("/m/X-2CD")), PathBuf::from("/m/X-2CD"));
         assert_eq!(
             unit_scope(Path::new("/m/Discography")),
             PathBuf::from("/m/Discography")
+        );
+    }
+
+    #[test]
+    fn a_disc_parent_exists_only_for_a_disc_folder_root() {
+        assert_eq!(
+            disc_parent_of(Path::new("/m/X-2CD/CD2")),
+            Some(PathBuf::from("/m/X-2CD"))
+        );
+        assert_eq!(disc_parent_of(Path::new("/m/X-2CD")), None);
+        assert_eq!(disc_parent_of(Path::new("/m/X-2CD/Disc 2/extra")), None);
+        assert_eq!(
+            disc_parent_of(Path::new("cd1")),
+            None,
+            "no parent to widen to"
         );
     }
 
@@ -537,10 +604,7 @@ mod tests {
                 ],
             ),
         ];
-        assert_eq!(
-            main_group(&groups).map(|group| group.title),
-            Some("augmented")
-        );
+        assert_eq!(main_title(&groups), Some("augmented"));
         let discs = [
             group("Shine 6 CD1", vec![file("/m/s/01.mp3", "Shine 6 CD1", 1)]),
             group("Shine 6 CD2", vec![file("/m/s/02.mp3", "Shine 6 CD2", 1)]),
@@ -550,6 +614,37 @@ mod tests {
             Some("Shine 6"),
             "a tie goes to the first path"
         );
+        assert_eq!(merged_title(&[]), None);
+    }
+
+    #[test]
+    fn the_main_title_counts_files_across_folders() {
+        // Album x2 (cd1) + Album x2 (cd2) = 4 files beat Albun x3 in cd2.
+        let groups = [
+            group(
+                "Album",
+                vec![
+                    file("/m/u/cd1/01.mp3", "Album", 1),
+                    file("/m/u/cd1/02.mp3", "Album", 2),
+                ],
+            ),
+            group(
+                "Album",
+                vec![
+                    file("/m/u/cd2/01.mp3", "Album", 1),
+                    file("/m/u/cd2/02.mp3", "Album", 2),
+                ],
+            ),
+            group(
+                "Albun",
+                vec![
+                    file("/m/u/cd2/03.mp3", "Albun", 3),
+                    file("/m/u/cd2/04.mp3", "Albun", 4),
+                    file("/m/u/cd2/05.mp3", "Albun", 5),
+                ],
+            ),
+        ];
+        assert_eq!(main_title(&groups), Some("Album"));
     }
 
     #[test]
@@ -613,10 +708,17 @@ mod tests {
     fn duplicates_gaps_and_different_albums_stay_apart() {
         // Two copies of track 1 in one folder.
         let copies = [
-            group("Album", vec![file("/m/c/01.mp3", "Album", 1)]),
-            group("Albun", vec![file("/m/c/01b.mp3", "Albun", 1)]),
+            group("augmented", vec![file("/m/c/01.mp3", "augmented", 1)]),
+            group("augmentes", vec![file("/m/c/01b.mp3", "augmentes", 1)]),
         ];
         assert!(!auto_merges("/m/c", &copies));
+        // The same titles with distinct track numbers merge, so the duplicate
+        // position is what blocked the pair above.
+        let distinct = [
+            group("augmented", vec![file("/m/c/01.mp3", "augmented", 1)]),
+            group("augmentes", vec![file("/m/c/02.mp3", "augmentes", 2)]),
+        ];
+        assert!(auto_merges("/m/c", &distinct));
         // Discs 1 and 3.
         let gap = [
             group("Album", vec![file("/m/g/cd1/01.mp3", "Album", 1)]),
@@ -632,5 +734,55 @@ mod tests {
         // One title is nothing to merge.
         let single = [group("Album", vec![file("/m/s/01.mp3", "Album", 1)])];
         assert!(!auto_merges("/m/s", &single));
+    }
+
+    #[test]
+    fn titles_that_each_name_the_scene_folder_title_merge() {
+        // Each title is close enough to the folder's title, but not to the other.
+        let unit = "/m/VA-Deathrow-1999-ERB";
+        let (a, b) = ("Dathrow", "Deathro");
+        assert!(same_album(a, "Deathrow") && same_album(b, "Deathrow"));
+        assert!(
+            !same_album(a, b),
+            "the pair needs the folder title to merge"
+        );
+        let one = format!("{unit}/01.mp3");
+        let two = format!("{unit}/02.mp3");
+        let groups = [
+            group(a, vec![file(&one, a, 1)]),
+            group(b, vec![file(&two, b, 2)]),
+        ];
+        assert!(auto_merges(unit, &groups));
+        // Another folder name offers no such bridge.
+        let other = "/m/VA-Something_Else-1999-ERB";
+        assert!(!auto_merges(other, &groups));
+    }
+
+    #[test]
+    fn two_disc_subfolders_naming_the_same_disc_stay_apart() {
+        let unit = "/m/Album-2CD-2001-GRP";
+        let groups = [
+            group(
+                "Album",
+                vec![file("/m/Album-2CD-2001-GRP/cd1/01.mp3", "Album", 1)],
+            ),
+            group(
+                "Album",
+                vec![file("/m/Album-2CD-2001-GRP/disc 1/02.mp3", "Album", 2)],
+            ),
+        ];
+        assert!(!auto_merges(unit, &groups));
+    }
+
+    #[test]
+    fn disc_marked_titles_in_one_folder_merge_into_a_two_disc_release() {
+        let unit = "/m/VA-Shine_6_2CD-1996-NuHS";
+        let one = format!("{unit}/101.mp3");
+        let two = format!("{unit}/201.mp3");
+        let groups = [
+            group("Shine 6 CD1", vec![file(&one, "Shine 6 CD1", 1)]),
+            group("Shine 6 CD2", vec![file(&two, "Shine 6 CD2", 1)]),
+        ];
+        assert!(auto_merges(unit, &groups));
     }
 }
