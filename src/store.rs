@@ -677,6 +677,7 @@ fn title_group<'a>(title: &'a str, members: &[&'a ObservedTrack]) -> TitleGroup<
                 disc_tag: track.disc_number,
                 track_number: track.track_number,
                 title: track.title.as_deref(),
+                artist: track.artist.as_deref(),
                 duration_secs: track.duration_secs,
             })
             .collect(),

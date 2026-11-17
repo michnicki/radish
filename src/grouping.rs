@@ -259,6 +259,8 @@ pub struct RuleFile<'a> {
     pub track_number: Option<i64>,
     /// The track title tag.
     pub title: Option<&'a str>,
+    /// The track artist tag.
+    pub artist: Option<&'a str>,
     /// The length in seconds, when known.
     pub duration_secs: Option<f64>,
 }
@@ -357,24 +359,41 @@ pub fn same_album(a: &str, b: &str) -> bool {
 }
 
 /// The longest two lengths may differ by, in seconds, for two files with one
-/// track title to count as copies of each other.
+/// track title and artist to count as copies of each other.
 const COPY_DURATION_TOLERANCE_SECS: f64 = 1.0;
 
-/// Whether two files share a normalized track title and a length within
-/// [`COPY_DURATION_TOLERANCE_SECS`]. Files without a title, with a title that
-/// normalizes to nothing, or without a known length never count. Different mixes
-/// of one title differ in length and are no copies.
+/// A tag value as copies compare it: normalized, or when that leaves nothing
+/// (`!!!`), trimmed and lowercased.
+fn copy_key(text: &str) -> String {
+    let key = matcher::normalize_text(text);
+    if key.is_empty() {
+        text.trim().to_lowercase()
+    } else {
+        key
+    }
+}
+
+/// Whether two files share a normalized track title and track artist and have
+/// lengths within [`COPY_DURATION_TOLERANCE_SECS`]. A missing artist matches
+/// only a missing artist. Files without a usable title or without a known
+/// length never count. Different mixes of one title differ in length, and
+/// different artists who happen to share a title and length (`Freestyle`) are
+/// no copies.
 fn has_copies<'f, 'a: 'f>(files: impl Iterator<Item = &'f RuleFile<'a>>) -> bool {
-    let mut lengths: HashMap<String, Vec<f64>> = HashMap::new();
+    let mut lengths: HashMap<(String, Option<String>), Vec<f64>> = HashMap::new();
     for file in files {
         let (Some(title), Some(secs)) = (file.title, file.duration_secs) else {
             continue;
         };
-        let key = matcher::normalize_text(title);
-        if key.is_empty() {
+        let title = copy_key(title);
+        if title.is_empty() {
             continue;
         }
-        let seen = lengths.entry(key).or_default();
+        let artist = file
+            .artist
+            .map(copy_key)
+            .filter(|artist| !artist.is_empty());
+        let seen = lengths.entry((title, artist)).or_default();
         if seen
             .iter()
             .any(|other| (other - secs).abs() <= COPY_DURATION_TOLERANCE_SECS)
@@ -395,7 +414,7 @@ fn has_copies<'f, 'a: 'f>(files: impl Iterator<Item = &'f RuleFile<'a>>) -> bool
 /// 1. every title names the same album as the main title, or both name the
 ///    same album as the title in the unit folder's scene name;
 /// 2. no two files share an effective disc and track number, or the same
-///    track title and length (within a second): two copies of one file;
+///    track title, artist and length (within a second): two copies of one file;
 /// 3. when the files span more than one disc, the effective discs run from 1
 ///    with no gap; disc subfolders always name different discs;
 /// 4. a disc count in the folder name (`2CD`) is met exactly.
@@ -598,15 +617,23 @@ mod tests {
             disc_tag: None,
             track_number: Some(track),
             title: None,
+            artist: None,
             duration_secs: None,
         }
     }
 
-    /// A file with a track title and a length, and no track number.
-    fn timed<'a>(path: &'a str, album: &'a str, title: &'a str, secs: f64) -> RuleFile<'a> {
+    /// A file with a track title, artist and length, and no track number.
+    fn timed<'a>(
+        path: &'a str,
+        album: &'a str,
+        title: &'a str,
+        artist: &'a str,
+        secs: f64,
+    ) -> RuleFile<'a> {
         RuleFile {
             track_number: None,
             title: Some(title),
+            artist: Some(artist),
             duration_secs: Some(secs),
             ..file(path, album, 1)
         }
@@ -858,15 +885,15 @@ mod tests {
             group(
                 album,
                 vec![
-                    timed(&cd2a, album, "encore (live)", 226.0),
-                    timed(&cd2b, album, "sonne (live)", 305.0),
+                    timed(&cd2a, album, "encore (live)", "Rammstein", 226.0),
+                    timed(&cd2b, album, "sonne (live)", "Rammstein", 305.0),
                 ],
             ),
             group(
                 album,
                 vec![
-                    timed(&copy_a, album, "encore (live)", 226.0),
-                    timed(&copy_b, album, "sonne (live)", 305.4),
+                    timed(&copy_a, album, "encore (live)", "Rammstein", 226.0),
+                    timed(&copy_b, album, "sonne (live)", "Rammstein", 305.4),
                 ],
             ),
         ];
@@ -882,9 +909,41 @@ mod tests {
         let one = format!("{unit}/CD1/a.mp3");
         let two = format!("{unit}/CD2/a.mp3");
         let groups = [
-            group(album, vec![timed(&one, album, "Intro Mix", 180.0)]),
-            group(album, vec![timed(&two, album, "Intro Mix", 240.0)]),
+            group(album, vec![timed(&one, album, "Intro Mix", "DJ A", 180.0)]),
+            group(album, vec![timed(&two, album, "Intro Mix", "DJ A", 240.0)]),
         ];
         assert!(auto_merges(unit, &groups));
+    }
+
+    #[test]
+    fn one_title_by_different_artists_with_alike_lengths_still_merges() {
+        // A mixtape of freestyles: the title and the length alike by chance.
+        let unit = "/m/VA-Streetsweepers_Mixtape-2CD-2003-GRP";
+        let album = "Streetsweepers Mixtape";
+        let one = format!("{unit}/CD1/a.mp3");
+        let two = format!("{unit}/CD2/a.mp3");
+        let groups = [
+            group(
+                album,
+                vec![timed(&one, album, "Freestyle", "Remy Martin", 100.3)],
+            ),
+            group(
+                album,
+                vec![timed(&two, album, "Freestyle", "Malicious", 100.2)],
+            ),
+        ];
+        assert!(auto_merges(unit, &groups));
+        // The same artist makes them copies.
+        let same = [
+            group(
+                album,
+                vec![timed(&one, album, "Freestyle", "Malicious", 100.3)],
+            ),
+            group(
+                album,
+                vec![timed(&two, album, "Freestyle", "malicious", 100.2)],
+            ),
+        ];
+        assert!(!auto_merges(unit, &same));
     }
 }
