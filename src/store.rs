@@ -12,7 +12,7 @@ use std::path::Path;
 
 mod folders;
 // `folders` has no public items until the folder commands arrive.
-#[allow(unused_imports, reason = "the folder commands add public items")]
+#[expect(unused_imports, reason = "the folder commands add public items")]
 pub use folders::*;
 
 pub const STATUS_UNMATCHED: &str = "unmatched";
@@ -618,10 +618,21 @@ pub struct GroupingContext {
 /// A stored release as grouping sees it.
 #[derive(Debug, Clone)]
 pub struct PriorRelease {
+    /// The directory the release is stored under.
     pub directory: String,
     /// Whether it is a merged release (`album_title_norm` is [`MERGED_KEY`]).
     pub merged: bool,
+    /// Whether it holds an accepted match.
     pub has_match: bool,
+}
+
+/// What a unit's stored releases say about its shape.
+#[derive(Debug, Clone, Copy, Default)]
+struct PriorShape {
+    /// Some release of the unit holds an accepted match.
+    has_match: bool,
+    /// Some release of the unit is a merged release.
+    merged: bool,
 }
 
 /// How one unit is grouped.
@@ -702,14 +713,16 @@ pub fn group_tracks(tracks: &[ObservedTrack], context: &GroupingContext) -> Vec<
         .collect();
     let units = Units::new(directories.iter().map(String::as_str));
 
-    // Per lowercased unit path: (held an accepted match, was merged).
-    let mut prior: HashMap<String, (bool, bool)> = HashMap::new();
+    // Per lowercased unit path. Each stored release is mapped through today's
+    // units, and a unit counts as merged when any of its releases is. That is
+    // deliberate: a matched merged `CD1` keeps its match when a `CD2` appears.
+    let mut prior: HashMap<String, PriorShape> = HashMap::new();
     for release in &context.prior {
         let shape = prior
             .entry(units.unit_of(&release.directory).to_ascii_lowercase())
             .or_default();
-        shape.0 |= release.has_match;
-        shape.1 |= release.merged;
+        shape.has_match |= release.has_match;
+        shape.merged |= release.merged;
     }
 
     type TitleGroups<'t> = Vec<(String, Vec<&'t ObservedTrack>)>;
@@ -737,14 +750,24 @@ pub fn group_tracks(tracks: &[ObservedTrack], context: &GroupingContext) -> Vec<
             Some(FolderMode::Merge) => Shape::MergeAll,
             Some(FolderMode::Separate) => Shape::Separate,
             None => match prior.get(&unit_key) {
-                Some(&(true, true)) => Shape::MergeTitled,
-                Some(&(true, false)) => Shape::Separate,
+                Some(&PriorShape {
+                    has_match: true,
+                    merged: true,
+                }) => Shape::MergeTitled,
+                Some(&PriorShape {
+                    has_match: true,
+                    merged: false,
+                }) => Shape::Separate,
                 _ if grouping::auto_merges(&unit, &rule_groups) => Shape::MergeTitled,
                 _ => Shape::Separate,
             },
         };
 
-        let title = grouping::merged_title(&rule_groups);
+        let title = if shape == Shape::Separate {
+            None
+        } else {
+            grouping::merged_title(&rule_groups)
+        };
         let mut merged: Vec<&ObservedTrack> = Vec::new();
         for (index, (norm, members)) in title_groups.into_iter().enumerate() {
             let joins = match shape {
@@ -766,7 +789,7 @@ pub fn group_tracks(tracks: &[ObservedTrack], context: &GroupingContext) -> Vec<
             }
         }
         if !merged.is_empty() {
-            merged.sort_by_key(|track| track.path.to_ascii_lowercase());
+            merged.sort_by_cached_key(|track| track.path.to_ascii_lowercase());
             groups.push(release_of(
                 unit.clone(),
                 unit,
@@ -1270,7 +1293,7 @@ fn plan_rebuild(
 /// release across several new titles still drops its match; the summary
 /// reports it in `dropped_matches`.
 ///
-/// A scope root inside a disc subfolder widens to the folder above it
+/// A scope root that is itself a disc subfolder widens to the folder above it
 /// ([`grouping::unit_scope`]), so a unit is always regrouped whole.
 pub async fn rebuild_local_releases(
     pool: &SqlitePool,
@@ -5054,6 +5077,97 @@ mod tests {
             release_shapes(&pool).await,
             vec![(BROADCAST.into(), "*".into(), 5, BROADCAST.into())]
         );
+    }
+
+    #[tokio::test]
+    async fn an_automatic_merge_leaves_a_junk_tagged_file_out() {
+        let pool = test_pool().await;
+        let mut files = augmented_files();
+        files.push(scanned(
+            &format!("{AUGMENTED}/04.mp3"),
+            Some("Unknown Album"),
+            Some("Chemical Brothers"),
+            4,
+        ));
+        insert(&pool, "/music", &files).await;
+        assert_eq!(
+            release_shapes(&pool).await,
+            vec![
+                (AUGMENTED.into(), "*".into(), 3, AUGMENTED.into()),
+                (
+                    AUGMENTED.into(),
+                    "unknown album".into(),
+                    1,
+                    AUGMENTED.into()
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_album_tagged_with_the_reserved_key_does_not_collide_with_it() {
+        let pool = test_pool().await;
+        let files = vec![
+            scanned("/music/star/01.mp3", Some("*"), Some("Artist"), 1),
+            scanned("/music/star/02.mp3", Some("*"), Some("Artist"), 2),
+        ];
+        insert(&pool, "/music", &files).await;
+        let shapes = release_shapes(&pool).await;
+        assert_eq!(shapes.len(), 1);
+        assert_ne!(shapes[0].1, MERGED_KEY);
+        assert_eq!(shapes[0].2, 2);
+    }
+
+    #[tokio::test]
+    async fn matched_disc_folders_keep_their_matches_after_the_migration_backfill() {
+        let pool = test_pool().await;
+        let releases = insert_disc_folders(&pool).await;
+        let id = ReleaseId::MusicBrainz(mbid("76df3287-6cda-33eb-8e9a-044b5e15ffdd"));
+        for release in &releases {
+            let candidate = Candidate::new(release, two_disc_release(id.clone()));
+            let guard = load_match_guard(&pool, release.id).await.unwrap();
+            accept_match(
+                &pool,
+                release,
+                &candidate,
+                AcceptanceMethod::Automatic,
+                MatchScope::Album,
+                &guard,
+            )
+            .await
+            .unwrap();
+        }
+
+        // What a migrated database looks like: no decision, and every release
+        // carries its own directory as its unit.
+        sqlx::query("DELETE FROM folder_groupings")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE local_releases SET unit_path = directory_path")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let summary = rebuild_local_releases(&pool, None).await.unwrap();
+
+        assert_eq!(summary.newly_stale, 0);
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT unit_path, status FROM local_releases ORDER BY directory_path")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("/music/Set-2CD".to_string(), STATUS_MATCHED.to_string()),
+                ("/music/Set-2CD".to_string(), STATUS_MATCHED.to_string()),
+            ]
+        );
+        let fresh: Vec<bool> = sqlx::query_scalar("SELECT stale FROM release_matches")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(fresh, vec![false, false]);
     }
 
     fn planned_group(directory: &str, norm: &str, track_ids: &[i64]) -> GroupedRelease {
