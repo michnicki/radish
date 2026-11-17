@@ -295,7 +295,9 @@ pub fn main_title<'a>(groups: &[TitleGroup<'a>]) -> Option<&'a str> {
         match tallies.iter_mut().find(|tally| tally.key == key) {
             Some(tally) => {
                 tally.files += group.files.len();
-                tally.first_path = tally.first_path.clone().min(first_path);
+                if first_path < tally.first_path {
+                    tally.first_path = first_path;
+                }
             }
             None => tallies.push(Tally {
                 key,
@@ -755,20 +757,26 @@ mod tests {
         assert!(auto_merges(unit, &groups));
         // Another folder name offers no such bridge.
         let other = "/m/VA-Something_Else-1999-ERB";
-        assert!(!auto_merges(other, &groups));
+        let one = format!("{other}/01.mp3");
+        let two = format!("{other}/02.mp3");
+        let elsewhere = [
+            group(a, vec![file(&one, a, 1)]),
+            group(b, vec![file(&two, b, 2)]),
+        ];
+        assert!(!auto_merges(other, &elsewhere));
     }
 
     #[test]
     fn two_disc_subfolders_naming_the_same_disc_stay_apart() {
-        let unit = "/m/Album-2CD-2001-GRP";
+        let unit = "/m/Album-2001-GRP";
         let groups = [
             group(
                 "Album",
-                vec![file("/m/Album-2CD-2001-GRP/cd1/01.mp3", "Album", 1)],
+                vec![file("/m/Album-2001-GRP/cd1/01.mp3", "Album", 1)],
             ),
             group(
                 "Album",
-                vec![file("/m/Album-2CD-2001-GRP/disc 1/02.mp3", "Album", 2)],
+                vec![file("/m/Album-2001-GRP/disc 1/02.mp3", "Album", 2)],
             ),
         ];
         assert!(!auto_merges(unit, &groups));
