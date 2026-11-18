@@ -173,6 +173,7 @@ fn router(pool: SqlitePool, bind: SocketAddr, token: String) -> Router {
         .route("/tracks", get(tracks_page))
         .route("/releases", get(releases_page))
         .route("/reviews", get(review::queue_page))
+        .route("/review", get(review::release_page))
         .route("/folders", get(folders_page))
         .route(
             "/folder",
