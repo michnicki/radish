@@ -34,6 +34,9 @@ pub struct ReviewSummary {
     pub blockers: i64,
 }
 
+/// Why a review saved against other file contents cannot be accepted.
+const OUT_OF_DATE_REASON: &str = "saved before the files changed";
+
 /// Summarizes the first of `candidates`, saved for `release`, as the page shows it.
 ///
 /// `can_apply` is [`matcher::mapping_can_apply`], the check the Accept button
@@ -309,7 +312,7 @@ fn summary_of_row(release: Option<&LocalRelease>, row: &PendingRow) -> ReviewSum
     match release {
         None => cannot(score, "local release is gone", blockers),
         Some(release) if release.revision != row.source_revision => {
-            cannot(score, "saved before the files changed", blockers)
+            cannot(score, OUT_OF_DATE_REASON, blockers)
         }
         Some(release) => summarize(release, &candidates, &reasons),
     }
@@ -429,14 +432,13 @@ pub struct QueuedRelease {
     /// How many tracks the release has.
     pub track_count: i64,
     /// Each queued provider with its top candidate's score, in the order
-    /// matching tries providers; `None` when that snapshot cannot be read or
-    /// holds no candidate.
+    /// matching tries providers; `None` when that snapshot holds no candidate,
+    /// cannot be read, or its review has not been summarized yet.
     ///
     /// The top candidate is the first in the saved list: after a fetch on the
     /// web, the release entered there, which need not be the best-scoring.
     pub top: Vec<(ProviderKind, Option<f64>)>,
-    /// The lead review; `None` when no review passes the view's filters,
-    /// which a listed release always has.
+    /// The lead review. Always `Some` for a listed release.
     pub lead: Option<Lead>,
 }
 
@@ -476,8 +478,13 @@ fn lead_of(rows: &[SummaryRow], view: &QueueView) -> Option<Lead> {
         .map(|row| Lead {
             provider: row.provider,
             score: row.score,
-            can_apply: row.can_apply,
-            reason: row.reason.clone(),
+            // The page offers no Accept for a review saved before the files changed.
+            can_apply: row.can_apply && row.current,
+            reason: if row.current {
+                row.reason.clone()
+            } else {
+                Some(OUT_OF_DATE_REASON.to_owned())
+            },
             blockers: row.blockers,
         })
 }
@@ -515,41 +522,32 @@ pub async fn queue_page(
     let provider = view.provider.map(ProviderKind::as_str);
     let acceptable = i64::from(view.acceptable);
     let mut tx = pool.begin().await?;
-    let rows: Vec<QueueRow> = match view.sort {
-        QueueSort::Folder => {
-            sqlx::query_as(concat!(
-                "SELECT lr.id, lr.directory_path, lr.unit_path, lr.album_title, lr.album_artist,
-                        lr.track_count
-                 FROM local_releases lr WHERE ",
-                queued_where!(),
-                " ORDER BY lr.directory_path, lr.album_title_norm LIMIT ?3 OFFSET ?4"
-            ))
-            .bind(provider)
-            .bind(acceptable)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&mut *tx)
-            .await?
-        }
-        QueueSort::Score => {
-            sqlx::query_as(concat!(
-                "WITH lead AS (",
-                lead_scores!(),
-                ")
-                 SELECT lr.id, lr.directory_path, lr.unit_path, lr.album_title, lr.album_artist,
-                        lr.track_count
-                 FROM lead JOIN local_releases lr ON lr.id = lead.id ",
-                score_order!(),
-                " LIMIT ?3 OFFSET ?4"
-            ))
-            .bind(provider)
-            .bind(acceptable)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&mut *tx)
-            .await?
-        }
+    let sql = match view.sort {
+        QueueSort::Folder => concat!(
+            "SELECT lr.id, lr.directory_path, lr.unit_path, lr.album_title, lr.album_artist,
+                    lr.track_count
+             FROM local_releases lr WHERE ",
+            queued_where!(),
+            " ORDER BY lr.directory_path, lr.album_title_norm LIMIT ?3 OFFSET ?4"
+        ),
+        QueueSort::Score => concat!(
+            "WITH lead AS (",
+            lead_scores!(),
+            ")
+             SELECT lr.id, lr.directory_path, lr.unit_path, lr.album_title, lr.album_artist,
+                    lr.track_count
+             FROM lead JOIN local_releases lr ON lr.id = lead.id ",
+            score_order!(),
+            " LIMIT ?3 OFFSET ?4"
+        ),
     };
+    let rows: Vec<QueueRow> = sqlx::query_as(sql)
+        .bind(provider)
+        .bind(acceptable)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&mut *tx)
+        .await?;
     let ids = serde_json::to_string(&rows.iter().map(|row| row.0).collect::<Vec<_>>())?;
     let summaries: Vec<SummaryRecord> = sqlx::query_as(
         "SELECT r.local_release_id, r.provider, r.top_score, r.top_can_apply, r.top_reason,
@@ -636,84 +634,84 @@ pub async fn queue_count(pool: &SqlitePool, view: &QueueView) -> Result<i64> {
 pub async fn next_queued(pool: &SqlitePool, after: i64, view: &QueueView) -> Result<Option<i64>> {
     let provider = view.provider.map(ProviderKind::as_str);
     let acceptable = i64::from(view.acceptable);
-    let position: Option<(String, String)> =
-        sqlx::query_as("SELECT directory_path, album_title_norm FROM local_releases WHERE id = ?1")
+    let next = match view.sort {
+        QueueSort::Folder => {
+            let position: Option<(String, String)> = sqlx::query_as(
+                "SELECT directory_path, album_title_norm FROM local_releases WHERE id = ?1",
+            )
             .bind(after)
             .fetch_optional(pool)
             .await?;
-    let next = match (view.sort, position) {
-        // Directory paths compare without case, as the listing orders them;
-        // (directory, title) is unique, so the order is total.
-        (QueueSort::Folder, Some((directory, title))) => {
-            sqlx::query_scalar(concat!(
-                "SELECT lr.id FROM local_releases lr WHERE ",
-                queued_where!(),
-                " AND (lr.directory_path, lr.album_title_norm) > (?3, ?4)
-                 ORDER BY lr.directory_path, lr.album_title_norm LIMIT 1"
-            ))
-            .bind(provider)
-            .bind(acceptable)
-            .bind(directory)
-            .bind(title)
-            .fetch_optional(pool)
-            .await?
-        }
-        (QueueSort::Folder, None) => {
-            sqlx::query_scalar(concat!(
-                "SELECT lr.id FROM local_releases lr WHERE ",
-                queued_where!(),
-                " ORDER BY lr.directory_path, lr.album_title_norm LIMIT 1"
-            ))
-            .bind(provider)
-            .bind(acceptable)
-            .fetch_optional(pool)
-            .await?
-        }
-        (QueueSort::Score, position) => {
-            let lead: Option<(Option<f64>,)> = match position {
-                Some(_) => {
-                    sqlx::query_as(concat!(
-                        "SELECT score FROM (",
-                        lead_scores!("AND lr.id = ?3"),
-                        ")"
-                    ))
-                    .bind(provider)
-                    .bind(acceptable)
-                    .bind(after)
-                    .fetch_optional(pool)
-                    .await?
-                }
-                None => None,
-            };
-            match (lead, position) {
-                (Some((score,)), Some((directory, title))) => {
+            match position {
+                // Directory paths compare without case, as the listing orders
+                // them; (directory, title) is unique, so the order is total.
+                Some((directory, title)) => {
                     sqlx::query_scalar(concat!(
-                        "WITH lead AS (",
-                        lead_scores!(),
-                        ")
-                         SELECT lr.id FROM lead JOIN local_releases lr ON lr.id = lead.id
-                         WHERE (lead.score IS NULL) > ?3
-                            OR ((lead.score IS NULL) = ?3 AND (
-                                  (?3 = 0 AND (lead.score < ?4
-                                               OR (lead.score = ?4
-                                                   AND (lr.directory_path, lr.album_title_norm)
-                                                       > (?5, ?6))))
-                               OR (?3 = 1 AND (lr.directory_path, lr.album_title_norm)
-                                              > (?5, ?6))))
-                         ",
-                        score_order!(),
-                        " LIMIT 1"
+                        "SELECT lr.id FROM local_releases lr WHERE ",
+                        queued_where!(),
+                        " AND (lr.directory_path, lr.album_title_norm) > (?3, ?4)
+                         ORDER BY lr.directory_path, lr.album_title_norm LIMIT 1"
                     ))
                     .bind(provider)
                     .bind(acceptable)
-                    .bind(i64::from(score.is_none()))
-                    .bind(score.unwrap_or(0.0))
                     .bind(directory)
                     .bind(title)
                     .fetch_optional(pool)
                     .await?
                 }
-                _ => {
+                None => {
+                    sqlx::query_scalar(concat!(
+                        "SELECT lr.id FROM local_releases lr WHERE ",
+                        queued_where!(),
+                        " ORDER BY lr.directory_path, lr.album_title_norm LIMIT 1"
+                    ))
+                    .bind(provider)
+                    .bind(acceptable)
+                    .fetch_optional(pool)
+                    .await?
+                }
+            }
+        }
+        QueueSort::Score => {
+            // `after`'s place in the view: its lead score and folder key. No
+            // row means it is not in the view (or is gone).
+            let position: Option<(Option<f64>, String, String)> = sqlx::query_as(concat!(
+                "SELECT lead.score, lr.directory_path, lr.album_title_norm
+                 FROM (",
+                lead_scores!("AND lr.id = ?3"),
+                ") lead JOIN local_releases lr ON lr.id = lead.id"
+            ))
+            .bind(provider)
+            .bind(acceptable)
+            .bind(after)
+            .fetch_optional(pool)
+            .await?;
+            match position {
+                // After `after`: no score sorts last, so a scored release is
+                // followed by every release with no score, by lower scores,
+                // and by equal scores later in folder order.
+                Some((score, directory, title)) => {
+                    sqlx::query_scalar(concat!(
+                        "WITH lead AS (",
+                        lead_scores!(),
+                        ")
+                         SELECT lr.id FROM lead JOIN local_releases lr ON lr.id = lead.id
+                         WHERE (lead.score IS NULL) > (?3 IS NULL)
+                            OR (lead.score IS ?3
+                                AND (lr.directory_path, lr.album_title_norm) > (?4, ?5))
+                            OR lead.score < ?3 ",
+                        score_order!(),
+                        " LIMIT 1"
+                    ))
+                    .bind(provider)
+                    .bind(acceptable)
+                    .bind(score)
+                    .bind(directory)
+                    .bind(title)
+                    .fetch_optional(pool)
+                    .await?
+                }
+                None => {
                     sqlx::query_scalar(concat!(
                         "WITH lead AS (",
                         lead_scores!(),
@@ -900,6 +898,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids(&acceptable), vec![a]);
+        // In the unfiltered view the stale lead says so, as the page offers no Accept.
+        let all = queue_page(&pool, &view(None, QueueSort::Score, false), 10, 0)
+            .await
+            .unwrap();
+        let stale = all.iter().find(|row| row.id == b).unwrap();
+        let lead = stale.lead.as_ref().unwrap();
+        assert!(!lead.can_apply);
+        assert_eq!(
+            lead.reason.as_deref(),
+            Some("saved before the files changed")
+        );
 
         // The provider filter combines with the others.
         let musicbrainz = queue_page(
@@ -916,6 +925,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids(&folder_order), vec![a]);
+        // Provider and acceptable together: a's Discogs review cannot be
+        // accepted, its MusicBrainz one can.
+        for sort in [QueueSort::Folder, QueueSort::Score] {
+            let discogs = view(Some(ProviderKind::Discogs), sort, true);
+            assert!(queue_page(&pool, &discogs, 10, 0).await.unwrap().is_empty());
+            assert_eq!(queue_count(&pool, &discogs).await.unwrap(), 0);
+            let musicbrainz = view(Some(ProviderKind::MusicBrainz), sort, true);
+            let page = queue_page(&pool, &musicbrainz, 10, 0).await.unwrap();
+            assert_eq!(ids(&page), vec![a]);
+            assert_eq!(page[0].lead.as_ref().unwrap().score, Some(0.70));
+        }
         assert_eq!(
             queue_count(&pool, &view(None, QueueSort::Folder, true))
                 .await
@@ -979,6 +999,79 @@ mod tests {
         assert_eq!(next_queued(&pool, d, &score).await.unwrap(), None);
     }
 
+    #[tokio::test]
+    async fn equal_scores_keep_folder_order_whatever_the_ids() {
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let titles = ["One", "Two"];
+        // /music/B2 has the higher id but sorts first without regard to case.
+        let c = seed_release(&pool, "/music/c", "Green", &titles).await;
+        let b2 = seed_release(&pool, "/music/B2", "Pink", &titles).await;
+        for release in [&c, &b2] {
+            queue(
+                &pool,
+                release,
+                remote_release(mbid_release(FIXTURE_MBID), "x", &titles),
+            )
+            .await;
+            set_summary(&pool, release.id, "musicbrainz", Some(0.8), true).await;
+        }
+        assert!(b2.id > c.id);
+        let score = view(None, QueueSort::Score, false);
+        let page = queue_page(&pool, &score, 10, 0).await.unwrap();
+        assert_eq!(ids(&page), vec![b2.id, c.id]);
+        assert_eq!(next_queued(&pool, b2.id, &score).await.unwrap(), Some(c.id));
+        assert_eq!(next_queued(&pool, c.id, &score).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn folder_order_next_honors_the_acceptable_filter() {
+        let (pool, [a, b, _, d]) = library().await;
+        set_summary(&pool, a, "musicbrainz", Some(0.7), true).await;
+        set_summary(&pool, b, "musicbrainz", Some(0.9), false).await;
+        set_summary(&pool, d, "deezer", Some(0.5), true).await;
+        let acceptable = view(None, QueueSort::Folder, true);
+        // b cannot be accepted, so a is followed by d.
+        assert_eq!(next_queued(&pool, a, &acceptable).await.unwrap(), Some(d));
+        assert_eq!(next_queued(&pool, d, &acceptable).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn score_order_next_honors_the_provider_filter() {
+        let (pool, [a, b, _, d]) = library().await;
+        set_summary(&pool, a, "musicbrainz", Some(0.60), true).await;
+        set_summary(&pool, a, "discogs", Some(0.99), true).await;
+        set_summary(&pool, b, "musicbrainz", Some(0.80), true).await;
+        set_summary(&pool, d, "deezer", Some(0.95), true).await;
+        let musicbrainz = view(Some(ProviderKind::MusicBrainz), QueueSort::Score, false);
+        // Only the MusicBrainz reviews count: b 0.80, then a 0.60.
+        assert_eq!(next_queued(&pool, b, &musicbrainz).await.unwrap(), Some(a));
+        assert_eq!(next_queued(&pool, a, &musicbrainz).await.unwrap(), None);
+        // d has no MusicBrainz review, so it is outside the view.
+        assert_eq!(next_queued(&pool, d, &musicbrainz).await.unwrap(), Some(b));
+    }
+
+    #[tokio::test]
+    async fn a_release_sits_at_its_best_allowed_review() {
+        let (pool, [a, b, c, d]) = library().await;
+        set_summary(&pool, a, "discogs", Some(0.99), false).await;
+        set_summary(&pool, a, "musicbrainz", Some(0.70), true).await;
+        set_summary(&pool, b, "musicbrainz", Some(0.80), true).await;
+        set_summary(&pool, d, "deezer", Some(0.60), true).await;
+        let acceptable = view(None, QueueSort::Score, true);
+        // a sits at 0.70, not at its unacceptable 0.99: b, a, d.
+        let page = queue_page(&pool, &acceptable, 10, 0).await.unwrap();
+        assert_eq!(ids(&page), vec![b, a, d]);
+        assert_eq!(page[1].lead.as_ref().unwrap().score, Some(0.70));
+        assert_eq!(next_queued(&pool, b, &acceptable).await.unwrap(), Some(a));
+        assert_eq!(next_queued(&pool, a, &acceptable).await.unwrap(), Some(d));
+
+        // A release with reviews but none the view allows restarts at the top.
+        set_summary(&pool, d, "deezer", Some(0.60), false).await;
+        assert_eq!(next_queued(&pool, d, &acceptable).await.unwrap(), Some(b));
+        // So does one with no reviews at all.
+        assert_eq!(next_queued(&pool, c, &acceptable).await.unwrap(), Some(b));
+    }
+
     #[test]
     fn the_lead_is_the_best_allowed_review() {
         let row = |provider, score, can_apply, current| SummaryRow {
@@ -1013,12 +1106,18 @@ mod tests {
             ..any
         };
         assert_eq!(lead_of(&rows, &deezer).unwrap().score, None);
+        // The provider filter alone leaves no review for a provider with none.
         let none = QueueView {
             provider: Some(ProviderKind::Discogs),
-            acceptable: true,
             ..any
         };
         assert!(lead_of(&rows[..1], &none).is_none());
+        // Acceptable alone leaves none when the only review is out of date.
+        assert!(lead_of(&rows[..1], &acceptable).is_none());
+        // A lead that is out of date cannot be accepted, whatever its summary says.
+        let stale = lead_of(&rows[..1], &any).unwrap();
+        assert!(!stale.can_apply);
+        assert_eq!(stale.reason.as_deref(), Some(OUT_OF_DATE_REASON));
     }
 
     fn ids(rows: &[QueuedRelease]) -> Vec<i64> {
