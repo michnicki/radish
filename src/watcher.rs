@@ -53,6 +53,7 @@ pub async fn watch_directory(pool: SqlitePool, root: &Path, db_path: &Path) -> R
         summary.unchanged,
         summary.removed
     );
+    importer::report_roots(&summary, &root);
     importer::report_rebuild(&summary.rebuild);
     let directory_id = summary.directory_id;
 

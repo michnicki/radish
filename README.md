@@ -381,6 +381,8 @@ These overrides exist for tests only. An unset or empty variable means the norma
 
 A track's identity is its stored file path. The import root is resolved to an absolute, canonical path before scanning. Importing a path already in the database updates its metadata and directory association; importing the same recording at a different path creates another track.
 
+Imported roots never nest. Importing or watching a folder inside an imported root counts toward that root and adds no new one. Importing a folder that holds imported roots takes them over: their tracks move to the new root and their entries go, without any file being read again or any track removed. The Status page then lists one root, so a library imported a year at a time (`/music/1998`, `/music/1999`, …) becomes one `/music` entry with a single `radish import /music`. Import prints `Merged N imported directories into PATH.` when it takes roots over. Roots only record where tracks were imported from; grouping and matching ignore them.
+
 Track and directory paths use SQLite's `NOCASE` collation, which ignores ASCII letter case. For example, paths ending in `Song.FLAC` and `song.flac` match the same database entry. This also means distinct files whose paths differ only in ASCII case share an entry, even on a case-sensitive filesystem. There is no content-based deduplication.
 
 ### Local releases
@@ -495,7 +497,7 @@ Other defaults to keep in mind:
 
 The SQLite database contains these tables:
 
-- `directories` — imported roots.
+- `directories` — imported roots, none inside another. Each track points to the root it was imported under; the Status page lists them.
 - `albums` — scanned album metadata.
 - `tracks` — file paths, observed tag metadata, observed MusicBrainz identifier JSON, and local-release association.
 - `local_releases` — grouping identity (`directory_path` and `album_title_norm`, which is `*` for a merged release), the unit it belongs to (`unit_path`), observed release metadata, embedded MusicBrainz evidence and problems, source revision, and status.
@@ -541,6 +543,7 @@ File databases use SQLite's WAL journal mode, so `<db>-wal` and `<db>-shm` files
 - The year used to be stored on an album row shared by every folder with the same title and artist, and now lives on each track. The upgrade copies each track's old (possibly wrong) year, then forces the next `import` or `watch` to read every file once, which replaces it with the file's own tag. Releases affected by the shared year may go stale at that first re-read. Review or refresh them as usual.
 - The Deezer migration copies `release_matches` and `match_reviews` once, on the first open by the new version, keeping every row, link and id counter. On an 8.2 GB library (a 5.2 GB review table) it took about 2.5 minutes and needs about 12 GB of free disk while it runs; run it with no other Radish process using the database. Afterwards the file keeps the old tables' space as free pages (8.2 GB became 14.6 GB), which SQLite reuses for later writes; `sqlite3 radish.db VACUUM` gives it back (about 3 minutes there, and as much free disk again as the database). Older versions then refuse to open the database, since they do not know the migration, so update every machine that opens it, such as the one that imports.
 - Folder merging adds `folder_groupings` and `local_releases.unit_path`. The first regroup after the upgrade (`import`, `watch` or `match`, including `match --dry-run`) merges the folders the automatic rule picks. None of them holds an accepted match, but the queued reviews of their merged-away releases are dropped. When that first regroup is `match`, it matches the merged releases in the same run. Until then each disc subfolder still counts as its own folder in `radish folder list` and on the Folders page, and the web folder page of a disc subfolder answers `404`; the decision commands bring a folder up to date themselves, but to see the merged view, run one regroup first. The cheapest regroup is a dry run of a single release, `radish match --dry-run --local-release ID` with any local release ID from `radish releases`: it regroups the whole library and saves the regroup before it looks the release up, then evaluates only that release (a matched one is just skipped), so it needs no offline index and does not walk every unmatched release. An ID that is gone after the regroup ends in `local release ID was not found`, but the regroup stays saved. Older binaries cannot open the migrated database.
+- Roots imported one subfolder at a time, such as one per year, stay separate entries until their parent is imported once: `radish import /mnt/mp3/daydirs` takes over `/mnt/mp3/daydirs/1998` through `/2025`. That import walks the whole tree, but files whose modification time is unchanged are only checked, not read again. Taking over the roots changes no release or match.
 
 ## Development
 

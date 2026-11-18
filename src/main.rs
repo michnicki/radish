@@ -861,6 +861,7 @@ async fn run_import(
         summary.unchanged,
         summary.removed
     );
+    importer::report_roots(&summary, &path);
     importer::report_rebuild(&summary.rebuild);
     Ok(path)
 }

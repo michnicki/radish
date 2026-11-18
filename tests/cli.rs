@@ -487,6 +487,52 @@ fn redirected_empty_import_has_no_progress_output() {
 }
 
 #[tokio::test]
+async fn importing_a_parent_merges_the_imported_directories_inside_it() {
+    let db = db_path("import-parent-root");
+    let music = temp_dir("import-parent-root-music");
+    let import = |path: &Path| {
+        let output = Command::new(env!("CARGO_BIN_EXE_radish"))
+            .arg("--db")
+            .arg(&db)
+            .arg("import")
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        stdout(&output)
+    };
+    for year in ["1998", "1999"] {
+        let folder = music.join(year);
+        std::fs::create_dir_all(&folder).unwrap();
+        write_wav(&folder.join("01.wav"));
+        assert!(!import(&folder).contains("Merged"));
+    }
+
+    let text = import(&music);
+    let root = music.canonicalize().unwrap();
+    assert!(
+        text.contains(&format!(
+            "Merged 2 imported directories into {}.",
+            root.display()
+        )),
+        "{text}"
+    );
+    assert!(text.contains(": 2 unchanged, 0 removed."), "{text}");
+    assert!(!import(&music.join("1998")).contains("Merged"));
+
+    let pool = radish::db::connect(&db).await.unwrap();
+    let status = store::library_status(&pool).await.unwrap();
+    assert_eq!(
+        status.directories,
+        [store::DirectorySummary {
+            path: root.to_string_lossy().to_string(),
+            tracks: 2,
+        }]
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn import_is_kept_when_matching_fails() {
     let db = db_path("import");
     let music = temp_dir("import-music");

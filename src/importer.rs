@@ -1,6 +1,7 @@
 //! The one import pipeline, shared by `radish import` and the watcher's
 //! initial sync.
 
+use crate::layout::plural;
 use crate::output::clean_path;
 use crate::progress::ImportProgress;
 use crate::scanner::{ScanEvent, ScanResult};
@@ -30,6 +31,8 @@ pub struct ImportSummary {
     /// looks like an unmounted volume rather than a deleted library.
     pub kept_no_audio: usize,
     pub rebuild: store::RebuildSummary,
+    /// Imported roots inside this one that it took over, in path order.
+    pub absorbed_roots: Vec<String>,
 }
 
 /// The warnings a rebuild deserves: accepted matches it dropped or staled.
@@ -73,11 +76,29 @@ pub async fn sync_directory(
     progress: &ImportProgress,
     force: bool,
 ) -> Result<ImportSummary> {
-    let directory_id = store::upsert_directory(pool, root).await?;
-    let mut summary = sync_files(pool, root, directory_id, Some(progress), force).await?;
+    // Claim the root only once it is known to be a directory: claiming can
+    // take over other roots, and a mistyped path should leave no row behind.
+    if !tokio::fs::metadata(root).await?.is_dir() {
+        bail!("{} is not a directory", clean_path(root));
+    }
+    let claim = store::claim_root(pool, root).await?;
+    let mut summary = sync_files(pool, root, claim.id, Some(progress), force).await?;
+    summary.absorbed_roots = claim.absorbed;
     progress.grouping();
     summary.rebuild = store::rebuild_local_releases(pool, Some(root)).await?;
     Ok(summary)
+}
+
+/// Prints which imported roots an import or watch took over, if any.
+pub fn report_roots(summary: &ImportSummary, root: &Path) {
+    let count = summary.absorbed_roots.len();
+    if count > 0 {
+        outln!(
+            "Merged {} into {}.",
+            plural(count as u64, "imported directory", "imported directories"),
+            clean_path(root)
+        );
+    }
 }
 
 /// Sends a scan event to the progress display, or prints its warning when
@@ -269,6 +290,7 @@ pub(crate) async fn sync_files(
         kept,
         kept_no_audio: 0,
         rebuild: store::RebuildSummary::default(),
+        absorbed_roots: Vec::new(),
     })
 }
 
@@ -297,6 +319,61 @@ mod tests {
 
         let stored = store::upsert_directory(&pool, music.path()).await.unwrap();
         assert_eq!(summary.directory_id, stored);
+    }
+
+    #[tokio::test]
+    async fn importing_a_parent_takes_over_its_imported_subfolders() {
+        let pool = db::connect_in_memory().await.unwrap();
+        let music = ScratchDir::new("importer-parent-root");
+        let progress = ImportProgress::new();
+        for year in ["1998", "1999"] {
+            let folder = music.path().join(year);
+            std::fs::create_dir_all(&folder).unwrap();
+            write_wav(&folder.join("01.wav"));
+            sync_directory(&pool, &folder, &progress, false)
+                .await
+                .unwrap();
+        }
+
+        let summary = sync_directory(&pool, music.path(), &progress, false)
+            .await
+            .unwrap();
+
+        let year = |name: &str| music.path().join(name).to_string_lossy().to_string();
+        assert_eq!(summary.absorbed_roots, [year("1998"), year("1999")]);
+        assert_eq!(summary.unchanged, 2);
+        assert_eq!(summary.scanned, 0);
+        let roots: Vec<(i64, String)> = sqlx::query_as("SELECT id, path FROM directories")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            roots,
+            [(
+                summary.directory_id,
+                music.path().to_string_lossy().to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_directory_adds_no_root() {
+        let pool = db::connect_in_memory().await.unwrap();
+        let music = ScratchDir::new("importer-missing-root");
+        let progress = ImportProgress::new();
+
+        let missing = music.path().join("gone");
+        assert!(
+            sync_directory(&pool, &missing, &progress, false)
+                .await
+                .is_err()
+        );
+
+        let roots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM directories")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(roots, 0);
     }
 
     #[test]

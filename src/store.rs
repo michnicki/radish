@@ -36,17 +36,87 @@ async fn begin_write(pool: &SqlitePool) -> Result<Transaction<'static, Sqlite>> 
     Ok(pool.begin_with("BEGIN IMMEDIATE").await?)
 }
 
+/// Returns the ID of the imported root that `path` counts toward.
+///
+/// See [`claim_root`], which this wraps.
+///
+/// # Errors
+///
+/// Returns an error when the database cannot be read or written.
 pub async fn upsert_directory(pool: &SqlitePool, path: &Path) -> Result<i64> {
+    Ok(claim_root(pool, path).await?.id)
+}
+
+/// The imported root a path counts toward, and the roots it took over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootClaim {
+    /// The `directories` row every track under the path points to.
+    pub id: i64,
+    /// Roots that were inside it and are now part of it, in path order.
+    pub absorbed: Vec<String>,
+}
+
+/// Finds or adds the imported root for `path`, so that roots never nest.
+///
+/// An existing root at or above `path` is used as it is, the outermost one
+/// when several are. Otherwise `path` becomes a new root. Either way, every
+/// root inside the chosen one is taken over: its tracks point to the chosen
+/// root and its row goes. No track is read, changed otherwise, or deleted,
+/// and roots play no part in grouping or matching.
+///
+/// # Errors
+///
+/// Returns an error when the database cannot be read or written.
+pub async fn claim_root(pool: &SqlitePool, path: &Path) -> Result<RootClaim> {
+    let root_key = |path: &str| path_key(Path::new(path)).trim_end_matches('/').to_string();
     let path_str = path.to_string_lossy().to_string();
-    let id: i64 = sqlx::query_scalar(
-        "INSERT INTO directories (path) VALUES (?1)
-         ON CONFLICT(path) DO UPDATE SET path = excluded.path
-         RETURNING id",
-    )
-    .bind(&path_str)
-    .fetch_one(pool)
-    .await?;
-    Ok(id)
+    let key = root_key(&path_str);
+
+    let mut tx = begin_write(pool).await?;
+    let mut roots: Vec<(i64, String)> = sqlx::query_as("SELECT id, path FROM directories")
+        .fetch_all(&mut *tx)
+        .await?;
+    roots.sort_by_key(|(_, path)| root_key(path).len());
+
+    let covering = roots
+        .iter()
+        .find(|(_, root)| key_within(&key, &root_key(root)));
+    let (id, chosen) = match covering {
+        Some((id, root)) => (*id, root_key(root)),
+        None => {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO directories (path) VALUES (?1)
+                 ON CONFLICT(path) DO UPDATE SET path = excluded.path
+                 RETURNING id",
+            )
+            .bind(&path_str)
+            .fetch_one(&mut *tx)
+            .await?;
+            (id, key)
+        }
+    };
+
+    let mut absorbed = Vec::new();
+    for (inner, root) in &roots {
+        if *inner == id || !key_within(&root_key(root), &chosen) {
+            continue;
+        }
+        // Tracks first: deleting a root row deletes its tracks.
+        sqlx::query("UPDATE tracks SET directory_id = ?1 WHERE directory_id = ?2")
+            .bind(id)
+            .bind(inner)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM directories WHERE id = ?1")
+            .bind(inner)
+            .execute(&mut *tx)
+            .await?;
+        absorbed.push(root.clone());
+    }
+    tx.commit().await?;
+
+    absorbed.sort_by_key(|root| root_key(root));
+    Ok(RootClaim { id, absorbed })
 }
 
 /// Finds or creates the album row for a title and artist. A missing and an
@@ -5761,6 +5831,84 @@ mod tests {
             1
         );
         assert_eq!(count(&pool, "tracks").await, 0);
+    }
+
+    #[tokio::test]
+    async fn claiming_a_parent_takes_over_the_roots_inside_it() {
+        let pool = test_pool().await;
+        let year = |root: &str, count: i64| {
+            (1..=count)
+                .map(|n| scanned(&format!("{root}/a/{n:02}.mp3"), Some("A"), Some("X"), n))
+                .collect::<Vec<_>>()
+        };
+        insert(&pool, "/m/1998", &year("/m/1998", 1)).await;
+        insert(&pool, "/m/1999", &year("/m/1999", 2)).await;
+        // A sibling that only shares a prefix, not a path component.
+        insert(&pool, "/mbox", &year("/mbox", 1)).await;
+        let releases = release_rows(&pool).await;
+
+        let claim = claim_root(&pool, Path::new("/m")).await.unwrap();
+        assert_eq!(claim.absorbed, ["/m/1998", "/m/1999"]);
+        assert_eq!(
+            roots(&pool).await,
+            [("/m".to_string(), 3), ("/mbox".to_string(), 1)]
+        );
+        let ids: Vec<i64> =
+            sqlx::query_scalar("SELECT DISTINCT directory_id FROM tracks WHERE path LIKE '/m/%'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(ids, [claim.id]);
+        assert_eq!(release_rows(&pool).await, releases);
+
+        let again = claim_root(&pool, Path::new("/m")).await.unwrap();
+        assert_eq!(again.id, claim.id);
+        assert!(again.absorbed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_folder_inside_a_root_counts_toward_that_root() {
+        let pool = test_pool().await;
+        let root = claim_root(&pool, Path::new("/m")).await.unwrap();
+        let child = claim_root(&pool, Path::new("/M/2026/01")).await.unwrap();
+        assert_eq!(child.id, root.id);
+        assert!(child.absorbed.is_empty());
+        assert_eq!(roots(&pool).await, [("/m".to_string(), 0)]);
+    }
+
+    #[tokio::test]
+    async fn nested_roots_from_older_versions_join_the_outermost() {
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO directories (id, path) VALUES (1, '/m'), (2, '/m/1998')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let claim = claim_root(&pool, Path::new("/m/1998")).await.unwrap();
+        assert_eq!(claim.id, 1);
+        assert_eq!(claim.absorbed, ["/m/1998"]);
+        assert_eq!(roots(&pool).await, [("/m".to_string(), 0)]);
+    }
+
+    /// The imported roots as `(path, tracks)`, in path order.
+    async fn roots(pool: &SqlitePool) -> Vec<(String, i64)> {
+        library_status(pool)
+            .await
+            .unwrap()
+            .directories
+            .into_iter()
+            .map(|root| (root.path, root.tracks))
+            .collect()
+    }
+
+    /// Every local release's ID, key, revision and status.
+    async fn release_rows(pool: &SqlitePool) -> Vec<(i64, String, String, String, String)> {
+        sqlx::query_as(
+            "SELECT id, directory_path, album_title_norm, source_revision, status
+             FROM local_releases ORDER BY id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
