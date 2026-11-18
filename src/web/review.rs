@@ -223,6 +223,7 @@ struct View<'a> {
     review: &'a ReleaseReview,
     /// The queue filter carried from `/reviews`; it decides `Next in queue`.
     filter: Option<ProviderKind>,
+    /// The release `Next in queue` leads to, if the queue has another.
     next: Option<i64>,
     /// The release accepted just before, now matched.
     accepted: Option<&'a store::LocalReleaseStatus>,
@@ -230,6 +231,7 @@ struct View<'a> {
     token: Option<&'a str>,
 }
 
+/// `/review?release=N`: one release's saved candidates, or `404`.
 pub(super) async fn release_page(
     State(state): State<AppState>,
     Query(params): Query<ReviewParams>,
@@ -274,11 +276,16 @@ async fn render_page(
     };
     Ok((
         status,
-        Html(page("Review", Nav::Review, &render_release(&view))),
+        Html(page(
+            &format!("Review #{id}"),
+            Nav::Review,
+            &render_release(&view),
+        )),
     )
         .into_response())
 }
 
+/// The release page body: header, files, one section per provider, fetch form.
 fn render_release(view: &View<'_>) -> String {
     let review = view.review;
     let release = &review.release;
@@ -316,8 +323,8 @@ fn render_release(view: &View<'_>) -> String {
     let groups: String = if review.groups.is_empty() {
         format!(
             "<p>No saved candidates. Enter a release below, or run \
-             <code>radish match --local-release {}</code>.</p>",
-            release.id
+             <code>{}</code>.</p>",
+            search_command(view)
         )
     } else {
         review
@@ -369,6 +376,18 @@ fn render_files(release: &LocalRelease) -> String {
     )
 }
 
+/// The command that searches the release again.
+///
+/// A matched release is skipped by a plain `match`, so it needs `--review`.
+fn search_command(view: &View<'_>) -> String {
+    let id = view.review.release.id;
+    if view.review.status.status == store::STATUS_MATCHED {
+        format!("radish match --review --local-release {id}")
+    } else {
+        format!("radish match --local-release {id}")
+    }
+}
+
 /// One provider's saved candidates, with accept buttons only while current.
 fn render_group(view: &View<'_>, group: &ReviewGroup) -> String {
     let reasons = if group.reasons.is_empty() {
@@ -394,8 +413,8 @@ fn render_group(view: &View<'_>, group: &ReviewGroup) -> String {
         GroupState::Current => format!("{heading}{}", cards(true)),
         GroupState::OutOfDate => format!(
             "{heading}<p>The files changed after these candidates were found. Run \
-             <code>radish match --local-release {}</code> to search again.</p>{}",
-            view.review.release.id,
+             <code>{}</code> to search again.</p>{}",
+            search_command(view),
             cards(false)
         ),
         GroupState::Unreadable(error) => format!(
@@ -441,6 +460,15 @@ fn render_card(
         )
     };
     let mut notes: Vec<String> = Vec::new();
+    if !current {
+        // A current card shows its blockers above the Accept button instead.
+        notes.extend(
+            evaluation
+                .blockers
+                .iter()
+                .map(|note| format!("blocker: {note}")),
+        );
+    }
     notes.extend(
         release
             .structure_issues
@@ -511,11 +539,31 @@ fn render_card(
     )
 }
 
+/// The most provider tracks no file maps to that a track table lists.
+///
+/// A release of a few files can map onto a box set of thousands of tracks;
+/// listing them all would make the page megabytes long. The rest are counted.
+const MAX_UNMAPPED_ROWS: usize = 25;
+
 /// The files side by side with the provider tracks they map to, then the
-/// provider's playable tracks that no file maps to (on the mapped disc only).
+/// provider's playable tracks that no file maps to (on the mapped disc only,
+/// at most [`MAX_UNMAPPED_ROWS`] of them).
 fn render_mapping(local: &LocalRelease, candidate: &Candidate) -> String {
     let remote = &candidate.release.tracklist;
     let media = candidate.release.track_media();
+    // A position such as `3` only means something with its disc beside it.
+    let several_media = media
+        .iter()
+        .flatten()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        >= 2;
+    let cells = |remote_index: usize| {
+        remote_cells(
+            &remote[remote_index],
+            media[remote_index].filter(|_| several_media),
+        )
+    };
     let mut shown = vec![false; remote.len()];
     let mut rows = String::new();
     for (index, track) in local.tracks.iter().enumerate() {
@@ -534,41 +582,65 @@ fn render_mapping(local: &LocalRelease, candidate: &Candidate) -> String {
             track_number(track.disc, track.track_number),
             escape_html(track.title.as_deref().unwrap_or("")),
             format_duration(track.duration_secs),
-            remote_cells(paired.map(|remote_index| &remote[remote_index])),
+            paired.map_or_else(
+                || "<td>—</td><td class=\"muted\">not mapped</td><td></td>".to_string(),
+                cells
+            ),
         ));
     }
+    let mut unmapped = 0_usize;
     for (remote_index, track) in remote.iter().enumerate() {
         let on_disc = candidate
             .mapping
             .medium
-            .is_none_or(|medium| media.get(remote_index).copied().flatten() == Some(medium));
+            .is_none_or(|medium| media[remote_index] == Some(medium));
         if shown[remote_index] || !track.is_playable() || !on_disc {
             continue;
         }
+        unmapped += 1;
+        if unmapped <= MAX_UNMAPPED_ROWS {
+            rows.push_str(&format!(
+                "<tr><td></td><td class=\"muted\">not in the files</td><td></td>{}</tr>",
+                cells(remote_index)
+            ));
+        }
+    }
+    if let Some(more) = unmapped
+        .checked_sub(MAX_UNMAPPED_ROWS)
+        .filter(|&more| more > 0)
+    {
         rows.push_str(&format!(
-            "<tr><td></td><td class=\"muted\">not in the files</td><td></td>{}</tr>",
-            remote_cells(Some(track))
+            "<tr><td></td><td class=\"muted\" colspan=\"5\">… and {more} more provider \
+             {} not in the files</td></tr>",
+            if more == 1 { "track" } else { "tracks" }
         ));
     }
     format!(
         "<div class=\"table\"><table><thead><tr><th class=\"num\">#</th><th>File title</th>\
-         <th class=\"num\">Time</th><th>Pos</th><th>{} title</th><th class=\"num\">Time</th>\
-         </tr></thead><tbody>{rows}</tbody></table></div>",
-        candidate.release.provider().label()
+         <th class=\"num\">File time</th><th>Pos</th><th>{label} title</th>\
+         <th class=\"num\">{label} time</th></tr></thead><tbody>{rows}</tbody></table></div>",
+        label = candidate.release.provider().label()
     )
 }
 
-/// The provider side of a track table row, or an empty one.
-fn remote_cells(track: Option<&RemoteTrack>) -> String {
-    match track {
-        Some(track) => format!(
-            "<td>{}</td><td>{}</td><td class=\"num\">{}</td>",
-            escape_html(track.position.as_deref().unwrap_or("")),
-            escape_html(&track.title),
-            format_duration(track.duration_secs),
-        ),
-        None => "<td>—</td><td></td><td></td>".to_string(),
-    }
+/// The provider side of a track table row.
+///
+/// `medium` is the disc to show before the position, for a release of several
+/// discs; a position that already names it (`2-3`) is left as it is.
+fn remote_cells(track: &RemoteTrack, medium: Option<u32>) -> String {
+    let position = track.position.as_deref().unwrap_or("");
+    let position = match medium {
+        Some(medium) if !position.is_empty() && !position.starts_with(&format!("{medium}-")) => {
+            format!("{medium}-{position}")
+        }
+        _ => position.to_string(),
+    };
+    format!(
+        "<td>{}</td><td>{}</td><td class=\"num\">{}</td>",
+        escape_html(&position),
+        escape_html(&track.title),
+        format_duration(track.duration_secs),
+    )
 }
 
 /// The text after `Cannot accept:` for a mapping that cannot be applied.
@@ -625,13 +697,14 @@ fn render_accept(
             plural(count as u64, "check", "checks")
         ),
     };
+    let id = escape_html(&candidate.release.id.storage_id());
     format!(
         "{blockers}<form method=\"post\" action=\"/review\">{}\
          <input type=\"hidden\" name=\"action\" value=\"accept\">\
          <input type=\"hidden\" name=\"provider\" value=\"{provider}\">\
-         <input type=\"hidden\" name=\"candidate\" value=\"{}\"><button>{label}</button></form>",
+         <input type=\"hidden\" name=\"candidate\" value=\"{id}\">\
+         <button aria-label=\"Accept {provider} {id}\">{label}</button></form>",
         hidden_fields(view, token),
-        escape_html(&candidate.release.id.storage_id()),
     )
 }
 
@@ -670,10 +743,22 @@ fn render_entry(view: &View<'_>) -> String {
              <li><code>radish match --review --local-release {id} --deezer-release ID</code></li></ul>"
         );
     };
+    // The provider the form opens on: the queue's filter for now.
+    let chosen: Option<ProviderKind> = view.filter;
     let options: String = ProviderPolicy::Chain { deezer: true }
         .order()
         .into_iter()
-        .map(|provider| format!("<option value=\"{provider}\">{}</option>", provider.label()))
+        .map(|provider| {
+            let selected = if chosen == Some(provider) {
+                " selected"
+            } else {
+                ""
+            };
+            format!(
+                "<option value=\"{provider}\"{selected}>{}</option>",
+                provider.label()
+            )
+        })
         .collect();
     format!(
         "<h2>Enter a release</h2><form method=\"post\" action=\"/review\">{}\
@@ -688,6 +773,10 @@ fn render_entry(view: &View<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::matcher::{MatchScope, RemoteRelease};
+    use crate::test_support::{
+        FIXTURE_MBID, OTHER_MBID, local_release, mbid_release, queue, remote_release, seed_release,
+    };
 
     fn queued(id: i64) -> store::QueuedRelease {
         store::QueuedRelease {
@@ -761,7 +850,8 @@ mod tests {
     #[tokio::test]
     async fn only_a_matched_release_is_reported_as_accepted() {
         let pool = crate::db::connect_in_memory().await.unwrap();
-        let release = crate::test_support::seed_release(&pool, "/music/a", "Blue", &["One"]).await;
+        let titles = ["One", "Two"];
+        let release = seed_release(&pool, "/music/a", "Blue", &titles).await;
         let state = AppState {
             pool,
             bind: "127.0.0.1:8787".parse().unwrap(),
@@ -781,6 +871,27 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+
+        queue(
+            &state.pool,
+            &release,
+            remote_release(mbid_release(FIXTURE_MBID), "Blue", &titles),
+        )
+        .await;
+        let shown = store::load_match_guard(&state.pool, release.id)
+            .await
+            .unwrap();
+        let outcome =
+            saved::accept_saved(&state.pool, release.id, &mbid_release(FIXTURE_MBID), &shown)
+                .await
+                .unwrap();
+        assert_eq!(outcome, saved::AcceptOutcome::Accepted);
+        let accepted = accepted_status(&state, Some(release.id))
+            .await
+            .unwrap()
+            .expect("a matched release is reported");
+        assert_eq!(accepted.id, release.id);
+        assert_eq!(accepted.status, store::STATUS_MATCHED);
     }
 
     #[test]
@@ -805,12 +916,6 @@ mod tests {
         };
         assert_eq!((params.filter(), params.page()), (None, 1));
     }
-
-    use crate::matcher::{Candidate, Evaluation, MatchScope, RemoteRelease};
-    use crate::review::{GroupState, ReleaseReview, ReviewGroup};
-    use crate::test_support::{
-        FIXTURE_MBID, OTHER_MBID, local_release, mbid_release, remote_release,
-    };
 
     const FILES: [&str; 2] = ["<script>x</script>", "Two"];
 
@@ -837,7 +942,7 @@ mod tests {
         }
     }
 
-    fn review(groups: Vec<ReviewGroup>) -> ReleaseReview {
+    fn review_of(groups: Vec<ReviewGroup>) -> ReleaseReview {
         let release = local_release(12, "/music/<b>", "<i>Blue</i>", &FILES);
         ReleaseReview {
             status: store::LocalReleaseStatus {
@@ -891,7 +996,7 @@ mod tests {
 
     #[test]
     fn a_candidate_card_escapes_everything_and_maps_track_by_track() {
-        let review = review(vec![group(
+        let review = review_of(vec![group(
             GroupState::Current,
             vec![
                 (exact(), vec!["<b>close</b>".into()]),
@@ -905,7 +1010,18 @@ mod tests {
         assert!(html.contains("&lt;script&gt;x&lt;/script&gt;"), "{html}");
         assert!(html.contains("Accepting overrides these checks:"), "{html}");
         assert!(
-            html.contains("<button>Accept, overriding 1 check</button>"),
+            html.contains(">Accept, overriding 1 check</button>"),
+            "{html}"
+        );
+        assert!(
+            html.contains(&format!(
+                "<button aria-label=\"Accept musicbrainz {FIXTURE_MBID}\">"
+            )),
+            "{html}"
+        );
+        assert!(html.contains("<th class=\"num\">File time</th>"), "{html}");
+        assert!(
+            html.contains("<th class=\"num\">MusicBrainz time</th>"),
             "{html}"
         );
         assert!(
@@ -937,7 +1053,7 @@ mod tests {
 
     #[test]
     fn a_server_without_writes_shows_commands_instead_of_forms() {
-        let review = review(vec![group(
+        let review = review_of(vec![group(
             GroupState::Current,
             vec![(exact(), Vec::new())],
         )]);
@@ -952,7 +1068,7 @@ mod tests {
 
     #[test]
     fn out_of_date_and_unreadable_groups_offer_no_accept() {
-        let review = review(vec![
+        let review = review_of(vec![
             group(GroupState::Unreadable("bad <json>".into()), Vec::new()),
             group(GroupState::OutOfDate, vec![(exact(), Vec::new())]),
         ]);
@@ -972,7 +1088,7 @@ mod tests {
 
     #[test]
     fn a_release_without_saved_candidates_says_how_to_get_some() {
-        let review = review(Vec::new());
+        let review = review_of(Vec::new());
         let mut shown = view(&review, Some("tok"));
         shown.next = Some(9);
         shown.filter = Some(ProviderKind::MusicBrainz);
@@ -986,5 +1102,222 @@ mod tests {
             html.contains("name=\"filter\" value=\"musicbrainz\""),
             "{html}"
         );
+    }
+
+    /// `remote_release` of `FILES` followed by `extra` more tracks.
+    fn remote_with_extra(extra: usize) -> RemoteRelease {
+        let more: Vec<String> = (0..extra).map(|index| format!("Extra {index}")).collect();
+        let mut titles: Vec<&str> = FILES.to_vec();
+        titles.extend(more.iter().map(String::as_str));
+        remote_release(mbid_release(FIXTURE_MBID), "<i>Blue</i>", &titles)
+    }
+
+    #[test]
+    fn unmapped_provider_tracks_are_listed_up_to_a_limit_and_then_counted() {
+        let review = review_of(vec![group(
+            GroupState::Current,
+            vec![(remote_with_extra(38), Vec::new())],
+        )]);
+        let html = render_release(&view(&review, Some("tok")));
+        assert_eq!(
+            html.matches("<td class=\"muted\">not in the files</td>")
+                .count(),
+            MAX_UNMAPPED_ROWS,
+            "{html}"
+        );
+        assert!(
+            html.contains("… and 13 more provider tracks not in the files"),
+            "{html}"
+        );
+        assert!(html.contains("Extra 0"), "{html}");
+        assert!(!html.contains("Extra 37"), "{html}");
+
+        // Exactly at the limit there is nothing to count.
+        let review = review_of(vec![group(
+            GroupState::Current,
+            vec![(remote_with_extra(MAX_UNMAPPED_ROWS), Vec::new())],
+        )]);
+        let html = render_release(&view(&review, Some("tok")));
+        assert!(!html.contains("more provider"), "{html}");
+    }
+
+    #[test]
+    fn unmapped_provider_tracks_come_after_the_mapped_rows() {
+        let review = review_of(vec![group(
+            GroupState::Current,
+            vec![(longer(), Vec::new())],
+        )]);
+        let html = render_release(&view(&review, Some("tok")));
+        let unmapped = html.find("not in the files").expect("an unmapped row");
+        let last_mapped = html.rfind("<td>Two</td>").expect("a mapped row");
+        assert!(last_mapped < unmapped, "{html}");
+        assert!(html.find("<td>Bonus</td>").unwrap() > unmapped, "{html}");
+    }
+
+    #[test]
+    fn a_mapping_shorter_than_the_files_still_lists_every_file() {
+        let mut review = review_of(vec![group(
+            GroupState::Current,
+            vec![(exact(), Vec::new())],
+        )]);
+        review.groups[0].candidates[0].0.mapping.pairs.truncate(1);
+        let html = render_release(&view(&review, Some("tok")));
+        assert!(
+            html.contains("<td>Two</td><td class=\"num\">3:00</td><td>—</td>"),
+            "{html}"
+        );
+        assert!(html.contains("not mapped"), "{html}");
+    }
+
+    #[test]
+    fn positions_name_the_disc_only_on_a_release_of_several_discs() {
+        let mut remote = remote_release(
+            mbid_release(FIXTURE_MBID),
+            "<i>Blue</i>",
+            &["A", "B", FILES[0], FILES[1]],
+        );
+        for (index, track) in remote.tracklist.iter_mut().enumerate() {
+            track.medium_position = Some(index as u32 / 2 + 1);
+            track.track_position = Some(index as u32 % 2 + 1);
+            track.position = Some((index % 2 + 1).to_string());
+        }
+        let review = review_of(vec![group(GroupState::Current, vec![(remote, Vec::new())])]);
+        let html = render_release(&view(&review, Some("tok")));
+        assert!(
+            html.contains("<td>2-1</td><td>&lt;script&gt;x&lt;/script&gt;</td>"),
+            "{html}"
+        );
+        assert!(html.contains("<td>2-2</td><td>Two</td>"), "{html}");
+
+        // One disc keeps its plain positions.
+        let review = review_of(vec![group(
+            GroupState::Current,
+            vec![(exact(), Vec::new())],
+        )]);
+        let html = render_release(&view(&review, Some("tok")));
+        assert!(
+            html.contains("<td>1</td><td>&lt;script&gt;x&lt;/script&gt;</td>"),
+            "{html}"
+        );
+        assert!(!html.contains("<td>1-1</td>"), "{html}");
+    }
+
+    #[test]
+    fn a_matched_release_is_searched_again_with_review() {
+        let mut matched = review_of(Vec::new());
+        matched.status.status = store::STATUS_MATCHED.into();
+        matched.status.provider = Some(ProviderKind::MusicBrainz);
+        matched.status.remote_release_id = Some("abc".into());
+        let html = render_release(&view(&matched, Some("tok")));
+        assert!(
+            html.contains("<code>radish match --review --local-release 12</code>"),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "Accepted now: musicbrainz abc. Accepting another candidate replaces it."
+            ),
+            "{html}"
+        );
+
+        let unmatched = review_of(Vec::new());
+        let html = render_release(&view(&unmatched, Some("tok")));
+        assert!(
+            html.contains("<code>radish match --local-release 12</code>"),
+            "{html}"
+        );
+        assert!(!html.contains("Accepted now"), "{html}");
+
+        let mut stale = review_of(vec![group(GroupState::OutOfDate, Vec::new())]);
+        stale.status.status = store::STATUS_MATCHED.into();
+        let html = render_release(&view(&stale, Some("tok")));
+        assert!(
+            html.contains("<code>radish match --review --local-release 12</code> to search again"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn an_out_of_date_card_lists_its_blockers_as_notes_without_a_button() {
+        let review = review_of(vec![group(
+            GroupState::OutOfDate,
+            vec![(exact(), vec!["<b>close</b>".into()])],
+        )]);
+        let html = render_release(&view(&review, Some("tok")));
+        assert!(
+            html.contains("<li>blocker: &lt;b&gt;close&lt;/b&gt;</li>"),
+            "{html}"
+        );
+        assert!(!html.contains("<button aria-label"), "{html}");
+
+        // A current card keeps them above its button instead.
+        let review = review_of(vec![group(
+            GroupState::Current,
+            vec![(exact(), vec!["<b>close</b>".into()])],
+        )]);
+        let html = render_release(&view(&review, Some("tok")));
+        assert!(!html.contains("blocker: "), "{html}");
+    }
+
+    #[test]
+    fn a_card_without_blockers_says_plain_accept_and_links_only_web_urls() {
+        let mut remote = exact();
+        remote.url = "javascript:alert(1)".into();
+        let review = review_of(vec![group(GroupState::Current, vec![(remote, Vec::new())])]);
+        let html = render_release(&view(&review, Some("tok")));
+        assert!(html.contains(">Accept</button>"), "{html}");
+        assert!(!html.contains("javascript"), "{html}");
+        assert!(html.contains(FIXTURE_MBID), "{html}");
+    }
+
+    #[test]
+    fn the_fetch_form_opens_on_the_queue_filter() {
+        let review = review_of(Vec::new());
+        let mut shown = view(&review, Some("tok"));
+        let html = render_release(&shown);
+        assert!(!html.contains(" selected"), "{html}");
+        shown.filter = Some(ProviderKind::Discogs);
+        let html = render_release(&shown);
+        assert!(
+            html.contains("<option value=\"discogs\" selected>Discogs</option>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<option value=\"musicbrainz\">MusicBrainz</option>"),
+            "{html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_page_is_titled_with_its_release_and_a_missing_release_is_a_404() {
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let release = seed_release(&pool, "/music/a", "Blue", &["One"]).await;
+        let state = AppState {
+            pool,
+            bind: "127.0.0.1:8787".parse().unwrap(),
+            token: "t".into(),
+            writable: true,
+        };
+        let params = |id: i64| ReviewParams {
+            release: Some(id.to_string()),
+            ..ReviewParams::default()
+        };
+        let Ok(response) = release_page(State(state.clone()), Query(params(release.id))).await
+        else {
+            panic!("the handler failed");
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            html.contains(&format!("<title>Review #{} · Radish</title>", release.id)),
+            "{html}"
+        );
+        let Ok(response) = release_page(State(state), Query(params(release.id + 100))).await else {
+            panic!("the handler failed");
+        };
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
