@@ -553,7 +553,7 @@ fn render_mapping(local: &LocalRelease, candidate: &Candidate) -> String {
     let media = candidate.release.track_media();
     // A position such as `3` only means something with its disc beside it.
     // Counted the way `disc_label` counts, so a CD plus a video DVD, whose
-    // tracks name no disc, keeps its plain positions.
+    // tracks are not audio, keeps its plain positions.
     let several_media = matcher::remote_media(&candidate.release).is_some();
     let cells = |remote_index: usize| {
         remote_cells(
@@ -1346,7 +1346,7 @@ mod tests {
 
     #[test]
     fn a_disc_without_a_named_medium_keeps_plain_positions() {
-        // Two discs and a track that names none, as a CD plus a video DVD do.
+        // Two discs and an audio track that names no disc.
         let mut remote = remote_with_extra(1);
         for (index, medium) in [(0, 1), (1, 2)] {
             remote.tracklist[index].medium_position = Some(medium);
