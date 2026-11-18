@@ -460,15 +460,6 @@ fn render_card(
         )
     };
     let mut notes: Vec<String> = Vec::new();
-    if !current {
-        // A current card shows its blockers above the Accept button instead.
-        notes.extend(
-            evaluation
-                .blockers
-                .iter()
-                .map(|note| format!("blocker: {note}")),
-        );
-    }
     notes.extend(
         release
             .structure_issues
@@ -489,6 +480,15 @@ fn render_card(
             .iter()
             .map(|note| format!("evidence: {note}")),
     );
+    if !current {
+        // A current card shows its blockers above the Accept button instead.
+        notes.extend(
+            evaluation
+                .blockers
+                .iter()
+                .map(|note| format!("blocker: {note}")),
+        );
+    }
     notes.extend(
         evaluation
             .warnings
@@ -552,12 +552,9 @@ fn render_mapping(local: &LocalRelease, candidate: &Candidate) -> String {
     let remote = &candidate.release.tracklist;
     let media = candidate.release.track_media();
     // A position such as `3` only means something with its disc beside it.
-    let several_media = media
-        .iter()
-        .flatten()
-        .collect::<std::collections::BTreeSet<_>>()
-        .len()
-        >= 2;
+    // Counted the way `disc_label` counts, so a CD plus a video DVD, whose
+    // tracks name no disc, keeps its plain positions.
+    let several_media = matcher::remote_media(&candidate.release).is_some();
     let cells = |remote_index: usize| {
         remote_cells(
             &remote[remote_index],
@@ -703,7 +700,7 @@ fn render_accept(
          <input type=\"hidden\" name=\"action\" value=\"accept\">\
          <input type=\"hidden\" name=\"provider\" value=\"{provider}\">\
          <input type=\"hidden\" name=\"candidate\" value=\"{id}\">\
-         <button aria-label=\"Accept {provider} {id}\">{label}</button></form>",
+         <button aria-label=\"{label}: {provider} {id}\">{label}</button></form>",
         hidden_fields(view, token),
     )
 }
@@ -1015,7 +1012,7 @@ mod tests {
         );
         assert!(
             html.contains(&format!(
-                "<button aria-label=\"Accept musicbrainz {FIXTURE_MBID}\">"
+                "<button aria-label=\"Accept, overriding 1 check: musicbrainz {FIXTURE_MBID}\">"
             )),
             "{html}"
         );
@@ -1266,6 +1263,12 @@ mod tests {
         let review = review_of(vec![group(GroupState::Current, vec![(remote, Vec::new())])]);
         let html = render_release(&view(&review, Some("tok")));
         assert!(html.contains(">Accept</button>"), "{html}");
+        assert!(
+            html.contains(&format!(
+                "aria-label=\"Accept: musicbrainz {FIXTURE_MBID}\""
+            )),
+            "{html}"
+        );
         assert!(!html.contains("javascript"), "{html}");
         assert!(html.contains(FIXTURE_MBID), "{html}");
     }
@@ -1319,5 +1322,80 @@ mod tests {
             panic!("the handler failed");
         };
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn positions_that_already_name_the_disc_are_not_prefixed_again() {
+        let mut remote = remote_release(
+            mbid_release(FIXTURE_MBID),
+            "<i>Blue</i>",
+            &["A", "B", FILES[0], FILES[1]],
+        );
+        for (index, track) in remote.tracklist.iter_mut().enumerate() {
+            let (medium, position) = (index as u32 / 2 + 1, index as u32 % 2 + 1);
+            track.medium_position = Some(medium);
+            track.track_position = Some(position);
+            track.position = Some(format!("{medium}-{position}"));
+        }
+        let review = review_of(vec![group(GroupState::Current, vec![(remote, Vec::new())])]);
+        let html = render_release(&view(&review, Some("tok")));
+        assert!(html.contains("<td>2-1</td>"), "{html}");
+        assert!(!html.contains("2-2-"), "{html}");
+        assert!(!html.contains("1-1-"), "{html}");
+    }
+
+    #[test]
+    fn a_disc_without_a_named_medium_keeps_plain_positions() {
+        // Two discs and a track that names none, as a CD plus a video DVD do.
+        let mut remote = remote_with_extra(1);
+        for (index, medium) in [(0, 1), (1, 2)] {
+            remote.tracklist[index].medium_position = Some(medium);
+            remote.tracklist[index].track_position = Some(1);
+        }
+        let review = review_of(vec![group(GroupState::Current, vec![(remote, Vec::new())])]);
+        let html = render_release(&view(&review, Some("tok")));
+        assert!(
+            !html.contains("<td>1-1</td>") && !html.contains("<td>2-2</td>"),
+            "{html}"
+        );
+        assert!(!html.contains("<td>2-1</td>"), "{html}");
+        assert!(html.contains("<td>2</td><td>Two</td>"), "{html}");
+    }
+
+    #[test]
+    fn a_pair_pointing_past_the_provider_tracks_shows_the_file_as_not_mapped() {
+        let mut review = review_of(vec![group(
+            GroupState::Current,
+            vec![(exact(), Vec::new())],
+        )]);
+        review.groups[0].candidates[0].0.mapping.pairs[0] = Some(99);
+        let html = render_release(&view(&review, Some("tok")));
+        assert!(
+            html.contains("<td>—</td><td class=\"muted\">not mapped</td>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn an_out_of_date_card_orders_its_notes_like_the_command_line() {
+        let mut review = review_of(vec![group(
+            GroupState::OutOfDate,
+            vec![(exact(), vec!["blocked".into()])],
+        )]);
+        review.groups[0].candidates[0]
+            .1
+            .warnings
+            .push("warned".into());
+        let html = render_release(&view(&review, Some("tok")));
+        let at = |needle: &str| {
+            html.find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {html}"))
+        };
+        let order = [
+            at("evidence: "),
+            at("blocker: blocked"),
+            at("warning: warned"),
+        ];
+        assert!(order.is_sorted(), "{order:?} in {html}");
     }
 }
