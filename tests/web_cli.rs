@@ -21,6 +21,7 @@ fn radish(db: &Path, args: &[&str]) -> std::process::Output {
         .arg("--db")
         .arg(db)
         .args(args)
+        .current_dir(db.parent().unwrap())
         .output()
         .unwrap()
 }
@@ -461,9 +462,11 @@ fn form_encode(text: &str) -> String {
 
 const BLUE_MBID: &str = "76df3287-6cda-33eb-8e9a-044b5e15ffdd";
 const BOLD_MBID: &str = "11111111-1111-1111-1111-111111111111";
+const MISSING_MBID: &str = "22222222-2222-2222-2222-222222222222";
 const SAME_SITE: &[&str] = &["Sec-Fetch-Site: same-origin"];
 
-/// MusicBrainz for the two albums of [`seeded_library`]; everything else fails.
+/// MusicBrainz for the two albums of [`seeded_library`], a 404 for
+/// [`MISSING_MBID`]; everything else fails.
 fn review_handler(target: &str) -> (u16, String) {
     if target.contains(&format!("/ws/2/release/{BLUE_MBID}")) {
         (
@@ -475,6 +478,8 @@ fn review_handler(target: &str) -> (u16, String) {
             200,
             musicbrainz_release_json(BOLD_MBID, &["<script>alert(1)</script>"], &[1.0]),
         )
+    } else if target.contains(&format!("/ws/2/release/{MISSING_MBID}")) {
+        (404, "{}".to_string())
     } else if target.contains("/ws/2/release") {
         (200, musicbrainz_empty_search())
     } else {
@@ -532,10 +537,11 @@ fn queue_with(db: &Path, server: &MockServer, id: i64, mbid: &str) {
     assert!(text.contains("Queued for review: 1"), "{text}");
 }
 
-/// The form body that accepts saved `candidate` for `release`.
-fn accept_body(token: &str, release: i64, revision: &str, candidate: &str) -> String {
+/// The form body that accepts saved `candidate` for `release`, with the queue
+/// `filter` the page was opened with (empty for none).
+fn accept_body(token: &str, release: i64, revision: &str, filter: &str, candidate: &str) -> String {
     format!(
-        "token={token}&action=accept&release={release}&revision={}&match=&filter=\
+        "token={token}&action=accept&release={release}&revision={}&match=&filter={filter}\
          &provider=musicbrainz&candidate={candidate}",
         form_encode(revision)
     )
@@ -718,7 +724,7 @@ fn queued_releases_are_accepted_one_after_another() {
 
     let stale = server.post(
         "/review",
-        &accept_body(&token, blue, "old", BLUE_MBID),
+        &accept_body(&token, blue, "old", "", BLUE_MBID),
         SAME_SITE,
     );
     assert_eq!(stale.status, 409, "{}", stale.body);
@@ -730,7 +736,7 @@ fn queued_releases_are_accepted_one_after_another() {
 
     let accepted = server.post(
         "/review",
-        &accept_body(&token, blue, &revision, BLUE_MBID),
+        &accept_body(&token, blue, &revision, "", BLUE_MBID),
         SAME_SITE,
     );
     assert_eq!(accepted.status, 303, "{}", accepted.body);
@@ -750,7 +756,7 @@ fn queued_releases_are_accepted_one_after_another() {
     let revision = unescape_html(between(&page.body, "name=\"revision\" value=\"", "\""));
     let last = server.post(
         "/review",
-        &accept_body(&token, bold, &revision, BOLD_MBID),
+        &accept_body(&token, bold, &revision, "", BOLD_MBID),
         SAME_SITE,
     );
     assert_eq!(last.status, 303, "{}", last.body);
@@ -766,6 +772,44 @@ fn queued_releases_are_accepted_one_after_another() {
             .body
             .contains("Nothing is queued for review.")
     );
+}
+
+#[test]
+fn the_queue_filter_decides_which_release_comes_next() {
+    let (db, _music) = seeded_library("web-review-filter");
+    let mock = MockServer::start(review_handler);
+    let blue = release_id(&db, "Blue");
+    let bold = release_id(&db, "<b>Bold</b>");
+    queue_with(&db, &mock, blue, BLUE_MBID);
+    queue_with(&db, &mock, bold, BOLD_MBID);
+    let server = Server::start(&db);
+
+    let page = server.get(&format!("/review?release={blue}&provider=musicbrainz"));
+    assert_eq!(page.status, 200);
+    let token = between(&page.body, "name=\"token\" value=\"", "\"").to_string();
+    let revision = unescape_html(between(&page.body, "name=\"revision\" value=\"", "\""));
+
+    // The next release is the next one in the filtered provider's queue.
+    let accepted = server.post(
+        "/review",
+        &accept_body(&token, blue, &revision, "musicbrainz", BLUE_MBID),
+        SAME_SITE,
+    );
+    assert_eq!(accepted.status, 303, "{}", accepted.body);
+    let next = format!("location: /review?release={bold}&provider=musicbrainz&accepted={blue}");
+    assert!(accepted.headers.contains(&next), "{}", accepted.headers);
+
+    // Nothing is queued for Deezer, so the queue page follows instead.
+    let page = server.get(&format!("/review?release={bold}"));
+    let revision = unescape_html(between(&page.body, "name=\"revision\" value=\"", "\""));
+    let last = server.post(
+        "/review",
+        &accept_body(&token, bold, &revision, "deezer", BOLD_MBID),
+        SAME_SITE,
+    );
+    assert_eq!(last.status, 303, "{}", last.body);
+    let queue = format!("location: /reviews?provider=deezer&accepted={bold}");
+    assert!(last.headers.contains(&queue), "{}", last.headers);
 }
 
 #[test]
@@ -816,6 +860,14 @@ fn a_release_entered_on_the_web_is_fetched_and_accepted() {
         no_token.body
     );
 
+    let missing = server.post(
+        "/review",
+        &fetch_body(&token, blue, &revision, "musicbrainz", MISSING_MBID),
+        SAME_SITE,
+    );
+    assert_eq!(missing.status, 502, "{}", missing.body);
+    assert!(missing.body.contains("was not found"), "{}", missing.body);
+
     let fetched = server.post(
         "/review",
         &fetch_body(&token, blue, &revision, "musicbrainz", &link),
@@ -839,7 +891,7 @@ fn a_release_entered_on_the_web_is_fetched_and_accepted() {
     );
     let accepted = server.post(
         "/review",
-        &accept_body(&token, blue, &revision, BLUE_MBID),
+        &accept_body(&token, blue, &revision, "", BLUE_MBID),
         SAME_SITE,
     );
     assert_eq!(accepted.status, 303, "{}", accepted.body);
@@ -853,6 +905,11 @@ fn a_release_entered_on_the_web_is_fetched_and_accepted() {
     assert_eq!(
         mock.requests_matching(&format!("/ws/2/release/{BLUE_MBID}")),
         1
+    );
+    assert_eq!(
+        mock.requests_matching(&format!("/ws/2/release/{MISSING_MBID}")),
+        1,
+        "a 404 is not retried"
     );
 }
 
