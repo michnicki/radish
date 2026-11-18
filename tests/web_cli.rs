@@ -68,9 +68,13 @@ impl Server {
             let _ = BufReader::new(stdout).read_line(&mut line);
             let _ = sender.send(line);
         });
-        let line = receiver
-            .recv_timeout(START_TIMEOUT)
-            .unwrap_or_else(|_| panic!("the server did not announce an address"));
+        let Ok(line) = receiver.recv_timeout(START_TIMEOUT) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            let mut stderr = String::new();
+            let _ = child.stderr.take().unwrap().read_to_string(&mut stderr);
+            panic!("the server did not announce an address; stderr: {stderr}");
+        };
         let Some(addr) = line
             .strip_prefix("Serving http://")
             .and_then(|rest| rest.split_whitespace().next())
@@ -483,7 +487,7 @@ fn review_handler(target: &str) -> (u16, String) {
     } else if target.contains("/ws/2/release") {
         (200, musicbrainz_empty_search())
     } else {
-        (500, "unexpected request".to_string())
+        (400, format!("unexpected request {target}"))
     }
 }
 
@@ -520,6 +524,27 @@ fn release_id(db: &Path, album: &str) -> i64 {
         .unwrap()
 }
 
+/// The status line of release `id` in `radish releases` (for example
+/// `2 tracks · matched`), the second line of its block.
+fn release_state(db: &Path, id: i64) -> String {
+    let output = radish(db, &["releases"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+    let tag = format!("#{id}");
+    while let Some(line) = lines.next() {
+        if line.split_whitespace().next() == Some(tag.as_str()) {
+            return lines.next().unwrap_or_default().trim().to_string();
+        }
+    }
+    panic!("no release #{id} in {text}");
+}
+
+/// The start of the notice a page shows for an accepted MusicBrainz release;
+/// the ID is a link to the release.
+fn accepted_notice(mbid: &str) -> String {
+    format!("Accepted musicbrainz <a href=\"https://musicbrainz.org/release/{mbid}\"")
+}
+
 /// Queues release `id` for review with a direct MusicBrainz selection.
 fn queue_with(db: &Path, server: &MockServer, id: i64, mbid: &str) {
     let output = radish_against(
@@ -534,7 +559,7 @@ fn queue_with(db: &Path, server: &MockServer, id: i64, mbid: &str) {
         ],
     );
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("Queued for review: 1"), "{text}");
+    assert!(text.contains("Queued for review: 1"), "{output:?}");
 }
 
 /// The form body that accepts saved `candidate` for `release`, with the queue
@@ -697,7 +722,7 @@ fn queued_releases_are_accepted_one_after_another() {
     let server = Server::start(&db);
 
     let queue = server.get("/reviews");
-    assert_eq!(queue.status, 200);
+    assert_eq!(queue.status, 200, "{}", queue.body);
     assert!(
         queue.body.contains("2 releases queued for review."),
         "{}",
@@ -710,15 +735,15 @@ fn queued_releases_are_accepted_one_after_another() {
         "{}",
         queue.body
     );
+    let deezer = server.get("/reviews?provider=deezer");
     assert!(
-        server
-            .get("/reviews?provider=deezer")
-            .body
-            .contains("Nothing is queued for review.")
+        deezer.body.contains("Nothing is queued for review."),
+        "{}",
+        deezer.body
     );
 
     let page = server.get(&format!("/review?release={blue}"));
-    assert_eq!(page.status, 200);
+    assert_eq!(page.status, 200, "{}", page.body);
     let token = between(&page.body, "name=\"token\" value=\"", "\"").to_string();
     let revision = unescape_html(between(&page.body, "name=\"revision\" value=\"", "\""));
 
@@ -748,10 +773,12 @@ fn queued_releases_are_accepted_one_after_another() {
     );
 
     let page = server.get(&next);
-    assert!(page.body.contains("Accepted musicbrainz"), "{}", page.body);
+    let notice = accepted_notice(BLUE_MBID);
+    assert!(page.body.contains(&notice), "{}", page.body);
+    assert!(page.body.contains(&format!("#{blue} ")), "{}", page.body);
     assert!(!page.body.contains("<script"), "{}", page.body);
-    let releases = String::from_utf8_lossy(&radish(&db, &["releases"]).stdout).to_string();
-    assert!(releases.contains("· matched"), "{releases}");
+    assert!(release_state(&db, blue).ends_with("· matched"));
+    assert!(release_state(&db, bold).contains("· unmatched"));
 
     let revision = unescape_html(between(&page.body, "name=\"revision\" value=\"", "\""));
     let last = server.post(
@@ -766,11 +793,12 @@ fn queued_releases_are_accepted_one_after_another() {
         "{}",
         last.headers
     );
+    assert!(release_state(&db, bold).ends_with("· matched"));
+    let empty = server.get("/reviews");
     assert!(
-        server
-            .get("/reviews")
-            .body
-            .contains("Nothing is queued for review.")
+        empty.body.contains("Nothing is queued for review."),
+        "{}",
+        empty.body
     );
 }
 
@@ -784,31 +812,32 @@ fn the_queue_filter_decides_which_release_comes_next() {
     queue_with(&db, &mock, bold, BOLD_MBID);
     let server = Server::start(&db);
 
-    let page = server.get(&format!("/review?release={blue}&provider=musicbrainz"));
-    assert_eq!(page.status, 200);
+    let page = server.get(&format!("/review?release={blue}&provider=deezer"));
+    assert_eq!(page.status, 200, "{}", page.body);
     let token = between(&page.body, "name=\"token\" value=\"", "\"").to_string();
     let revision = unescape_html(between(&page.body, "name=\"revision\" value=\"", "\""));
 
-    // The next release is the next one in the filtered provider's queue.
+    // Bold is still queued for MusicBrainz, but nothing is queued for Deezer:
+    // the next release comes from the filtered queue, so the queue page follows.
     let accepted = server.post(
         "/review",
-        &accept_body(&token, blue, &revision, "musicbrainz", BLUE_MBID),
+        &accept_body(&token, blue, &revision, "deezer", BLUE_MBID),
         SAME_SITE,
     );
     assert_eq!(accepted.status, 303, "{}", accepted.body);
-    let next = format!("location: /review?release={bold}&provider=musicbrainz&accepted={blue}");
-    assert!(accepted.headers.contains(&next), "{}", accepted.headers);
+    let queue = format!("location: /reviews?provider=deezer&accepted={blue}");
+    assert!(accepted.headers.contains(&queue), "{}", accepted.headers);
 
-    // Nothing is queued for Deezer, so the queue page follows instead.
-    let page = server.get(&format!("/review?release={bold}"));
+    // The filter the form carried comes back in the redirect.
+    let page = server.get(&format!("/review?release={bold}&provider=musicbrainz"));
     let revision = unescape_html(between(&page.body, "name=\"revision\" value=\"", "\""));
     let last = server.post(
         "/review",
-        &accept_body(&token, bold, &revision, "deezer", BOLD_MBID),
+        &accept_body(&token, bold, &revision, "musicbrainz", BOLD_MBID),
         SAME_SITE,
     );
     assert_eq!(last.status, 303, "{}", last.body);
-    let queue = format!("location: /reviews?provider=deezer&accepted={bold}");
+    let queue = format!("location: /reviews?provider=musicbrainz&accepted={bold}");
     assert!(last.headers.contains(&queue), "{}", last.headers);
 }
 
@@ -901,6 +930,12 @@ fn a_release_entered_on_the_web_is_fetched_and_accepted() {
             .contains(&format!("location: /reviews?accepted={blue}")),
         "{}",
         accepted.headers
+    );
+    let done = server.get(&format!("/reviews?accepted={blue}"));
+    assert!(
+        done.body.contains(&accepted_notice(BLUE_MBID)),
+        "{}",
+        done.body
     );
     assert_eq!(
         mock.requests_matching(&format!("/ws/2/release/{BLUE_MBID}")),
