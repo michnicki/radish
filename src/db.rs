@@ -74,10 +74,15 @@ pub async fn connect_in_memory() -> Result<SqlitePool> {
 
 /// Brings a database up to the current schema: first the legacy baseline, then
 /// versioned migrations. Never scans files or touches the network, so stored
-/// metadata stays absent until the next rescan.
+/// metadata stays absent until the next rescan. It also summarizes saved
+/// reviews that have no summary yet (a one-time pass after the upgrade that
+/// adds the summary columns).
 pub async fn initialize(pool: &SqlitePool) -> Result<()> {
     sqlx::raw_sql(LEGACY_SCHEMA).execute(pool).await?;
     MIGRATOR.run(pool).await?;
+    // Reviews saved before the summary columns existed are summarized once;
+    // later opens find nothing to do.
+    crate::store::fill_review_summaries(pool).await?;
 
     Ok(())
 }
@@ -1015,6 +1020,32 @@ mod tests {
                 .unwrap();
         assert_eq!(applied, 11);
         pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn opening_a_database_summarizes_reviews_saved_before_the_summaries() {
+        use crate::test_support::{
+            FIXTURE_MBID, mbid_release, queue, remote_release, seed_release,
+        };
+        let pool = connect_in_memory().await.unwrap();
+        let release = seed_release(&pool, "/music/a", "Blue", &["One", "Two"]).await;
+        queue(
+            &pool,
+            &release,
+            remote_release(mbid_release(FIXTURE_MBID), "Blue", &["One", "Two"]),
+        )
+        .await;
+        sqlx::query("UPDATE match_reviews SET top_score = NULL, top_can_apply = NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        initialize(&pool).await.unwrap();
+        let pending: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM match_reviews WHERE top_can_apply IS NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pending, 0);
     }
 
     #[tokio::test]

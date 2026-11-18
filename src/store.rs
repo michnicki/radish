@@ -1737,7 +1737,7 @@ pub async fn load_selected_releases(
     scope: Option<&Path>,
     id: Option<i64>,
 ) -> Result<Vec<LocalRelease>> {
-    load_releases(pool, scope, id, None).await
+    load_releases(pool, scope, id.map_or(Pick::Any, Pick::One), None).await
 }
 
 /// The releases under `scope` that wait for review by one of `providers`.
@@ -1754,7 +1754,33 @@ pub async fn load_queued_releases(
     scope: Option<&Path>,
     providers: &[ProviderKind],
 ) -> Result<Vec<LocalRelease>> {
-    load_releases(pool, scope, None, Some(providers)).await
+    load_releases(pool, scope, Pick::Any, Some(providers)).await
+}
+
+/// The local releases `ids` names, whatever their status; unknown ids are skipped.
+///
+/// # Errors
+///
+/// When the database cannot be read.
+pub(crate) async fn load_releases_by_id(
+    pool: &SqlitePool,
+    ids: &[i64],
+) -> Result<Vec<LocalRelease>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    load_releases(pool, None, Pick::Many(ids), None).await
+}
+
+/// Which releases [`load_releases`] reads, beyond its scope and queue filters.
+#[derive(Debug, Clone, Copy)]
+enum Pick<'a> {
+    /// Every release the filters allow.
+    Any,
+    /// One release, by its key.
+    One(i64),
+    /// These releases, by their keys.
+    Many(&'a [i64]),
 }
 
 // The SQL of `load_releases`, once with the ID as its own condition and once
@@ -1838,7 +1864,7 @@ macro_rules! track_sql {
 async fn load_releases(
     pool: &SqlitePool,
     scope: Option<&Path>,
-    id: Option<i64>,
+    pick: Pick<'_>,
     queued: Option<&[ProviderKind]>,
 ) -> Result<Vec<LocalRelease>> {
     // The providers whose saved reviews select a release, as a JSON array for
@@ -1861,29 +1887,49 @@ async fn load_releases(
     // snapshot even while an import or rebuild commits in between.
     let mut tx = pool.begin().await?;
 
-    let release_rows = sqlx::query_as::<_, LocalReleaseRow>(if id.is_some() {
-        release_sql!("lr.id = ?2")
-    } else {
-        release_sql!("(?2 IS NULL OR lr.id = ?2)")
-    })
-    .bind(scope)
-    .bind(id)
-    .bind(merged_parent.as_deref())
-    .bind(queued.as_deref())
-    .fetch_all(&mut *tx)
-    .await?;
+    // `Many` binds its keys as a JSON array, for `json_each`.
+    let ids_json = match pick {
+        Pick::Many(ids) => Some(serde_json::to_string(ids)?),
+        Pick::Any | Pick::One(_) => None,
+    };
+    let release_sql = match pick {
+        Pick::One(_) => release_sql!("lr.id = ?2"),
+        Pick::Many(_) => release_sql!("lr.id IN (SELECT value FROM json_each(?2))"),
+        Pick::Any => release_sql!("(?2 IS NULL OR lr.id = ?2)"),
+    };
+    let track_sql = match pick {
+        Pick::One(_) => track_sql!("t.local_release_id = ?2"),
+        Pick::Many(_) => track_sql!("t.local_release_id IN (SELECT value FROM json_each(?2))"),
+        Pick::Any => track_sql!("(?2 IS NULL OR lr.id = ?2)"),
+    };
 
-    let track_rows = sqlx::query_as::<_, LocalTrackRow>(if id.is_some() {
-        track_sql!("t.local_release_id = ?2")
-    } else {
-        track_sql!("(?2 IS NULL OR lr.id = ?2)")
-    })
-    .bind(scope)
-    .bind(id)
-    .bind(merged_parent.as_deref())
-    .bind(queued.as_deref())
-    .fetch_all(&mut *tx)
-    .await?;
+    let release_rows = {
+        let query = sqlx::query_as::<_, LocalReleaseRow>(release_sql).bind(scope);
+        let query = match pick {
+            Pick::One(id) => query.bind(Some(id)),
+            Pick::Many(_) => query.bind(ids_json.as_deref()),
+            Pick::Any => query.bind(None::<i64>),
+        };
+        query
+            .bind(merged_parent.as_deref())
+            .bind(queued.as_deref())
+            .fetch_all(&mut *tx)
+            .await?
+    };
+
+    let track_rows = {
+        let query = sqlx::query_as::<_, LocalTrackRow>(track_sql).bind(scope);
+        let query = match pick {
+            Pick::One(id) => query.bind(Some(id)),
+            Pick::Many(_) => query.bind(ids_json.as_deref()),
+            Pick::Any => query.bind(None::<i64>),
+        };
+        query
+            .bind(merged_parent.as_deref())
+            .bind(queued.as_deref())
+            .fetch_all(&mut *tx)
+            .await?
+    };
 
     tx.commit().await?;
 
@@ -7361,5 +7407,26 @@ mod tests {
             }
         );
         assert_eq!(merged.label(), "2 album titles, 2 folders (manual)");
+    }
+
+    #[tokio::test]
+    async fn releases_load_by_id_in_one_go() {
+        use crate::test_support::seed_release;
+        let pool = test_pool().await;
+        let a = seed_release(&pool, "/music/a", "Blue", &["One", "Two"]).await;
+        seed_release(&pool, "/music/b", "Red", &["One"]).await;
+        let c = seed_release(&pool, "/music/c", "Green", &["One", "Two", "Three"]).await;
+        let mut loaded = load_releases_by_id(&pool, &[c.id, a.id, a.id + 1000])
+            .await
+            .unwrap();
+        loaded.sort_by_key(|release| release.id);
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|r| (r.id, r.tracks.len()))
+                .collect::<Vec<_>>(),
+            vec![(a.id, 2), (c.id, 3)]
+        );
+        assert!(load_releases_by_id(&pool, &[]).await.unwrap().is_empty());
     }
 }

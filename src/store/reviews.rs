@@ -9,6 +9,7 @@
 // Rust guideline compliant 2026-08-14
 
 use super::{MatchGuard, StoredCandidate, begin_write, decode_stored_candidates, queue_review_in};
+use crate::layout::grouped;
 use crate::matcher::{self, Candidate, LocalRelease};
 use crate::providers::ProviderKind;
 use anyhow::Result;
@@ -136,6 +137,134 @@ pub async fn add_review_candidate(
     .await?;
     tx.commit().await?;
     Ok(true)
+}
+
+/// Releases whose saved reviews one chunk of [`fill_review_summaries`] reads.
+///
+/// 2,000 releases hold about 21,000 tracks and 4,500 first candidates (about
+/// 30 MB of JSON), so memory stays bounded; each chunk is one write
+/// transaction, so a concurrent writer waits at most for one chunk.
+const SUMMARY_CHUNK: usize = 2_000;
+
+/// Summarizes every saved review that has no summary yet; returns how many.
+///
+/// Runs after migrations on every open and returns at once when nothing is
+/// left (an index-only check). Reviews saved before the summary columns
+/// existed are summarized here, once: only each review's first candidate is
+/// read, the releases are loaded in chunks of [`SUMMARY_CHUNK`], and progress
+/// goes to stderr. A review that cannot be decoded, or that was saved before
+/// its files changed, is summarized as one that cannot be accepted, so no row
+/// is left for the next open.
+///
+/// # Errors
+///
+/// When the database cannot be read or written.
+pub async fn fill_review_summaries(pool: &SqlitePool) -> Result<u64> {
+    let pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM match_reviews WHERE top_can_apply IS NULL)",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !pending {
+        return Ok(0);
+    }
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT local_release_id FROM match_reviews
+         WHERE top_can_apply IS NULL ORDER BY local_release_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM match_reviews WHERE top_can_apply IS NULL")
+            .fetch_one(pool)
+            .await?;
+    let total = total.max(0).unsigned_abs();
+    eprintln!(
+        "Summarizing {} saved reviews for the review queue\u{2026}",
+        grouped(total)
+    );
+
+    let mut done = 0u64;
+    for chunk in ids.chunks(SUMMARY_CHUNK) {
+        let releases: HashMap<i64, LocalRelease> = super::load_releases_by_id(pool, chunk)
+            .await?
+            .into_iter()
+            .map(|release| (release.id, release))
+            .collect();
+        let rows: Vec<PendingRow> = sqlx::query_as(
+            "SELECT local_release_id, provider, snapshot_version, source_revision, reasons_json,
+                    json_valid(candidates_json),
+                    CASE WHEN json_valid(candidates_json) THEN candidates_json -> '$[0]' END
+             FROM match_reviews
+             WHERE top_can_apply IS NULL
+               AND local_release_id IN (SELECT value FROM json_each(?1))",
+        )
+        .bind(serde_json::to_string(chunk)?)
+        .fetch_all(pool)
+        .await?;
+        let mut tx = begin_write(pool).await?;
+        for row in &rows {
+            let summary = summary_of_row(releases.get(&row.0), row);
+            sqlx::query(
+                "UPDATE match_reviews
+                 SET top_score = ?1, top_can_apply = ?2, top_reason = ?3, top_blockers = ?4
+                 WHERE local_release_id = ?5 AND provider = ?6 AND top_can_apply IS NULL",
+            )
+            .bind(summary.score)
+            .bind(i64::from(summary.can_apply))
+            .bind(summary.reason)
+            .bind(summary.blockers)
+            .bind(row.0)
+            .bind(&row.1)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        done += rows.len() as u64;
+        eprintln!("  {} of {}", grouped(done), grouped(total));
+    }
+    Ok(done)
+}
+
+/// One unsummarized review: release, provider, snapshot version, source
+/// revision, reasons, whether the candidates are valid JSON, first candidate.
+type PendingRow = (i64, String, i64, String, String, bool, Option<String>);
+
+/// The summary of one unsummarized review, given its release if it exists.
+fn summary_of_row(release: Option<&LocalRelease>, row: &PendingRow) -> ReviewSummary {
+    let (_, provider, version, source_revision, reasons_json, valid, first) = row;
+    let reasons: Vec<String> = serde_json::from_str(reasons_json).unwrap_or_default();
+    let cannot = |score: Option<f64>, reason: &str, blockers: i64| ReviewSummary {
+        score,
+        can_apply: false,
+        reason: Some(reason.to_string()),
+        blockers,
+    };
+    let Some(provider) = ProviderKind::parse(provider) else {
+        return cannot(None, "saved review cannot be read", 0);
+    };
+    let candidate = match first {
+        Some(json) => match decode_stored_candidates(*version, provider, &format!("[{json}]")) {
+            Ok(mut decoded) => decoded.pop(),
+            Err(_) => return cannot(None, "saved review cannot be read", 0),
+        },
+        None if *valid => None,
+        None => return cannot(None, "saved review cannot be read", 0),
+    };
+    let candidates: Vec<StoredCandidate> = candidate.into_iter().collect();
+    let score = candidates
+        .first()
+        .map(|first| first.match_scope.score(&first.score));
+    let blockers = candidates
+        .first()
+        .map_or(0, |first| first.blockers.len() as i64);
+    match release {
+        None => cannot(score, "local release is gone", blockers),
+        Some(release) if release.revision != *source_revision => {
+            cannot(score, "saved before the files changed", blockers)
+        }
+        Some(release) => summarize(release, &candidates, &reasons),
+    }
 }
 
 /// The condition that puts release `lr` in the review queue: not matched,
@@ -607,5 +736,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(can_apply, Some(0));
+    }
+
+    #[tokio::test]
+    async fn the_one_time_pass_summarizes_every_unsummarized_review() {
+        let (pool, [a, b, _, d]) = library().await;
+        // As if the reviews were saved before the summary columns existed.
+        sqlx::query(
+            "UPDATE match_reviews
+             SET top_score = NULL, top_can_apply = NULL, top_reason = NULL, top_blockers = NULL",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE match_reviews SET candidates_json = 'nonsense' WHERE local_release_id = ?1",
+        )
+        .bind(b)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE match_reviews SET source_revision = 'old' WHERE local_release_id = ?1")
+            .bind(d)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(fill_review_summaries(&pool).await.unwrap(), 4);
+        let rows: Vec<(i64, Option<f64>, i64, Option<String>)> = sqlx::query_as(
+            "SELECT local_release_id, top_score, top_can_apply, top_reason
+             FROM match_reviews ORDER BY local_release_id, provider",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        for (id, score, can_apply, reason) in &rows {
+            if *id == a {
+                assert!(score.is_some() && *can_apply == 1, "{rows:?}");
+            } else if *id == b {
+                assert_eq!(
+                    (score, *can_apply, reason.as_deref()),
+                    (&None, 0, Some("saved review cannot be read"))
+                );
+            } else if *id == d {
+                assert!(score.is_some(), "{rows:?}");
+                assert_eq!(
+                    (*can_apply, reason.as_deref()),
+                    (0, Some("saved before the files changed"))
+                );
+            }
+        }
+        // Nothing is left for the next open.
+        assert_eq!(fill_review_summaries(&pool).await.unwrap(), 0);
     }
 }
