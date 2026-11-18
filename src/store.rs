@@ -13,6 +13,8 @@ use std::path::Path;
 
 mod folders;
 pub use folders::*;
+mod reviews;
+pub use reviews::*;
 
 pub const STATUS_UNMATCHED: &str = "unmatched";
 pub const STATUS_MATCHED: &str = "matched";
@@ -2944,6 +2946,35 @@ pub async fn queue_review(
     proposed_mapping: &Mapping,
     reasons: &[String],
 ) -> Result<()> {
+    let mut conn = pool.acquire().await?;
+    queue_review_in(
+        &mut conn,
+        local_release_id,
+        provider,
+        source_revision,
+        expected_match_id,
+        candidates,
+        proposed_mapping,
+        reasons,
+    )
+    .await
+}
+
+/// [`queue_review`] on `conn`, so it can run inside a write transaction.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one review row's columns; the same arguments as queue_review"
+)]
+async fn queue_review_in(
+    conn: &mut SqliteConnection,
+    local_release_id: i64,
+    provider: ProviderKind,
+    source_revision: &str,
+    expected_match_id: Option<i64>,
+    candidates: &[StoredCandidate],
+    proposed_mapping: &Mapping,
+    reasons: &[String],
+) -> Result<()> {
     let candidates_json = serde_json::to_string(candidates)?;
     let mapping_json = serde_json::to_string(proposed_mapping)?;
     let reasons_json = serde_json::to_string(reasons)?;
@@ -2971,7 +3002,7 @@ pub async fn queue_review(
     .bind(mapping_json)
     .bind(reasons_json)
     .bind(source_revision)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
     Ok(())

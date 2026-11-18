@@ -7,12 +7,17 @@
 //! a candidate card shows ([`edition_details`], [`score_parts`]), and
 //! accepting one saved candidate as the page showed it ([`accept_saved`]).
 //!
+//! A release fetched by its ID is added to a provider's saved review with
+//! [`add_fetched`].
+//!
 //! The terminal prompt in [`crate::runner`] and the pages in [`crate::web`]
 //! both use it, so a candidate is judged and accepted the same way in both.
 
 // Rust guideline compliant 2026-08-14
 
-use crate::matcher::{self, Candidate, Evaluation, LocalRelease, MatchScope, RemoteRelease};
+use crate::matcher::{
+    self, Candidate, DiscoveryEvidence, Evaluation, LocalRelease, MatchScope, RemoteRelease,
+};
 use crate::providers::{ProviderKind, ProviderPolicy, ReleaseId};
 use crate::store::{self, AcceptanceMethod, LocalReleaseStatus, MatchGuard, StoredCandidate};
 use anyhow::{Context, Result, bail};
@@ -380,6 +385,52 @@ pub async fn accept_saved(
             }
         }
     }
+}
+
+/// The reason stored with a review that holds only a release entered by hand.
+pub const ENTERED_REASON: &str = "entered by hand";
+
+/// What became of a release fetched from a review page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddOutcome {
+    /// The release is the first candidate of its provider's saved review.
+    Added,
+    /// The release is gone or changed after the page was built.
+    Changed,
+}
+
+/// Adds `remote`, fetched by its ID, to release `local_id`'s saved review.
+///
+/// `remote` is mapped and judged as a direct selection (the way `[i]d` judges
+/// it), then stored first in its provider's review through
+/// [`store::add_review_candidate`]. A release whose mapping cannot be applied
+/// is stored all the same, so the page can show why.
+///
+/// # Errors
+///
+/// When the database cannot be read or written.
+pub async fn add_fetched(
+    pool: &SqlitePool,
+    local_id: i64,
+    revision: &str,
+    remote: RemoteRelease,
+) -> Result<AddOutcome> {
+    let Some(release) = load_release(pool, local_id).await? else {
+        return Ok(AddOutcome::Changed);
+    };
+    if release.revision != revision {
+        return Ok(AddOutcome::Changed);
+    }
+    let candidate = Candidate::new(&release, remote);
+    let evaluation = matcher::evaluate(&release, &candidate, None, &DiscoveryEvidence::default());
+    let stored = stored_candidate(&candidate, &evaluation);
+    let added =
+        store::add_review_candidate(pool, local_id, revision, stored, ENTERED_REASON).await?;
+    Ok(if added {
+        AddOutcome::Added
+    } else {
+        AddOutcome::Changed
+    })
 }
 
 /// The release's current guard, or `None` when the release is gone.
@@ -774,5 +825,83 @@ mod tests {
             AcceptOutcome::CannotApply(notes) => assert!(!notes.is_empty()),
             other => panic!("expected CannotApply, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_fetched_release_goes_first_in_its_providers_review() {
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let titles = ["One", "Two"];
+        let release = seed_release(&pool, "/music/a", "Blue", &titles).await;
+        let other = || remote_release(mbid_release(OTHER_MBID), "Blue", &titles);
+        let first = || remote_release(mbid_release(FIXTURE_MBID), "Blue", &titles);
+        queue(&pool, &release, first()).await;
+        let ids = |review: &ReleaseReview, index: usize| -> Vec<String> {
+            review.groups[index]
+                .candidates
+                .iter()
+                .map(|(candidate, _)| candidate.release.id.storage_id())
+                .collect()
+        };
+
+        let added = add_fetched(&pool, release.id, &release.revision, other())
+            .await
+            .unwrap();
+        assert_eq!(added, AddOutcome::Added);
+        let review = load(&pool, release.id).await.unwrap().unwrap();
+        assert_eq!(ids(&review, 0), vec![OTHER_MBID, FIXTURE_MBID]);
+        assert_eq!(review.groups[0].reasons, vec!["uncertain".to_string()]);
+
+        // Fetching a saved one again moves it to the front without a copy.
+        add_fetched(&pool, release.id, &release.revision, first())
+            .await
+            .unwrap();
+        let review = load(&pool, release.id).await.unwrap().unwrap();
+        assert_eq!(ids(&review, 0), vec![FIXTURE_MBID, OTHER_MBID]);
+
+        // Another provider gets a group of its own.
+        let discogs = remote_release(ReleaseId::Discogs(42), "Blue", &titles);
+        add_fetched(&pool, release.id, &release.revision, discogs)
+            .await
+            .unwrap();
+        let review = load(&pool, release.id).await.unwrap().unwrap();
+        assert_eq!(ids(&review, 1), vec!["42"]);
+        assert_eq!(review.groups[1].reasons, vec![ENTERED_REASON.to_string()]);
+        assert_eq!(review.groups[1].state, GroupState::Current);
+
+        // An out-of-date group is replaced by the fetched release alone.
+        sqlx::query(
+            "UPDATE match_reviews SET source_revision = 'old' WHERE provider = 'musicbrainz'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        add_fetched(&pool, release.id, &release.revision, other())
+            .await
+            .unwrap();
+        let review = load(&pool, release.id).await.unwrap().unwrap();
+        assert_eq!(ids(&review, 0), vec![OTHER_MBID]);
+        assert_eq!(review.groups[0].state, GroupState::Current);
+
+        // A release that cannot be applied is still stored, so the page can say why.
+        let short = remote_release(mbid_release(FIXTURE_MBID), "Blue", &["One"]);
+        add_fetched(&pool, release.id, &release.revision, short)
+            .await
+            .unwrap();
+        let review = load(&pool, release.id).await.unwrap().unwrap();
+        let (candidate, evaluation) = &review.groups[0].candidates[0];
+        assert!(!evaluation.can_apply(&review.release, candidate));
+
+        assert_eq!(
+            add_fetched(&pool, release.id, "stale", other())
+                .await
+                .unwrap(),
+            AddOutcome::Changed
+        );
+        assert_eq!(
+            add_fetched(&pool, release.id + 100, &release.revision, other())
+                .await
+                .unwrap(),
+            AddOutcome::Changed
+        );
     }
 }
