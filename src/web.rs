@@ -42,6 +42,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
+mod review;
+
 /// Rows on one page of tracks or releases.
 ///
 /// Large enough to scan a whole album or a short search result in one go, and
@@ -170,6 +172,7 @@ fn router(pool: SqlitePool, bind: SocketAddr, token: String) -> Router {
         .route("/", get(status_page))
         .route("/tracks", get(tracks_page))
         .route("/releases", get(releases_page))
+        .route("/reviews", get(review::queue_page))
         .route("/folders", get(folders_page))
         .route(
             "/folder",
