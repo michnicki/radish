@@ -406,8 +406,8 @@ pub async fn folder_view(pool: &SqlitePool, path: &str) -> Result<Option<FolderV
                 track.disc_number,
             ),
             track_number: track.track_number,
-            album: track.album.clone(),
-            title: track.title.clone(),
+            album: shown_tag(track.album.clone()),
+            title: shown_tag(track.title.clone()),
             duration_secs: track.duration_secs,
         })
         .collect();

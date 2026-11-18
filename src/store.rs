@@ -2466,6 +2466,13 @@ fn non_empty(value: &str) -> Option<String> {
     }
 }
 
+/// A tag as the listings show it. Fixed-width tags (ID3v1) pad values with
+/// spaces, and a blank value counts as missing. The stored tags keep the
+/// padding, since the source revision hashes them.
+fn shown_tag(value: Option<String>) -> Option<String> {
+    value.as_deref().and_then(non_empty)
+}
+
 /// Applies an accepted match atomically. The whole overlay is replaced, so a
 /// failure leaves no partial state behind.
 pub async fn accept_match(
@@ -2951,7 +2958,15 @@ async fn track_rows(
     .bind(offset)
     .fetch_all(pool)
     .await?;
-    Ok(rows)
+    Ok(rows
+        .into_iter()
+        .map(|row| TrackRow {
+            title: shown_tag(row.title),
+            artist: shown_tag(row.artist),
+            album: shown_tag(row.album),
+            ..row
+        })
+        .collect())
 }
 
 /// A `LIKE` pattern matching `query` as a literal substring. The backslash is
@@ -3261,6 +3276,36 @@ mod tests {
 
         let releases = load_local_releases(&pool, None).await.unwrap();
         assert_eq!(releases.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn track_listings_drop_the_padding_of_fixed_width_tags() {
+        let pool = test_pool().await;
+        // ID3v1 fields are 30 characters wide and often padded with spaces.
+        let album = "Blue                          ";
+        let artist = "Artist                        ";
+        let mut padded = scanned("/music/a/01.mp3", Some(album), Some(artist), 1);
+        padded.title = Some("One                           ".to_string());
+        let mut blank = scanned("/music/a/02.mp3", Some(album), Some(artist), 2);
+        blank.title = Some(" ".repeat(30));
+        insert(&pool, "/music/a", &[padded, blank]).await;
+
+        for rows in [
+            list_tracks(&pool).await.unwrap(),
+            search_tracks(&pool, "Blue").await.unwrap(),
+        ] {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].title.as_deref(), Some("One"));
+            assert_eq!(rows[0].artist.as_deref(), Some("Artist"));
+            assert_eq!(rows[0].album.as_deref(), Some("Blue"));
+            assert_eq!(rows[1].title, None);
+            assert_eq!(rows[1].display_title(), "02.mp3");
+        }
+
+        let view = folder_view(&pool, "/music/a").await.unwrap().unwrap();
+        assert_eq!(view.files[0].album.as_deref(), Some("Blue"));
+        assert_eq!(view.files[0].title.as_deref(), Some("One"));
+        assert_eq!(view.files[1].title, None);
     }
 
     #[tokio::test]
