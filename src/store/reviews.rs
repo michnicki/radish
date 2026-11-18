@@ -306,13 +306,12 @@ fn summary_of_row(release: Option<&LocalRelease>, row: &PendingRow) -> ReviewSum
     let score = candidates
         .first()
         .map(|first| first.match_scope.score(&first.score));
-    let blockers = candidates
-        .first()
-        .map_or(0, |first| first.blockers.len() as i64);
     match release {
-        None => cannot(score, "local release is gone", blockers),
+        // The replaced reasons explain the whole review, so no blockers
+        // are counted behind them.
+        None => cannot(score, "local release is gone", 0),
         Some(release) if release.revision != row.source_revision => {
-            cannot(score, OUT_OF_DATE_REASON, blockers)
+            cannot(score, OUT_OF_DATE_REASON, 0)
         }
         Some(release) => summarize(release, &candidates, &reasons),
     }
@@ -480,12 +479,14 @@ fn lead_of(rows: &[SummaryRow], view: &QueueView) -> Option<Lead> {
             score: row.score,
             // The page offers no Accept for a review saved before the files changed.
             can_apply: row.can_apply && row.current,
+            // The replaced reason explains the whole review; a stale review's
+            // blockers are not counted behind it.
             reason: if row.current {
                 row.reason.clone()
             } else {
                 Some(OUT_OF_DATE_REASON.to_owned())
             },
-            blockers: row.blockers,
+            blockers: if row.current { row.blockers } else { 0 },
         })
 }
 
@@ -909,6 +910,7 @@ mod tests {
             lead.reason.as_deref(),
             Some("saved before the files changed")
         );
+        assert_eq!(lead.blockers, 0, "set_summary gave the row two blockers");
 
         // The provider filter combines with the others.
         let musicbrainz = queue_page(
@@ -1431,6 +1433,39 @@ mod tests {
         }
         // Nothing is left for the next open.
         assert_eq!(fill_review_summaries(&pool).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_stale_review_counts_no_blockers_behind_its_replaced_reason() {
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let release = seed_release(&pool, "/music/a", "Blue", &["One", "Two", "Three"]).await;
+        queue(
+            &pool,
+            &release,
+            remote_release(mbid_release(FIXTURE_MBID), "Blue", &["One", "Two"]),
+        )
+        .await;
+        let blockers = |pool: SqlitePool| async move {
+            sqlx::query_as::<_, (Option<String>, Option<i64>)>(
+                "SELECT top_reason, top_blockers FROM match_reviews",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        let (_, current) = blockers(pool.clone()).await;
+        assert!(current.unwrap() > 0, "the fixture has a blocker");
+
+        sqlx::query("UPDATE match_reviews SET source_revision = 'old'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        forget_summaries(&pool).await;
+        fill_review_summaries(&pool).await.unwrap();
+        assert_eq!(
+            blockers(pool).await,
+            (Some(OUT_OF_DATE_REASON.to_string()), Some(0))
+        );
     }
 
     /// Reviews saved before the summaries: every `top_*` column empty.

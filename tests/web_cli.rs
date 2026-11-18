@@ -935,15 +935,19 @@ fn a_release_entered_on_the_web_is_fetched_and_accepted() {
     assert_eq!(missing.status, 502, "{}", missing.body);
     assert!(missing.body.contains("was not found"), "{}", missing.body);
 
+    // The queue view the page was reached from rides along in the form.
     let fetched = server.post(
         "/review",
-        &fetch_body(&token, blue, &revision, "musicbrainz", &link),
+        &format!(
+            "{}&sort=score",
+            fetch_body(&token, blue, &revision, "musicbrainz", &link)
+        ),
         SAME_SITE,
     );
     assert_eq!(fetched.status, 303, "{}", fetched.body);
     assert!(
         fetched.headers.contains(&format!(
-            "location: /review?release={blue}#group-musicbrainz"
+            "location: /review?release={blue}&sort=score#group-musicbrainz"
         )),
         "{}",
         fetched.headers

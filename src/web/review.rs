@@ -73,36 +73,58 @@ fn view_of(provider: Option<&str>, sort: Option<&str>, show: Option<&str>) -> st
     store::QueueView {
         provider: provider.and_then(ProviderKind::parse),
         sort: match sort.map(str::trim) {
-            Some("score") => store::QueueSort::Score,
+            Some(value) if value.eq_ignore_ascii_case("score") => store::QueueSort::Score,
             _ => store::QueueSort::Folder,
         },
-        acceptable: show.map(str::trim) == Some("acceptable"),
+        acceptable: show.is_some_and(|value| value.trim().eq_ignore_ascii_case("acceptable")),
     }
 }
 
+/// The `sort` value that names `sort`; none for the default order.
+fn sort_param(sort: store::QueueSort) -> Option<&'static str> {
+    match sort {
+        store::QueueSort::Folder => None,
+        store::QueueSort::Score => Some("score"),
+    }
+}
+
+/// The `show` value for `acceptable`; none for showing every queued release.
+fn show_param(acceptable: bool) -> Option<&'static str> {
+    acceptable.then_some("acceptable")
+}
+
 /// The query parameters that name `view`, defaults left out.
+///
+/// The one encoding of a view: links, the pager and the forms' hidden fields
+/// all take their values from here and from [`sort_param`] / [`show_param`].
 fn view_params(view: &store::QueueView) -> Vec<(&'static str, &'static str)> {
     let mut params = Vec::new();
     if let Some(provider) = view.provider {
         params.push(("provider", provider.as_str()));
     }
-    if view.sort == store::QueueSort::Score {
-        params.push(("sort", "score"));
+    if let Some(sort) = sort_param(view.sort) {
+        params.push(("sort", sort));
     }
-    if view.acceptable {
-        params.push(("show", "acceptable"));
+    if let Some(show) = show_param(view.acceptable) {
+        params.push(("show", show));
     }
     params
 }
 
-/// `path`, then the view's parameters and the release just accepted.
+/// `path`, then the release (when given), the view's parameters and the
+/// release just accepted, as a query string.
+///
+/// Every value is a static string or an integer, so none needs encoding.
 fn href_with(
     path: &str,
-    first: Option<String>,
+    release: Option<i64>,
     view: &store::QueueView,
     accepted: Option<i64>,
 ) -> String {
-    let mut parts: Vec<String> = first.into_iter().collect();
+    let mut parts: Vec<String> = release
+        .into_iter()
+        .map(|release| format!("release={release}"))
+        .collect();
     parts.extend(
         view_params(view)
             .into_iter()
@@ -120,12 +142,7 @@ fn href_with(
 
 /// `/review?release=N`, with the queue view and the release just accepted.
 fn review_href(release: i64, view: &store::QueueView, accepted: Option<i64>) -> String {
-    href_with(
-        "/review",
-        Some(format!("release={release}")),
-        view,
-        accepted,
-    )
+    href_with("/review", Some(release), view, accepted)
 }
 
 /// `/reviews`, with the queue view and the release just accepted.
@@ -173,11 +190,11 @@ async fn accepted_status(
 }
 
 /// `Accepted musicbrainz <id> (title) for #12 Artist — Album.`
-fn render_accepted(status: &store::LocalReleaseStatus) -> String {
+fn render_accepted(status: &store::LocalReleaseStatus, view: &store::QueueView) -> String {
     format!(
         "<p class=\"notice\">Accepted {} for <a href=\"{}\">#{} {} — {}</a>.</p>",
         render_match(status),
-        escape_html(&review_href(status.id, &store::QueueView::default(), None)),
+        escape_html(&review_href(status.id, view, None)),
         status.id,
         escape_html(status.album_artist.as_deref().unwrap_or("(unknown artist)")),
         escape_html(status.album_title.as_deref().unwrap_or("(no album tag)")),
@@ -199,8 +216,9 @@ fn render_controls(view: &store::QueueView) -> String {
             })
             .collect();
         format!(
-            "<p class=\"filters\"><span class=\"muted\">{label}:</span> {}</p>",
-            links.join(" ")
+            "<p class=\"filters\" role=\"group\" aria-label=\"{label}\">\
+             <span class=\"muted\">{label}:</span> {}</p>",
+            links.join(" · ")
         )
     };
     let with_sort = |sort| queue_href(&store::QueueView { sort, ..*view }, None);
@@ -256,7 +274,9 @@ fn render_queue(
     page_number: u64,
     has_next: bool,
 ) -> String {
-    let notice = accepted.map(render_accepted).unwrap_or_default();
+    let notice = accepted
+        .map(|status| render_accepted(status, view))
+        .unwrap_or_default();
     let controls = render_controls(view);
     if total == 0 {
         let empty = if view.acceptable {
@@ -302,7 +322,7 @@ fn queue_row(row: &store::QueuedRelease, view: &store::QueueView) -> String {
             let mark = if lead.can_apply {
                 ""
             } else {
-                " <span class=\"blocker\">can't accept</span>"
+                " <span class=\"blocker\">top candidate can't be accepted</span>"
             };
             format!(
                 "{}: {}{more}{mark}",
@@ -435,7 +455,10 @@ fn render_release(view: &View<'_>) -> String {
     } else {
         ""
     };
-    let accepted = view.accepted.map(render_accepted).unwrap_or_default();
+    let accepted = view
+        .accepted
+        .map(|status| render_accepted(status, &view.view))
+        .unwrap_or_default();
     let problems: String = release
         .embedded_evidence
         .problems
@@ -590,16 +613,8 @@ fn hidden_fields(view: &View<'_>, token: &str) -> String {
             .map(|id| id.to_string())
             .unwrap_or_default(),
         view.view.provider.map_or("", ProviderKind::as_str),
-        if view.view.sort == store::QueueSort::Score {
-            "score"
-        } else {
-            ""
-        },
-        if view.view.acceptable {
-            "acceptable"
-        } else {
-            ""
-        },
+        sort_param(view.view.sort).unwrap_or(""),
+        show_param(view.view.acceptable).unwrap_or(""),
     )
 }
 
@@ -679,9 +694,14 @@ pub(super) struct ReviewForm {
     /// The accepted match id the page showed; empty for none.
     #[serde(rename = "match")]
     accepted_match: String,
+    /// The queue view the page was reached from (`filter`, `sort`, `show`);
+    /// `provider` is the candidate's provider, not the queue's.
     filter: String,
+    /// See `filter`: `score` or empty.
     sort: String,
+    /// See `filter`: `acceptable` or empty.
     show: String,
+    /// The provider of the candidate accepted or the release fetched.
     provider: String,
     candidate: String,
     id: String,
@@ -1028,6 +1048,38 @@ mod tests {
             store::QueueView::default()
         );
         assert_eq!(view_of(None, None, None), store::QueueView::default());
+        assert_eq!(
+            view_of(None, Some(" Score "), Some("ACCEPTABLE")),
+            view_of(None, Some("score"), Some("acceptable"))
+        );
+    }
+
+    #[test]
+    fn the_accepted_notice_links_with_the_view() {
+        let view = view_of(None, Some("score"), None);
+        let status = store::LocalReleaseStatus {
+            id: 4,
+            directory: "/music/a".into(),
+            unit: "/music/a".into(),
+            album_title: None,
+            album_artist: None,
+            track_count: 2,
+            status: store::STATUS_MATCHED.into(),
+            provider: Some(ProviderKind::MusicBrainz),
+            remote_release_id: Some("abc".into()),
+            remote_url: None,
+            remote_title: None,
+            match_scope: None,
+            medium: None,
+            stale: false,
+            queued_providers: Vec::new(),
+            merged: None,
+        };
+        let html = render_accepted(&status, &view);
+        assert!(
+            html.contains("href=\"/review?release=4&amp;sort=score\""),
+            "{html}"
+        );
     }
 
     #[test]
@@ -1064,12 +1116,21 @@ mod tests {
             "{html}"
         );
         assert!(
-            html.contains("<span class=\"blocker\">can't accept</span>"),
+            html.contains("<span class=\"blocker\">top candidate can't be accepted</span>"),
             "{html}"
         );
         assert!(!html.contains("<b>edition"), "{html}");
         assert!(html.contains("1 release can be accepted."), "{html}");
         assert!(html.contains("<th>Reason</th>"), "{html}");
+        for label in ["Sort", "Show", "Provider"] {
+            assert!(
+                html.contains(&format!(
+                    "<p class=\"filters\" role=\"group\" aria-label=\"{label}\">"
+                )),
+                "{html}"
+            );
+        }
+        assert!(html.contains("Folder</a> · <a"), "{html}");
         assert!(
             html.contains(
                 "<a href=\"/reviews?sort=score&amp;show=acceptable\" aria-current=\"true\">Can be accepted</a>"
@@ -1108,7 +1169,7 @@ mod tests {
         });
         let html = render_queue(&[row], 1, &store::QueueView::default(), None, 1, false);
         assert!(html.contains("musicbrainz: uncertain</td>"), "{html}");
-        assert!(!html.contains("can't accept"), "{html}");
+        assert!(!html.contains("can't be accepted"), "{html}");
         assert!(html.contains("1 release queued for review."), "{html}");
         let view = view_of(None, None, Some("acceptable"));
         let html = render_queue(&[], 0, &view, None, 1, false);
@@ -1537,8 +1598,17 @@ mod tests {
                 };
                 fields.provider = provider.into();
                 fields.id = id.into();
+                fields.sort = "score".into();
+                fields.show = "acceptable".into();
                 Ok(Form(fields))
             };
+        let kept_view = |html: &str| {
+            assert!(html.contains("name=\"sort\" value=\"score\""), "{html}");
+            assert!(
+                html.contains("name=\"show\" value=\"acceptable\""),
+                "{html}"
+            );
+        };
         let link = format!("https://musicbrainz.org/release/{FIXTURE_MBID}");
         let wrong = post(
             &state,
@@ -1560,6 +1630,7 @@ mod tests {
             html.contains("<option value=\"discogs\" selected>"),
             "{html}"
         );
+        kept_view(&html);
 
         let stale = post(
             &state,
@@ -1568,6 +1639,7 @@ mod tests {
         )
         .await;
         assert_eq!(stale.status(), StatusCode::CONFLICT);
+        kept_view(&body(stale).await);
     }
 
     #[tokio::test]
