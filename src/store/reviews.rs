@@ -113,6 +113,8 @@ macro_rules! queued_where {
 }
 
 /// [`queued_where!`] for counting, where the `IN` form is faster.
+///
+/// Keep the two in step: they must select the same releases.
 macro_rules! queued_count_where {
     () => {
         "lr.status <> 'matched'

@@ -1761,6 +1761,9 @@ pub async fn load_queued_releases(
 // with the optional `?2 IS NULL OR` form. SQLite reads a release by its primary
 // key and its tracks by `idx_tracks_local_release` only from the first form;
 // the second hides the key from the planner and scans every row.
+// The `?4` condition at the end is the review queue's rule, limited to a set of
+// providers, as `queued_where!` in `store/reviews.rs` defines it: `?4` is a JSON
+// array that `json_each` expands, where the definition takes one provider.
 macro_rules! release_sql {
     ($id_filter:literal) => {
         concat!(
@@ -1794,6 +1797,8 @@ macro_rules! release_sql {
     };
 }
 
+// The `?4` condition at the end is the review queue's rule for the releases
+// above (`release_sql!`), repeated here so the tracks match the same releases.
 macro_rules! track_sql {
     ($id_filter:literal) => {
         concat!(
@@ -2019,6 +2024,9 @@ impl LocalReleaseStatus {
     }
 
     /// Whether the release waits in the review queue: not matched, with a saved review.
+    ///
+    /// The same rule as `queued_where!` in `store/reviews.rs`, which defines it
+    /// for SQL; this form works on a status already loaded.
     pub fn awaits_review(&self) -> bool {
         self.queued() && self.status != STATUS_MATCHED
     }
@@ -2328,15 +2336,7 @@ pub async fn library_status(pool: &SqlitePool) -> Result<LibraryStatus> {
     .fetch_all(pool)
     .await?;
 
-    let queued: i64 = sqlx::query_scalar(
-        "SELECT COUNT(DISTINCT r.local_release_id)
-         FROM match_reviews r
-         JOIN local_releases lr ON lr.id = r.local_release_id
-         WHERE lr.status <> ?1",
-    )
-    .bind(STATUS_MATCHED)
-    .fetch_one(pool)
-    .await?;
+    let queued = queue_count(pool, None).await?;
 
     let folders: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM (
