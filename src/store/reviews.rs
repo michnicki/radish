@@ -22,7 +22,7 @@ use std::collections::HashMap;
 
 /// What the queue shows of a saved review: its first candidate, summarized.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ReviewSummary {
+pub(crate) struct ReviewSummary {
     /// The first candidate's score at the scope it was judged at; `None`
     /// without a candidate.
     pub score: Option<f64>,
@@ -37,11 +37,17 @@ pub struct ReviewSummary {
 /// Why a review saved against other file contents cannot be accepted.
 const OUT_OF_DATE_REASON: &str = "saved before the files changed";
 
+/// Why a review whose saved candidates cannot be decoded cannot be accepted.
+const UNREADABLE_REASON: &str = "saved review cannot be read";
+
+/// Why a review whose local release no longer exists cannot be accepted.
+const RELEASE_GONE_REASON: &str = "local release is gone";
+
 /// Summarizes the first of `candidates`, saved for `release`, as the page shows it.
 ///
 /// `can_apply` is [`matcher::mapping_can_apply`], the check the Accept button
 /// uses, so the queue's "can be accepted" never disagrees with the page.
-pub fn summarize(
+pub(crate) fn summarize(
     release: &LocalRelease,
     candidates: &[StoredCandidate],
     reasons: &[String],
@@ -174,7 +180,7 @@ const SUMMARY_CHUNK: usize = 2_000;
 /// # Errors
 ///
 /// When the database cannot be read or written.
-pub async fn fill_review_summaries(pool: &SqlitePool) -> Result<u64> {
+pub(crate) async fn fill_review_summaries(pool: &SqlitePool) -> Result<u64> {
     fill_review_summaries_in(pool, SUMMARY_CHUNK).await
 }
 
@@ -284,23 +290,23 @@ fn summary_of_row(release: Option<&LocalRelease>, row: &PendingRow) -> ReviewSum
         blockers,
     };
     let Some(provider) = ProviderKind::parse(&row.provider) else {
-        return cannot(None, "saved review cannot be read", 0);
+        return cannot(None, UNREADABLE_REASON, 0);
     };
     let version = row.snapshot_version;
     let candidate = match &row.first_candidate {
         Some(json) => match decode_stored_candidates(version, provider, &format!("[{json}]")) {
             Ok(mut decoded) => decoded.pop(),
-            Err(_) => return cannot(None, "saved review cannot be read", 0),
+            Err(_) => return cannot(None, UNREADABLE_REASON, 0),
         },
         // An array with no first element holds no candidate, but an unknown
         // snapshot version still makes the review unreadable.
         None if row.candidates_type.as_deref() == Some("array") => {
             match decode_stored_candidates(version, provider, "[]") {
                 Ok(mut decoded) => decoded.pop(),
-                Err(_) => return cannot(None, "saved review cannot be read", 0),
+                Err(_) => return cannot(None, UNREADABLE_REASON, 0),
             }
         }
-        None => return cannot(None, "saved review cannot be read", 0),
+        None => return cannot(None, UNREADABLE_REASON, 0),
     };
     let candidates: Vec<StoredCandidate> = candidate.into_iter().collect();
     let score = candidates
@@ -309,7 +315,7 @@ fn summary_of_row(release: Option<&LocalRelease>, row: &PendingRow) -> ReviewSum
     match release {
         // The replaced reasons explain the whole review, so no blockers
         // are counted behind them.
-        None => cannot(score, "local release is gone", 0),
+        None => cannot(score, RELEASE_GONE_REASON, 0),
         Some(release) if release.revision != row.source_revision => {
             cannot(score, OUT_OF_DATE_REASON, 0)
         }
@@ -1565,7 +1571,7 @@ mod tests {
             } else if *id == b {
                 assert_eq!(
                     (score, *can_apply, reason.as_deref()),
-                    (&None, 0, Some("saved review cannot be read"))
+                    (&None, 0, Some(UNREADABLE_REASON))
                 );
             } else if *id == d {
                 assert!(score.is_some(), "{rows:?}");
@@ -1696,7 +1702,7 @@ mod tests {
         assert!(rows.iter().any(|row| row.0 == a && row.3 == Some(1)));
         assert!(
             rows.iter()
-                .all(|row| row.4.as_deref() != Some("local release is gone"))
+                .all(|row| row.4.as_deref() != Some(RELEASE_GONE_REASON))
         );
     }
 
@@ -1767,7 +1773,7 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        let unreadable = Some("saved review cannot be read".to_string());
+        let unreadable = Some(UNREADABLE_REASON.to_string());
         let reason_of = |id: i64| {
             reasons
                 .iter()
