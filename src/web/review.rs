@@ -548,6 +548,8 @@ const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// The review form's fields; which ones matter depends on `action`.
 #[derive(Debug, Deserialize)]
 pub(super) struct ReviewForm {
+    /// Empty when the form has no token, which the token check then refuses.
+    #[serde(default)]
     token: String,
     action: String,
     release: String,

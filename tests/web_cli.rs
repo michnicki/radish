@@ -612,6 +612,13 @@ fn a_folder_form_merges_only_with_the_token_from_this_site() {
         &["Sec-Fetch-Site: same-origin"],
     );
     assert_eq!(wrong.status, 403);
+    let missing = server.post(
+        "/folder",
+        &format!("path={}&action=merge", form_encode(&path)),
+        &["Sec-Fetch-Site: same-origin"],
+    );
+    assert_eq!(missing.status, 403, "{}", missing.body);
+    assert!(missing.body.contains("reload"), "{}", missing.body);
     let foreign = server.post(
         "/folder",
         &body("merge", &token, &path),
@@ -876,6 +883,18 @@ fn a_release_entered_on_the_web_is_fetched_and_accepted() {
         "{}",
         wrong.body
     );
+
+    // A form without a token field is an empty token: refused like a wrong one.
+    for body in [
+        fetch_body(&token, blue, &revision, "musicbrainz", &link),
+        accept_body(&token, blue, &revision, "", BLUE_MBID),
+    ] {
+        let body = body.replacen(&format!("token={token}&"), "", 1);
+        assert!(!body.contains("token="), "{body}");
+        let refused = server.post("/review", &body, SAME_SITE);
+        assert_eq!(refused.status, 403, "{}", refused.body);
+        assert!(refused.body.contains("reload"), "{}", refused.body);
+    }
 
     let no_token = server.post(
         "/review",

@@ -434,6 +434,8 @@ fn stale_form() -> Response {
 struct FolderForm {
     path: String,
     action: String,
+    /// Empty when the form has no token, which the token check then refuses.
+    #[serde(default)]
     token: String,
 }
 
