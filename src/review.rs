@@ -10,18 +10,27 @@
 //! A release fetched by its ID is added to a provider's saved review with
 //! [`add_fetched`].
 //!
+//! [`Fetcher`] fetches such a release for the web server, from the network or
+//! from the local dump indexes.
+//!
 //! The terminal prompt in [`crate::runner`] and the pages in [`crate::web`]
 //! both use it, so a candidate is judged and accepted the same way in both.
 
 // Rust guideline compliant 2026-08-14
 
+use crate::deezer::DeezerAdapter;
+use crate::discogs::DiscogsAdapter;
+use crate::index::local::LocalIndex;
+use crate::index::{IndexKind, IndexPaths};
 use crate::matcher::{
     self, Candidate, DiscoveryEvidence, Evaluation, LocalRelease, MatchScope, RemoteRelease,
 };
-use crate::providers::{ProviderKind, ProviderPolicy, ReleaseId};
+use crate::musicbrainz::MusicBrainzAdapter;
+use crate::providers::{MetadataProvider, ProviderError, ProviderKind, ProviderPolicy, ReleaseId};
 use crate::store::{self, AcceptanceMethod, LocalReleaseStatus, MatchGuard, StoredCandidate};
 use anyhow::{Context, Result, bail};
 use sqlx::SqlitePool;
+use tokio::sync::OnceCell;
 
 /// The release ID a person entered for `provider`: a bare ID or a link.
 ///
@@ -433,6 +442,151 @@ pub async fn add_fetched(
     })
 }
 
+/// Where a [`Fetcher`] reads MusicBrainz and Discogs releases from.
+#[derive(Debug, Clone)]
+pub enum Source {
+    /// The services' web APIs; Discogs needs `RADISH_DISCOGS_TOKEN`.
+    Network,
+    /// The local dump indexes in this directory (`serve --offline`).
+    Indexes(IndexPaths),
+}
+
+/// A MusicBrainz or Discogs client: the network adapter or a local index.
+enum Client<A> {
+    Network(A),
+    Index(LocalIndex),
+}
+
+impl<A: MetadataProvider> Client<A> {
+    async fn fetch(&self, id: ReleaseId) -> Result<RemoteRelease, ProviderError> {
+        match self {
+            Self::Network(adapter) => adapter.fetch_release(id).await,
+            Self::Index(index) => index.fetch_release(id).await,
+        }
+    }
+}
+
+/// Why a fetch from a review page failed.
+#[derive(Debug, Clone)]
+pub enum FetchError {
+    /// The provider's client cannot be built: no token, or a missing index.
+    Unavailable {
+        /// The provider whose client is missing.
+        provider: ProviderKind,
+        /// Why it cannot be built.
+        message: String,
+    },
+    /// The provider answered with an error.
+    Provider(ProviderError),
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable { provider, message } => {
+                write!(f, "{} is not available: {message}", provider.label())
+            }
+            Self::Provider(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for FetchError {}
+
+/// Fetches one release by its ID for the web review page.
+///
+/// Each provider's client is built the first time a release of that provider
+/// is fetched, so a server where nobody enters an ID contacts and opens
+/// nothing. A client that cannot be built is not remembered: adding the token
+/// or building the index and trying again works without a restart. Deezer has
+/// no dump, so it always uses the network.
+pub struct Fetcher {
+    source: Source,
+    musicbrainz: OnceCell<Client<MusicBrainzAdapter>>,
+    discogs: OnceCell<Client<DiscogsAdapter>>,
+    deezer: OnceCell<DeezerAdapter>,
+}
+
+impl std::fmt::Debug for Fetcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fetcher")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Fetcher {
+    /// A fetcher reading from `source`; nothing is built yet.
+    pub fn new(source: Source) -> Self {
+        Self {
+            source,
+            musicbrainz: OnceCell::new(),
+            discogs: OnceCell::new(),
+            deezer: OnceCell::new(),
+        }
+    }
+
+    /// Fetches release `id` from its provider.
+    ///
+    /// # Errors
+    ///
+    /// [`FetchError::Unavailable`] when the provider's client cannot be built,
+    /// and [`FetchError::Provider`] when the provider fails or does not know
+    /// the release.
+    pub async fn fetch(&self, id: ReleaseId) -> Result<RemoteRelease, FetchError> {
+        let provider = id.provider();
+        let unavailable = |error: anyhow::Error| FetchError::Unavailable {
+            provider,
+            message: format!("{error:#}"),
+        };
+        let fetched = match provider {
+            ProviderKind::MusicBrainz => {
+                let client = self
+                    .musicbrainz
+                    .get_or_try_init(|| async {
+                        match &self.source {
+                            Source::Network => MusicBrainzAdapter::new().map(Client::Network),
+                            Source::Indexes(paths) => {
+                                LocalIndex::open(paths, IndexKind::MusicBrainz)
+                                    .await
+                                    .map(Client::Index)
+                            }
+                        }
+                    })
+                    .await
+                    .map_err(unavailable)?;
+                client.fetch(id).await
+            }
+            ProviderKind::Discogs => {
+                let client = self
+                    .discogs
+                    .get_or_try_init(|| async {
+                        match &self.source {
+                            Source::Network => DiscogsAdapter::from_env()
+                                .map_err(anyhow::Error::new)
+                                .map(Client::Network),
+                            Source::Indexes(paths) => LocalIndex::open(paths, IndexKind::Discogs)
+                                .await
+                                .map(Client::Index),
+                        }
+                    })
+                    .await
+                    .map_err(unavailable)?;
+                client.fetch(id).await
+            }
+            ProviderKind::Deezer => {
+                let client = self
+                    .deezer
+                    .get_or_try_init(|| async { DeezerAdapter::new() })
+                    .await
+                    .map_err(unavailable)?;
+                client.fetch_release(id).await
+            }
+        };
+        fetched.map_err(FetchError::Provider)
+    }
+}
+
 /// The release's current guard, or `None` when the release is gone.
 async fn current_guard(pool: &SqlitePool, local_id: i64) -> Result<Option<MatchGuard>> {
     match store::load_match_guard(pool, local_id).await {
@@ -445,8 +599,9 @@ async fn current_guard(pool: &SqlitePool, local_id: i64) -> Result<Option<MatchG
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::IndexPaths;
     use crate::test_support::{
-        FIXTURE_MBID, OTHER_MBID, mbid_release, queue, remote_release, seed_release,
+        FIXTURE_MBID, OTHER_MBID, ScratchDir, mbid_release, queue, remote_release, seed_release,
     };
 
     const MBID: &str = FIXTURE_MBID;
@@ -903,5 +1058,35 @@ mod tests {
                 .unwrap(),
             AddOutcome::Changed
         );
+    }
+
+    #[tokio::test]
+    async fn a_missing_index_is_reported_and_tried_again_next_time() {
+        let dir = ScratchDir::new("fetcher-missing-index");
+        let fetcher = Fetcher::new(Source::Indexes(IndexPaths::from_dir(dir.path())));
+        for _ in 0..2 {
+            let error = fetcher.fetch(mbid_release(FIXTURE_MBID)).await.unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    FetchError::Unavailable {
+                        provider: ProviderKind::MusicBrainz,
+                        ..
+                    }
+                ),
+                "{error}"
+            );
+            assert!(error.to_string().contains("index is missing"), "{error}");
+        }
+    }
+
+    #[test]
+    fn fetching_can_run_on_the_web_servers_tasks() {
+        fn shared<T: Send + Sync>(_: &T) {}
+        fn sendable<T: Send>(_: T) {}
+        let fetcher = Fetcher::new(Source::Network);
+        shared(&fetcher);
+        // Building the future is enough to check it; it is never polled.
+        sendable(fetcher.fetch(ReleaseId::Deezer(1)));
     }
 }
