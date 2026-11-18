@@ -2,10 +2,12 @@
 //!
 //! `radish serve` shows server-rendered HTML pages: **Status** (what the
 //! library holds), **Tracks** (the `list` and `search` data), **Releases**
-//! (the `releases` data) and **Folders** (the `folder list` data, with a page
-//! per folder). The one write is the folder form, which merges a folder's
-//! releases, keeps them apart or leaves them to the automatic rule. No
-//! JavaScript is served.
+//! (the `releases` data), **Review** (the queue of releases waiting for a
+//! decision, with a page per release) and **Folders** (the `folder list` data,
+//! with a page per folder). There are two writes: the folder form, which
+//! merges a folder's releases, keeps them apart or leaves them to the
+//! automatic rule, and the review form, which accepts a saved candidate or
+//! fetches a release by its ID. No JavaScript is served.
 //!
 //! The server has no authentication, so safety rests on its defaults:
 //!
@@ -77,8 +79,8 @@ const CONTENT_SECURITY_POLICY: &str =
 
 /// The page stylesheet, inlined so the server never serves a second file.
 const STYLE: &str = "\
-:root{color-scheme:light dark;--bg:#fff;--fg:#1c1c1e;--muted:#6b6b70;--line:#e2e2e6;--accent:#2f6f3e;--card:#f6f6f8}\
-@media(prefers-color-scheme:dark){:root{--bg:#161618;--fg:#e8e8ea;--muted:#9a9aa0;--line:#2e2e33;--accent:#7bc98d;--card:#1f1f23}}\
+:root{color-scheme:light dark;--bg:#fff;--fg:#1c1c1e;--muted:#6b6b70;--line:#e2e2e6;--accent:#2f6f3e;--card:#f6f6f8;--warn:#a3341f}\
+@media(prefers-color-scheme:dark){:root{--bg:#161618;--fg:#e8e8ea;--muted:#9a9aa0;--line:#2e2e33;--accent:#7bc98d;--card:#1f1f23;--warn:#f2a38f}}\
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,sans-serif}\
 header,main{max-width:72rem;margin:0 auto;padding:0 1rem}\
 header{display:flex;gap:1.5rem;align-items:baseline;border-bottom:1px solid var(--line);padding-top:.75rem;padding-bottom:.5rem}\
@@ -100,6 +102,16 @@ form{display:flex;gap:.5rem;margin-bottom:1rem}\
 input[type=search]{flex:1;padding:.4rem .6rem;font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:.4rem}\
 button{font:inherit;padding:.4rem .9rem;border:0;border-radius:.4rem;background:var(--accent);color:var(--bg)}\
 .pager{display:flex;gap:1rem;margin:1rem 0;color:var(--muted)}\
+h2{font-size:1.05rem;margin:1.25rem 0 .5rem}\
+h3{font-size:.95rem;margin:0 0 .4rem}\
+.card{border:1px solid var(--line);border-radius:.5rem;padding:.6rem .8rem;margin:0 0 1rem}\
+.card ul{margin:.25rem 0;padding-left:1.2rem}\
+.notice{background:var(--card);border-left:3px solid var(--accent);padding:.4rem .6rem}\
+.blocker{color:var(--warn)}\
+.filters a{margin-right:.75rem}\
+.filters a[aria-current]{font-weight:600;color:var(--fg)}\
+select,input[type=text]{padding:.4rem .6rem;font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:.4rem}\
+input[type=text]{flex:1}\
 a{color:var(--accent)}";
 
 /// Shared state for the handlers and the request guard.
@@ -282,10 +294,7 @@ struct ListParams {
 impl ListParams {
     /// The 1-based page, defaulting to 1 for anything unusable.
     fn page(&self) -> u64 {
-        self.page
-            .as_deref()
-            .and_then(|page| page.trim().parse::<u64>().ok())
-            .map_or(1, |page| page.clamp(1, MAX_PAGE))
+        page_param(self.page.as_deref())
     }
 
     /// The trimmed search text, or `None` when empty.
@@ -294,6 +303,13 @@ impl ListParams {
         let query: String = query.chars().take(MAX_QUERY_CHARS).collect();
         (!query.is_empty()).then_some(query)
     }
+}
+
+/// The 1-based page in `value`, defaulting to 1 for anything unusable.
+fn page_param(value: Option<&str>) -> u64 {
+    value
+        .and_then(|page| page.trim().parse::<u64>().ok())
+        .map_or(1, |page| page.clamp(1, MAX_PAGE))
 }
 
 async fn status_page(State(state): State<AppState>) -> Result<Html<String>, AppError> {
@@ -442,6 +458,7 @@ enum Nav {
     Status,
     Tracks,
     Releases,
+    Review,
     Folders,
 }
 
@@ -461,10 +478,11 @@ fn page(title: &str, active: Nav, body: &str) -> String {
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
          <title>{title} · Radish</title><style>{STYLE}</style></head><body>\
-         <header><b>Radish</b><nav>{}{}{}{}</nav></header><main>{body}</main></body></html>\n",
+         <header><b>Radish</b><nav>{}{}{}{}{}</nav></header><main>{body}</main></body></html>\n",
         link(Nav::Status, "/", "Status"),
         link(Nav::Tracks, "/tracks", "Tracks"),
         link(Nav::Releases, "/releases", "Releases"),
+        link(Nav::Review, "/reviews", "Review"),
         link(Nav::Folders, "/folders", "Folders"),
     )
 }
@@ -536,6 +554,11 @@ fn stat(label: &str, value: i64) -> String {
     format!("<div><b>{value}</b><span>{label}</span></div>")
 }
 
+/// One tile on the status page whose number links to `href`.
+fn stat_link(label: &str, value: i64, href: &str) -> String {
+    format!("<div><b><a href=\"{href}\">{value}</a></b><span>{label}</span></div>")
+}
+
 fn render_status(status: &store::LibraryStatus) -> String {
     let tiles = [
         stat("Directories", status.directories.len() as i64),
@@ -544,7 +567,7 @@ fn render_status(status: &store::LibraryStatus) -> String {
         stat("Matched", status.matched),
         stat("Unmatched", status.unmatched),
         stat("Stale", status.stale),
-        stat("Queued for review", status.queued),
+        stat_link("Queued for review", status.queued, "/reviews"),
     ]
     .concat();
 
@@ -664,8 +687,10 @@ fn release_row(row: &store::LocalReleaseStatus) -> String {
         })
         .unwrap_or_default();
     format!(
-        "<tr><td class=\"num\">{}</td><td>{}</td><td>{}{merged}</td><td class=\"num\">{}</td>\
+        "<tr><td class=\"num\"><a href=\"/review?release={}\">{}</a></td><td>{}</td>\
+         <td>{}{merged}</td><td class=\"num\">{}</td>\
          <td>{}</td><td>{}</td><td class=\"path\"><a href=\"{}\">{}</a></td></tr>",
+        row.id,
         row.id,
         escape_html(row.album_artist.as_deref().unwrap_or("(unknown artist)")),
         escape_html(row.album_title.as_deref().unwrap_or("(no album tag)")),
@@ -871,14 +896,19 @@ fn is_web_url(url: &str) -> bool {
 ///
 /// The search text is carried through both links.
 fn pager(path: &str, query: Option<&str>, page_number: u64, has_next: bool) -> String {
+    pager_with(path, query.map(|query| ("q", query)), page_number, has_next)
+}
+
+/// Previous and next links that carry one query parameter, such as a filter.
+fn pager_with(path: &str, param: Option<(&str, &str)>, page_number: u64, has_next: bool) -> String {
     if page_number == 1 && !has_next {
         return String::new();
     }
     let href = |target: u64| {
         let mut href = path.to_string();
         let mut separator = '?';
-        if let Some(query) = query {
-            href.push_str(&format!("?q={}", percent_encode(query)));
+        if let Some((key, value)) = param {
+            href.push_str(&format!("?{key}={}", percent_encode(value)));
             separator = '&';
         }
         if target > 1 {
@@ -1106,6 +1136,38 @@ mod tests {
     }
 
     #[test]
+    fn every_page_links_the_review_queue() {
+        let html = page("Status", Nav::Status, "");
+        assert!(
+            html.contains("<a href=\"/releases\">Releases</a><a href=\"/reviews\">Review</a>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn release_ids_link_to_their_review_page() {
+        let html = render_releases(&[release(12)], 1, false);
+        assert!(
+            html.contains("<a href=\"/review?release=12\">12</a>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn the_pager_carries_any_one_parameter() {
+        let html = pager_with("/reviews", Some(("provider", "deezer")), 2, true);
+        assert!(html.contains("href=\"/reviews?provider=deezer\""), "{html}");
+        assert!(
+            html.contains("href=\"/reviews?provider=deezer&amp;page=3\""),
+            "{html}"
+        );
+        assert_eq!(
+            pager("/tracks", Some("a b"), 1, true),
+            pager_with("/tracks", Some(("q", "a b")), 1, true)
+        );
+    }
+
+    #[test]
     fn status_page_shows_counts_and_an_empty_hint() {
         let empty = render_status(&store::LibraryStatus::default());
         assert!(empty.contains("Nothing imported yet"), "{empty}");
@@ -1128,7 +1190,7 @@ mod tests {
         assert!(html.contains("/music/&lt;a&gt;"), "{html}");
         assert!(html.contains("<b>7</b><span>Tracks</span>"), "{html}");
         assert!(
-            html.contains("<b>1</b><span>Queued for review</span>"),
+            html.contains("<b><a href=\"/reviews\">1</a></b><span>Queued for review</span>"),
             "{html}"
         );
         assert!(html.contains("2023-11-14 22:13 UTC"), "{html}");
