@@ -629,14 +629,31 @@ fn read_tags_noting(path: &Path) -> Result<(ScannedTrack, Option<Dropped>)> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum ScanEvent {
     Discovering,
+    /// The walk entered a folder. Sent once per folder, the root included.
+    Walking {
+        /// Audio files found so far.
+        files: usize,
+        /// Folders entered so far, this one included.
+        folders: usize,
+        /// The folder, relative to the root; empty for the root itself.
+        folder: PathBuf,
+    },
+    /// The walk is done.
     Discovered {
+        /// Audio files found.
         total: usize,
+        /// Of those, the files whose tags need no read.
+        unchanged: usize,
+        /// Folders the walk entered, the root included.
+        folders: usize,
     },
     /// A path the walk could not visit; it is not counted in the totals.
     Warning {
         message: String,
     },
-    /// Every attempted read counts, including failures and panicked tasks.
+    /// A file's tags were read. Every attempted read counts, including
+    /// failures and panicked tasks; `total` is the number of files to read,
+    /// without the unchanged ones.
     FileFinished {
         completed: usize,
         total: usize,
@@ -653,7 +670,10 @@ pub fn eprint_warning(event: ScanEvent) {
             warning: Some(message),
             ..
         } => eprintln!("{}", Clean(&message)),
-        ScanEvent::Discovering | ScanEvent::Discovered { .. } | ScanEvent::FileFinished { .. } => {}
+        ScanEvent::Discovering
+        | ScanEvent::Walking { .. }
+        | ScanEvent::Discovered { .. }
+        | ScanEvent::FileFinished { .. } => {}
     }
 }
 
@@ -698,8 +718,8 @@ pub async fn scan_directory_with_progress(
 /// Each file is stat-ed during the walk and `is_unchanged(path, modified_at)`
 /// is asked before any tags are read, where `modified_at` is the value
 /// [`read_tags`] would store. Skipped files land in [`ScanResult::unchanged`]
-/// and still count as finished in the progress events. At most
-/// [`read_limit`] reads run at once.
+/// and are counted in [`ScanEvent::Discovered`], not in the read progress. At
+/// most [`read_limit`] reads run at once.
 pub async fn scan_directory_incremental(
     root: &Path,
     is_unchanged: impl Fn(&Path, i64) -> bool,
@@ -708,9 +728,19 @@ pub async fn scan_directory_incremental(
     on_progress(ScanEvent::Discovering);
     let mut result = ScanResult::default();
     let mut files: Vec<(PathBuf, Option<i64>)> = Vec::new();
+    let mut folders = 0;
     // Following links lets symlinked libraries import; walkdir reports loops as errors.
     for entry in WalkDir::new(root).follow_links(true) {
         match entry {
+            Ok(entry) if entry.file_type().is_dir() => {
+                folders += 1;
+                let folder = entry.path().strip_prefix(root).unwrap_or(entry.path());
+                on_progress(ScanEvent::Walking {
+                    files: files.len(),
+                    folders,
+                    folder: folder.to_path_buf(),
+                });
+            }
             Ok(entry) if entry.file_type().is_file() && is_audio_file(entry.path()) => {
                 // A failed stat is not fatal: the read reports the real error.
                 let mtime = entry
@@ -741,24 +771,23 @@ pub async fn scan_directory_incremental(
             }
         }
     }
-    let total = files.len();
-    on_progress(ScanEvent::Discovered { total });
-
-    let mut completed = 0;
+    let found = files.len();
     let mut to_read = Vec::new();
     for (path, mtime) in files {
         if mtime.is_some_and(|mtime| is_unchanged(&path, mtime)) {
-            completed += 1;
-            on_progress(ScanEvent::FileFinished {
-                completed,
-                total,
-                warning: None,
-            });
             result.unchanged.push(path);
         } else {
             to_read.push(path);
         }
     }
+    on_progress(ScanEvent::Discovered {
+        total: found,
+        unchanged: result.unchanged.len(),
+        folders,
+    });
+
+    let total = to_read.len();
+    let mut completed = 0;
 
     run_bounded(
         to_read,

@@ -3,7 +3,27 @@ mod support;
 use radish::scanner::{
     ScanEvent, scan_directory, scan_directory_incremental, scan_directory_with_progress,
 };
+use std::path::PathBuf;
 use support::{temp_dir, write_wav};
+
+/// The folders the walk reported entering, relative to the root, in order.
+fn walked(events: &[ScanEvent]) -> Vec<PathBuf> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ScanEvent::Walking { folder, .. } => Some(folder.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The events other than the walk's per-folder progress.
+fn without_walking(events: Vec<ScanEvent>) -> Vec<ScanEvent> {
+    events
+        .into_iter()
+        .filter(|event| !matches!(event, ScanEvent::Walking { .. }))
+        .collect()
+}
 
 #[tokio::test]
 async fn empty_directory_reports_discovery_without_file_completions() {
@@ -16,7 +36,19 @@ async fn empty_directory_reports_discovery_without_file_completions() {
     assert!(tracks.is_empty());
     assert_eq!(
         events,
-        [ScanEvent::Discovering, ScanEvent::Discovered { total: 0 }]
+        [
+            ScanEvent::Discovering,
+            ScanEvent::Walking {
+                files: 0,
+                folders: 1,
+                folder: PathBuf::new()
+            },
+            ScanEvent::Discovered {
+                total: 0,
+                unchanged: 0,
+                folders: 1
+            }
+        ]
     );
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -34,11 +66,16 @@ async fn scan_counts_successful_reads_and_ignores_non_audio_files() {
         .unwrap();
 
     assert_eq!(tracks.len(), 2);
+    assert_eq!(walked(&events), [PathBuf::new(), PathBuf::from("nested")]);
     assert_eq!(
-        events,
+        without_walking(events),
         [
             ScanEvent::Discovering,
-            ScanEvent::Discovered { total: 2 },
+            ScanEvent::Discovered {
+                total: 2,
+                unchanged: 0,
+                folders: 2
+            },
             ScanEvent::FileFinished {
                 completed: 1,
                 total: 2,
@@ -68,8 +105,16 @@ async fn failed_tag_reads_advance_progress_and_leave_successful_tracks() {
 
     assert_eq!(tracks.len(), 1);
     assert_eq!(tracks[0].path, root.join("good.wav"));
+    let events = without_walking(events);
     assert_eq!(events[0], ScanEvent::Discovering);
-    assert_eq!(events[1], ScanEvent::Discovered { total: 2 });
+    assert_eq!(
+        events[1],
+        ScanEvent::Discovered {
+            total: 2,
+            unchanged: 0,
+            folders: 1
+        }
+    );
     let mut warnings = Vec::new();
     for (index, event) in events[2..].iter().enumerate() {
         let ScanEvent::FileFinished {
@@ -179,7 +224,7 @@ fn mtime_secs(path: &std::path::Path) -> i64 {
 }
 
 #[tokio::test]
-async fn unchanged_files_are_skipped_but_still_counted_as_finished() {
+async fn unchanged_files_are_skipped_and_counted_apart_from_reads() {
     let root = temp_dir("scan-incremental");
     let known = root.join("known.wav");
     let fresh = root.join("fresh.wav");
@@ -199,20 +244,29 @@ async fn unchanged_files_are_skipped_but_still_counted_as_finished() {
     assert_eq!(result.unchanged, std::slice::from_ref(&known));
     assert_eq!(result.tracks.len(), 1);
     assert_eq!(result.tracks[0].path, fresh);
-    assert_eq!(events[1], ScanEvent::Discovered { total: 2 });
+    let events = without_walking(events);
+    assert_eq!(
+        events[1],
+        ScanEvent::Discovered {
+            total: 2,
+            unchanged: 1,
+            folders: 1
+        }
+    );
+    // Only the file that is read counts toward the reading progress.
     let finished: Vec<usize> = events
         .iter()
         .filter_map(|event| match event {
             ScanEvent::FileFinished {
                 completed, total, ..
             } => {
-                assert_eq!(*total, 2);
+                assert_eq!(*total, 1);
                 Some(*completed)
             }
             _ => None,
         })
         .collect();
-    assert_eq!(finished, [1, 2]);
+    assert_eq!(finished, [1]);
 
     // A different modification time means the file is read again.
     let stale = scan_directory_incremental(&root, |_, mtime| mtime == known_mtime + 1, |_| {})

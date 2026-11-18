@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use radish::grouping::{self, FolderAction};
-use radish::layout::{Column, Table, format_duration, plural, track_number};
+use radish::layout::{
+    Column, Table, format_duration, grouped, plural, plural_grouped, track_number,
+};
 use radish::output::{Clean, clean_path};
 use radish::progress::ImportProgress;
 use radish::providers::{ProviderKind, ReleaseId};
@@ -836,32 +838,35 @@ async fn run_import(
     let summary = importer::sync_directory(pool, &path, &progress, rescan).await?;
     drop(progress);
 
+    importer::report_roots(&summary, &path);
     let mut kept = String::new();
     if summary.kept > 0 {
-        kept.push_str(&format!(", {} kept (unreadable)", summary.kept));
+        kept.push_str(&format!(
+            ", {} kept (unreadable)",
+            grouped(summary.kept as u64)
+        ));
     }
     if summary.kept_no_audio > 0 {
         kept.push_str(&format!(
             ", {} kept (no audio files found)",
-            summary.kept_no_audio
+            grouped(summary.kept_no_audio as u64)
         ));
     }
     outln!(
         "Imported {} into {}: {} unchanged, {} removed{kept}.",
-        plural(
+        plural_grouped(
             summary.saved,
             "new or changed track",
             "new or changed tracks"
         ),
-        plural(
+        plural_grouped(
             summary.rebuild.groups as u64,
             "local release",
             "local releases"
         ),
-        summary.unchanged,
-        summary.removed
+        grouped(summary.unchanged as u64),
+        grouped(summary.removed)
     );
-    importer::report_roots(&summary, &path);
     importer::report_rebuild(&summary.rebuild);
     Ok(path)
 }

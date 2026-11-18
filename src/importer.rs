@@ -1,7 +1,7 @@
 //! The one import pipeline, shared by `radish import` and the watcher's
 //! initial sync.
 
-use crate::layout::plural;
+use crate::layout::plural_grouped;
 use crate::output::clean_path;
 use crate::progress::ImportProgress;
 use crate::scanner::{ScanEvent, ScanResult};
@@ -95,7 +95,7 @@ pub fn report_roots(summary: &ImportSummary, root: &Path) {
     if count > 0 {
         outln!(
             "Merged {} into {}.",
-            plural(count as u64, "imported directory", "imported directories"),
+            plural_grouped(count as u64, "imported directory", "imported directories"),
             clean_path(root)
         );
     }

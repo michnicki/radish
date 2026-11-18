@@ -10,6 +10,7 @@
 // Rust guideline compliant 2026-08-14
 
 use crate::output::Clean;
+use std::time::Duration;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Text between two columns.
@@ -34,6 +35,59 @@ const ELLIPSIS_WIDTH: usize = 1;
 pub fn plural(count: u64, singular: &str, plural: &str) -> String {
     let noun = if count == 1 { singular } else { plural };
     format!("{count} {noun}")
+}
+
+/// Formats `count` with commas between groups of three digits.
+///
+/// # Examples
+///
+/// ```
+/// use radish::layout::grouped;
+///
+/// assert_eq!(grouped(2_762_328), "2,762,328");
+/// assert_eq!(grouped(428), "428");
+/// ```
+pub fn grouped(count: u64) -> String {
+    indicatif::HumanCount(count).to_string()
+}
+
+/// Like [`plural`], with the count written by [`grouped`].
+///
+/// # Examples
+///
+/// ```
+/// use radish::layout::plural_grouped;
+///
+/// assert_eq!(plural_grouped(52_310, "folder", "folders"), "52,310 folders");
+/// assert_eq!(plural_grouped(1, "folder", "folders"), "1 folder");
+/// ```
+pub fn plural_grouped(count: u64, singular: &str, plural: &str) -> String {
+    let noun = if count == 1 { singular } else { plural };
+    format!("{} {noun}", grouped(count))
+}
+
+/// Formats how long a step ran, in whole seconds: `4s`, `3m12s` or `1h04m09s`.
+///
+/// # Examples
+///
+/// ```
+/// use radish::layout::format_elapsed;
+/// use std::time::Duration;
+///
+/// assert_eq!(format_elapsed(Duration::from_millis(4_900)), "4s");
+/// assert_eq!(format_elapsed(Duration::from_secs(192)), "3m12s");
+/// assert_eq!(format_elapsed(Duration::from_secs(3_849)), "1h04m09s");
+/// ```
+pub fn format_elapsed(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    let (hours, minutes, seconds) = (secs / 3600, secs / 60 % 60, secs % 60);
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 /// Formats a duration as `minutes:seconds`, or `?:??` when it is unknown.

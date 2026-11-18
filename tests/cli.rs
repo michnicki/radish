@@ -446,6 +446,11 @@ async fn redirected_import_keeps_warnings_without_live_progress() {
     assert!(output.status.success(), "{output:?}");
     let text = stdout(&output);
     assert!(text.starts_with("Scanning "), "{text}");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines[1], "Found 2 audio files in 1 folder in 0s: 0 unchanged, 2 to read.",
+        "{text}"
+    );
     assert!(
         text.contains(
             "Imported 1 new or changed track into 1 local release: 0 unchanged, 0 removed."
@@ -481,7 +486,12 @@ fn redirected_empty_import_has_no_progress_output() {
 
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
-    assert!(stdout(&output).contains(
+    let text = stdout(&output);
+    assert!(
+        text.contains("Found 0 audio files in 1 folder in 0s: 0 unchanged, 0 to read."),
+        "{text}"
+    );
+    assert!(text.contains(
         "Imported 0 new or changed tracks into 0 local releases: 0 unchanged, 0 removed."
     ));
 }
@@ -518,6 +528,10 @@ async fn importing_a_parent_merges_the_imported_directories_inside_it() {
         "{text}"
     );
     assert!(text.contains(": 2 unchanged, 0 removed."), "{text}");
+    assert!(
+        text.contains("Found 2 audio files in 3 folders in 0s: 2 unchanged, 0 to read."),
+        "{text}"
+    );
     assert!(!import(&music.join("1998")).contains("Merged"));
 
     let pool = radish::db::connect(&db).await.unwrap();

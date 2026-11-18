@@ -1,4 +1,4 @@
-use crate::layout::plural;
+use crate::layout::{grouped, plural, plural_grouped};
 use crate::output::{Clean, clean_path};
 use crate::progress::ImportProgress;
 use crate::{importer, outln, scanner, store};
@@ -43,17 +43,17 @@ pub async fn watch_directory(pool: SqlitePool, root: &Path, db_path: &Path) -> R
     let progress = ImportProgress::new();
     let summary = importer::sync_directory(&pool, &root, &progress, false).await?;
     drop(progress);
+    importer::report_roots(&summary, &root);
     outln!(
         "Synced {} ({} unchanged, {} removed). Watching for changes... (Ctrl+C to stop)",
-        plural(
+        plural_grouped(
             (summary.scanned + summary.unchanged) as u64,
             "track",
             "tracks"
         ),
-        summary.unchanged,
-        summary.removed
+        grouped(summary.unchanged as u64),
+        grouped(summary.removed)
     );
-    importer::report_roots(&summary, &root);
     importer::report_rebuild(&summary.rebuild);
     let directory_id = summary.directory_id;
 
