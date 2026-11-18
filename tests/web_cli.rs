@@ -8,7 +8,10 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
-use support::{db_path, temp_dir, write_tagged_wav};
+use support::{
+    MockServer, db_path, musicbrainz_empty_search, musicbrainz_release_json, temp_dir,
+    write_tagged_wav,
+};
 
 /// How long to wait for the server to announce its address.
 const START_TIMEOUT: Duration = Duration::from_secs(20);
@@ -36,14 +39,26 @@ struct Reply {
 
 impl Server {
     fn start(db: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_radish"))
+        Self::start_with(db, &[], &[])
+    }
+
+    /// Starts `serve` with extra arguments and environment, from the
+    /// database's directory, so a `.env` in the checkout is never read.
+    fn start_with(db: &Path, args: &[&str], env: &[(&str, &str)]) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_radish"));
+        command
             .arg("--db")
             .arg(db)
             .args(["serve", "--bind", "127.0.0.1:0"])
+            .args(args)
+            .current_dir(db.parent().unwrap())
+            .env_remove("RADISH_DISCOGS_TOKEN")
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::piped());
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().unwrap();
 
         let stdout = child.stdout.take().unwrap();
         let (sender, receiver) = mpsc::channel();
@@ -444,6 +459,97 @@ fn form_encode(text: &str) -> String {
         .collect()
 }
 
+const BLUE_MBID: &str = "76df3287-6cda-33eb-8e9a-044b5e15ffdd";
+const BOLD_MBID: &str = "11111111-1111-1111-1111-111111111111";
+const SAME_SITE: &[&str] = &["Sec-Fetch-Site: same-origin"];
+
+/// MusicBrainz for the two albums of [`seeded_library`]; everything else fails.
+fn review_handler(target: &str) -> (u16, String) {
+    if target.contains(&format!("/ws/2/release/{BLUE_MBID}")) {
+        (
+            200,
+            musicbrainz_release_json(BLUE_MBID, &["Blue Moon", "Other Song"], &[1.0, 1.0]),
+        )
+    } else if target.contains(&format!("/ws/2/release/{BOLD_MBID}")) {
+        (
+            200,
+            musicbrainz_release_json(BOLD_MBID, &["<script>alert(1)</script>"], &[1.0]),
+        )
+    } else if target.contains("/ws/2/release") {
+        (200, musicbrainz_empty_search())
+    } else {
+        (500, "unexpected request".to_string())
+    }
+}
+
+/// Runs radish with every provider pointed at `server`, no Discogs token, and
+/// the database's directory as working directory.
+fn radish_against(db: &Path, server: &MockServer, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_radish"))
+        .arg("--db")
+        .arg(db)
+        .args(args)
+        .current_dir(db.parent().unwrap())
+        .env("RADISH_MUSICBRAINZ_BASE_URL", &server.url)
+        .env("RADISH_DISCOGS_BASE_URL", &server.url)
+        .env("RADISH_DEEZER_BASE_URL", &server.url)
+        .env_remove("RADISH_DISCOGS_TOKEN")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+/// The ID `radish releases` shows for the release whose album is `album`.
+fn release_id(db: &Path, album: &str) -> i64 {
+    let output = radish(db, &["releases"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text
+        .lines()
+        .find(|line| line.starts_with('#') && line.ends_with(&format!("— {album}")))
+        .unwrap_or_else(|| panic!("no {album} in {text}"));
+    line[1..]
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+/// Queues release `id` for review with a direct MusicBrainz selection.
+fn queue_with(db: &Path, server: &MockServer, id: i64, mbid: &str) {
+    let output = radish_against(
+        db,
+        server,
+        &[
+            "match",
+            "--local-release",
+            &id.to_string(),
+            "--musicbrainz-release",
+            mbid,
+        ],
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("Queued for review: 1"), "{text}");
+}
+
+/// The form body that accepts saved `candidate` for `release`.
+fn accept_body(token: &str, release: i64, revision: &str, candidate: &str) -> String {
+    format!(
+        "token={token}&action=accept&release={release}&revision={}&match=&filter=\
+         &provider=musicbrainz&candidate={candidate}",
+        form_encode(revision)
+    )
+}
+
+/// The form body that fetches `id` from `provider` for `release`.
+fn fetch_body(token: &str, release: i64, revision: &str, provider: &str, id: &str) -> String {
+    format!(
+        "token={token}&action=fetch&release={release}&revision={}&match=&filter=&provider={provider}&id={}",
+        form_encode(revision),
+        form_encode(id)
+    )
+}
+
 #[test]
 fn a_folder_form_merges_only_with_the_token_from_this_site() {
     let db = folder_library("web-folder", true);
@@ -572,4 +678,208 @@ fn an_unknown_folder_page_is_not_found() {
     let server = Server::start(&db);
     assert_eq!(server.get("/folder?path=%2Fnowhere").status, 404);
     assert_eq!(server.get("/folder").status, 404);
+}
+
+#[test]
+fn queued_releases_are_accepted_one_after_another() {
+    let (db, _music) = seeded_library("web-review-accept");
+    let mock = MockServer::start(review_handler);
+    let blue = release_id(&db, "Blue");
+    let bold = release_id(&db, "<b>Bold</b>");
+    queue_with(&db, &mock, blue, BLUE_MBID);
+    queue_with(&db, &mock, bold, BOLD_MBID);
+    let server = Server::start(&db);
+
+    let queue = server.get("/reviews");
+    assert_eq!(queue.status, 200);
+    assert!(
+        queue.body.contains("2 releases queued for review."),
+        "{}",
+        queue.body
+    );
+    assert!(
+        queue
+            .body
+            .contains(&format!("href=\"/review?release={blue}\"")),
+        "{}",
+        queue.body
+    );
+    assert!(
+        server
+            .get("/reviews?provider=deezer")
+            .body
+            .contains("Nothing is queued for review.")
+    );
+
+    let page = server.get(&format!("/review?release={blue}"));
+    assert_eq!(page.status, 200);
+    let token = between(&page.body, "name=\"token\" value=\"", "\"").to_string();
+    let revision = unescape_html(between(&page.body, "name=\"revision\" value=\"", "\""));
+
+    let stale = server.post(
+        "/review",
+        &accept_body(&token, blue, "old", BLUE_MBID),
+        SAME_SITE,
+    );
+    assert_eq!(stale.status, 409, "{}", stale.body);
+    assert!(
+        stale.body.contains("changed after the page was loaded"),
+        "{}",
+        stale.body
+    );
+
+    let accepted = server.post(
+        "/review",
+        &accept_body(&token, blue, &revision, BLUE_MBID),
+        SAME_SITE,
+    );
+    assert_eq!(accepted.status, 303, "{}", accepted.body);
+    let next = format!("/review?release={bold}&accepted={blue}");
+    assert!(
+        accepted.headers.contains(&format!("location: {next}")),
+        "{}",
+        accepted.headers
+    );
+
+    let page = server.get(&next);
+    assert!(page.body.contains("Accepted musicbrainz"), "{}", page.body);
+    assert!(!page.body.contains("<script"), "{}", page.body);
+    let releases = String::from_utf8_lossy(&radish(&db, &["releases"]).stdout).to_string();
+    assert!(releases.contains("· matched"), "{releases}");
+
+    let revision = unescape_html(between(&page.body, "name=\"revision\" value=\"", "\""));
+    let last = server.post(
+        "/review",
+        &accept_body(&token, bold, &revision, BOLD_MBID),
+        SAME_SITE,
+    );
+    assert_eq!(last.status, 303, "{}", last.body);
+    assert!(
+        last.headers
+            .contains(&format!("location: /reviews?accepted={bold}")),
+        "{}",
+        last.headers
+    );
+    assert!(
+        server
+            .get("/reviews")
+            .body
+            .contains("Nothing is queued for review.")
+    );
+}
+
+#[test]
+fn a_release_entered_on_the_web_is_fetched_and_accepted() {
+    let (db, _music) = seeded_library("web-review-fetch");
+    let mock = MockServer::start(review_handler);
+    let blue = release_id(&db, "Blue");
+    let url = mock.url.clone();
+    let server = Server::start_with(
+        &db,
+        &[],
+        &[
+            ("RADISH_MUSICBRAINZ_BASE_URL", url.as_str()),
+            ("RADISH_DISCOGS_BASE_URL", url.as_str()),
+            ("RADISH_DEEZER_BASE_URL", url.as_str()),
+        ],
+    );
+
+    let page = server.get(&format!("/review?release={blue}"));
+    assert!(page.body.contains("No saved candidates."), "{}", page.body);
+    let token = between(&page.body, "name=\"token\" value=\"", "\"").to_string();
+    let revision = unescape_html(between(&page.body, "name=\"revision\" value=\"", "\""));
+    let link = format!("https://musicbrainz.org/release/{BLUE_MBID}");
+
+    let wrong = server.post(
+        "/review",
+        &fetch_body(&token, blue, &revision, "discogs", &link),
+        SAME_SITE,
+    );
+    assert_eq!(wrong.status, 400, "{}", wrong.body);
+    assert!(
+        wrong
+            .body
+            .contains("that is a MusicBrainz link; choose MusicBrainz"),
+        "{}",
+        wrong.body
+    );
+
+    let no_token = server.post(
+        "/review",
+        &fetch_body(&token, blue, &revision, "discogs", "42"),
+        SAME_SITE,
+    );
+    assert_eq!(no_token.status, 502, "{}", no_token.body);
+    assert!(
+        no_token.body.contains("RADISH_DISCOGS_TOKEN"),
+        "{}",
+        no_token.body
+    );
+
+    let fetched = server.post(
+        "/review",
+        &fetch_body(&token, blue, &revision, "musicbrainz", &link),
+        SAME_SITE,
+    );
+    assert_eq!(fetched.status, 303, "{}", fetched.body);
+    assert!(
+        fetched.headers.contains(&format!(
+            "location: /review?release={blue}#group-musicbrainz"
+        )),
+        "{}",
+        fetched.headers
+    );
+
+    let page = server.get(&format!("/review?release={blue}"));
+    assert!(
+        page.body
+            .contains(&format!("name=\"candidate\" value=\"{BLUE_MBID}\"")),
+        "{}",
+        page.body
+    );
+    let accepted = server.post(
+        "/review",
+        &accept_body(&token, blue, &revision, BLUE_MBID),
+        SAME_SITE,
+    );
+    assert_eq!(accepted.status, 303, "{}", accepted.body);
+    assert!(
+        accepted
+            .headers
+            .contains(&format!("location: /reviews?accepted={blue}")),
+        "{}",
+        accepted.headers
+    );
+    assert_eq!(
+        mock.requests_matching(&format!("/ws/2/release/{BLUE_MBID}")),
+        1
+    );
+}
+
+#[test]
+fn serve_offline_starts_without_indexes_and_says_what_a_fetch_needs() {
+    let (db, _music) = seeded_library("web-review-offline");
+    let blue = release_id(&db, "Blue");
+    let empty = temp_dir("web-review-offline-indexes");
+    let server = Server::start_with(
+        &db,
+        &["--offline"],
+        &[("RADISH_INDEX_DIR", empty.to_str().unwrap())],
+    );
+    assert_eq!(server.get("/").status, 200);
+
+    let page = server.get(&format!("/review?release={blue}"));
+    let token = between(&page.body, "name=\"token\" value=\"", "\"").to_string();
+    let revision = unescape_html(between(&page.body, "name=\"revision\" value=\"", "\""));
+    let missing = server.post(
+        "/review",
+        &fetch_body(&token, blue, &revision, "musicbrainz", BLUE_MBID),
+        SAME_SITE,
+    );
+    assert_eq!(missing.status, 502, "{}", missing.body);
+    assert!(
+        missing.body.contains("index is missing"),
+        "{}",
+        missing.body
+    );
 }
