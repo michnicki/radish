@@ -913,13 +913,46 @@ mod tests {
         assert_eq!(kept, (Some(0.5), Some("kept".to_string())));
     }
 
+    /// Every review's summary columns, in a fixed order.
+    async fn summary_rows(
+        pool: &SqlitePool,
+    ) -> Vec<(
+        i64,
+        String,
+        Option<f64>,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+    )> {
+        sqlx::query_as(
+            "SELECT local_release_id, provider, top_score, top_can_apply, top_reason, top_blockers
+             FROM match_reviews ORDER BY local_release_id, provider",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
     #[tokio::test]
-    async fn the_pass_fills_every_row_over_several_chunks() {
-        let (pool, _) = library().await;
-        forget_summaries(&pool).await;
-        // Three releases with reviews, one release per chunk.
-        assert_eq!(fill_review_summaries_in(&pool, 1).await.unwrap(), 4);
-        assert_eq!(unsummarized(&pool).await, 0);
+    async fn the_pass_summarizes_the_same_over_several_chunks() {
+        let (whole, [a, ..]) = library().await;
+        forget_summaries(&whole).await;
+        assert_eq!(fill_review_summaries(&whole).await.unwrap(), 4);
+        let expected = summary_rows(&whole).await;
+
+        // The same library, three releases with reviews, one release per chunk.
+        let (chunked, _) = library().await;
+        forget_summaries(&chunked).await;
+        assert_eq!(fill_review_summaries_in(&chunked, 1).await.unwrap(), 4);
+        let rows = summary_rows(&chunked).await;
+        assert_eq!(rows, expected);
+
+        // Each chunk read its own releases: a's reviews can be applied.
+        assert!(rows.iter().any(|row| row.0 == a && row.3 == Some(1)));
+        assert!(
+            rows.iter()
+                .all(|row| row.4.as_deref() != Some("local release is gone"))
+        );
     }
 
     #[tokio::test]
@@ -947,8 +980,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(summarized, 1);
+        // Nothing writes after the pass and no reader is open, so the
+        // truncating checkpoint leaves the WAL empty (or removes it).
         let wal = std::fs::metadata(path.with_extension("db-wal")).map_or(0, |meta| meta.len());
-        assert!(wal < 64 * 1024, "the WAL holds {wal} bytes");
+        assert_eq!(wal, 0, "the WAL holds {wal} bytes");
         pool.close().await;
     }
 
