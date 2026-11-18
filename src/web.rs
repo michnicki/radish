@@ -447,7 +447,8 @@ struct FolderForm {
 /// process's token; `400` for an unknown action; `404` for a path that names
 /// no unit. The checks that need no body come first, so a server that takes no
 /// writes answers `403` whatever the body holds, and a bad body gets its own
-/// rejection (`413`, `415` or `422` for text that is not a form) only on a server that could use it.
+/// rejection (`413` or `415`) only on a server that could use it. A body serde
+/// cannot decode, such as a repeated field (`token=a&token=b`), gets `422`.
 async fn folder_action(
     State(state): State<AppState>,
     headers: HeaderMap,

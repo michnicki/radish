@@ -155,7 +155,8 @@ pub enum ProviderKind {
 impl ProviderKind {
     /// Every provider, in the order matching tries them.
     ///
-    /// Use it wherever all providers are listed, such as the review screens.
+    /// Use it wherever all providers are listed in matching order, such as the
+    /// review screens.
     pub const CHAIN: [ProviderKind; 3] = [
         ProviderKind::MusicBrainz,
         ProviderKind::Discogs,

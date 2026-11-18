@@ -63,7 +63,7 @@ Layering rules:
 
 ## Conventions that are easy to miss
 
-- Web form structs are `#[serde(default)]` as a whole, so any `POST` without the right token, whatever else it lacks, gets the token check's `403`, not axum's `422`.
+- Web form structs are `#[serde(default)]` as a whole, so any form `POST` that lacks fields or the right token gets the token check's `403`, not axum's `422`. An oversized or non-form body still gets `413`/`415` first, and a repeated field `422`.
 - Write to stdout with the `outln!` / `out!` macros, not `println!`, so `radish list | head` exits cleanly. Wrap any path, tag value, or provider response, on stdout or stderr, in `output::Clean` / `output::clean_path` so control and bidirectional characters are escaped.
 - In `runner.rs`, a release's progress goes through its `Transcript` with `outln_to!` / `eprintln_to!`, not `outln!` / `eprintln!`: releases matched at once hold their lines and print them together when they finish.
 - `.cargo/config.toml` builds the bundled SQLite without `SQLITE_ENABLE_MEMORY_MANAGEMENT` (via `LIBSQLITE3_FLAGS`). That option puts every connection's page cache behind one global mutex, which kept parallel offline matching from scaling past four jobs.

@@ -142,8 +142,8 @@ pub struct QueuedRelease {
     /// matching tries providers; `None` when that snapshot cannot be read or
     /// holds no candidate.
     ///
-    /// The top candidate is the first in the saved list: after a fetch on the web, the
-    /// release entered there, which need not be the best scoring.
+    /// The top candidate is the first in the saved list: after a fetch on the
+    /// web, the release entered there, which need not be the best-scoring.
     pub top: Vec<(ProviderKind, Option<f64>)>,
 }
 
