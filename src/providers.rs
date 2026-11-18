@@ -153,6 +153,15 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
+    /// Every provider, in the order matching tries them.
+    ///
+    /// Use it wherever all providers are listed, such as the review screens.
+    pub const CHAIN: [ProviderKind; 3] = [
+        ProviderKind::MusicBrainz,
+        ProviderKind::Discogs,
+        ProviderKind::Deezer,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Discogs => "discogs",
@@ -223,9 +232,9 @@ impl ProviderPolicy {
     pub fn order(self) -> Vec<ProviderKind> {
         match self {
             Self::Chain { deezer } => {
-                let mut order = vec![ProviderKind::MusicBrainz, ProviderKind::Discogs];
-                if deezer {
-                    order.push(ProviderKind::Deezer);
+                let mut order = ProviderKind::CHAIN.to_vec();
+                if !deezer {
+                    order.retain(|provider| *provider != ProviderKind::Deezer);
                 }
                 order
             }

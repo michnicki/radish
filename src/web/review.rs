@@ -18,7 +18,7 @@ use super::{
 };
 use crate::layout::{format_duration, plural, track_number};
 use crate::matcher::LocalRelease;
-use crate::providers::{ProviderKind, ProviderPolicy, ReleaseId};
+use crate::providers::{ProviderKind, ReleaseId};
 use crate::review::{
     self as saved, AcceptOutcome, AddOutcome, GroupState, ReleaseReview, ReviewGroup,
 };
@@ -156,8 +156,7 @@ fn render_filters(filter: Option<ProviderKind>) -> String {
     };
     let mut links = vec![link(None, "All")];
     links.extend(
-        ProviderPolicy::Chain { deezer: true }
-            .order()
+        ProviderKind::CHAIN
             .into_iter()
             .map(|provider| link(Some(provider), provider.label())),
     );
@@ -507,8 +506,7 @@ fn render_entry(view: &View<'_>) -> String {
         }
         _ => String::new(),
     };
-    let options: String = ProviderPolicy::Chain { deezer: true }
-        .order()
+    let options: String = ProviderKind::CHAIN
         .into_iter()
         .map(|provider| {
             let selected = if chosen == Some(provider) {

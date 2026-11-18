@@ -9,7 +9,7 @@
 // Rust guideline compliant 2026-08-14
 
 use super::{MatchGuard, StoredCandidate, begin_write, decode_stored_candidates, queue_review_in};
-use crate::providers::{ProviderKind, ProviderPolicy};
+use crate::providers::ProviderKind;
 use anyhow::Result;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -192,7 +192,7 @@ pub async fn queue_page(
     .await?;
     tx.commit().await?;
 
-    let order = ProviderPolicy::Chain { deezer: true }.order();
+    let order = ProviderKind::CHAIN;
     let mut best: HashMap<i64, Vec<(ProviderKind, Option<f64>)>> = HashMap::new();
     for (id, provider, version, first) in firsts {
         let Some(provider) = ProviderKind::parse(&provider) else {

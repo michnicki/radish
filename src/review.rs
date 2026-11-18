@@ -26,7 +26,7 @@ use crate::matcher::{
     self, Candidate, DiscoveryEvidence, Evaluation, LocalRelease, MatchScope, RemoteRelease,
 };
 use crate::musicbrainz::MusicBrainzAdapter;
-use crate::providers::{MetadataProvider, ProviderError, ProviderKind, ProviderPolicy, ReleaseId};
+use crate::providers::{MetadataProvider, ProviderError, ProviderKind, ReleaseId};
 use crate::store::{self, AcceptanceMethod, LocalReleaseStatus, MatchGuard, StoredCandidate};
 use anyhow::{Context, Result, bail};
 use sqlx::SqlitePool;
@@ -190,7 +190,7 @@ pub async fn load(pool: &SqlitePool, local_id: i64) -> Result<Option<ReleaseRevi
         return Ok(None);
     };
     let mut groups = Vec::new();
-    for provider in (ProviderPolicy::Chain { deezer: true }).order() {
+    for provider in ProviderKind::CHAIN {
         match store::load_review(pool, local_id, provider).await {
             Ok(None) => {}
             Ok(Some(review)) => groups.push(ReviewGroup {
