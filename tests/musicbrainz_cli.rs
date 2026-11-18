@@ -306,7 +306,15 @@ async fn album_dry_run_keeps_the_database_unmatched() {
     let output = run(&db, &server, &["match", "--dry-run"]);
     let text = stdout(&output);
     assert!(output.status.success(), "{output:?}");
-    assert!(text.contains("would accept"), "{text}");
+    assert_eq!(text.matches("would accept").count(), 1, "{text}");
+    assert!(
+        text.contains(
+            "  would accept musicbrainz release 11111111-1111-1111-1111-111111111111 \
+             (score 1.000) as automatic"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("release musicbrainz"), "{text}");
     assert!(text.contains("edition unconfirmed"), "{text}");
     let pool = radish::db::connect(&db).await.unwrap();
     for query in [

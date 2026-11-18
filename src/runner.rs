@@ -1578,11 +1578,11 @@ async fn accept(
     }
 
     if dry_run {
-        print_decision_for(provider, candidate, evaluation, transcript);
+        print_candidate_for(provider, candidate, evaluation, transcript);
         outln_to!(
             transcript,
             "  would accept {provider} release {} (score {:.3}) as {}",
-            candidate.release.id,
+            candidate.release.id.storage_id(),
             evaluation.match_scope.score(&candidate.score),
             method.as_str()
         );
@@ -2490,6 +2490,27 @@ fn print_promotion(attempt: &ProviderAttempt, transcript: &mut Transcript) {
 }
 
 fn print_decision(attempt: &ProviderAttempt, transcript: &mut Transcript) {
+    print_candidates(attempt, transcript);
+    if let (Some(candidate), Some(evaluation)) =
+        (attempt.candidates.first(), attempt.evaluations.first())
+    {
+        if evaluation.auto_accept {
+            outln_to!(
+                transcript,
+                "  would accept {} release {} (score {:.3})",
+                attempt.provider,
+                candidate.release.id.storage_id(),
+                evaluation.match_scope.score(&candidate.score)
+            );
+        } else {
+            outln_to!(transcript, "  would queue for review");
+        }
+    }
+}
+
+/// Lists an attempt's top candidates without a verdict, for callers that
+/// print their own.
+fn print_candidates(attempt: &ProviderAttempt, transcript: &mut Transcript) {
     for (index, (candidate, evaluation)) in attempt
         .candidates
         .iter()
@@ -2518,30 +2539,17 @@ fn print_decision(attempt: &ProviderAttempt, transcript: &mut Transcript) {
             outln_to!(transcript, "       note: {}", Clean(warning));
         }
     }
-    if let (Some(candidate), Some(evaluation)) =
-        (attempt.candidates.first(), attempt.evaluations.first())
-    {
-        if evaluation.auto_accept {
-            outln_to!(
-                transcript,
-                "  would accept {} release {} (score {:.3})",
-                attempt.provider,
-                candidate.release.id.storage_id(),
-                evaluation.match_scope.score(&candidate.score)
-            );
-        } else {
-            outln_to!(transcript, "  would queue for review");
-        }
-    }
 }
 
-fn print_decision_for(
+/// Lists the one candidate `accept_candidate` is about to accept; the caller
+/// prints the verdict.
+fn print_candidate_for(
     provider: ProviderKind,
     candidate: &Candidate,
     evaluation: &Evaluation,
     transcript: &mut Transcript,
 ) {
-    print_decision(
+    print_candidates(
         &ProviderAttempt {
             provider,
             candidates: vec![candidate.clone()],
