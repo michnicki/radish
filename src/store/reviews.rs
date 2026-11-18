@@ -638,14 +638,43 @@ pub struct QueuePlace {
     pub score: Option<f64>,
 }
 
-/// The release that follows another in a view, with its lead score under it.
+/// The release that follows another in a view, with its place in it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QueueNext {
     /// The release's ID.
     pub id: i64,
-    /// Its lead score under the view. Read in score order only; in folder
-    /// order it is `None`, whatever the release's score.
-    pub score: Option<f64>,
+    /// Where it stands in the score order, its lead score under the view;
+    /// `None` in folder order, where a place means nothing.
+    pub place: Option<QueuePlace>,
+}
+
+/// Where release `id` stands in `view`'s score order now: its lead score.
+///
+/// `None` when the release is not in the view (or is gone). The folder order
+/// has no places, so it answers `None` too.
+///
+/// # Errors
+///
+/// When the database cannot be read.
+pub async fn queue_place(
+    pool: &SqlitePool,
+    id: i64,
+    view: &QueueView,
+) -> Result<Option<QueuePlace>> {
+    if view.sort != QueueSort::Score {
+        return Ok(None);
+    }
+    let score: Option<(Option<f64>,)> = sqlx::query_as(concat!(
+        "SELECT lead.score FROM (",
+        lead_scores!("AND lr.id = ?3"),
+        ") lead"
+    ))
+    .bind(view.provider.map(ProviderKind::as_str))
+    .bind(i64::from(view.acceptable))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(score.map(|(score,)| QueuePlace { score }))
 }
 
 /// The first release after release `after` in `view`'s order.
@@ -659,7 +688,8 @@ pub struct QueueNext {
 /// `at` pins the score order's starting point: with `Some`, `after` is taken
 /// to sit at that lead score, with its own folder position, wherever its
 /// reviews put it now. A release that is gone still starts again from the top.
-/// Folder order ignores `at`.
+/// Folder order ignores `at`. The release is never its own next, even when
+/// its reviews now put it below `at`.
 ///
 /// # Errors
 ///
@@ -709,36 +739,26 @@ pub async fn next_queued(
                     .await?
                 }
             };
-            id.map(|id| QueueNext { id, score: None })
+            id.map(|id| QueueNext { id, place: None })
         }
         QueueSort::Score => {
-            // `after`'s place in the view: its lead score and folder key. No
-            // row means it is not in the view (or is gone).
-            let position: Option<(Option<f64>, String, String)> = match at {
-                Some(place) => {
-                    let folder: Option<(String, String)> = sqlx::query_as(
-                        "SELECT directory_path, album_title_norm FROM local_releases
-                         WHERE id = ?1",
-                    )
-                    .bind(after)
-                    .fetch_optional(pool)
-                    .await?;
-                    folder.map(|(directory, title)| (place.score, directory, title))
-                }
-                None => {
-                    sqlx::query_as(concat!(
-                        "SELECT lead.score, lr.directory_path, lr.album_title_norm
-                         FROM (",
-                        lead_scores!("AND lr.id = ?3"),
-                        ") lead JOIN local_releases lr ON lr.id = lead.id"
-                    ))
-                    .bind(provider)
-                    .bind(acceptable)
-                    .bind(after)
-                    .fetch_optional(pool)
-                    .await?
-                }
+            // `after`'s place in the view: the pinned one, else its lead score,
+            // and its folder key. No place means it is not in the view (or is
+            // gone), and no folder key that it is gone.
+            let folder: Option<(String, String)> = sqlx::query_as(
+                "SELECT directory_path, album_title_norm FROM local_releases WHERE id = ?1",
+            )
+            .bind(after)
+            .fetch_optional(pool)
+            .await?;
+            let place = match (&folder, at) {
+                (None, _) => None,
+                (Some(_), Some(place)) => Some(place),
+                (Some(_), None) => queue_place(pool, after, view).await?,
             };
+            let position = folder
+                .zip(place)
+                .map(|((directory, title), place)| (place.score, directory, title));
             match position {
                 // After `after`: no score sorts last, so a scored release is
                 // followed by every release with no score, by lower scores,
@@ -750,10 +770,11 @@ pub async fn next_queued(
                         ")
                          SELECT lr.id, lead.score
                          FROM lead JOIN local_releases lr ON lr.id = lead.id
-                         WHERE (lead.score IS NULL) > (?3 IS NULL)
-                            OR (lead.score IS ?3
-                                AND (lr.directory_path, lr.album_title_norm) > (?4, ?5))
-                            OR lead.score < ?3 ",
+                         WHERE lr.id <> ?6
+                           AND ((lead.score IS NULL) > (?3 IS NULL)
+                             OR (lead.score IS ?3
+                                 AND (lr.directory_path, lr.album_title_norm) > (?4, ?5))
+                             OR lead.score < ?3) ",
                         score_order!(),
                         " LIMIT 1"
                     ))
@@ -762,6 +783,7 @@ pub async fn next_queued(
                     .bind(score)
                     .bind(directory)
                     .bind(title)
+                    .bind(after)
                     .fetch_optional(pool)
                     .await?
                 }
@@ -781,7 +803,10 @@ pub async fn next_queued(
                     .await?
                 }
             }
-            .map(|(id, score)| QueueNext { id, score })
+            .map(|(id, score)| QueueNext {
+                id,
+                place: Some(QueuePlace { score }),
+            })
         }
     };
     Ok(next)
@@ -963,10 +988,7 @@ mod tests {
         let stale = all.iter().find(|row| row.id == b).unwrap();
         let lead = stale.lead.as_ref().unwrap();
         assert!(!lead.can_apply);
-        assert_eq!(
-            lead.reason.as_deref(),
-            Some("saved before the files changed")
-        );
+        assert_eq!(lead.reason.as_deref(), Some(OUT_OF_DATE_REASON));
         assert_eq!(lead.blockers, 0, "set_summary gave the row two blockers");
 
         // The provider filter combines with the others.
@@ -1114,7 +1136,7 @@ mod tests {
             next_at(&pool, a, &score, Some(0.8)).await,
             Some(QueueNext {
                 id: d,
-                score: Some(0.7)
+                place: Some(QueuePlace { score: Some(0.7) })
             })
         );
         // Without a pin the answer is the same as from `None`, with its score.
@@ -1122,7 +1144,7 @@ mod tests {
             next_queued(&pool, a, &score, None).await.unwrap(),
             Some(QueueNext {
                 id: b,
-                score: Some(0.9)
+                place: Some(QueuePlace { score: Some(0.9) })
             })
         );
         // A pin works for a release the view no longer holds, too.
@@ -1157,10 +1179,105 @@ mod tests {
         // and nothing above it comes back.
         assert_eq!(
             next_at(&pool, b, &score, None).await,
-            Some(QueueNext { id: d, score: None })
+            Some(QueueNext {
+                id: d,
+                place: Some(QueuePlace { score: None })
+            })
         );
         assert_eq!(next_at(&pool, a, &score, None).await.map(|n| n.id), Some(d));
         assert_eq!(next_at(&pool, d, &score, None).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_release_moved_below_its_pin_is_not_its_own_next() {
+        let (pool, [a, b, _, d]) = library().await;
+        set_summary(&pool, b, "musicbrainz", Some(0.9), true).await;
+        set_summary(&pool, a, "musicbrainz", Some(0.8), true).await;
+        set_summary(&pool, a, "discogs", Some(0.8), true).await;
+        set_summary(&pool, d, "deezer", Some(0.6), true).await;
+        let score = view(None, QueueSort::Score, false);
+        // A fetch moved a down to 0.7, still above d but below where it was found.
+        sqlx::query("UPDATE match_reviews SET top_score = 0.7 WHERE local_release_id = ?1")
+            .bind(a)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Found at 0.8, a is followed by d; it is met again on the way down.
+        assert_eq!(
+            next_at(&pool, a, &score, Some(0.8)).await.map(|n| n.id),
+            Some(d)
+        );
+        // Pinned level with its new score, it is followed by d as well.
+        assert_eq!(
+            next_at(&pool, a, &score, Some(0.7)).await.map(|n| n.id),
+            Some(d)
+        );
+        // From where it sits now, unpinned, the same.
+        assert_eq!(next_id(&pool, a, &score).await, Some(d));
+    }
+
+    #[tokio::test]
+    async fn a_pinned_tie_continues_in_folder_order() {
+        let (pool, [a, b, _, d]) = library().await;
+        for (id, provider) in [
+            (a, "musicbrainz"),
+            (a, "discogs"),
+            (b, "musicbrainz"),
+            (d, "deezer"),
+        ] {
+            set_summary(&pool, id, provider, Some(0.8), true).await;
+        }
+        let score = view(None, QueueSort::Score, false);
+        // b was found at 0.8 and has since moved up: the tie continues with d,
+        // and a, earlier in folder order, is not brought back.
+        sqlx::query("UPDATE match_reviews SET top_score = 0.95 WHERE local_release_id = ?1")
+            .bind(b)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            next_at(&pool, b, &score, Some(0.8)).await.map(|n| n.id),
+            Some(d)
+        );
+        // a, moved down, is not its own next either; the tie goes on with b.
+        sqlx::query("UPDATE match_reviews SET top_score = 0.7 WHERE local_release_id = ?1")
+            .bind(a)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE match_reviews SET top_score = 0.8 WHERE local_release_id = ?1")
+            .bind(b)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            next_at(&pool, a, &score, Some(0.8)).await.map(|n| n.id),
+            Some(b)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_place_is_the_lead_score_in_score_order_only() {
+        let (pool, [a, b, c, _]) = library().await;
+        set_summary(&pool, a, "musicbrainz", Some(0.6), true).await;
+        set_summary(&pool, a, "discogs", Some(0.8), true).await;
+        set_summary(&pool, b, "musicbrainz", None, false).await;
+        let score = view(None, QueueSort::Score, false);
+        let place = |score| Some(QueuePlace { score });
+        assert_eq!(
+            queue_place(&pool, a, &score).await.unwrap(),
+            place(Some(0.8))
+        );
+        assert_eq!(queue_place(&pool, b, &score).await.unwrap(), place(None));
+        // The provider filter changes the lead; a release outside the view has none.
+        let musicbrainz = view(Some(ProviderKind::MusicBrainz), QueueSort::Score, false);
+        assert_eq!(
+            queue_place(&pool, a, &musicbrainz).await.unwrap(),
+            place(Some(0.6))
+        );
+        assert_eq!(queue_place(&pool, c, &score).await.unwrap(), None);
+        assert_eq!(queue_place(&pool, a + 100, &score).await.unwrap(), None);
+        assert_eq!(queue_place(&pool, a, &folder(None)).await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -1168,6 +1285,10 @@ mod tests {
         let (pool, [a, b, _, d]) = library().await;
         set_summary(&pool, a, "musicbrainz", Some(0.1), true).await;
         let folder_view = folder(None);
+        assert_eq!(
+            next_at(&pool, a, &folder_view, Some(0.1)).await,
+            Some(QueueNext { id: b, place: None })
+        );
         for score in [None, Some(0.1), Some(0.99)] {
             assert_eq!(
                 next_at(&pool, a, &folder_view, score).await.map(|n| n.id),
@@ -1577,7 +1698,7 @@ mod tests {
                 assert!(score.is_some(), "{rows:?}");
                 assert_eq!(
                     (*can_apply, reason.as_deref()),
-                    (0, Some("saved before the files changed"))
+                    (0, Some(OUT_OF_DATE_REASON))
                 );
             }
         }

@@ -950,7 +950,7 @@ fn a_release_entered_on_the_web_is_fetched_and_accepted() {
     let fetched = server.post(
         "/review",
         &format!(
-            "{}&sort=score",
+            "{}&sort=score&at=0.5",
             fetch_body(&token, blue, &revision, "musicbrainz", &link)
         ),
         SAME_SITE,
@@ -958,10 +958,36 @@ fn a_release_entered_on_the_web_is_fetched_and_accepted() {
     assert_eq!(fetched.status, 303, "{}", fetched.body);
     assert!(
         fetched.headers.contains(&format!(
-            "location: /review?release={blue}&sort=score#group-musicbrainz"
+            "location: /review?release={blue}&sort=score&at=0.5#group-musicbrainz"
         )),
         "{}",
         fetched.headers
+    );
+
+    // A page that came without a place gets the release's own, as it was
+    // before this fetch moved it.
+    let queue = server.get("/reviews?sort=score");
+    let lead = between(
+        &queue.body,
+        &format!("/review?release={blue}&amp;sort=score&amp;at="),
+        "\"",
+    )
+    .to_string();
+    let refetched = server.post(
+        "/review",
+        &format!(
+            "{}&sort=score",
+            fetch_body(&token, blue, &revision, "musicbrainz", &link)
+        ),
+        SAME_SITE,
+    );
+    assert_eq!(refetched.status, 303, "{}", refetched.body);
+    assert!(
+        refetched.headers.contains(&format!(
+            "location: /review?release={blue}&sort=score&at={lead}#group-musicbrainz"
+        )),
+        "{}",
+        refetched.headers
     );
 
     let page = server.get(&format!("/review?release={blue}"));

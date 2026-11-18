@@ -83,6 +83,13 @@ fn place_text(place: store::QueuePlace) -> String {
         .map_or_else(|| "none".to_string(), |score| score.to_string())
 }
 
+/// The `at` value to write for `at` under `view`: only the score order has
+/// places, so any other order writes none. The one rule for links and forms.
+fn written_place(view: &store::QueueView, at: Option<store::QueuePlace>) -> Option<String> {
+    at.filter(|_| view.sort == store::QueueSort::Score)
+        .map(place_text)
+}
+
 /// The place `text` names; anything that is not `none` or a finite number is
 /// no place.
 fn parse_place(text: &str) -> Option<store::QueuePlace> {
@@ -161,8 +168,8 @@ fn href_with(
             .into_iter()
             .map(|(key, value)| format!("{key}={value}")),
     );
-    if let Some(place) = at.filter(|_| view.sort == store::QueueSort::Score) {
-        parts.push(format!("at={}", place_text(place)));
+    if let Some(place) = written_place(view, at) {
+        parts.push(format!("at={place}"));
     }
     if let Some(id) = accepted {
         parts.push(format!("accepted={id}"));
@@ -492,13 +499,10 @@ fn render_release(view: &View<'_>) -> String {
     let release = &review.release;
     let status = &review.status;
     let next = match view.next {
-        Some(next) => {
-            let place = store::QueuePlace { score: next.score };
-            format!(
-                "<a href=\"{}\">Next in queue →</a>",
-                escape_html(&review_href(next.id, &view.view, Some(place), None))
-            )
-        }
+        Some(next) => format!(
+            "<a href=\"{}\">Next in queue →</a>",
+            escape_html(&review_href(next.id, &view.view, next.place, None))
+        ),
         None => format!(
             "<a href=\"{}\">Back to the queue</a>",
             escape_html(&queue_href(&view.view, None))
@@ -651,14 +655,11 @@ fn render_group(view: &View<'_>, group: &ReviewGroup) -> String {
 /// empty for none), so a decision on an outdated page is refused.
 fn hidden_fields(view: &View<'_>, token: &str) -> String {
     let guard = &view.review.guard;
-    // The place means something only in score order.
-    let at = view
-        .at
-        .filter(|_| view.view.sort == store::QueueSort::Score)
+    let at = written_place(&view.view, view.at)
         .map(|place| {
             format!(
                 "<input type=\"hidden\" name=\"at\" value=\"{}\">",
-                escape_html(&place_text(place))
+                escape_html(&place)
             )
         })
         .unwrap_or_default();
@@ -875,10 +876,7 @@ async fn accept(
     let (status, text) = match saved::accept_saved(&state.pool, release, candidate, shown).await? {
         AcceptOutcome::Accepted => {
             let target = match next {
-                Some(next) => {
-                    let place = store::QueuePlace { score: next.score };
-                    review_href(next.id, &view, Some(place), Some(release))
-                }
+                Some(next) => review_href(next.id, &view, next.place, Some(release)),
                 None => queue_href(&view, Some(release)),
             };
             return Ok(Redirect::to(&target).into_response());
@@ -948,6 +946,12 @@ async fn fetch(
             );
             return again(StatusCode::GATEWAY_TIMEOUT, text).await;
         }
+    };
+    // A page that came without a place gets one now, from before the fetch
+    // moves the release, so the redirect keeps it.
+    let at = match at {
+        None => store::queue_place(&state.pool, release, &view).await?,
+        placed => placed,
     };
     match saved::add_fetched(&state.pool, release, revision, remote).await? {
         AddOutcome::Added => {
@@ -1317,7 +1321,7 @@ mod tests {
         shown.at = Some(store::QueuePlace { score: Some(0.8) });
         shown.next = Some(store::QueueNext {
             id: 9,
-            score: Some(0.7),
+            place: Some(store::QueuePlace { score: Some(0.7) }),
         });
         let html = render_release(&shown);
         assert!(
@@ -1326,7 +1330,10 @@ mod tests {
         );
         // The forms carry this page's own place.
         assert!(html.contains("name=\"at\" value=\"0.8\""), "{html}");
-        shown.next = Some(store::QueueNext { id: 9, score: None });
+        shown.next = Some(store::QueueNext {
+            id: 9,
+            place: Some(store::QueuePlace { score: None }),
+        });
         assert!(
             render_release(&shown)
                 .contains("href=\"/review?release=9&amp;sort=score&amp;at=none\""),
@@ -1458,7 +1465,10 @@ mod tests {
     fn a_release_without_saved_candidates_says_how_to_get_some() {
         let review = review_of(Vec::new());
         let mut shown = view(&review, Some("tok"));
-        shown.next = Some(store::QueueNext { id: 9, score: None });
+        shown.next = Some(store::QueueNext {
+            id: 9,
+            place: Some(store::QueuePlace { score: None }),
+        });
         shown.view = view_of(Some("musicbrainz"), Some("score"), Some("acceptable"));
         let html = render_release(&shown);
         assert!(html.contains("No saved candidates."), "{html}");
@@ -1818,6 +1828,122 @@ mod tests {
             .as_str(),
             "{} is the release above",
             top.id
+        );
+    }
+
+    /// Queues one release per `(directory, score)` for MusicBrainz, at that lead score.
+    async fn queued_at(state: &AppState, places: &[(&str, f64)]) -> Vec<LocalRelease> {
+        let titles = ["One", "Two"];
+        let mut releases = Vec::new();
+        for (dir, score) in places {
+            let release = seed_release(&state.pool, dir, "Blue", &titles).await;
+            queue(
+                &state.pool,
+                &release,
+                remote_release(mbid_release(FIXTURE_MBID), "Blue", &titles),
+            )
+            .await;
+            sqlx::query(
+                "UPDATE match_reviews SET top_score = ?1, top_can_apply = 1 WHERE local_release_id = ?2",
+            )
+            .bind(score)
+            .bind(release.id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+            releases.push(release);
+        }
+        releases
+    }
+
+    #[tokio::test]
+    async fn accepting_after_a_downward_move_does_not_land_on_the_same_release() {
+        let state = state(true).await;
+        let releases = queued_at(
+            &state,
+            &[("/music/a", 0.9), ("/music/b", 0.8), ("/music/c", 0.7)],
+        )
+        .await;
+        let [middle, bottom] = [&releases[1], &releases[2]];
+        // A fetch moved the 0.8 release down to 0.75: still above the 0.7
+        // release, but below where its page was found.
+        sqlx::query("UPDATE match_reviews SET top_score = 0.75 WHERE local_release_id = ?1")
+            .bind(middle.id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let Ok(Form(mut fields)) = form("accept", middle.id, &middle.revision, "t") else {
+            unreachable!()
+        };
+        fields.sort = "score".into();
+        fields.at = "0.8".into();
+        let response = post(&state, HeaderMap::new(), Ok(Form(fields))).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers()[header::LOCATION],
+            format!(
+                "/review?release={}&sort=score&at=0.7&accepted={}",
+                bottom.id, middle.id
+            )
+            .as_str()
+        );
+    }
+
+    async fn get_page(state: &AppState, params: ReviewParams) -> Response {
+        match release_page(State(state.clone()), Query(params)).await {
+            Ok(response) => response,
+            Err(_) => panic!("the handler failed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_review_page_passes_its_place_to_next_and_to_its_forms() {
+        let state = state(true).await;
+        let releases = queued_at(&state, &[("/music/a", 0.8), ("/music/b", 0.7)]).await;
+        let params = |at: &str| ReviewParams {
+            release: Some(releases[0].id.to_string()),
+            sort: Some("score".into()),
+            at: Some(at.into()),
+            ..ReviewParams::default()
+        };
+        // Found at 0.95, though it sits at 0.8 now: the forms keep 0.95, and
+        // the next release, the one at 0.8's place, is the one below it.
+        let response = get_page(&state, params("0.95")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = body(response).await;
+        assert!(html.contains("name=\"at\" value=\"0.95\""), "{html}");
+        assert!(
+            html.contains(&format!(
+                "href=\"/review?release={}&amp;sort=score&amp;at=0.7\">Next in queue",
+                releases[1].id
+            )),
+            "{html}"
+        );
+        // A place nobody can read is no place: the page counts from where the release sits.
+        let html = body(get_page(&state, params("high")).await).await;
+        assert!(!html.contains("name=\"at\""), "{html}");
+        assert!(
+            html.contains("sort=score&amp;at=0.7\">Next in queue"),
+            "{html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_accept_keeps_the_place() {
+        let state = state(true).await;
+        let releases = queued_at(&state, &[("/music/a", 0.8), ("/music/b", 0.7)]).await;
+        let Ok(Form(mut fields)) = form("accept", releases[0].id, "old", "t") else {
+            unreachable!()
+        };
+        fields.sort = "score".into();
+        fields.at = "0.8".into();
+        let response = post(&state, HeaderMap::new(), Ok(Form(fields))).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let html = body(response).await;
+        assert!(html.contains("name=\"at\" value=\"0.8\""), "{html}");
+        assert!(
+            html.contains("sort=score&amp;at=0.7\">Next in queue"),
+            "{html}"
         );
     }
 
