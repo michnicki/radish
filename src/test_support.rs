@@ -343,7 +343,8 @@ pub(crate) fn remote_release(id: ReleaseId, album: &str, titles: &[&str]) -> Rem
 }
 
 /// Queues `release` for `remote`'s provider with `remote` as its one candidate,
-/// evaluated as a direct selection, under the release's current guard.
+/// evaluated as a direct selection. The review's source revision is the one
+/// `release` carries; only the accepted match comes from the database.
 pub(crate) async fn queue(pool: &SqlitePool, release: &LocalRelease, remote: RemoteRelease) {
     let candidate = Candidate::new(release, remote);
     let evaluation = matcher::evaluate(release, &candidate, None, &DiscoveryEvidence::default());

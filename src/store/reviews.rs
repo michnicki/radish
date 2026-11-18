@@ -147,7 +147,8 @@ pub async fn add_review_candidate(
 /// transaction, so a concurrent writer waits at most for one chunk.
 const SUMMARY_CHUNK: usize = 2_000;
 
-/// Summarizes every saved review that has no summary yet; returns how many.
+/// Summarizes every saved review that has no summary yet; returns how many
+/// rows it filled.
 ///
 /// Runs after migrations on every open and returns at once when nothing is
 /// left (an index-only check). Reviews saved before the summary columns
@@ -155,15 +156,23 @@ const SUMMARY_CHUNK: usize = 2_000;
 /// read, the releases are loaded in chunks of [`SUMMARY_CHUNK`], and progress
 /// goes to stderr. A review that cannot be decoded, or that was saved before
 /// its files changed, is summarized as one that cannot be accepted, so no row
-/// is left for the next open.
+/// is left for the next open. A row that a concurrent writer summarized first
+/// is left as that writer saved it, and is not counted.
 ///
 /// Filling the columns rewrites each review row through the WAL, so the pass
-/// truncates the WAL afterwards; a checkpoint that reports busy is ignored.
+/// truncates the WAL afterwards. That final `wal_checkpoint(TRUNCATE)` may
+/// wait up to the busy timeout for other processes, and is otherwise ignored
+/// when it reports busy.
 ///
 /// # Errors
 ///
 /// When the database cannot be read or written.
 pub async fn fill_review_summaries(pool: &SqlitePool) -> Result<u64> {
+    fill_review_summaries_in(pool, SUMMARY_CHUNK).await
+}
+
+/// [`fill_review_summaries`] with `chunk` releases per write transaction.
+async fn fill_review_summaries_in(pool: &SqlitePool, chunk: usize) -> Result<u64> {
     let pending: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM match_reviews WHERE top_can_apply IS NULL)",
     )
@@ -189,27 +198,30 @@ pub async fn fill_review_summaries(pool: &SqlitePool) -> Result<u64> {
     );
 
     let mut done = 0u64;
-    for chunk in ids.chunks(SUMMARY_CHUNK) {
-        let releases: HashMap<i64, LocalRelease> = super::load_releases_by_id(pool, chunk)
+    for ids in ids.chunks(chunk) {
+        let releases: HashMap<i64, LocalRelease> = super::load_releases_by_id(pool, ids)
             .await?
             .into_iter()
             .map(|release| (release.id, release))
             .collect();
         let rows: Vec<PendingRow> = sqlx::query_as(
-            "SELECT local_release_id, provider, snapshot_version, source_revision, reasons_json,
-                    CASE WHEN json_valid(candidates_json) THEN json_type(candidates_json) END,
-                    CASE WHEN json_valid(candidates_json) THEN candidates_json -> '$[0]' END
+            "SELECT local_release_id AS release_id, provider, snapshot_version, source_revision,
+                    reasons_json,
+                    CASE WHEN json_valid(candidates_json)
+                         THEN json_type(candidates_json) END AS candidates_type,
+                    CASE WHEN json_valid(candidates_json)
+                         THEN candidates_json -> '$[0]' END AS first_candidate
              FROM match_reviews
              WHERE top_can_apply IS NULL
                AND local_release_id IN (SELECT value FROM json_each(?1))",
         )
-        .bind(serde_json::to_string(chunk)?)
+        .bind(serde_json::to_string(ids)?)
         .fetch_all(pool)
         .await?;
         let mut tx = begin_write(pool).await?;
         for row in &rows {
-            let summary = summary_of_row(releases.get(&row.0), row);
-            sqlx::query(
+            let summary = summary_of_row(releases.get(&row.release_id), row);
+            done += sqlx::query(
                 "UPDATE match_reviews
                  SET top_score = ?1, top_can_apply = ?2, top_reason = ?3, top_blockers = ?4
                  WHERE local_release_id = ?5 AND provider = ?6 AND top_can_apply IS NULL",
@@ -218,13 +230,13 @@ pub async fn fill_review_summaries(pool: &SqlitePool) -> Result<u64> {
             .bind(i64::from(summary.can_apply))
             .bind(summary.reason)
             .bind(summary.blockers)
-            .bind(row.0)
-            .bind(&row.1)
+            .bind(row.release_id)
+            .bind(&row.provider)
             .execute(&mut *tx)
-            .await?;
+            .await?
+            .rows_affected();
         }
         tx.commit().await?;
-        done += rows.len() as u64;
         eprintln!("  {} of {}", grouped(done), grouped(total));
     }
     // The pragma returns a row (busy flag and page counts), so fetch it; a
@@ -236,41 +248,47 @@ pub async fn fill_review_summaries(pool: &SqlitePool) -> Result<u64> {
     Ok(done)
 }
 
-/// One unsummarized review: release, provider, snapshot version, source
-/// revision, reasons, the JSON type of the candidates (`None` when they are
-/// not valid JSON), first candidate.
-type PendingRow = (
-    i64,
-    String,
-    i64,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-);
+/// One unsummarized review, as [`fill_review_summaries`] reads it.
+#[derive(Debug, sqlx::FromRow)]
+struct PendingRow {
+    /// The local release the review belongs to.
+    release_id: i64,
+    /// The review's provider, as stored.
+    provider: String,
+    /// The snapshot version the candidates were saved in.
+    snapshot_version: i64,
+    /// The source revision the review was saved for.
+    source_revision: String,
+    /// The review's reasons, as JSON.
+    reasons_json: String,
+    /// The JSON type of the candidates; `None` when they are not valid JSON.
+    candidates_type: Option<String>,
+    /// The first candidate as JSON text, when there is one.
+    first_candidate: Option<String>,
+}
 
 /// The summary of one unsummarized review, given its release if it exists.
 fn summary_of_row(release: Option<&LocalRelease>, row: &PendingRow) -> ReviewSummary {
-    let (_, provider, version, source_revision, reasons_json, kind, first) = row;
-    let reasons: Vec<String> = serde_json::from_str(reasons_json).unwrap_or_default();
+    let reasons: Vec<String> = serde_json::from_str(&row.reasons_json).unwrap_or_default();
     let cannot = |score: Option<f64>, reason: &str, blockers: i64| ReviewSummary {
         score,
         can_apply: false,
         reason: Some(reason.to_string()),
         blockers,
     };
-    let Some(provider) = ProviderKind::parse(provider) else {
+    let Some(provider) = ProviderKind::parse(&row.provider) else {
         return cannot(None, "saved review cannot be read", 0);
     };
-    let candidate = match first {
-        Some(json) => match decode_stored_candidates(*version, provider, &format!("[{json}]")) {
+    let version = row.snapshot_version;
+    let candidate = match &row.first_candidate {
+        Some(json) => match decode_stored_candidates(version, provider, &format!("[{json}]")) {
             Ok(mut decoded) => decoded.pop(),
             Err(_) => return cannot(None, "saved review cannot be read", 0),
         },
         // An array with no first element holds no candidate, but an unknown
         // snapshot version still makes the review unreadable.
-        None if kind.as_deref() == Some("array") => {
-            match decode_stored_candidates(*version, provider, "[]") {
+        None if row.candidates_type.as_deref() == Some("array") => {
+            match decode_stored_candidates(version, provider, "[]") {
                 Ok(mut decoded) => decoded.pop(),
                 Err(_) => return cannot(None, "saved review cannot be read", 0),
             }
@@ -286,7 +304,7 @@ fn summary_of_row(release: Option<&LocalRelease>, row: &PendingRow) -> ReviewSum
         .map_or(0, |first| first.blockers.len() as i64);
     match release {
         None => cannot(score, "local release is gone", blockers),
-        Some(release) if release.revision != *source_revision => {
+        Some(release) if release.revision != row.source_revision => {
             cannot(score, "saved before the files changed", blockers)
         }
         Some(release) => summarize(release, &candidates, &reasons),
@@ -704,6 +722,31 @@ mod tests {
     }
 
     #[test]
+    fn a_summary_is_of_the_first_candidate_even_when_a_later_one_scores_higher() {
+        let titles = ["One", "Two"];
+        let local = local_release(1, "/music/a", "Blue", &titles);
+        let weak = stored(
+            &local,
+            remote_release(mbid_release(OTHER_MBID), "Red", &["Uno", "Dos"]),
+            MatchScope::Album,
+            &["weak"],
+        );
+        let strong = stored(
+            &local,
+            remote_release(mbid_release(FIXTURE_MBID), "Blue", &titles),
+            MatchScope::Album,
+            &[],
+        );
+        let weak_score = weak.match_scope.score(&weak.score);
+        let strong_score = strong.match_scope.score(&strong.score);
+        assert!(weak_score < strong_score, "{weak_score} {strong_score}");
+        let summary = summarize(&local, &[weak, strong], &["uncertain".to_string()]);
+        assert_eq!(summary.score, Some(weak_score));
+        assert_eq!(summary.reason.as_deref(), Some("weak"));
+        assert_eq!(summary.blockers, 1);
+    }
+
+    #[test]
     fn the_first_tracks_rule_counts_as_applicable_at_album_scope_only() {
         // Seven files that are the first seven of an eight-track release.
         let files = ["One", "Two", "Three", "Four", "Five", "Six", "Seven"];
@@ -736,10 +779,11 @@ mod tests {
                 .unwrap();
         assert!(row.0.is_some());
         assert_eq!(row.1, Some(1));
+        let first_score = row.0;
 
         // A fetched release put first replaces the summary: three provider
         // tracks for two files cannot be applied.
-        let longer = remote_release(mbid_release(OTHER_MBID), "Blue", &["One", "Two", "Three"]);
+        let longer = remote_release(mbid_release(OTHER_MBID), "Orange", &["One", "Two", "Three"]);
         let candidate = Candidate::new(&release, longer);
         let evaluation = matcher::evaluate(
             &release,
@@ -747,21 +791,28 @@ mod tests {
             None,
             &matcher::DiscoveryEvidence::default(),
         );
+        let fetched = stored_candidate(&candidate, &evaluation);
         assert!(
-            add_review_candidate(
-                &pool,
-                &release,
-                stored_candidate(&candidate, &evaluation),
-                "entered by hand"
-            )
-            .await
-            .unwrap()
+            add_review_candidate(&pool, &release, fetched.clone(), "entered by hand")
+                .await
+                .unwrap()
         );
-        let can_apply: Option<i64> = sqlx::query_scalar("SELECT top_can_apply FROM match_reviews")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(can_apply, Some(0));
+        let row: (Option<f64>, Option<i64>, Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT top_score, top_can_apply, top_reason, top_blockers FROM match_reviews",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let expected = fetched.match_scope.score(&fetched.score);
+        assert_eq!(row.0, Some(expected));
+        assert_ne!(row.0, first_score, "the score is the fetched candidate's");
+        assert_eq!(row.1, Some(0));
+        // The fetched candidate's first blocker, else the kept review's reason.
+        assert_eq!(
+            row.2.as_deref(),
+            Some(fetched.blockers.first().map_or("uncertain", String::as_str))
+        );
+        assert_eq!(row.3, Some(fetched.blockers.len() as i64));
     }
 
     #[tokio::test]
@@ -814,6 +865,91 @@ mod tests {
         }
         // Nothing is left for the next open.
         assert_eq!(fill_review_summaries(&pool).await.unwrap(), 0);
+    }
+
+    /// Reviews saved before the summaries: every `top_*` column empty.
+    async fn forget_summaries(pool: &SqlitePool) {
+        sqlx::query(
+            "UPDATE match_reviews
+             SET top_score = NULL, top_can_apply = NULL, top_reason = NULL, top_blockers = NULL",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn unsummarized(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM match_reviews WHERE top_can_apply IS NULL")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_resumed_pass_leaves_summarized_rows_alone() {
+        let (pool, [a, ..]) = library().await;
+        forget_summaries(&pool).await;
+        sqlx::query(
+            "UPDATE match_reviews
+             SET top_score = 0.5, top_can_apply = 1, top_reason = 'kept', top_blockers = 0
+             WHERE local_release_id = ?1 AND provider = 'musicbrainz'",
+        )
+        .bind(a)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Four reviews, one already summarized: only three rows are filled.
+        assert_eq!(fill_review_summaries(&pool).await.unwrap(), 3);
+        assert_eq!(unsummarized(&pool).await, 0);
+        let kept: (Option<f64>, Option<String>) = sqlx::query_as(
+            "SELECT top_score, top_reason FROM match_reviews
+             WHERE local_release_id = ?1 AND provider = 'musicbrainz'",
+        )
+        .bind(a)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(kept, (Some(0.5), Some("kept".to_string())));
+    }
+
+    #[tokio::test]
+    async fn the_pass_fills_every_row_over_several_chunks() {
+        let (pool, _) = library().await;
+        forget_summaries(&pool).await;
+        // Three releases with reviews, one release per chunk.
+        assert_eq!(fill_review_summaries_in(&pool, 1).await.unwrap(), 4);
+        assert_eq!(unsummarized(&pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn reopening_a_file_database_summarizes_reviews_and_truncates_the_wal() {
+        let dir = crate::test_support::ScratchDir::new("summary-reopen");
+        let path = dir.path().join("library.db");
+        let pool = crate::db::connect(&path).await.unwrap();
+        let titles = ["One", "Two"];
+        let release = seed_release(&pool, "/music/a", "Blue", &titles).await;
+        queue(
+            &pool,
+            &release,
+            remote_release(mbid_release(FIXTURE_MBID), "Blue", &titles),
+        )
+        .await;
+        forget_summaries(&pool).await;
+        pool.close().await;
+
+        let pool = crate::db::connect(&path).await.unwrap();
+        assert_eq!(unsummarized(&pool).await, 0);
+        let summarized: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM match_reviews WHERE top_can_apply = 1 AND top_score IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(summarized, 1);
+        let wal = std::fs::metadata(path.with_extension("db-wal")).map_or(0, |meta| meta.len());
+        assert!(wal < 64 * 1024, "the WAL holds {wal} bytes");
+        pool.close().await;
     }
 
     #[tokio::test]

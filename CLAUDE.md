@@ -71,6 +71,7 @@ Layering rules:
 - `.env` is read from the current directory only, and only for the keys in `DOTENV_KEYS` (`src/main.rs`); add new config keys there. The `RADISH_*_BASE_URL` overrides are for tests only, accept loopback hosts only (`providers::loopback_override`), and are never read from `.env`.
 - A scoped rebuild goes through `grouping::unit_scope` (a disc-subfolder root widens to the folder above it), or it regroups half a unit; scoped loads and listings instead add the merged release at `grouping::disc_parent_of`.
 - Decisions are versioned. `matcher::MUSICBRAINZ_ALGORITHM_VERSION` / `DISCOGS_ALGORITHM_VERSION` are stored with accepted matches.
+- The review summaries (`match_reviews.top_*`) are computed with `matcher::mapping_can_apply` (and `leading_tracks`) and the score weights. A change to any of these ships a new migration that runs `UPDATE match_reviews SET top_can_apply = NULL`, so the next open re-summarizes every review (about 80 s on a 197k-review library).
 
 ## Tests
 

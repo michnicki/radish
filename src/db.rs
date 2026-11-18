@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
 };
@@ -82,7 +82,9 @@ pub async fn initialize(pool: &SqlitePool) -> Result<()> {
     MIGRATOR.run(pool).await?;
     // Reviews saved before the summary columns existed are summarized once;
     // later opens find nothing to do.
-    crate::store::fill_review_summaries(pool).await?;
+    crate::store::fill_review_summaries(pool)
+        .await
+        .context("summarizing saved reviews")?;
 
     Ok(())
 }
