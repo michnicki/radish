@@ -10,17 +10,20 @@
 // Rust guideline compliant 2026-08-14
 
 use super::{
-    AppError, AppState, Nav, PAGE_SIZE, escape_html, folder_href, is_web_url, page, page_param,
-    pager_with, relative_path, render_match,
+    AppError, AppState, Nav, PAGE_SIZE, cross_site, escape_html, folder_href, is_web_url, page,
+    page_param, pager_with, relative_path, render_match, same_token,
 };
 use crate::layout::{format_duration, plural, track_number};
 use crate::matcher::{self, Candidate, Evaluation, LocalRelease, RemoteTrack};
 use crate::providers::{ProviderKind, ProviderPolicy, ReleaseId};
-use crate::review::{self as saved, GroupState, ReleaseReview, ReviewGroup};
+use crate::review::{
+    self as saved, AcceptOutcome, AddOutcome, GroupState, ReleaseReview, ReviewGroup,
+};
 use crate::store;
-use axum::extract::{Query, State};
-use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Response};
+use axum::extract::rejection::FormRejection;
+use axum::extract::{Form, Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use serde::Deserialize;
 
 /// The query of `/reviews` and `/review`.
@@ -218,6 +221,16 @@ fn queue_row(row: &store::QueuedRelease, filter: Option<ProviderKind>) -> String
 /// anything longer is not an ID, and the limit keeps the echoed field small.
 const MAX_ENTERED_CHARS: usize = 200;
 
+/// A message shown next to the form that caused it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Notice {
+    /// Set for the fetch form, which then shows the message and keeps the
+    /// provider and the text entered; the message goes above the candidates
+    /// otherwise.
+    entered: Option<(ProviderKind, String)>,
+    text: String,
+}
+
 /// Everything one review page shows.
 struct View<'a> {
     review: &'a ReleaseReview,
@@ -229,6 +242,8 @@ struct View<'a> {
     accepted: Option<&'a store::LocalReleaseStatus>,
     /// This process's form token, on a server that takes writes.
     token: Option<&'a str>,
+    /// A message from the form just sent.
+    notice: Option<&'a Notice>,
 }
 
 /// `/review?release=N`: one release's saved candidates, or `404`.
@@ -245,6 +260,7 @@ pub(super) async fn release_page(
         id,
         params.filter(),
         accepted.as_ref(),
+        None,
         StatusCode::OK,
     )
     .await
@@ -261,6 +277,7 @@ async fn render_page(
     id: i64,
     filter: Option<ProviderKind>,
     accepted: Option<&store::LocalReleaseStatus>,
+    notice: Option<Notice>,
     status: StatusCode,
 ) -> Result<Response, AppError> {
     let Some(review) = saved::load(&state.pool, id).await? else {
@@ -273,6 +290,7 @@ async fn render_page(
         next,
         accepted,
         token: state.writable.then_some(&*state.token),
+        notice: notice.as_ref(),
     };
     Ok((
         status,
@@ -320,6 +338,12 @@ fn render_release(view: &View<'_>) -> String {
     } else {
         String::new()
     };
+    let notice = match view.notice {
+        Some(notice) if notice.entered.is_none() => {
+            format!("<p class=\"notice\">{}</p>", escape_html(&notice.text))
+        }
+        _ => String::new(),
+    };
     let groups: String = if review.groups.is_empty() {
         format!(
             "<p>No saved candidates. Enter a release below, or run \
@@ -335,7 +359,7 @@ fn render_release(view: &View<'_>) -> String {
     };
     format!(
         "<p class=\"pager\">{next}</p>{accepted}<h1>#{} {} — {}</h1>\
-         <p class=\"path\"><a href=\"{}\">{}</a></p><p>{} · {}</p>{problems}{current}\
+         <p class=\"path\"><a href=\"{}\">{}</a></p><p>{} · {}</p>{problems}{current}{notice}\
          <h2>Files</h2>{}{groups}{}",
         release.id,
         escape_html(
@@ -740,8 +764,18 @@ fn render_entry(view: &View<'_>) -> String {
              <li><code>radish match --review --local-release {id} --deezer-release ID</code></li></ul>"
         );
     };
-    // The provider the form opens on: the queue's filter for now.
-    let chosen: Option<ProviderKind> = view.filter;
+    // After a failed fetch the form keeps what was entered, and the provider
+    // chosen then wins over the queue's filter.
+    let (chosen, text) = match view.notice.and_then(|notice| notice.entered.as_ref()) {
+        Some((provider, text)) => (Some(*provider), text.as_str()),
+        None => (view.filter, ""),
+    };
+    let notice = match view.notice {
+        Some(notice) if notice.entered.is_some() => {
+            format!("<p class=\"notice\">{}</p>", escape_html(&notice.text))
+        }
+        _ => String::new(),
+    };
     let options: String = ProviderPolicy::Chain { deezer: true }
         .order()
         .into_iter()
@@ -758,13 +792,207 @@ fn render_entry(view: &View<'_>) -> String {
         })
         .collect();
     format!(
-        "<h2>Enter a release</h2><form method=\"post\" action=\"/review\">{}\
+        "<h2>Enter a release</h2>{notice}<form method=\"post\" action=\"/review\">{}\
          <input type=\"hidden\" name=\"action\" value=\"fetch\">\
          <select name=\"provider\" aria-label=\"Provider\">{options}</select>\
-         <input type=\"text\" name=\"id\" value=\"\" maxlength=\"{MAX_ENTERED_CHARS}\" \
+         <input type=\"text\" name=\"id\" value=\"{}\" maxlength=\"{MAX_ENTERED_CHARS}\" \
          placeholder=\"ID or link\" aria-label=\"Release ID or link\"><button>Fetch</button></form>",
         hidden_fields(view, token),
+        escape_html(text),
     )
+}
+
+/// What a page built from an outdated release says.
+const CHANGED: &str = "This release changed after the page was loaded; review it again.";
+
+/// How long a fetch from the review page may take before the page gives up.
+///
+/// The adapters pace MusicBrainz to about a request a second and retry
+/// transient failures, honoring a `Retry-After` of up to two minutes; a
+/// browser request should not hang that long. Thirty seconds covers a retried
+/// lookup. A fetch cut off here changes nothing: the release was not stored.
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The review form's fields; which ones matter depends on `action`.
+#[derive(Debug, Deserialize)]
+pub(super) struct ReviewForm {
+    token: String,
+    action: String,
+    release: String,
+    revision: String,
+    /// The accepted match id the page showed; empty for none.
+    #[serde(default, rename = "match")]
+    accepted_match: String,
+    #[serde(default)]
+    filter: String,
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    candidate: String,
+    #[serde(default)]
+    id: String,
+}
+
+/// The `403` for a review form from another site or with the wrong token.
+///
+/// A tab left open across a server restart holds the old process's token, so
+/// the body says what to do.
+fn stale_review() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        "forbidden: reload the review page and try again",
+    )
+        .into_response()
+}
+
+/// Accepts a saved candidate, or fetches a release by its ID into the review.
+///
+/// Refused like the folder form: `403` off loopback, from another site, or
+/// without this process's token. Then `400` for an unknown action or provider
+/// and `404` for an unknown release. See [`accept`] and [`fetch`] for the rest.
+pub(super) async fn action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    form: Result<Form<ReviewForm>, FormRejection>,
+) -> Result<Response, AppError> {
+    if !state.writable {
+        return Ok((StatusCode::FORBIDDEN, "forbidden").into_response());
+    }
+    if cross_site(&headers) {
+        return Ok(stale_review());
+    }
+    let Form(form) = match form {
+        Ok(form) => form,
+        Err(rejection) => return Ok(rejection.into_response()),
+    };
+    if !same_token(&state.token, &form.token) {
+        return Ok(stale_review());
+    }
+    let accepting = match form.action.as_str() {
+        "accept" => true,
+        "fetch" => false,
+        _ => return Ok((StatusCode::BAD_REQUEST, "unknown action").into_response()),
+    };
+    let Ok(release) = form.release.trim().parse::<i64>() else {
+        return Ok(no_release());
+    };
+    let Some(provider) = ProviderKind::parse(&form.provider) else {
+        return Ok((StatusCode::BAD_REQUEST, "unknown provider").into_response());
+    };
+    let filter = ProviderKind::parse(&form.filter);
+    let revision = form.revision.trim();
+    if !accepting {
+        return fetch(&state, release, revision, filter, provider, form.id.trim()).await;
+    }
+    // The page writes these fields itself, so text that does not read is not
+    // from a review page.
+    let accepted_match_id = match form.accepted_match.trim() {
+        "" => None,
+        id => match id.parse::<i64>() {
+            Ok(id) => Some(id),
+            Err(_) => return Ok((StatusCode::BAD_REQUEST, "unknown match").into_response()),
+        },
+    };
+    let Ok(candidate) = saved::parse_entered(provider, form.candidate.trim()) else {
+        return Ok((StatusCode::BAD_REQUEST, "unknown candidate").into_response());
+    };
+    let shown = store::MatchGuard {
+        source_revision: revision.to_string(),
+        accepted_match_id,
+    };
+    accept(&state, release, &shown, filter, &candidate).await
+}
+
+/// Accepts saved release `candidate` and goes to the next queued release.
+///
+/// `shown` is the guard the page was built from. `409` with the page again
+/// when the release or its accepted match changed since, or the candidate is
+/// no longer saved; `422` when its mapping cannot be applied.
+async fn accept(
+    state: &AppState,
+    release: i64,
+    shown: &store::MatchGuard,
+    filter: Option<ProviderKind>,
+    candidate: &ReleaseId,
+) -> Result<Response, AppError> {
+    let (status, text) = match saved::accept_saved(&state.pool, release, candidate, shown).await? {
+        AcceptOutcome::Accepted => {
+            let target = match store::next_queued(&state.pool, release, filter).await? {
+                Some(next) => review_href(next, filter, Some(release)),
+                None => queue_href(filter, Some(release)),
+            };
+            return Ok(Redirect::to(&target).into_response());
+        }
+        AcceptOutcome::Changed => (StatusCode::CONFLICT, CHANGED.to_string()),
+        AcceptOutcome::NotFound => (
+            StatusCode::CONFLICT,
+            "That candidate is no longer saved for this release.".to_string(),
+        ),
+        AcceptOutcome::CannotApply(notes) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("Cannot accept: {}", cannot_apply_text(&notes)),
+        ),
+    };
+    let notice = Notice {
+        entered: None,
+        text,
+    };
+    render_page(state, release, filter, None, Some(notice), status).await
+}
+
+/// Fetches the release `entered` names and puts it first in its provider's review.
+///
+/// The page is checked before any provider is asked: `404` for a release that
+/// is gone, `409` for one that changed. Then `400` for text that names no
+/// release of `provider`, and `502` when the fetch fails (the provider's
+/// message, or a missing token or index). A success goes back to the page.
+async fn fetch(
+    state: &AppState,
+    release: i64,
+    revision: &str,
+    filter: Option<ProviderKind>,
+    provider: ProviderKind,
+    entered: &str,
+) -> Result<Response, AppError> {
+    let again = |status: StatusCode, text: String| {
+        let notice = Notice {
+            entered: Some((provider, entered.to_string())),
+            text,
+        };
+        render_page(state, release, filter, None, Some(notice), status)
+    };
+    match store::load_match_guard(&state.pool, release).await {
+        Ok(guard) if guard.source_revision == revision => {}
+        Ok(_) => return again(StatusCode::CONFLICT, CHANGED.to_string()).await,
+        Err(error) if error.downcast_ref::<store::SnapshotChanged>().is_some() => {
+            return Ok(no_release());
+        }
+        Err(error) => return Err(error.into()),
+    }
+    if entered.chars().count() > MAX_ENTERED_CHARS {
+        let text = format!("A release ID or link has at most {MAX_ENTERED_CHARS} characters.");
+        return again(StatusCode::BAD_REQUEST, text).await;
+    }
+    let id = match saved::parse_entered(provider, entered) {
+        Ok(id) => id,
+        Err(error) => return again(StatusCode::BAD_REQUEST, error.to_string()).await,
+    };
+    let remote = match tokio::time::timeout(FETCH_TIMEOUT, state.fetcher.fetch(id)).await {
+        Ok(Ok(remote)) => remote,
+        Ok(Err(error)) => return again(StatusCode::BAD_GATEWAY, error.to_string()).await,
+        Err(_) => {
+            let text = format!(
+                "{} did not answer within {} seconds; try again later.",
+                provider.label(),
+                FETCH_TIMEOUT.as_secs()
+            );
+            return again(StatusCode::BAD_GATEWAY, text).await;
+        }
+    };
+    match saved::add_fetched(&state.pool, release, revision, remote).await? {
+        AddOutcome::Added => Ok(Redirect::to(&review_href(release, filter, None)).into_response()),
+        AddOutcome::Changed => again(StatusCode::CONFLICT, CHANGED.to_string()).await,
+    }
 }
 
 #[cfg(test)]
@@ -774,6 +1002,9 @@ mod tests {
     use crate::test_support::{
         FIXTURE_MBID, OTHER_MBID, local_release, mbid_release, queue, remote_release, seed_release,
     };
+    use axum::extract::rejection::FormRejection;
+    use axum::http::{HeaderValue, header};
+    use std::sync::Arc;
 
     fn queued(id: i64) -> store::QueuedRelease {
         store::QueuedRelease {
@@ -854,6 +1085,7 @@ mod tests {
             bind: "127.0.0.1:8787".parse().unwrap(),
             token: "t".into(),
             writable: true,
+            fetcher: Arc::new(saved::Fetcher::new(saved::Source::Network)),
         };
         assert!(accepted_status(&state, None).await.unwrap().is_none());
         assert!(
@@ -976,6 +1208,7 @@ mod tests {
             next: None,
             accepted: None,
             token,
+            notice: None,
         }
     }
 
@@ -1300,6 +1533,7 @@ mod tests {
             bind: "127.0.0.1:8787".parse().unwrap(),
             token: "t".into(),
             writable: true,
+            fetcher: Arc::new(saved::Fetcher::new(saved::Source::Network)),
         };
         let params = |id: i64| ReviewParams {
             release: Some(id.to_string()),
@@ -1374,6 +1608,235 @@ mod tests {
             html.contains("<td>—</td><td class=\"muted\">not mapped</td>"),
             "{html}"
         );
+    }
+
+    async fn state(writable: bool) -> AppState {
+        let bind = if writable {
+            "127.0.0.1:8787"
+        } else {
+            "0.0.0.0:8787"
+        };
+        AppState {
+            pool: crate::db::connect_in_memory().await.unwrap(),
+            bind: bind.parse().unwrap(),
+            token: "t".into(),
+            writable,
+            fetcher: Arc::new(saved::Fetcher::new(saved::Source::Network)),
+        }
+    }
+
+    fn form(
+        action: &str,
+        release: i64,
+        revision: &str,
+        token: &str,
+    ) -> Result<Form<ReviewForm>, FormRejection> {
+        Ok(Form(ReviewForm {
+            token: token.into(),
+            action: action.into(),
+            release: release.to_string(),
+            revision: revision.into(),
+            accepted_match: String::new(),
+            filter: String::new(),
+            provider: "musicbrainz".into(),
+            candidate: FIXTURE_MBID.into(),
+            id: String::new(),
+        }))
+    }
+
+    async fn post(
+        state: &AppState,
+        headers: HeaderMap,
+        form: Result<Form<ReviewForm>, FormRejection>,
+    ) -> Response {
+        match action(State(state.clone()), headers, form).await {
+            Ok(response) => response,
+            Err(_) => panic!("the handler failed"),
+        }
+    }
+
+    async fn body(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// A writable server with one release queued for MusicBrainz.
+    async fn queued_state() -> (AppState, LocalRelease) {
+        let state = state(true).await;
+        let release = seed_release(&state.pool, "/music/a", "Blue", &["One", "Two"]).await;
+        queue(
+            &state.pool,
+            &release,
+            remote_release(mbid_release(FIXTURE_MBID), "Blue", &["One", "Two"]),
+        )
+        .await;
+        (state, release)
+    }
+
+    #[tokio::test]
+    async fn review_posts_need_a_loopback_server_this_site_and_the_token() {
+        let off = state(false).await;
+        assert_eq!(
+            post(&off, HeaderMap::new(), form("accept", 1, "rev", "t"))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let on = state(true).await;
+        let mut foreign = HeaderMap::new();
+        foreign.insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
+        for (headers, token) in [(foreign, "t"), (HeaderMap::new(), "old")] {
+            let response = post(&on, headers, form("accept", 1, "rev", token)).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(
+                body(response).await,
+                "forbidden: reload the review page and try again"
+            );
+        }
+        assert_eq!(
+            post(&on, HeaderMap::new(), form("bogus", 1, "rev", "t"))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post(&on, HeaderMap::new(), form("accept", 99, "rev", "t"))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn accepting_redirects_to_the_queue_and_an_outdated_page_is_refused() {
+        let (state, release) = queued_state().await;
+        let stale = post(
+            &state,
+            HeaderMap::new(),
+            form("accept", release.id, "old", "t"),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        assert!(
+            body(stale)
+                .await
+                .contains("changed after the page was loaded")
+        );
+
+        // A page that showed an accepted match the release no longer has.
+        let Ok(Form(mut shown_matched)) = form("accept", release.id, &release.revision, "t") else {
+            unreachable!()
+        };
+        shown_matched.accepted_match = "5".into();
+        let refused = post(&state, HeaderMap::new(), Ok(Form(shown_matched))).await;
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+
+        let accepted = post(
+            &state,
+            HeaderMap::new(),
+            form("accept", release.id, &release.revision, "t"),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            accepted.headers()[header::LOCATION],
+            format!("/reviews?accepted={}", release.id).as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fetch_is_checked_before_any_provider_is_asked() {
+        let (state, release) = queued_state().await;
+        let fetch =
+            |revision: &str, provider: &str, id: &str| -> Result<Form<ReviewForm>, FormRejection> {
+                let Ok(Form(mut fields)) = form("fetch", release.id, revision, "t") else {
+                    unreachable!()
+                };
+                fields.provider = provider.into();
+                fields.id = id.into();
+                Ok(Form(fields))
+            };
+        let link = format!("https://musicbrainz.org/release/{FIXTURE_MBID}");
+        let wrong = post(
+            &state,
+            HeaderMap::new(),
+            fetch(&release.revision, "discogs", &link),
+        )
+        .await;
+        assert_eq!(wrong.status(), StatusCode::BAD_REQUEST);
+        let html = body(wrong).await;
+        assert!(
+            html.contains("that is a MusicBrainz link; choose MusicBrainz"),
+            "{html}"
+        );
+        assert!(
+            html.contains(&format!("value=\"{link}\"")),
+            "the entered text is kept: {html}"
+        );
+        assert!(
+            html.contains("<option value=\"discogs\" selected>"),
+            "{html}"
+        );
+
+        let stale = post(
+            &state,
+            HeaderMap::new(),
+            fetch("old", "musicbrainz", FIXTURE_MBID),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn a_fetch_that_cannot_start_answers_502_with_the_page_and_the_entered_text() {
+        let (mut state, release) = queued_state().await;
+        let missing = crate::test_support::ScratchDir::new("review-no-index");
+        state.fetcher = Arc::new(saved::Fetcher::new(saved::Source::Indexes(
+            crate::index::IndexPaths::from_dir(missing.path().join("none")),
+        )));
+        let Ok(Form(mut fields)) = form("fetch", release.id, &release.revision, "t") else {
+            unreachable!()
+        };
+        fields.id = format!(" {FIXTURE_MBID} ");
+        let response = post(&state, HeaderMap::new(), Ok(Form(fields))).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let html = body(response).await;
+        assert!(html.contains("MusicBrainz is not available"), "{html}");
+        assert!(
+            html.contains(&format!("value=\"{FIXTURE_MBID}\"")),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_fetch_error_selects_the_entered_provider_over_the_queue_filter() {
+        let review = review_of(Vec::new());
+        let notice = Notice {
+            entered: Some((ProviderKind::Deezer, "<b>x</b>".into())),
+            text: "bad <i>id</i>".into(),
+        };
+        let mut shown = view(&review, Some("tok"));
+        shown.filter = Some(ProviderKind::Discogs);
+        shown.notice = Some(&notice);
+        let html = render_release(&shown);
+        assert!(
+            html.contains("<option value=\"deezer\" selected>Deezer</option>"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("<option value=\"discogs\" selected>"),
+            "{html}"
+        );
+        assert!(html.contains("value=\"&lt;b&gt;x&lt;/b&gt;\""), "{html}");
+        assert!(
+            html.contains("<p class=\"notice\">bad &lt;i&gt;id&lt;/i&gt;</p>"),
+            "{html}"
+        );
+        // A notice from the fetch form is shown once, beside that form.
+        assert_eq!(html.matches("class=\"notice\"").count(), 1, "{html}");
     }
 
     #[test]

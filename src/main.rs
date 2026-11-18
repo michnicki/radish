@@ -7,7 +7,7 @@ use radish::layout::{
 use radish::output::{Clean, clean_path};
 use radish::progress::ImportProgress;
 use radish::providers::{ProviderKind, ReleaseId};
-use radish::{db, importer, index, outln, runner, store, watcher, web};
+use radish::{db, importer, index, outln, review, runner, store, watcher, web};
 use std::io::{self, IsTerminal};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -64,13 +64,18 @@ enum Command {
     },
     /// Watch a music directory and keep the library in sync in real time
     Watch { path: PathBuf },
-    /// Serve a web interface: status, tracks (with search), releases and folders,
-    /// with a form to merge or split a folder (loopback only)
+    /// Serve a web interface: status, tracks (with search), releases, the review
+    /// queue and folders, with forms to review releases and merge or split
+    /// folders (loopback only)
     Serve {
         /// Address to listen on. Anything but a loopback address exposes the
         /// library paths to the network without authentication.
         #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8787")]
         bind: SocketAddr,
+        /// Fetch releases entered on the review page from the local dump
+        /// indexes (MusicBrainz and Discogs; Deezer always uses the network)
+        #[arg(long)]
+        offline: bool,
     },
     /// List every track in the library
     List,
@@ -628,7 +633,14 @@ async fn run() -> Result<()> {
             }
         }
         Command::Watch { path } => watcher::watch_directory(pool, &path, &cli.db).await?,
-        Command::Serve { bind } => web::serve(pool, bind).await?,
+        Command::Serve { bind, offline } => {
+            let source = if offline {
+                review::Source::Indexes(index::IndexPaths::from_dir(&index_dir))
+            } else {
+                review::Source::Network
+            };
+            web::serve(pool, bind, review::Fetcher::new(source)).await?;
+        }
         Command::Index { action } => match action {
             IndexAction::Build {
                 musicbrainz,
@@ -893,6 +905,12 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("radish").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn serve_can_fetch_from_the_indexes() {
+        assert!(parse(&["serve", "--offline"]).is_ok());
+        assert!(parse(&["serve", "--bind", "127.0.0.1:0", "--offline"]).is_ok());
     }
 
     #[test]

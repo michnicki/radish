@@ -64,7 +64,8 @@ const MAX_QUERY_CHARS: usize = 200;
 const MAX_PAGE: u64 = 1_000_000;
 
 /// The largest form body accepted, in bytes. A folder form holds a path, an
-/// action and a token.
+/// action and a token; a review form a few short fields and an entered ID of
+/// at most 200 characters.
 const MAX_FORM_BYTES: usize = 16 * 1024;
 
 /// The column headings of a release table.
@@ -127,6 +128,8 @@ struct AppState {
     token: Arc<str>,
     /// Whether forms may change anything: only on a loopback bind.
     writable: bool,
+    /// Fetches releases entered on the review page; builds nothing until then.
+    fetcher: Arc<crate::review::Fetcher>,
 }
 
 /// Serves the web interface on `bind` until Ctrl+C.
@@ -135,10 +138,16 @@ struct AppState {
 /// `bind` asked for port 0. A non-loopback `bind` is allowed but warns on
 /// stderr, because the pages show library paths to anyone who can connect.
 ///
+/// `fetcher` serves the review page's fetch form.
+///
 /// # Errors
 ///
 /// Returns an error when the address cannot be bound or the server fails.
-pub async fn serve(pool: SqlitePool, bind: SocketAddr) -> Result<()> {
+pub async fn serve(
+    pool: SqlitePool,
+    bind: SocketAddr,
+    fetcher: crate::review::Fetcher,
+) -> Result<()> {
     if !bind.ip().is_loopback() {
         eprintln!(
             "warning: {bind} is not a loopback address; the web interface has no \
@@ -152,7 +161,7 @@ pub async fn serve(pool: SqlitePool, bind: SocketAddr) -> Result<()> {
     let token = new_token()?;
 
     outln!("Serving http://{bind} (Ctrl+C to stop)");
-    axum::serve(listener, router(pool, bind, token))
+    axum::serve(listener, router(pool, bind, token, fetcher))
         .with_graceful_shutdown(async {
             // A failed signal handler leaves Ctrl+C to the default action.
             let _ = tokio::signal::ctrl_c().await;
@@ -161,19 +170,30 @@ pub async fn serve(pool: SqlitePool, bind: SocketAddr) -> Result<()> {
         .context("web server failed")
 }
 
-fn router(pool: SqlitePool, bind: SocketAddr, token: String) -> Router {
+fn router(
+    pool: SqlitePool,
+    bind: SocketAddr,
+    token: String,
+    fetcher: crate::review::Fetcher,
+) -> Router {
     let state = AppState {
         pool,
         bind,
         token: token.into(),
         writable: writes_allowed(bind),
+        fetcher: Arc::new(fetcher),
     };
     Router::new()
         .route("/", get(status_page))
         .route("/tracks", get(tracks_page))
         .route("/releases", get(releases_page))
         .route("/reviews", get(review::queue_page))
-        .route("/review", get(review::release_page))
+        .route(
+            "/review",
+            get(review::release_page)
+                .post(review::action)
+                .layer(DefaultBodyLimit::max(MAX_FORM_BYTES)),
+        )
         .route("/folders", get(folders_page))
         .route(
             "/folder",
@@ -1242,6 +1262,7 @@ mod tests {
             bind: addr("0.0.0.0:8787"),
             token: "t".into(),
             writable: false,
+            fetcher: Arc::new(crate::review::Fetcher::new(crate::review::Source::Network)),
         };
         let form = FolderForm {
             path: "/m/x".into(),
@@ -1262,6 +1283,7 @@ mod tests {
             bind: addr("127.0.0.1:8787"),
             token: "t".into(),
             writable: true,
+            fetcher: Arc::new(crate::review::Fetcher::new(crate::review::Source::Network)),
         };
         let form = |token: &str| {
             Ok(Form(FolderForm {
