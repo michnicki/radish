@@ -829,7 +829,8 @@ where
         && let Some(saved) = load_saved_reviews(pool, release, &guard, release_policy).await?
     {
         return Ok(
-            match review_saved_release(pool, release, saved, options.dry_run, &guard).await {
+            match review_saved_release(pool, release, saved, options.dry_run, &guard, clients).await
+            {
                 Ok(
                     outcome @ (Outcome::Accepted
                     | Outcome::Queued
@@ -1418,17 +1419,8 @@ where
     // A settled primary result needed no fallback, so no later stage was asked.
     if let Some(found @ Settlement::Primary) = &verdict {
         if !found.is_automatic(has_direct, options.review) {
-            return review_attempts(
-                pool,
-                release,
-                &attempts,
-                guard,
-                options.dry_run,
-                clients.musicbrainz.get(),
-                clients.discogs.get(),
-                clients.deezer.get(),
-            )
-            .await;
+            return review_attempts(pool, release, &attempts, guard, options.dry_run, clients)
+                .await;
         }
 
         return accept(
@@ -1513,17 +1505,8 @@ where
             return Ok(Outcome::Queued);
         }
         if options.review {
-            return review_attempts(
-                pool,
-                release,
-                &attempts,
-                guard,
-                options.dry_run,
-                clients.musicbrainz.get(),
-                clients.discogs.get(),
-                clients.deezer.get(),
-            )
-            .await;
+            return review_attempts(pool, release, &attempts, guard, options.dry_run, clients)
+                .await;
         }
         queue_attempts(pool, release, &attempts, guard, transcript).await?;
         return Ok(Outcome::Queued);
@@ -1760,13 +1743,19 @@ fn review_groups(
         .collect()
 }
 
-async fn review_saved_release(
+async fn review_saved_release<M, D, Z>(
     pool: &SqlitePool,
     release: &LocalRelease,
     saved: Vec<store::StoredReview>,
     dry_run: bool,
     guard: &MatchGuard,
-) -> Result<Outcome> {
+    clients: &Clients<'_, M, D, Z>,
+) -> Result<Outcome>
+where
+    M: MetadataProvider,
+    D: MetadataProvider,
+    Z: MetadataProvider,
+{
     let mut groups = review_groups(&saved);
 
     print_release_header(release);
@@ -1778,15 +1767,7 @@ async fn review_saved_release(
         }
     }
 
-    match review_prompt(
-        release,
-        &mut groups,
-        Option::<&MusicBrainzAdapter>::None,
-        Option::<&DiscogsAdapter>::None,
-        Option::<&DeezerAdapter>::None,
-    )
-    .await?
-    {
+    match review_prompt(release, &mut groups, clients).await? {
         ReviewOutcome::Accept(provider, candidate, evaluation) => {
             if dry_run {
                 outln!(
@@ -1814,16 +1795,13 @@ async fn review_saved_release(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn review_attempts<M, D, Z>(
     pool: &SqlitePool,
     release: &LocalRelease,
     attempts: &[ProviderAttempt],
     guard: &MatchGuard,
     dry_run: bool,
-    musicbrainz: Option<&M>,
-    discogs: Option<&D>,
-    deezer: Option<&Z>,
+    clients: &Clients<'_, M, D, Z>,
 ) -> Result<Outcome>
 where
     M: MetadataProvider,
@@ -1859,7 +1837,7 @@ where
         }
     }
 
-    match review_prompt(release, &mut groups, musicbrainz, discogs, deezer).await? {
+    match review_prompt(release, &mut groups, clients).await? {
         ReviewOutcome::Accept(provider, candidate, evaluation) => {
             if dry_run {
                 outln!(
@@ -2263,49 +2241,56 @@ fn chosen_provider(providers: &[ProviderKind], reply: &str) -> ProviderKind {
         .unwrap_or(ProviderKind::MusicBrainz)
 }
 
+/// Fetches the release a person entered, building its provider's client first
+/// when this run has not needed it yet.
+///
+/// A saved review contacts no provider until an ID is entered, so the client
+/// comes from the run's own factories: the network adapter, or the local index
+/// with `--offline`. A client that cannot be built comes back as
+/// [`ProviderError::Configuration`], which the prompt prints before asking again.
 async fn fetch_entered<M, D, Z>(
     provider: ProviderKind,
     id: ReleaseId,
-    musicbrainz: Option<&M>,
-    discogs: Option<&D>,
-    deezer: Option<&Z>,
+    clients: &Clients<'_, M, D, Z>,
 ) -> Result<RemoteRelease, ProviderError>
 where
     M: MetadataProvider,
     D: MetadataProvider,
     Z: MetadataProvider,
 {
+    let unavailable = |error: anyhow::Error| ProviderError::Configuration {
+        provider,
+        message: format!("{error:#}"),
+    };
     match provider {
-        ProviderKind::MusicBrainz => match musicbrainz {
-            Some(client) => client.fetch_release(id).await,
-            None => Err(ProviderError::Configuration {
-                provider,
-                message: "no MusicBrainz session is available in this run".to_string(),
-            }),
-        },
-        ProviderKind::Discogs => match discogs {
-            Some(client) => client.fetch_release(id).await,
-            None => Err(ProviderError::Configuration {
-                provider,
-                message: "no Discogs session is available in this run".to_string(),
-            }),
-        },
-        ProviderKind::Deezer => match deezer {
-            Some(client) => client.fetch_release(id).await,
-            None => Err(ProviderError::Configuration {
-                provider,
-                message: "no Deezer session is available in this run".to_string(),
-            }),
-        },
+        ProviderKind::MusicBrainz => {
+            clients
+                .musicbrainz()
+                .map_err(unavailable)?
+                .fetch_release(id)
+                .await
+        }
+        ProviderKind::Discogs => {
+            clients
+                .discogs()
+                .map_err(unavailable)?
+                .fetch_release(id)
+                .await
+        }
+        ProviderKind::Deezer => {
+            clients
+                .deezer()
+                .map_err(unavailable)?
+                .fetch_release(id)
+                .await
+        }
     }
 }
 
 async fn review_prompt<M, D, Z>(
     local: &LocalRelease,
     groups: &mut Vec<(ProviderKind, Vec<Candidate>, Vec<Evaluation>)>,
-    musicbrainz: Option<&M>,
-    discogs: Option<&D>,
-    deezer: Option<&Z>,
+    clients: &Clients<'_, M, D, Z>,
 ) -> Result<ReviewOutcome>
 where
     M: MetadataProvider,
@@ -2384,7 +2369,7 @@ where
                         continue;
                     }
                 };
-                match fetch_entered(provider, id, musicbrainz, discogs, deezer).await {
+                match fetch_entered(provider, id, clients).await {
                     Ok(release) => {
                         let candidate = Candidate::new(local, release);
                         let evaluation = matcher::evaluate(
@@ -3712,6 +3697,47 @@ mod tests {
                     id: id.storage_id(),
                 })
         }
+    }
+
+    #[tokio::test]
+    async fn an_entered_id_builds_its_client_only_when_needed() {
+        let built = std::cell::Cell::new(0);
+        let release = ten_track_edition(ReleaseId::Discogs(42));
+        let make_discogs = || {
+            built.set(built.get() + 1);
+            Ok(OneRelease::new(
+                ProviderKind::Discogs,
+                Some(release.clone()),
+            ))
+        };
+        let make_none = || -> Result<OneRelease> { bail!("not this one") };
+        let clients = Clients {
+            musicbrainz: OnceCell::new(),
+            discogs: OnceCell::new(),
+            deezer: OnceCell::new(),
+            discogs_disabled: RefCell::new(None),
+            make_musicbrainz: &make_none,
+            make_discogs: &make_discogs,
+            make_deezer: &make_none,
+        };
+        assert_eq!(built.get(), 0, "nothing is built before an ID is entered");
+
+        for _ in 0..2 {
+            let fetched = fetch_entered(ProviderKind::Discogs, ReleaseId::Discogs(42), &clients)
+                .await
+                .unwrap();
+            assert_eq!(fetched.id, ReleaseId::Discogs(42));
+        }
+        assert_eq!(built.get(), 1, "the client is built once and kept");
+
+        let error = fetch_entered(ProviderKind::MusicBrainz, musicbrainz_id(), &clients)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ProviderError::Configuration { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("not this one"), "{error}");
     }
 
     /// [`edition`] of the ten files, all ten tracks, under `id`.
