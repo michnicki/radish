@@ -896,16 +896,16 @@ fn a_release_entered_on_the_web_is_fetched_and_accepted() {
         assert!(refused.body.contains("reload"), "{}", refused.body);
     }
 
-    let no_token = server.post(
+    let no_discogs_token = server.post(
         "/review",
         &fetch_body(&token, blue, &revision, "discogs", "42"),
         SAME_SITE,
     );
-    assert_eq!(no_token.status, 502, "{}", no_token.body);
+    assert_eq!(no_discogs_token.status, 502, "{}", no_discogs_token.body);
     assert!(
-        no_token.body.contains("RADISH_DISCOGS_TOKEN"),
+        no_discogs_token.body.contains("RADISH_DISCOGS_TOKEN"),
         "{}",
-        no_token.body
+        no_discogs_token.body
     );
 
     let missing = server.post(
