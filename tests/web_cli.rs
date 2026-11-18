@@ -467,10 +467,12 @@ fn form_encode(text: &str) -> String {
 const BLUE_MBID: &str = "76df3287-6cda-33eb-8e9a-044b5e15ffdd";
 const BOLD_MBID: &str = "11111111-1111-1111-1111-111111111111";
 const MISSING_MBID: &str = "22222222-2222-2222-2222-222222222222";
+/// A release with two tracks, which cannot be applied to the one-file Bold.
+const SHORT_MBID: &str = "33333333-3333-3333-3333-333333333333";
 const SAME_SITE: &[&str] = &["Sec-Fetch-Site: same-origin"];
 
-/// MusicBrainz for the two albums of [`seeded_library`], a 404 for
-/// [`MISSING_MBID`]; everything else fails.
+/// MusicBrainz for the two albums of [`seeded_library`] and for [`SHORT_MBID`],
+/// a 404 for [`MISSING_MBID`]; everything else fails.
 fn review_handler(target: &str) -> (u16, String) {
     if target.contains(&format!("/ws/2/release/{BLUE_MBID}")) {
         (
@@ -481,6 +483,15 @@ fn review_handler(target: &str) -> (u16, String) {
         (
             200,
             musicbrainz_release_json(BOLD_MBID, &["<script>alert(1)</script>"], &[1.0]),
+        )
+    } else if target.contains(&format!("/ws/2/release/{SHORT_MBID}")) {
+        (
+            200,
+            musicbrainz_release_json(
+                SHORT_MBID,
+                &["<script>alert(1)</script>", "Extra"],
+                &[1.0, 1.0],
+            ),
         )
     } else if target.contains(&format!("/ws/2/release/{MISSING_MBID}")) {
         (404, "{}".to_string())
@@ -1015,5 +1026,66 @@ fn serve_offline_starts_without_indexes_and_says_what_a_fetch_needs() {
         missing.body.contains("index is missing"),
         "{}",
         missing.body
+    );
+}
+
+#[test]
+fn the_queue_sorts_by_score_and_hides_what_cannot_be_accepted() {
+    let (db, _music) = seeded_library("web-review-triage");
+    let mock = MockServer::start(review_handler);
+    let blue = release_id(&db, "Blue");
+    let bold = release_id(&db, "<b>Bold</b>");
+    queue_with(&db, &mock, blue, BLUE_MBID);
+    queue_with(&db, &mock, bold, SHORT_MBID);
+    let server = Server::start(&db);
+
+    let all = server.get("/reviews?sort=score");
+    assert_eq!(all.status, 200, "{}", all.body);
+    assert!(
+        all.body.contains("top candidate can&#39;t be accepted")
+            || all.body.contains("top candidate can't be accepted"),
+        "{}",
+        all.body
+    );
+
+    let acceptable = server.get("/reviews?sort=score&show=acceptable");
+    assert!(
+        acceptable.body.contains("1 release can be accepted."),
+        "{}",
+        acceptable.body
+    );
+    assert!(
+        acceptable.body.contains(&format!(
+            "href=\"/review?release={blue}&amp;sort=score&amp;show=acceptable\""
+        )),
+        "{}",
+        acceptable.body
+    );
+    assert!(
+        !acceptable
+            .body
+            .contains(&format!("/review?release={bold}&amp;")),
+        "{}",
+        acceptable.body
+    );
+
+    // Accepting from the filtered view keeps the view in the redirect.
+    let page = server.get(&format!(
+        "/review?release={blue}&sort=score&show=acceptable"
+    ));
+    let token = between(&page.body, "name=\"token\" value=\"", "\"").to_string();
+    let revision = unescape_html(between(&page.body, "name=\"revision\" value=\"", "\""));
+    let body = format!(
+        "{}&sort=score&show=acceptable",
+        accept_body(&token, blue, &revision, "", BLUE_MBID)
+    );
+    let accepted = server.post("/review", &body, SAME_SITE);
+    assert_eq!(accepted.status, 303, "{}", accepted.body);
+    assert!(
+        accepted.headers.contains(&format!(
+            "location: /reviews?sort=score&show=acceptable&accepted={blue}"
+        )),
+        "{}",
+        accepted.headers
     );
 }
