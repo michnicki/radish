@@ -9,15 +9,60 @@
 // Rust guideline compliant 2026-08-14
 
 use super::{MatchGuard, StoredCandidate, begin_write, decode_stored_candidates, queue_review_in};
+use crate::matcher::{self, Candidate, LocalRelease};
 use crate::providers::ProviderKind;
 use anyhow::Result;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 
+/// What the queue shows of a saved review: its first candidate, summarized.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReviewSummary {
+    /// The first candidate's score at the scope it was judged at; `None`
+    /// without a candidate.
+    pub score: Option<f64>,
+    /// Whether the first candidate's mapping can be accepted.
+    pub can_apply: bool,
+    /// The first candidate's first blocker, else the review's first reason.
+    pub reason: Option<String>,
+    /// How many blockers the first candidate has.
+    pub blockers: i64,
+}
+
+/// Summarizes the first of `candidates`, saved for `release`, as the page shows it.
+///
+/// `can_apply` is [`matcher::mapping_can_apply`], the check the Accept button
+/// uses, so the queue's "can be accepted" never disagrees with the page.
+pub fn summarize(
+    release: &LocalRelease,
+    candidates: &[StoredCandidate],
+    reasons: &[String],
+) -> ReviewSummary {
+    let Some(first) = candidates.first() else {
+        return ReviewSummary {
+            score: None,
+            can_apply: false,
+            reason: reasons.first().cloned(),
+            blockers: 0,
+        };
+    };
+    let candidate = Candidate {
+        release: first.release.clone(),
+        mapping: first.mapping.clone(),
+        score: first.score,
+    };
+    ReviewSummary {
+        score: Some(first.match_scope.score(&first.score)),
+        can_apply: matcher::mapping_can_apply(release, &candidate, first.match_scope),
+        reason: first.blockers.first().or_else(|| reasons.first()).cloned(),
+        blockers: first.blockers.len() as i64,
+    }
+}
+
 /// Adds `candidate` in front of its provider's saved review of a release.
 ///
-/// The release must still have source `revision`. A saved review made for the
-/// release as it is now keeps its other candidates (without an earlier entry
+/// The release must still have the source revision `release` was loaded with.
+/// A saved review made for the release as it is now keeps its other candidates (without an earlier entry
 /// for the same release) and its reasons; any other saved review is replaced
 /// by `candidate` alone, with `reason`. The review's guard is the release's
 /// current revision and accepted match.
@@ -29,12 +74,12 @@ use std::collections::HashMap;
 /// When the database cannot be read or written.
 pub async fn add_review_candidate(
     pool: &SqlitePool,
-    local_release_id: i64,
-    revision: &str,
+    release: &LocalRelease,
     candidate: StoredCandidate,
     reason: &str,
 ) -> Result<bool> {
     let provider = candidate.release.provider();
+    let local_release_id = release.id;
     let mut tx = begin_write(pool).await?;
     let current: Option<(String, Option<i64>)> = sqlx::query_as(
         "SELECT lr.source_revision,
@@ -47,7 +92,7 @@ pub async fn add_review_candidate(
     let Some((source_revision, accepted_match_id)) = current else {
         return Ok(false);
     };
-    if source_revision != revision {
+    if source_revision != release.revision {
         return Ok(false);
     }
     let guard = MatchGuard {
@@ -81,9 +126,8 @@ pub async fn add_review_candidate(
 
     queue_review_in(
         &mut tx,
-        local_release_id,
+        release,
         provider,
-        &guard.source_revision,
         guard.accepted_match_id,
         &candidates,
         &candidates[0].mapping,
@@ -293,8 +337,12 @@ pub async fn next_queued(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::matcher::MatchScope;
     use crate::providers::{ProviderKind, ReleaseId};
-    use crate::test_support::{FIXTURE_MBID, mbid_release, queue, remote_release, seed_release};
+    use crate::review::stored_candidate;
+    use crate::test_support::{
+        FIXTURE_MBID, OTHER_MBID, local_release, mbid_release, queue, remote_release, seed_release,
+    };
 
     /// Releases a to d; a is queued for MusicBrainz and Discogs, b for
     /// MusicBrainz, d for Deezer, and c not at all.
@@ -426,5 +474,138 @@ mod tests {
         );
         // A release that is gone starts the queue again from the top.
         assert_eq!(next_queued(&pool, d + 100, None).await.unwrap(), Some(a));
+    }
+
+    fn stored(
+        local: &LocalRelease,
+        remote: crate::matcher::RemoteRelease,
+        scope: MatchScope,
+        blockers: &[&str],
+    ) -> StoredCandidate {
+        let candidate = Candidate::new(local, remote);
+        let mut evaluation = matcher::evaluate(
+            local,
+            &candidate,
+            None,
+            &matcher::DiscoveryEvidence::default(),
+        );
+        evaluation.match_scope = scope;
+        evaluation.blockers = blockers.iter().map(|text| (*text).to_string()).collect();
+        stored_candidate(&candidate, &evaluation)
+    }
+
+    #[test]
+    fn a_summary_reads_the_first_candidate_as_the_page_shows_it() {
+        let titles = ["One", "Two"];
+        let local = local_release(1, "/music/a", "Blue", &titles);
+        let exact = remote_release(mbid_release(FIXTURE_MBID), "Blue", &titles);
+        let first = stored(
+            &local,
+            exact,
+            MatchScope::Edition,
+            &["edition qualifiers differ", "close alternative"],
+        );
+        let summary = summarize(
+            &local,
+            std::slice::from_ref(&first),
+            &["uncertain".to_string()],
+        );
+        assert_eq!(summary.score, Some(first.score.total));
+        assert!(summary.can_apply);
+        assert_eq!(summary.reason.as_deref(), Some("edition qualifiers differ"));
+        assert_eq!(summary.blockers, 2);
+
+        // No blockers: the review's first reason explains it.
+        let plain = stored(
+            &local,
+            remote_release(mbid_release(OTHER_MBID), "Blue", &titles),
+            MatchScope::Album,
+            &[],
+        );
+        let summary = summarize(
+            &local,
+            std::slice::from_ref(&plain),
+            &["uncertain".to_string()],
+        );
+        assert_eq!(summary.reason.as_deref(), Some("uncertain"));
+        assert_eq!(summary.score, Some(plain.score.album_score()));
+
+        // An incomplete mapping at edition scope cannot be applied.
+        let longer = stored(
+            &local,
+            remote_release(ReleaseId::Discogs(9), "Blue", &["One", "Two", "Three"]),
+            MatchScope::Edition,
+            &["track mapping is incomplete"],
+        );
+        assert!(!summarize(&local, std::slice::from_ref(&longer), &[]).can_apply);
+
+        // No candidates at all.
+        let empty = summarize(&local, &[], &["nothing found".to_string()]);
+        assert_eq!(
+            (empty.score, empty.can_apply, empty.blockers),
+            (None, false, 0)
+        );
+        assert_eq!(empty.reason.as_deref(), Some("nothing found"));
+    }
+
+    #[test]
+    fn the_first_tracks_rule_counts_as_applicable_at_album_scope_only() {
+        // Seven files that are the first seven of an eight-track release.
+        let files = ["One", "Two", "Three", "Four", "Five", "Six", "Seven"];
+        let local = local_release(1, "/music/a", "Blue", &files);
+        let listed = [
+            "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Bonus",
+        ];
+        let remote = remote_release(mbid_release(FIXTURE_MBID), "Blue", &listed);
+        let album = stored(&local, remote.clone(), MatchScope::Album, &[]);
+        let edition = stored(&local, remote, MatchScope::Edition, &[]);
+        assert!(summarize(&local, &[album], &[]).can_apply);
+        assert!(!summarize(&local, &[edition], &[]).can_apply);
+    }
+
+    #[tokio::test]
+    async fn every_writer_stores_the_first_candidates_summary() {
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let titles = ["One", "Two"];
+        let release = seed_release(&pool, "/music/a", "Blue", &titles).await;
+        queue(
+            &pool,
+            &release,
+            remote_release(mbid_release(FIXTURE_MBID), "Blue", &titles),
+        )
+        .await;
+        let row: (Option<f64>, Option<i64>, Option<i64>) =
+            sqlx::query_as("SELECT top_score, top_can_apply, top_blockers FROM match_reviews")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(row.0.is_some());
+        assert_eq!(row.1, Some(1));
+
+        // A fetched release put first replaces the summary: three provider
+        // tracks for two files cannot be applied.
+        let longer = remote_release(mbid_release(OTHER_MBID), "Blue", &["One", "Two", "Three"]);
+        let candidate = Candidate::new(&release, longer);
+        let evaluation = matcher::evaluate(
+            &release,
+            &candidate,
+            None,
+            &matcher::DiscoveryEvidence::default(),
+        );
+        assert!(
+            add_review_candidate(
+                &pool,
+                &release,
+                stored_candidate(&candidate, &evaluation),
+                "entered by hand"
+            )
+            .await
+            .unwrap()
+        );
+        let can_apply: Option<i64> = sqlx::query_scalar("SELECT top_can_apply FROM match_reviews")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(can_apply, Some(0));
     }
 }

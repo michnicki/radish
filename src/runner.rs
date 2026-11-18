@@ -1706,9 +1706,8 @@ async fn queue_attempts(
 
         store::queue_review(
             pool,
-            release.id,
+            release,
             attempt.provider,
-            &release.revision,
             guard.accepted_match_id,
             &stored,
             &attempt.candidates[0].mapping,

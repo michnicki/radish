@@ -439,8 +439,7 @@ pub async fn add_fetched(
     let candidate = Candidate::new(&release, remote);
     let evaluation = matcher::evaluate(&release, &candidate, None, &DiscoveryEvidence::default());
     let stored = stored_candidate(&candidate, &evaluation);
-    let added =
-        store::add_review_candidate(pool, local_id, revision, stored, ENTERED_REASON).await?;
+    let added = store::add_review_candidate(pool, &release, stored, ENTERED_REASON).await?;
     Ok(if added {
         AddOutcome::Added
     } else {

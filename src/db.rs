@@ -288,7 +288,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(applied, 10);
+        assert_eq!(applied, 11);
     }
 
     /// A database migrated up to and including the album-matching migration.
@@ -659,6 +659,9 @@ mod tests {
     /// The migration before Deezer joined the provider CHECKs.
     const BEFORE_DEEZER: i64 = 20261115000000;
 
+    /// The version of the Deezer migration.
+    const DEEZER: i64 = 20261116000000;
+
     /// A database migrated up to [`BEFORE_DEEZER`], through sqlx's migrator,
     /// holding an accepted match with an ALTER-added scope and medium, its track
     /// overlay, and two reviews, one of which expects that match.
@@ -976,7 +979,9 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        initialize(&pool).await.unwrap();
+        // Only the Deezer migration: a later one (the review summaries) adds
+        // an index over the table, and writes to the WAL after the checkpoint.
+        MIGRATOR.run_to(DEEZER, &pool).await.unwrap();
 
         // The copy wrote about 2 MB; only sqlx's bookkeeping row follows the
         // checkpoint, so the WAL holds a few pages.
@@ -1008,7 +1013,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(applied, 10);
+        assert_eq!(applied, 11);
         pool.close().await;
     }
 

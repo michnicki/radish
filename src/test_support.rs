@@ -351,9 +351,8 @@ pub(crate) async fn queue(pool: &SqlitePool, release: &LocalRelease, remote: Rem
     let stored = crate::review::stored_candidate(&candidate, &evaluation);
     store::queue_review(
         pool,
-        release.id,
+        release,
         candidate.release.provider(),
-        &guard.source_revision,
         guard.accepted_match_id,
         &[stored],
         &candidate.mapping,

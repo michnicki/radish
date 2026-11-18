@@ -2965,12 +2965,13 @@ pub async fn clear_match(pool: &SqlitePool, local_release_id: i64) -> Result<boo
 
 /// Stores candidate summaries for later interactive review, one group per
 /// provider so a fallback group never overwrites the primary group.
-#[allow(clippy::too_many_arguments)]
+///
+/// The review is saved for `release` as loaded: its key and source revision.
+/// The row also keeps a summary of the first candidate ([`summarize`]).
 pub async fn queue_review(
     pool: &SqlitePool,
-    local_release_id: i64,
+    release: &LocalRelease,
     provider: ProviderKind,
-    source_revision: &str,
     expected_match_id: Option<i64>,
     candidates: &[StoredCandidate],
     proposed_mapping: &Mapping,
@@ -2979,9 +2980,8 @@ pub async fn queue_review(
     let mut conn = pool.acquire().await?;
     queue_review_in(
         &mut conn,
-        local_release_id,
+        release,
         provider,
-        source_revision,
         expected_match_id,
         candidates,
         proposed_mapping,
@@ -2991,15 +2991,10 @@ pub async fn queue_review(
 }
 
 /// [`queue_review`] on `conn`, so it can run inside a write transaction.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one review row's columns; the same arguments as queue_review"
-)]
 async fn queue_review_in(
     conn: &mut SqliteConnection,
-    local_release_id: i64,
+    release: &LocalRelease,
     provider: ProviderKind,
-    source_revision: &str,
     expected_match_id: Option<i64>,
     candidates: &[StoredCandidate],
     proposed_mapping: &Mapping,
@@ -3008,13 +3003,15 @@ async fn queue_review_in(
     let candidates_json = serde_json::to_string(candidates)?;
     let mapping_json = serde_json::to_string(proposed_mapping)?;
     let reasons_json = serde_json::to_string(reasons)?;
+    let summary = reviews::summarize(release, candidates, reasons);
 
     sqlx::query(
         "INSERT INTO match_reviews (
             local_release_id, provider, snapshot_version, expected_match_id, candidates_json,
-            proposed_mapping_json, reasons_json, source_revision
+            proposed_mapping_json, reasons_json, source_revision,
+            top_score, top_can_apply, top_reason, top_blockers
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(local_release_id, provider) DO UPDATE SET
             snapshot_version = excluded.snapshot_version,
             expected_match_id = excluded.expected_match_id,
@@ -3022,16 +3019,24 @@ async fn queue_review_in(
             proposed_mapping_json = excluded.proposed_mapping_json,
             reasons_json = excluded.reasons_json,
             source_revision = excluded.source_revision,
+            top_score = excluded.top_score,
+            top_can_apply = excluded.top_can_apply,
+            top_reason = excluded.top_reason,
+            top_blockers = excluded.top_blockers,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
     )
-    .bind(local_release_id)
+    .bind(release.id)
     .bind(provider.as_str())
     .bind(SNAPSHOT_VERSION)
     .bind(expected_match_id)
     .bind(candidates_json)
     .bind(mapping_json)
     .bind(reasons_json)
-    .bind(source_revision)
+    .bind(&release.revision)
+    .bind(summary.score)
+    .bind(i64::from(summary.can_apply))
+    .bind(summary.reason)
+    .bind(summary.blockers)
     .execute(&mut *conn)
     .await?;
 
@@ -4256,9 +4261,8 @@ mod tests {
 
         queue_review(
             &pool,
-            release.id,
+            &release,
             ProviderKind::Discogs,
-            &release.revision,
             None,
             std::slice::from_ref(&stored),
             &candidate.mapping,
@@ -4268,9 +4272,8 @@ mod tests {
         .unwrap();
         queue_review(
             &pool,
-            release.id,
+            &release,
             ProviderKind::MusicBrainz,
-            &release.revision,
             None,
             std::slice::from_ref(&stored),
             &candidate.mapping,
@@ -4324,9 +4327,8 @@ mod tests {
         ] {
             queue_review(
                 &pool,
-                release.id,
+                &release,
                 provider,
-                &release.revision,
                 None,
                 std::slice::from_ref(&stored),
                 &candidate.mapping,
@@ -4445,9 +4447,8 @@ mod tests {
         };
         queue_review(
             &pool,
-            blue.id,
+            &blue,
             ProviderKind::Discogs,
-            &blue.revision,
             None,
             std::slice::from_ref(&stored),
             &candidate.mapping,
