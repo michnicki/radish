@@ -833,7 +833,8 @@ where
     // Explicit review stays offline. Normal matching rediscovers candidates
     // so an old edition-only review does not permanently block automation.
     if options.review
-        && let Some(saved) = load_saved_reviews(pool, release, &guard, release_policy).await?
+        && let Some(saved) =
+            load_saved_reviews(pool, release, &guard, release_policy, transcript).await?
     {
         return Ok(
             match review_saved_release(pool, release, saved, options.dry_run, &guard, clients).await
@@ -945,18 +946,31 @@ fn transient_note(failed: ProviderKind) -> String {
     )
 }
 
+/// The saved reviews of `release` that the `policy`'s providers hold for `guard`.
+///
+/// A review whose snapshot cannot be decoded is skipped with a note, as
+/// `review::load` does, so one bad row does not end a `--review` session; a
+/// database error still fails the release.
 async fn load_saved_reviews(
     pool: &SqlitePool,
     release: &LocalRelease,
     guard: &MatchGuard,
     policy: ProviderPolicy,
+    transcript: &mut Transcript,
 ) -> Result<Option<Vec<store::StoredReview>>> {
     let mut saved = Vec::new();
     for provider in policy.order() {
-        if let Some(review) = store::load_review(pool, release.id, provider).await?
-            && review.guard == *guard
-        {
-            saved.push(review);
+        match store::load_review(pool, release.id, provider).await {
+            Ok(Some(review)) if review.guard == *guard => saved.push(review),
+            Ok(_) => {}
+            Err(error) if error.downcast_ref::<sqlx::Error>().is_some() => return Err(error),
+            Err(error) => {
+                outln_to!(
+                    transcript,
+                    "  saved {provider} review cannot be read: {}; searching again",
+                    Clean(&format!("{error:#}"))
+                );
+            }
         }
     }
     Ok((!saved.is_empty()).then_some(saved))
@@ -2512,6 +2526,64 @@ mod tests {
         );
         assert!(resolve_policy(Some(ProviderKind::Discogs), None, true).is_err());
         assert!(resolve_policy(None, Some(&id), true).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_saved_review_that_cannot_be_read_is_skipped() {
+        use crate::test_support::{
+            FIXTURE_MBID, mbid_release, queue, remote_release, seed_release,
+        };
+
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let release = seed_release(&pool, "/music/a", "Blue", &["One", "Two"]).await;
+        queue(
+            &pool,
+            &release,
+            remote_release(mbid_release(FIXTURE_MBID), "Blue", &["One", "Two"]),
+        )
+        .await;
+        queue(
+            &pool,
+            &release,
+            remote_release(ReleaseId::Discogs(42), "Blue", &["One", "Two"]),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE match_reviews SET candidates_json = 'nonsense' WHERE provider = 'musicbrainz'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let guard = store::load_match_guard(&pool, release.id).await.unwrap();
+
+        let mut transcript = Transcript::held();
+        let saved = load_saved_reviews(
+            &pool,
+            &release,
+            &guard,
+            ProviderPolicy::Chain { deezer: true },
+            &mut transcript,
+        )
+        .await
+        .unwrap()
+        .expect("the good review is still found");
+        assert_eq!(
+            saved
+                .iter()
+                .map(|review| review.provider)
+                .collect::<Vec<_>>(),
+            vec![ProviderKind::Discogs]
+        );
+        let lines = transcript.held.unwrap();
+        assert!(
+            matches!(
+                lines.as_slice(),
+                [Line::Out(note)]
+                    if note.contains("saved musicbrainz review cannot be read")
+                        && note.ends_with("searching again")
+            ),
+            "{lines:?}"
+        );
     }
 
     fn album_fixture() -> (LocalRelease, RemoteRelease) {
