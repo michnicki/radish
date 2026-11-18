@@ -512,9 +512,11 @@ fn most_common_value(values: impl Iterator<Item = String>) -> Option<(String, St
         let Some(normalized) = identity_key(&value) else {
             continue;
         };
+        // Fixed-width tags (ID3v1) pad values with spaces; keep the value
+        // without them.
         let entry = counts
             .entry(normalized)
-            .or_insert_with(|| (0, value.clone()));
+            .or_insert_with(|| (0, value.trim().to_string()));
         entry.0 += 1;
     }
 
@@ -3259,6 +3261,26 @@ mod tests {
 
         let releases = load_local_releases(&pool, None).await.unwrap();
         assert_eq!(releases.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn release_artists_drop_the_padding_of_fixed_width_tags() {
+        let pool = test_pool().await;
+        // ID3v1 fields are 30 characters wide and often padded with spaces.
+        let mut tag = scanned("/music/tag/01.mp3", Some("Blue"), None, 1);
+        tag.album_artist = Some("Album Artist                  ".to_string());
+        tag.artist = Some("Track Artist                  ".to_string());
+        let mut untagged = scanned("/music/untagged/01.mp3", Some("Red"), None, 1);
+        untagged.artist = Some("Stereophonics                 ".to_string());
+        insert(&pool, "/music/tag", &[tag]).await;
+        insert(&pool, "/music/untagged", &[untagged]).await;
+
+        let releases = load_local_releases(&pool, None).await.unwrap();
+        let artists: Vec<_> = releases
+            .iter()
+            .map(|release| release.album_artist.as_deref())
+            .collect();
+        assert_eq!(artists, [Some("Album Artist"), Some("Stereophonics")]);
     }
 
     #[tokio::test]
