@@ -2241,13 +2241,14 @@ fn chosen_provider(providers: &[ProviderKind], reply: &str) -> ProviderKind {
         .unwrap_or(ProviderKind::MusicBrainz)
 }
 
-/// Fetches the release a person entered, building its provider's client first
-/// when this run has not needed it yet.
+/// Fetches the release a person entered, building its client first if needed.
 ///
 /// A saved review contacts no provider until an ID is entered, so the client
-/// comes from the run's own factories: the network adapter, or the local index
-/// with `--offline`. A client that cannot be built comes back as
-/// [`ProviderError::Configuration`], which the prompt prints before asking again.
+/// comes from the run's own factories. MusicBrainz and Discogs come from the
+/// network adapter or, with `--offline`, the local index; Deezer always comes
+/// from the network. A client that cannot be built comes back as a
+/// [`ProviderError`] (a missing token, say), which the prompt prints before
+/// asking again.
 async fn fetch_entered<M, D, Z>(
     provider: ProviderKind,
     id: ReleaseId,
@@ -2258,29 +2259,25 @@ where
     D: MetadataProvider,
     Z: MetadataProvider,
 {
-    let unavailable = |error: anyhow::Error| ProviderError::Configuration {
-        provider,
-        message: format!("{error:#}"),
-    };
     match provider {
         ProviderKind::MusicBrainz => {
             clients
                 .musicbrainz()
-                .map_err(unavailable)?
+                .map_err(|error| provider_error_from(provider, error))?
                 .fetch_release(id)
                 .await
         }
         ProviderKind::Discogs => {
             clients
                 .discogs()
-                .map_err(unavailable)?
+                .map_err(|error| provider_error_from(provider, error))?
                 .fetch_release(id)
                 .await
         }
         ProviderKind::Deezer => {
             clients
                 .deezer()
-                .map_err(unavailable)?
+                .map_err(|error| provider_error_from(provider, error))?
                 .fetch_release(id)
                 .await
         }

@@ -20,8 +20,8 @@ use anyhow::{Context, Result, bail};
 /// in its path; Discogs a number or a `discogs.com` link with
 /// `release/<number>`, optionally followed by `-slug`; Deezer a number or a
 /// `deezer.com` link with `album/<number>`. A language prefix in the path
-/// (`/de/release/…`), surrounding whitespace, and any query or fragment are
-/// ignored.
+/// (`/de/release/…`), surrounding whitespace, a missing `https://`, a trailing
+/// slash, and any query or fragment are ignored.
 ///
 /// # Errors
 ///
@@ -32,6 +32,10 @@ pub fn parse_entered(provider: ProviderKind, raw: &str) -> Result<ReleaseId> {
     let raw = raw.trim();
     if raw.contains("://") {
         return parse_link(provider, raw);
+    }
+    // A link pasted without its scheme: `www.discogs.com/release/249504`.
+    if raw.contains('/') {
+        return parse_link(provider, &format!("https://{raw}"));
     }
     parse_bare(provider, raw)
 }
@@ -90,16 +94,16 @@ fn parse_link(provider: ProviderKind, raw: &str) -> Result<ReleaseId> {
     if provider == ProviderKind::Discogs && segments.contains(&"master") {
         bail!("a Discogs master is not a release; open one of its releases and use that link");
     }
-    let kind = match provider {
-        ProviderKind::MusicBrainz | ProviderKind::Discogs => "release",
-        ProviderKind::Deezer => "album",
+    let (kind, noun) = match provider {
+        ProviderKind::MusicBrainz | ProviderKind::Discogs => ("release", "a release"),
+        ProviderKind::Deezer => ("album", "an album"),
     };
     let Some(value) = segments
         .iter()
         .position(|segment| *segment == kind)
         .and_then(|position| segments.get(position + 1))
     else {
-        bail!("that {} link does not name a {kind}", provider.label());
+        bail!("that {} link does not name {noun}", provider.label());
     };
     // Discogs appends a slug: `release/249504-Artist-Title`. An MBID has
     // hyphens of its own, so only Discogs is cut.
@@ -123,6 +127,7 @@ mod tests {
             MBID.to_string(),
             format!(" https://musicbrainz.org/release/{MBID} "),
             format!("https://beta.musicbrainz.org/release/{MBID}/discids?x=1#top"),
+            format!("musicbrainz.org/release/{MBID}"),
         ];
         for raw in &musicbrainz {
             assert_eq!(
@@ -136,6 +141,7 @@ mod tests {
             "https://www.discogs.com/release/249504-Artist-Title",
             "https://www.discogs.com/de/release/249504",
             "HTTPS://WWW.DISCOGS.COM/release/249504?ev=rb",
+            "www.discogs.com/release/249504",
         ] {
             assert_eq!(
                 parse_entered(ProviderKind::Discogs, raw).unwrap(),
@@ -147,6 +153,7 @@ mod tests {
             "302127",
             "https://www.deezer.com/album/302127",
             "https://www.deezer.com/en/album/302127?utm=x",
+            "https://www.deezer.com/album/302127/",
         ] {
             assert_eq!(
                 parse_entered(ProviderKind::Deezer, raw).unwrap(),
@@ -186,7 +193,13 @@ mod tests {
         .to_string();
         assert!(master.contains("master"), "{master}");
         assert!(parse_entered(ProviderKind::MusicBrainz, "not-an-mbid").is_err());
-        assert!(parse_entered(ProviderKind::Deezer, "https://www.deezer.com/artist/27").is_err());
+        assert_eq!(
+            parse_entered(ProviderKind::Deezer, "https://www.deezer.com/artist/27")
+                .unwrap_err()
+                .to_string(),
+            "that Deezer link does not name an album"
+        );
+        assert!(parse_entered(ProviderKind::Discogs, "https://www.discogs.com/release/").is_err());
         assert_eq!(
             parse_entered(ProviderKind::Discogs, "abc")
                 .unwrap_err()
