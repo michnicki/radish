@@ -544,24 +544,22 @@ const CHANGED: &str = "This release changed after the page was loaded; review it
 const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The review form's fields; which ones matter depends on `action`.
-#[derive(Debug, Deserialize)]
+///
+/// A missing field is empty, so a body without the token reaches the token
+/// check and gets its `403` rather than a rejection of the body.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 pub(super) struct ReviewForm {
-    /// Empty when the form has no token, which the token check then refuses.
-    #[serde(default)]
     token: String,
     action: String,
     release: String,
     revision: String,
     /// The accepted match id the page showed; empty for none.
-    #[serde(default, rename = "match")]
+    #[serde(rename = "match")]
     accepted_match: String,
-    #[serde(default)]
     filter: String,
-    #[serde(default)]
     provider: String,
-    #[serde(default)]
     candidate: String,
-    #[serde(default)]
     id: String,
 }
 

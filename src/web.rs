@@ -430,12 +430,14 @@ fn stale_form() -> Response {
 }
 
 /// The folder form's fields.
-#[derive(Debug, Deserialize)]
+///
+/// A missing field is empty, so a body without the token reaches the token
+/// check and gets its `403` rather than a rejection of the body.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 struct FolderForm {
     path: String,
     action: String,
-    /// Empty when the form has no token, which the token check then refuses.
-    #[serde(default)]
     token: String,
 }
 
@@ -445,7 +447,7 @@ struct FolderForm {
 /// process's token; `400` for an unknown action; `404` for a path that names
 /// no unit. The checks that need no body come first, so a server that takes no
 /// writes answers `403` whatever the body holds, and a bad body gets its own
-/// rejection (`413`, `415` or `422`) only on a server that could use it.
+/// rejection (`413`, `415` or `422` for text that is not a form) only on a server that could use it.
 async fn folder_action(
     State(state): State<AppState>,
     headers: HeaderMap,

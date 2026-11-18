@@ -644,6 +644,15 @@ fn a_folder_form_merges_only_with_the_token_from_this_site() {
         &["Sec-Fetch-Site: same-origin"],
     );
     assert_eq!(subfolder.status, 404);
+    // A body with no fields at all lacks the token too: 403, not a rejection of
+    // the body. With the token, a missing action or path answers as an empty one.
+    let empty = server.post("/folder", "", SAME_SITE);
+    assert_eq!(empty.status, 403, "{}", empty.body);
+    assert!(empty.body.contains("reload"), "{}", empty.body);
+    let no_action = server.post("/folder", &format!("token={token}"), SAME_SITE);
+    assert_eq!(no_action.status, 400, "{}", no_action.body);
+    let no_path = server.post("/folder", &format!("token={token}&action=merge"), SAME_SITE);
+    assert_eq!(no_path.status, 404, "{}", no_path.body);
     // A body over the limit is refused before it is read in full.
     let huge = server.post(
         "/folder",
@@ -895,6 +904,16 @@ fn a_release_entered_on_the_web_is_fetched_and_accepted() {
         assert_eq!(refused.status, 403, "{}", refused.body);
         assert!(refused.body.contains("reload"), "{}", refused.body);
     }
+
+    // So is a body with no fields at all; with the token, a missing action or
+    // release answers as an empty one.
+    let empty = server.post("/review", "", SAME_SITE);
+    assert_eq!(empty.status, 403, "{}", empty.body);
+    assert!(empty.body.contains("reload"), "{}", empty.body);
+    let no_action = server.post("/review", &format!("token={token}"), SAME_SITE);
+    assert_eq!(no_action.status, 400, "{}", no_action.body);
+    let no_release = server.post("/review", &format!("token={token}&action=fetch"), SAME_SITE);
+    assert_eq!(no_release.status, 404, "{}", no_release.body);
 
     let no_discogs_token = server.post(
         "/review",
