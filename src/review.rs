@@ -172,10 +172,8 @@ pub async fn load(pool: &SqlitePool, local_id: i64) -> Result<Option<ReleaseRevi
     let Some(status) = store::release_status(pool, local_id).await? else {
         return Ok(None);
     };
-    let guard = match store::load_match_guard(pool, local_id).await {
-        Ok(guard) => guard,
-        Err(error) if error.downcast_ref::<store::SnapshotChanged>().is_some() => return Ok(None),
-        Err(error) => return Err(error),
+    let Some(guard) = current_guard(pool, local_id).await? else {
+        return Ok(None);
     };
     let mut groups = Vec::new();
     for provider in (ProviderPolicy::Chain { deezer: true }).order() {
@@ -191,6 +189,7 @@ pub async fn load(pool: &SqlitePool, local_id: i64) -> Result<Option<ReleaseRevi
                 reasons: review.reasons,
                 candidates: candidate_pairs(&review.candidates),
             }),
+            Err(error) if error.downcast_ref::<sqlx::Error>().is_some() => return Err(error),
             Err(error) => groups.push(ReviewGroup {
                 provider,
                 state: GroupState::Unreadable(format!("{error:#}")),
@@ -217,25 +216,25 @@ async fn load_release(pool: &SqlitePool, local_id: i64) -> Result<Option<LocalRe
 
 /// Saved candidates as the matcher's types, each with its stored evaluation.
 pub fn candidate_pairs(stored: &[StoredCandidate]) -> Vec<(Candidate, Evaluation)> {
-    stored
-        .iter()
-        .map(|saved| {
-            (
-                Candidate {
-                    release: saved.release.clone(),
-                    mapping: saved.mapping.clone(),
-                    score: saved.score,
-                },
-                Evaluation {
-                    auto_accept: saved.auto_accept,
-                    match_scope: saved.match_scope,
-                    blockers: saved.blockers.clone(),
-                    warnings: saved.warnings.clone(),
-                    evidence: saved.evidence.clone(),
-                },
-            )
-        })
-        .collect()
+    stored.iter().cloned().map(pair_of).collect()
+}
+
+/// One saved candidate as the matcher's types, with its stored evaluation.
+fn pair_of(saved: StoredCandidate) -> (Candidate, Evaluation) {
+    (
+        Candidate {
+            release: saved.release,
+            mapping: saved.mapping,
+            score: saved.score,
+        },
+        Evaluation {
+            auto_accept: saved.auto_accept,
+            match_scope: saved.match_scope,
+            blockers: saved.blockers,
+            warnings: saved.warnings,
+            evidence: saved.evidence,
+        },
+    )
 }
 
 /// `candidate` and its `evaluation` as a saved review stores them.
@@ -252,8 +251,10 @@ pub fn stored_candidate(candidate: &Candidate, evaluation: &Evaluation) -> Store
     }
 }
 
-/// The edition facts of `release`: year, country, labels, catalog numbers,
-/// formats and edition notes, in that order, each present only when known.
+/// The edition facts of `release`, in the order a card lists them.
+///
+/// These are year, country, labels, catalog numbers, formats and edition
+/// notes, each present only when known.
 pub fn edition_details(release: &RemoteRelease) -> Vec<String> {
     let mut details = Vec::new();
     if let Some(year) = release.year {
@@ -313,12 +314,12 @@ pub enum AcceptOutcome {
     CannotApply(Vec<String>),
 }
 
-/// Accepts the saved `release_id` of `provider` for release `local_id`.
+/// Accepts the saved candidate `id` for release `local_id`, as the page showed it.
 ///
-/// `revision` is the source revision the page was built from: the release,
-/// the provider's saved review and the accepted match must all still be as
-/// they were then. The decision is stored as `manual`, at the scope it was
-/// judged at, and clears the release's saved reviews.
+/// `shown` is the guard the page was built from: the release, the provider's
+/// saved review and the accepted match must all still be as they were then. The
+/// decision is stored as `manual`, at the scope it was judged at, and clears the
+/// release's saved reviews.
 ///
 /// # Errors
 ///
@@ -326,40 +327,34 @@ pub enum AcceptOutcome {
 pub async fn accept_saved(
     pool: &SqlitePool,
     local_id: i64,
-    provider: ProviderKind,
-    release_id: &str,
-    revision: &str,
+    id: &ReleaseId,
+    shown: &MatchGuard,
 ) -> Result<AcceptOutcome> {
     let Some(release) = load_release(pool, local_id).await? else {
         return Ok(AcceptOutcome::Changed);
     };
-    if release.revision != revision {
+    let Some(guard) = current_guard(pool, local_id).await? else {
         return Ok(AcceptOutcome::Changed);
-    }
-    let guard = match store::load_match_guard(pool, local_id).await {
-        Ok(guard) => guard,
-        Err(error) if error.downcast_ref::<store::SnapshotChanged>().is_some() => {
-            return Ok(AcceptOutcome::Changed);
-        }
-        Err(error) => return Err(error),
     };
-    if guard.source_revision != revision {
+    if guard != *shown || release.revision != shown.source_revision {
         return Ok(AcceptOutcome::Changed);
     }
-    let Some(review) = store::load_review(pool, local_id, provider).await? else {
+    let Some(review) = store::load_review(pool, local_id, id.provider()).await? else {
         return Ok(AcceptOutcome::NotFound);
     };
     if review.guard != guard {
         return Ok(AcceptOutcome::Changed);
     }
-    let Some((candidate, evaluation)) = candidate_pairs(&review.candidates)
+    let Some(saved) = review
+        .candidates
         .into_iter()
-        .find(|(candidate, _)| candidate.release.id.storage_id() == release_id)
+        .find(|saved| saved.release.id == *id)
     else {
         return Ok(AcceptOutcome::NotFound);
     };
+    let (candidate, evaluation) = pair_of(saved);
     if !evaluation.can_apply(&release, &candidate) {
-        return Ok(AcceptOutcome::CannotApply(candidate.mapping.notes.clone()));
+        return Ok(AcceptOutcome::CannotApply(candidate.mapping.notes));
     }
     match store::accept_match(
         pool,
@@ -375,6 +370,23 @@ pub async fn accept_saved(
         Err(error) if error.downcast_ref::<store::SnapshotChanged>().is_some() => {
             Ok(AcceptOutcome::Changed)
         }
+        Err(error) => {
+            // Another decision may have got in between; `accept_match` refuses
+            // that with a plain error, so look at the guard again.
+            if current_guard(pool, local_id).await?.as_ref() == Some(&guard) {
+                Err(error)
+            } else {
+                Ok(AcceptOutcome::Changed)
+            }
+        }
+    }
+}
+
+/// The release's current guard, or `None` when the release is gone.
+async fn current_guard(pool: &SqlitePool, local_id: i64) -> Result<Option<MatchGuard>> {
+    match store::load_match_guard(pool, local_id).await {
+        Ok(guard) => Ok(Some(guard)),
+        Err(error) if error.downcast_ref::<store::SnapshotChanged>().is_some() => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -529,6 +541,40 @@ mod tests {
         assert!(load(&pool, release.id + 100).await.unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn a_review_saved_under_another_accepted_match_is_out_of_date() {
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let titles = ["One", "Two"];
+        let release = seed_release(&pool, "/music/a", "Blue", &titles).await;
+        queue(
+            &pool,
+            &release,
+            remote_release(mbid_release(FIXTURE_MBID), "Blue", &titles),
+        )
+        .await;
+        let shown = store::load_match_guard(&pool, release.id).await.unwrap();
+        let outcome = accept_saved(&pool, release.id, &mbid_release(FIXTURE_MBID), &shown)
+            .await
+            .unwrap();
+        assert_eq!(outcome, AcceptOutcome::Accepted);
+        queue(
+            &pool,
+            &release,
+            remote_release(ReleaseId::Discogs(42), "Blue", &titles),
+        )
+        .await;
+        let review = load(&pool, release.id).await.unwrap().unwrap();
+        assert_eq!(review.groups[0].state, GroupState::Current);
+
+        sqlx::query("UPDATE match_reviews SET expected_match_id = NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let review = load(&pool, release.id).await.unwrap().unwrap();
+        assert_eq!(review.groups[0].provider, ProviderKind::Discogs);
+        assert_eq!(review.groups[0].state, GroupState::OutOfDate);
+    }
+
     #[test]
     fn card_text_lists_edition_details_and_weighted_scores() {
         use crate::matcher::{Candidate, Evaluation, MatchScope};
@@ -571,16 +617,11 @@ mod tests {
             remote_release(mbid_release(FIXTURE_MBID), "Blue", &titles),
         )
         .await;
+        let shown = store::load_match_guard(&pool, release.id).await.unwrap();
 
-        let outcome = accept_saved(
-            &pool,
-            release.id,
-            ProviderKind::MusicBrainz,
-            FIXTURE_MBID,
-            &release.revision,
-        )
-        .await
-        .unwrap();
+        let outcome = accept_saved(&pool, release.id, &mbid_release(FIXTURE_MBID), &shown)
+            .await
+            .unwrap();
         assert_eq!(outcome, AcceptOutcome::Accepted);
         let status = store::release_status(&pool, release.id)
             .await
@@ -603,15 +644,10 @@ mod tests {
             remote_release(ReleaseId::Discogs(42), "Blue", &titles),
         )
         .await;
-        let outcome = accept_saved(
-            &pool,
-            release.id,
-            ProviderKind::Discogs,
-            "42",
-            &release.revision,
-        )
-        .await
-        .unwrap();
+        let shown = store::load_match_guard(&pool, release.id).await.unwrap();
+        let outcome = accept_saved(&pool, release.id, &ReleaseId::Discogs(42), &shown)
+            .await
+            .unwrap();
         assert_eq!(outcome, AcceptOutcome::Accepted);
         let status = store::release_status(&pool, release.id)
             .await
@@ -631,42 +667,35 @@ mod tests {
             remote_release(mbid_release(FIXTURE_MBID), "Blue", &titles),
         )
         .await;
-        let accept = |provider, id: &'static str, revision: String| {
-            let pool = pool.clone();
-            async move {
-                accept_saved(&pool, release.id, provider, id, &revision)
-                    .await
-                    .unwrap()
-            }
-        };
+        let shown = store::load_match_guard(&pool, release.id).await.unwrap();
+        let musicbrainz = mbid_release(FIXTURE_MBID);
 
+        let other_revision = MatchGuard {
+            source_revision: "other".to_string(),
+            accepted_match_id: None,
+        };
         assert_eq!(
-            accept(ProviderKind::MusicBrainz, FIXTURE_MBID, "other".into()).await,
+            accept_saved(&pool, release.id, &musicbrainz, &other_revision)
+                .await
+                .unwrap(),
             AcceptOutcome::Changed
         );
         assert_eq!(
-            accept(
-                ProviderKind::MusicBrainz,
-                OTHER_MBID,
-                release.revision.clone()
-            )
-            .await,
+            accept_saved(&pool, release.id, &mbid_release(OTHER_MBID), &shown)
+                .await
+                .unwrap(),
             AcceptOutcome::NotFound
         );
         assert_eq!(
-            accept(ProviderKind::Deezer, "7", release.revision.clone()).await,
+            accept_saved(&pool, release.id, &ReleaseId::Deezer(7), &shown)
+                .await
+                .unwrap(),
             AcceptOutcome::NotFound
         );
         assert_eq!(
-            accept_saved(
-                &pool,
-                release.id + 100,
-                ProviderKind::MusicBrainz,
-                FIXTURE_MBID,
-                &release.revision
-            )
-            .await
-            .unwrap(),
+            accept_saved(&pool, release.id + 100, &musicbrainz, &shown)
+                .await
+                .unwrap(),
             AcceptOutcome::Changed
         );
         sqlx::query("UPDATE match_reviews SET source_revision = 'old'")
@@ -674,12 +703,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            accept(
-                ProviderKind::MusicBrainz,
-                FIXTURE_MBID,
-                release.revision.clone()
-            )
-            .await,
+            accept_saved(&pool, release.id, &musicbrainz, &shown)
+                .await
+                .unwrap(),
             AcceptOutcome::Changed
         );
         let status = store::release_status(&pool, release.id)
@@ -694,6 +720,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_page_built_before_another_decision_cannot_replace_it() {
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let titles = ["One", "Two"];
+        let release = seed_release(&pool, "/music/a", "Blue", &titles).await;
+        queue(
+            &pool,
+            &release,
+            remote_release(mbid_release(FIXTURE_MBID), "Blue", &titles),
+        )
+        .await;
+        queue(
+            &pool,
+            &release,
+            remote_release(ReleaseId::Discogs(42), "Blue", &titles),
+        )
+        .await;
+        let shown = store::load_match_guard(&pool, release.id).await.unwrap();
+
+        // Another page accepts the Discogs candidate first.
+        let outcome = accept_saved(&pool, release.id, &ReleaseId::Discogs(42), &shown)
+            .await
+            .unwrap();
+        assert_eq!(outcome, AcceptOutcome::Accepted);
+
+        let outcome = accept_saved(&pool, release.id, &mbid_release(FIXTURE_MBID), &shown)
+            .await
+            .unwrap();
+        assert_eq!(outcome, AcceptOutcome::Changed);
+        let status = store::release_status(&pool, release.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.provider, Some(ProviderKind::Discogs), "not replaced");
+    }
+
+    #[tokio::test]
     async fn a_mapping_that_cannot_be_applied_is_refused() {
         let pool = crate::db::connect_in_memory().await.unwrap();
         let release = seed_release(&pool, "/music/a", "Blue", &["One", "Two", "Three"]).await;
@@ -704,18 +766,13 @@ mod tests {
             remote_release(mbid_release(FIXTURE_MBID), "Blue", &["One", "Two"]),
         )
         .await;
-        let outcome = accept_saved(
-            &pool,
-            release.id,
-            ProviderKind::MusicBrainz,
-            FIXTURE_MBID,
-            &release.revision,
-        )
-        .await
-        .unwrap();
-        assert!(
-            matches!(outcome, AcceptOutcome::CannotApply(_)),
-            "{outcome:?}"
-        );
+        let shown = store::load_match_guard(&pool, release.id).await.unwrap();
+        let outcome = accept_saved(&pool, release.id, &mbid_release(FIXTURE_MBID), &shown)
+            .await
+            .unwrap();
+        match outcome {
+            AcceptOutcome::CannotApply(notes) => assert!(!notes.is_empty()),
+            other => panic!("expected CannotApply, got {other:?}"),
+        }
     }
 }

@@ -7,7 +7,7 @@ use crate::matcher::{
 };
 use crate::providers::{ProviderKind, ReleaseId};
 use crate::scanner::{ObservedMusicBrainzIds, ScannedTrack};
-use crate::store::{self, StoredCandidate};
+use crate::store;
 use sqlx::SqlitePool;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -348,16 +348,7 @@ pub(crate) async fn queue(pool: &SqlitePool, release: &LocalRelease, remote: Rem
     let candidate = Candidate::new(release, remote);
     let evaluation = matcher::evaluate(release, &candidate, None, &DiscoveryEvidence::default());
     let guard = store::load_match_guard(pool, release.id).await.unwrap();
-    let stored = StoredCandidate {
-        release: candidate.release.clone(),
-        mapping: candidate.mapping.clone(),
-        score: candidate.score,
-        auto_accept: evaluation.auto_accept,
-        match_scope: evaluation.match_scope,
-        blockers: evaluation.blockers.clone(),
-        warnings: evaluation.warnings.clone(),
-        evidence: evaluation.evidence.clone(),
-    };
+    let stored = crate::review::stored_candidate(&candidate, &evaluation);
     store::queue_review(
         pool,
         release.id,
