@@ -111,7 +111,6 @@ h3{font-size:.95rem;margin:0 0 .4rem}\
 .card ul{margin:.25rem 0;padding-left:1.2rem}\
 .notice{background:var(--card);border-left:3px solid var(--accent);padding:.4rem .6rem}\
 .blocker{color:var(--warn)}\
-.filters a{margin-right:.75rem}\
 .filters a[aria-current]{font-weight:600;color:var(--fg)}\
 select,input[type=text]{padding:.4rem .6rem;font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:.4rem}\
 input[type=text]{flex:1}\
