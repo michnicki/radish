@@ -967,7 +967,7 @@ async fn load_saved_reviews(
             Err(error) => {
                 outln_to!(
                     transcript,
-                    "  saved {provider} review cannot be read: {}; searching again",
+                    "  saved {provider} review cannot be read: {}; skipping it",
                     Clean(&format!("{error:#}"))
                 );
             }
@@ -2580,7 +2580,7 @@ mod tests {
                 lines.as_slice(),
                 [Line::Out(note)]
                     if note.contains("saved musicbrainz review cannot be read")
-                        && note.ends_with("searching again")
+                        && note.ends_with("skipping it")
             ),
             "{lines:?}"
         );
