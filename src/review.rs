@@ -14,7 +14,7 @@
 
 use crate::matcher::{self, Candidate, Evaluation, LocalRelease, MatchScope, RemoteRelease};
 use crate::providers::{ProviderKind, ProviderPolicy, ReleaseId};
-use crate::store::{self, LocalReleaseStatus, MatchGuard, StoredCandidate};
+use crate::store::{self, AcceptanceMethod, LocalReleaseStatus, MatchGuard, StoredCandidate};
 use anyhow::{Context, Result, bail};
 use sqlx::SqlitePool;
 
@@ -299,10 +299,92 @@ pub fn score_parts(candidate: &Candidate, evaluation: &Evaluation) -> Vec<String
         .collect()
 }
 
+/// What became of an accept made from a review page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptOutcome {
+    /// The candidate is the release's accepted match now.
+    Accepted,
+    /// The release is gone, or it or its accepted match changed after the page
+    /// was built; the page must be loaded again.
+    Changed,
+    /// The provider's saved review does not hold that release.
+    NotFound,
+    /// The mapping cannot be written; the mapping notes say why.
+    CannotApply(Vec<String>),
+}
+
+/// Accepts the saved `release_id` of `provider` for release `local_id`.
+///
+/// `revision` is the source revision the page was built from: the release,
+/// the provider's saved review and the accepted match must all still be as
+/// they were then. The decision is stored as `manual`, at the scope it was
+/// judged at, and clears the release's saved reviews.
+///
+/// # Errors
+///
+/// When the database cannot be read or written.
+pub async fn accept_saved(
+    pool: &SqlitePool,
+    local_id: i64,
+    provider: ProviderKind,
+    release_id: &str,
+    revision: &str,
+) -> Result<AcceptOutcome> {
+    let Some(release) = load_release(pool, local_id).await? else {
+        return Ok(AcceptOutcome::Changed);
+    };
+    if release.revision != revision {
+        return Ok(AcceptOutcome::Changed);
+    }
+    let guard = match store::load_match_guard(pool, local_id).await {
+        Ok(guard) => guard,
+        Err(error) if error.downcast_ref::<store::SnapshotChanged>().is_some() => {
+            return Ok(AcceptOutcome::Changed);
+        }
+        Err(error) => return Err(error),
+    };
+    if guard.source_revision != revision {
+        return Ok(AcceptOutcome::Changed);
+    }
+    let Some(review) = store::load_review(pool, local_id, provider).await? else {
+        return Ok(AcceptOutcome::NotFound);
+    };
+    if review.guard != guard {
+        return Ok(AcceptOutcome::Changed);
+    }
+    let Some((candidate, evaluation)) = candidate_pairs(&review.candidates)
+        .into_iter()
+        .find(|(candidate, _)| candidate.release.id.storage_id() == release_id)
+    else {
+        return Ok(AcceptOutcome::NotFound);
+    };
+    if !evaluation.can_apply(&release, &candidate) {
+        return Ok(AcceptOutcome::CannotApply(candidate.mapping.notes.clone()));
+    }
+    match store::accept_match(
+        pool,
+        &release,
+        &candidate,
+        AcceptanceMethod::Manual,
+        evaluation.match_scope,
+        &guard,
+    )
+    .await
+    {
+        Ok(()) => Ok(AcceptOutcome::Accepted),
+        Err(error) if error.downcast_ref::<store::SnapshotChanged>().is_some() => {
+            Ok(AcceptOutcome::Changed)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{FIXTURE_MBID, mbid_release, queue, remote_release, seed_release};
+    use crate::test_support::{
+        FIXTURE_MBID, OTHER_MBID, mbid_release, queue, remote_release, seed_release,
+    };
 
     const MBID: &str = FIXTURE_MBID;
 
@@ -475,6 +557,165 @@ mod tests {
             !score_parts(&candidate, &evaluation)
                 .iter()
                 .any(|part| part.starts_with("year "))
+        );
+    }
+
+    #[tokio::test]
+    async fn accepting_a_saved_candidate_matches_the_release_and_clears_its_queue() {
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let titles = ["One", "Two"];
+        let release = seed_release(&pool, "/music/a", "Blue", &titles).await;
+        queue(
+            &pool,
+            &release,
+            remote_release(mbid_release(FIXTURE_MBID), "Blue", &titles),
+        )
+        .await;
+
+        let outcome = accept_saved(
+            &pool,
+            release.id,
+            ProviderKind::MusicBrainz,
+            FIXTURE_MBID,
+            &release.revision,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, AcceptOutcome::Accepted);
+        let status = store::release_status(&pool, release.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.status, store::STATUS_MATCHED);
+        assert_eq!(status.provider, Some(ProviderKind::MusicBrainz));
+        let (reviews, method): (i64, String) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM match_reviews), acceptance_method FROM release_matches",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((reviews, method.as_str()), (0, "manual"));
+
+        // A candidate saved after the match replaces it.
+        queue(
+            &pool,
+            &release,
+            remote_release(ReleaseId::Discogs(42), "Blue", &titles),
+        )
+        .await;
+        let outcome = accept_saved(
+            &pool,
+            release.id,
+            ProviderKind::Discogs,
+            "42",
+            &release.revision,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, AcceptOutcome::Accepted);
+        let status = store::release_status(&pool, release.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.provider, Some(ProviderKind::Discogs));
+    }
+
+    #[tokio::test]
+    async fn accepting_refuses_what_the_page_no_longer_shows() {
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let titles = ["One", "Two"];
+        let release = seed_release(&pool, "/music/a", "Blue", &titles).await;
+        queue(
+            &pool,
+            &release,
+            remote_release(mbid_release(FIXTURE_MBID), "Blue", &titles),
+        )
+        .await;
+        let accept = |provider, id: &'static str, revision: String| {
+            let pool = pool.clone();
+            async move {
+                accept_saved(&pool, release.id, provider, id, &revision)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        assert_eq!(
+            accept(ProviderKind::MusicBrainz, FIXTURE_MBID, "other".into()).await,
+            AcceptOutcome::Changed
+        );
+        assert_eq!(
+            accept(
+                ProviderKind::MusicBrainz,
+                OTHER_MBID,
+                release.revision.clone()
+            )
+            .await,
+            AcceptOutcome::NotFound
+        );
+        assert_eq!(
+            accept(ProviderKind::Deezer, "7", release.revision.clone()).await,
+            AcceptOutcome::NotFound
+        );
+        assert_eq!(
+            accept_saved(
+                &pool,
+                release.id + 100,
+                ProviderKind::MusicBrainz,
+                FIXTURE_MBID,
+                &release.revision
+            )
+            .await
+            .unwrap(),
+            AcceptOutcome::Changed
+        );
+        sqlx::query("UPDATE match_reviews SET source_revision = 'old'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            accept(
+                ProviderKind::MusicBrainz,
+                FIXTURE_MBID,
+                release.revision.clone()
+            )
+            .await,
+            AcceptOutcome::Changed
+        );
+        let status = store::release_status(&pool, release.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            status.status,
+            store::STATUS_UNMATCHED,
+            "nothing was accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mapping_that_cannot_be_applied_is_refused() {
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let release = seed_release(&pool, "/music/a", "Blue", &["One", "Two", "Three"]).await;
+        // Two provider tracks for three files: the mapping is incomplete.
+        queue(
+            &pool,
+            &release,
+            remote_release(mbid_release(FIXTURE_MBID), "Blue", &["One", "Two"]),
+        )
+        .await;
+        let outcome = accept_saved(
+            &pool,
+            release.id,
+            ProviderKind::MusicBrainz,
+            FIXTURE_MBID,
+            &release.revision,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, AcceptOutcome::CannotApply(_)),
+            "{outcome:?}"
         );
     }
 }
