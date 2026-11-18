@@ -984,8 +984,9 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        // Only the Deezer migration: a later one (the review summaries) adds
-        // an index over the table, and writes to the WAL after the checkpoint.
+        // Only the migrations up to the Deezer one: the later migrations, and
+        // the summary pass that rewrites review rows, write to the WAL after
+        // its checkpoint.
         MIGRATOR.run_to(DEEZER, &pool).await.unwrap();
 
         // The copy wrote about 2 MB; only sqlx's bookkeeping row follows the

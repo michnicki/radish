@@ -63,10 +63,11 @@ pub fn summarize(
 /// Adds `candidate` in front of its provider's saved review of a release.
 ///
 /// The release must still have the source revision `release` was loaded with.
-/// A saved review made for the release as it is now keeps its other candidates (without an earlier entry
-/// for the same release) and its reasons; any other saved review is replaced
-/// by `candidate` alone, with `reason`. The review's guard is the release's
-/// current revision and accepted match.
+/// A saved review made for the release as it is now keeps its other
+/// candidates (without an earlier entry for the same release) and its
+/// reasons; any other saved review is replaced by `candidate` alone, with
+/// `reason`. The review's guard is the release's current revision and
+/// accepted match.
 ///
 /// Returns `false`, writing nothing, when the release is gone or changed.
 ///
@@ -156,6 +157,9 @@ const SUMMARY_CHUNK: usize = 2_000;
 /// its files changed, is summarized as one that cannot be accepted, so no row
 /// is left for the next open.
 ///
+/// Filling the columns rewrites each review row through the WAL, so the pass
+/// truncates the WAL afterwards; a checkpoint that reports busy is ignored.
+///
 /// # Errors
 ///
 /// When the database cannot be read or written.
@@ -193,7 +197,7 @@ pub async fn fill_review_summaries(pool: &SqlitePool) -> Result<u64> {
             .collect();
         let rows: Vec<PendingRow> = sqlx::query_as(
             "SELECT local_release_id, provider, snapshot_version, source_revision, reasons_json,
-                    json_valid(candidates_json),
+                    CASE WHEN json_valid(candidates_json) THEN json_type(candidates_json) END,
                     CASE WHEN json_valid(candidates_json) THEN candidates_json -> '$[0]' END
              FROM match_reviews
              WHERE top_can_apply IS NULL
@@ -223,16 +227,31 @@ pub async fn fill_review_summaries(pool: &SqlitePool) -> Result<u64> {
         done += rows.len() as u64;
         eprintln!("  {} of {}", grouped(done), grouped(total));
     }
+    // The pragma returns a row (busy flag and page counts), so fetch it; a
+    // busy checkpoint only leaves the WAL for the next one. Memory databases
+    // have no WAL, and it is a no-op there.
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .fetch_all(pool)
+        .await?;
     Ok(done)
 }
 
 /// One unsummarized review: release, provider, snapshot version, source
-/// revision, reasons, whether the candidates are valid JSON, first candidate.
-type PendingRow = (i64, String, i64, String, String, bool, Option<String>);
+/// revision, reasons, the JSON type of the candidates (`None` when they are
+/// not valid JSON), first candidate.
+type PendingRow = (
+    i64,
+    String,
+    i64,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
 
 /// The summary of one unsummarized review, given its release if it exists.
 fn summary_of_row(release: Option<&LocalRelease>, row: &PendingRow) -> ReviewSummary {
-    let (_, provider, version, source_revision, reasons_json, valid, first) = row;
+    let (_, provider, version, source_revision, reasons_json, kind, first) = row;
     let reasons: Vec<String> = serde_json::from_str(reasons_json).unwrap_or_default();
     let cannot = |score: Option<f64>, reason: &str, blockers: i64| ReviewSummary {
         score,
@@ -248,7 +267,14 @@ fn summary_of_row(release: Option<&LocalRelease>, row: &PendingRow) -> ReviewSum
             Ok(mut decoded) => decoded.pop(),
             Err(_) => return cannot(None, "saved review cannot be read", 0),
         },
-        None if *valid => None,
+        // An array with no first element holds no candidate, but an unknown
+        // snapshot version still makes the review unreadable.
+        None if kind.as_deref() == Some("array") => {
+            match decode_stored_candidates(*version, provider, "[]") {
+                Ok(mut decoded) => decoded.pop(),
+                Err(_) => return cannot(None, "saved review cannot be read", 0),
+            }
+        }
         None => return cannot(None, "saved review cannot be read", 0),
     };
     let candidates: Vec<StoredCandidate> = candidate.into_iter().collect();
@@ -788,5 +814,57 @@ mod tests {
         }
         // Nothing is left for the next open.
         assert_eq!(fill_review_summaries(&pool).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_one_time_pass_reads_only_an_array_of_candidates() {
+        let (pool, [a, b, _, d]) = library().await;
+        sqlx::query("UPDATE match_reviews SET top_score = NULL, top_can_apply = NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Valid JSON that is not an array, an empty array, and an empty array
+        // under a snapshot version nothing decodes.
+        for (id, json, version) in [(a, "{}", 2), (b, "[]", 2), (d, "[]", 99)] {
+            sqlx::query(
+                "UPDATE match_reviews SET candidates_json = ?2, snapshot_version = ?3
+                 WHERE local_release_id = ?1 AND provider = (
+                    SELECT provider FROM match_reviews WHERE local_release_id = ?1
+                    ORDER BY provider LIMIT 1)",
+            )
+            .bind(id)
+            .bind(json)
+            .bind(version)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        fill_review_summaries(&pool).await.unwrap();
+        let reasons: Vec<(i64, Option<String>)> = sqlx::query_as(
+            "SELECT local_release_id, top_reason FROM match_reviews
+             WHERE local_release_id IN (?1, ?2, ?3) AND top_can_apply = 0
+             ORDER BY local_release_id, provider",
+        )
+        .bind(a)
+        .bind(b)
+        .bind(d)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let unreadable = Some("saved review cannot be read".to_string());
+        let reason_of = |id: i64| {
+            reasons
+                .iter()
+                .find(|(row, _)| *row == id)
+                .map(|(_, reason)| reason.clone())
+        };
+        assert_eq!(reason_of(a), Some(unreadable.clone()), "{reasons:?}");
+        assert_eq!(reason_of(d), Some(unreadable), "{reasons:?}");
+        // An empty array is a review with no candidate: its first reason.
+        assert_eq!(
+            reason_of(b),
+            Some(Some("uncertain".to_string())),
+            "{reasons:?}"
+        );
     }
 }

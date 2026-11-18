@@ -1783,10 +1783,12 @@ enum Pick<'a> {
     Many(&'a [i64]),
 }
 
-// The SQL of `load_releases`, once with the ID as its own condition and once
-// with the optional `?2 IS NULL OR` form. SQLite reads a release by its primary
-// key and its tracks by `idx_tracks_local_release` only from the first form;
-// the second hides the key from the planner and scans every row.
+// The SQL of `load_releases`, once for each form of the ID condition: one
+// release (`lr.id = ?2`), many (`lr.id IN (SELECT value FROM json_each(?2))`,
+// `?2` a JSON array) and any (`?2 IS NULL OR lr.id = ?2`). SQLite reads a
+// release by its primary key and its tracks by `idx_tracks_local_release` only
+// from the first two forms; the third hides the key from the planner and scans
+// every row.
 // The `?4` condition at the end is the review queue's rule, limited to a set of
 // providers, as `queued_where!` in `store/reviews.rs` defines it: `?4` is a JSON
 // array that `json_each` expands, where the definition takes one provider.
