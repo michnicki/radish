@@ -210,6 +210,83 @@ async fn seed_without_edition_ids(db: &Path) -> i64 {
     id
 }
 
+/// Adds `/music/red`, two tracks with no identifiers, and returns its ID.
+async fn seed_red(db: &Path) -> i64 {
+    let pool = radish::db::connect(db).await.unwrap();
+    let directory = Path::new("/music/red");
+    let directory_id = store::upsert_directory(&pool, directory).await.unwrap();
+    for number in 1..=2i64 {
+        let track = ScannedTrack {
+            path: directory.join(format!("0{number}.flac")),
+            title: Some(format!("Red {number}")),
+            artist: Some("Other Artist".to_string()),
+            album: Some("Red".to_string()),
+            album_artist: Some("Other Artist".to_string()),
+            year: Some(1999),
+            track_number: Some(number),
+            disc_number: None,
+            barcode: None,
+            catalog_number: None,
+            discogs_release_id: None,
+            musicbrainz: ObservedMusicBrainzIds::default(),
+            duration_secs: Some(200.0),
+            modified_at: 1,
+        };
+        store::upsert_track(&pool, &track, directory_id)
+            .await
+            .unwrap();
+    }
+    store::rebuild_local_releases(&pool, None).await.unwrap();
+    let id = store::list_local_releases(&pool, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|release| release.directory == "/music/red")
+        .unwrap()
+        .id;
+    pool.close().await;
+    id
+}
+
+/// Queues the blue release with a direct MusicBrainz selection.
+fn queue_blue(db: &Path, server: &MockServer, blue: i64) {
+    let queued = run(
+        db,
+        server,
+        &[
+            "match",
+            "--local-release",
+            &blue.to_string(),
+            "--musicbrainz-release",
+            MBID,
+        ],
+    );
+    assert!(
+        stdout(&queued).contains("Queued for review: 1"),
+        "{queued:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_queued_run_matches_only_the_queued_releases() {
+    let db = db_path("queued-match");
+    let blue = seed(&db, 2001).await;
+    let red = seed_red(&db).await;
+    let server = MockServer::start(handler);
+    queue_blue(&db, &server, blue);
+
+    let output = run(&db, &server, &["match", "--queued", "--dry-run"]);
+    let text = stdout(&output);
+    assert!(
+        text.contains(&format!("Matching local release {blue} (")),
+        "{text}"
+    );
+    assert!(
+        !text.contains(&format!("Matching local release {red} (")),
+        "{text}"
+    );
+}
+
 #[tokio::test]
 async fn equivalent_editions_match_automatically_without_edition_identifiers() {
     let db = db_path("album-auto");

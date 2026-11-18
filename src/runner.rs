@@ -67,6 +67,8 @@ pub struct MatchOptions {
     pub local_release: Option<i64>,
     pub direct_release: Option<ReleaseId>,
     pub review: bool,
+    /// Only releases queued for review by a provider the policy allows.
+    pub queued: bool,
     pub dry_run: bool,
     pub policy: ProviderPolicy,
     /// How many releases to match at once; 0 and 1 both mean one at a time.
@@ -605,9 +607,11 @@ where
 
     let statuses = store::status_by_id(pool).await?;
     let existing_matches = store::accepted_matches_by_release(pool).await?;
-    let releases =
-        store::load_selected_releases(pool, options.scope.as_deref(), options.local_release)
-            .await?;
+    let releases = if options.queued {
+        store::load_queued_releases(pool, options.scope.as_deref(), &options.policy.order()).await?
+    } else {
+        store::load_selected_releases(pool, options.scope.as_deref(), options.local_release).await?
+    };
 
     if let Some(id) = options.local_release
         && releases.is_empty()

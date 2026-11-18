@@ -136,6 +136,9 @@ enum Command {
         /// Review candidates interactively instead of accepting automatically
         #[arg(long, conflicts_with = "clear")]
         review: bool,
+        /// Only releases queued for review by a provider this run may use
+        #[arg(long, conflicts_with_all = ["local_release", "clear"])]
+        queued: bool,
         /// Search and show decisions without storing matches
         #[arg(long = "dry-run")]
         dry_run: bool,
@@ -663,6 +666,7 @@ async fn run() -> Result<()> {
             discogs_release: _,
             deezer_release: _,
             review,
+            queued,
             dry_run,
             offline,
             jobs,
@@ -681,6 +685,7 @@ async fn run() -> Result<()> {
                     local_release,
                     direct_release: direct,
                     review,
+                    queued,
                     dry_run,
                     policy: policy.unwrap_or_default(),
                     jobs: match_jobs(offline, jobs),
@@ -961,6 +966,16 @@ mod tests {
     #[test]
     fn local_release_conflicts_with_a_path() {
         assert!(parse(&["match", "--local-release", "3", "/music"]).is_err());
+    }
+
+    #[test]
+    fn queued_combines_with_selections_but_not_with_one_release() {
+        assert!(parse(&["match", "--queued"]).is_ok());
+        assert!(parse(&["match", "--queued", "--review", "/music"]).is_ok());
+        assert!(parse(&["match", "--queued", "--offline", "--jobs", "2", "--deezer"]).is_ok());
+        assert!(parse(&["match", "--queued", "--provider", "discogs", "--dry-run"]).is_ok());
+        assert!(parse(&["match", "--queued", "--local-release", "3"]).is_err());
+        assert!(parse(&["match", "--queued", "--clear", "3"]).is_err());
     }
 
     #[test]

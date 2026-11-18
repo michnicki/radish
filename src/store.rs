@@ -1735,6 +1735,44 @@ pub async fn load_selected_releases(
     scope: Option<&Path>,
     id: Option<i64>,
 ) -> Result<Vec<LocalRelease>> {
+    load_releases(pool, scope, id, None).await
+}
+
+/// The releases under `scope` that wait for review by one of `providers`.
+///
+/// A release waits for review when it is not matched and has a saved review.
+/// Only reviews of `providers` count, so a run that could not load a release's
+/// only review does not select it and search again.
+///
+/// # Errors
+///
+/// When the database cannot be read.
+pub async fn load_queued_releases(
+    pool: &SqlitePool,
+    scope: Option<&Path>,
+    providers: &[ProviderKind],
+) -> Result<Vec<LocalRelease>> {
+    load_releases(pool, scope, None, Some(providers)).await
+}
+
+/// Loads releases and their tracks in one read transaction.
+///
+/// `queued` limits the result to unmatched releases with a saved review from
+/// one of the listed providers; `None` does not look at reviews.
+async fn load_releases(
+    pool: &SqlitePool,
+    scope: Option<&Path>,
+    id: Option<i64>,
+    queued: Option<&[ProviderKind]>,
+) -> Result<Vec<LocalRelease>> {
+    // The providers whose saved reviews select a release, as a JSON array for
+    // `json_each`; `None` selects without looking at reviews.
+    let queued = queued
+        .map(|providers| {
+            serde_json::to_string(&providers.iter().map(|p| p.as_str()).collect::<Vec<_>>())
+        })
+        .transpose()?;
+
     // A merged release lives at its unit's folder, above the disc subfolder
     // the scope may name; take that release too, and nothing else from there.
     let merged_parent = scope
@@ -1765,11 +1803,17 @@ pub async fn load_selected_releases(
                                   AND substr(replace(m.path, '\\', '/'), 1, length(?1) + 1)
                                       = (?1 || '/') COLLATE NOCASE)))
            AND (?2 IS NULL OR lr.id = ?2)
+           AND (?4 IS NULL
+                OR (lr.status <> 'matched'
+                    AND EXISTS (SELECT 1 FROM match_reviews r
+                                WHERE r.local_release_id = lr.id
+                                  AND r.provider IN (SELECT value FROM json_each(?4)))))
          ORDER BY lr.directory_path, lr.album_title_norm",
     )
     .bind(scope)
     .bind(id)
     .bind(merged_parent.as_deref())
+    .bind(queued.as_deref())
     .fetch_all(&mut *tx)
     .await?;
 
@@ -1790,11 +1834,17 @@ pub async fn load_selected_releases(
                                   AND substr(replace(m.path, '\\', '/'), 1, length(?1) + 1)
                                       = (?1 || '/') COLLATE NOCASE)))
            AND (?2 IS NULL OR lr.id = ?2)
+           AND (?4 IS NULL
+                OR (lr.status <> 'matched'
+                    AND EXISTS (SELECT 1 FROM match_reviews r
+                                WHERE r.local_release_id = lr.id
+                                  AND r.provider IN (SELECT value FROM json_each(?4)))))
          ORDER BY t.path",
     )
     .bind(scope)
     .bind(id)
     .bind(merged_parent.as_deref())
+    .bind(queued.as_deref())
     .fetch_all(&mut *tx)
     .await?;
 
@@ -5712,6 +5762,68 @@ mod tests {
             vec![Target::New, Target::New, Target::Existing(3)]
         );
         assert_eq!(plan.removed, vec![1, 2, 4]);
+    }
+
+    #[tokio::test]
+    async fn queued_loading_takes_unmatched_releases_reviewed_by_an_allowed_provider() {
+        use crate::test_support::{
+            FIXTURE_MBID, mbid_release, queue, remote_release, seed_release,
+        };
+        let pool = test_pool().await;
+        let titles = ["One", "Two"];
+        let a = seed_release(&pool, "/music/a", "Blue", &titles).await;
+        let b = seed_release(&pool, "/music/b", "Red", &titles).await;
+        seed_release(&pool, "/music/c", "Green", &titles).await;
+        queue(
+            &pool,
+            &a,
+            remote_release(mbid_release(FIXTURE_MBID), "Blue", &titles),
+        )
+        .await;
+        queue(
+            &pool,
+            &b,
+            remote_release(ReleaseId::Deezer(7), "Red", &titles),
+        )
+        .await;
+
+        let ids = |releases: Vec<LocalRelease>| -> Vec<i64> {
+            releases.into_iter().map(|release| release.id).collect()
+        };
+        let chain = [ProviderKind::MusicBrainz, ProviderKind::Discogs];
+        let with_deezer = [
+            ProviderKind::MusicBrainz,
+            ProviderKind::Discogs,
+            ProviderKind::Deezer,
+        ];
+        assert_eq!(
+            ids(load_queued_releases(&pool, None, &chain).await.unwrap()),
+            vec![a.id]
+        );
+        assert_eq!(
+            ids(load_queued_releases(&pool, None, &with_deezer)
+                .await
+                .unwrap()),
+            vec![a.id, b.id]
+        );
+        let scoped = load_queued_releases(&pool, Some(Path::new("/music/b")), &with_deezer)
+            .await
+            .unwrap();
+        assert_eq!(scoped[0].tracks.len(), 2, "tracks come with the release");
+        assert_eq!(ids(scoped), vec![b.id]);
+
+        // A matched release with a leftover review is not queued.
+        sqlx::query("UPDATE local_releases SET status = 'matched' WHERE id = ?1")
+            .bind(a.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            load_queued_releases(&pool, None, &chain)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
