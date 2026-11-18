@@ -2072,6 +2072,28 @@ pub async fn list_local_releases(
         .collect())
 }
 
+/// The status of one release, as `releases` shows it, or `None` when it is gone.
+///
+/// Reads only the release's unit, through the same listing as the folder page.
+///
+/// # Errors
+///
+/// When the database cannot be read.
+pub async fn release_status(pool: &SqlitePool, id: i64) -> Result<Option<LocalReleaseStatus>> {
+    let mut tx = pool.begin().await?;
+    let unit: Option<String> =
+        sqlx::query_scalar("SELECT unit_path FROM local_releases WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(unit) = unit else {
+        return Ok(None);
+    };
+    let (rows, _) = status_listing(&mut tx, Some(&unit)).await?;
+    tx.commit().await?;
+    Ok(rows.into_iter().find(|row| row.id == id))
+}
+
 /// The select list and joins every status query shares, followed by `$tail`.
 macro_rules! status_select {
     ($tail:literal) => {
@@ -3160,6 +3182,32 @@ mod tests {
 
     async fn test_pool() -> SqlitePool {
         crate::db::connect_in_memory().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn release_status_reads_one_release() {
+        let pool = test_pool().await;
+        insert(
+            &pool,
+            "/music/a",
+            &[scanned("/music/a/01.flac", Some("Blue"), Some("Artist"), 1)],
+        )
+        .await;
+        insert(
+            &pool,
+            "/music/b",
+            &[scanned("/music/b/01.flac", Some("Red"), Some("Artist"), 1)],
+        )
+        .await;
+        let listed = list_local_releases(&pool, None).await.unwrap();
+        let red = listed
+            .iter()
+            .find(|row| row.album_title.as_deref() == Some("Red"))
+            .unwrap();
+        let status = release_status(&pool, red.id).await.unwrap().unwrap();
+        assert_eq!(status.id, red.id);
+        assert_eq!(status.directory, "/music/b");
+        assert!(release_status(&pool, red.id + 100).await.unwrap().is_none());
     }
 
     fn observed(path: &str, album: &str) -> ObservedTrack {

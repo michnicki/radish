@@ -3,16 +3,20 @@
 //! A release that matching cannot settle is queued with up to five candidates
 //! per provider (`match_reviews`). This module holds what both review front
 //! ends need: reading what a person typed as a release ID or link
-//! ([`parse_entered`]), and, in later sections, loading a release's saved
-//! reviews, accepting one candidate, and adding a release fetched by its ID.
+//! ([`parse_entered`]), loading a release's saved reviews ([`load`]), the text
+//! a candidate card shows ([`edition_details`], [`score_parts`]), and
+//! accepting one saved candidate as the page showed it ([`accept_saved`]).
 //!
 //! The terminal prompt in [`crate::runner`] and the pages in [`crate::web`]
 //! both use it, so a candidate is judged and accepted the same way in both.
 
 // Rust guideline compliant 2026-08-14
 
-use crate::providers::{ProviderKind, ReleaseId};
+use crate::matcher::{self, Candidate, Evaluation, LocalRelease, MatchScope, RemoteRelease};
+use crate::providers::{ProviderKind, ProviderPolicy, ReleaseId};
+use crate::store::{self, LocalReleaseStatus, MatchGuard, StoredCandidate};
 use anyhow::{Context, Result, bail};
+use sqlx::SqlitePool;
 
 /// The release ID a person entered for `provider`: a bare ID or a link.
 ///
@@ -114,11 +118,193 @@ fn parse_link(provider: ProviderKind, raw: &str) -> Result<ReleaseId> {
     parse_bare(provider, value)
 }
 
+/// Whether a saved review can still be acted on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupState {
+    /// Saved for the release as it is now.
+    Current,
+    /// Saved before the files or the accepted match changed; its mapping
+    /// indexes files that may have moved, so it cannot be accepted.
+    OutOfDate,
+    /// The stored snapshot cannot be decoded; the message says why.
+    Unreadable(String),
+}
+
+/// One provider's saved candidates for a release.
+#[derive(Debug, Clone)]
+pub struct ReviewGroup {
+    /// The provider that proposed the candidates.
+    pub provider: ProviderKind,
+    /// Whether the group can still be accepted from.
+    pub state: GroupState,
+    /// Why matching queued the release instead of accepting it.
+    pub reasons: Vec<String>,
+    /// Each candidate with its evaluation as it was stored, best first.
+    pub candidates: Vec<(Candidate, Evaluation)>,
+}
+
+/// One release with everything its review page shows.
+#[derive(Debug, Clone)]
+pub struct ReleaseReview {
+    /// The release as matching loads it.
+    pub release: LocalRelease,
+    /// The status label and accepted match, as `releases` shows them.
+    pub status: LocalReleaseStatus,
+    /// The release's current source revision and accepted match.
+    pub guard: MatchGuard,
+    /// Saved reviews in the order matching tries providers.
+    pub groups: Vec<ReviewGroup>,
+}
+
+/// Loads release `local_id` with each provider's saved review.
+///
+/// A group whose stored guard differs from the release's current one is
+/// [`GroupState::OutOfDate`]; one that cannot be decoded is
+/// [`GroupState::Unreadable`], and the others still load.
+///
+/// # Errors
+///
+/// When the database cannot be read.
+pub async fn load(pool: &SqlitePool, local_id: i64) -> Result<Option<ReleaseReview>> {
+    let Some(release) = load_release(pool, local_id).await? else {
+        return Ok(None);
+    };
+    let Some(status) = store::release_status(pool, local_id).await? else {
+        return Ok(None);
+    };
+    let guard = match store::load_match_guard(pool, local_id).await {
+        Ok(guard) => guard,
+        Err(error) if error.downcast_ref::<store::SnapshotChanged>().is_some() => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut groups = Vec::new();
+    for provider in (ProviderPolicy::Chain { deezer: true }).order() {
+        match store::load_review(pool, local_id, provider).await {
+            Ok(None) => {}
+            Ok(Some(review)) => groups.push(ReviewGroup {
+                provider,
+                state: if review.guard == guard && guard.source_revision == release.revision {
+                    GroupState::Current
+                } else {
+                    GroupState::OutOfDate
+                },
+                reasons: review.reasons,
+                candidates: candidate_pairs(&review.candidates),
+            }),
+            Err(error) => groups.push(ReviewGroup {
+                provider,
+                state: GroupState::Unreadable(format!("{error:#}")),
+                reasons: Vec::new(),
+                candidates: Vec::new(),
+            }),
+        }
+    }
+    Ok(Some(ReleaseReview {
+        release,
+        status,
+        guard,
+        groups,
+    }))
+}
+
+/// The local release `local_id` as matching loads it, if it exists.
+async fn load_release(pool: &SqlitePool, local_id: i64) -> Result<Option<LocalRelease>> {
+    Ok(store::load_selected_releases(pool, None, Some(local_id))
+        .await?
+        .into_iter()
+        .next())
+}
+
+/// Saved candidates as the matcher's types, each with its stored evaluation.
+pub fn candidate_pairs(stored: &[StoredCandidate]) -> Vec<(Candidate, Evaluation)> {
+    stored
+        .iter()
+        .map(|saved| {
+            (
+                Candidate {
+                    release: saved.release.clone(),
+                    mapping: saved.mapping.clone(),
+                    score: saved.score,
+                },
+                Evaluation {
+                    auto_accept: saved.auto_accept,
+                    match_scope: saved.match_scope,
+                    blockers: saved.blockers.clone(),
+                    warnings: saved.warnings.clone(),
+                    evidence: saved.evidence.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// `candidate` and its `evaluation` as a saved review stores them.
+pub fn stored_candidate(candidate: &Candidate, evaluation: &Evaluation) -> StoredCandidate {
+    StoredCandidate {
+        release: candidate.release.clone(),
+        mapping: candidate.mapping.clone(),
+        score: candidate.score,
+        auto_accept: evaluation.auto_accept,
+        match_scope: evaluation.match_scope,
+        blockers: evaluation.blockers.clone(),
+        warnings: evaluation.warnings.clone(),
+        evidence: evaluation.evidence.clone(),
+    }
+}
+
+/// The edition facts of `release`: year, country, labels, catalog numbers,
+/// formats and edition notes, in that order, each present only when known.
+pub fn edition_details(release: &RemoteRelease) -> Vec<String> {
+    let mut details = Vec::new();
+    if let Some(year) = release.year {
+        details.push(format!("year {year}"));
+    }
+    if let Some(country) = &release.country {
+        details.push(country.clone());
+    }
+    if let Some(label) = release.label_display() {
+        details.push(label);
+    }
+    for catalog in &release.catalog_numbers {
+        details.push(format!("catno {catalog}"));
+    }
+    if let Some(format) = release.format_display() {
+        details.push(format);
+    }
+    if !release.edition_notes.is_empty() {
+        details.push(format!("edition: {}", release.edition_notes.join(", ")));
+    }
+    details
+}
+
+/// Each score component as `name value×weight`, as the candidate was judged.
+///
+/// An album match does not count the year, so it is left out and the other
+/// weights are scaled to sum to one again.
+pub fn score_parts(candidate: &Candidate, evaluation: &Evaluation) -> Vec<String> {
+    let album = evaluation.match_scope == MatchScope::Album;
+    candidate
+        .score
+        .components()
+        .iter()
+        .filter(|(name, _, _)| !(album && *name == "year"))
+        .map(|(name, value, weight)| {
+            let weight = if album {
+                weight / (1.0 - matcher::WEIGHT_YEAR)
+            } else {
+                *weight
+            };
+            format!("{name} {value:.2}×{weight:.2}")
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{FIXTURE_MBID, mbid_release, queue, remote_release, seed_release};
 
-    const MBID: &str = "76df3287-6cda-33eb-8e9a-044b5e15ffdd";
+    const MBID: &str = FIXTURE_MBID;
 
     #[test]
     fn entered_ids_take_bare_ids_and_links() {
@@ -205,6 +391,90 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "'abc' is not a Discogs release ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_marks_each_saved_group_current_out_of_date_or_unreadable() {
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let titles = ["One", "Two"];
+        let release = seed_release(&pool, "/music/a", "Blue", &titles).await;
+        queue(
+            &pool,
+            &release,
+            remote_release(ReleaseId::Discogs(42), "Blue", &titles),
+        )
+        .await;
+        queue(
+            &pool,
+            &release,
+            remote_release(mbid_release(FIXTURE_MBID), "Blue", &titles),
+        )
+        .await;
+
+        let review = load(&pool, release.id).await.unwrap().unwrap();
+        let providers: Vec<ProviderKind> =
+            review.groups.iter().map(|group| group.provider).collect();
+        assert_eq!(
+            providers,
+            vec![ProviderKind::MusicBrainz, ProviderKind::Discogs]
+        );
+        assert!(
+            review
+                .groups
+                .iter()
+                .all(|group| group.state == GroupState::Current)
+        );
+        assert_eq!(review.groups[0].candidates.len(), 1);
+        assert_eq!(review.groups[0].reasons, vec!["uncertain".to_string()]);
+        assert_eq!(review.status.id, release.id);
+        assert_eq!(review.guard.source_revision, release.revision);
+
+        sqlx::query("UPDATE match_reviews SET source_revision = 'old' WHERE provider = 'discogs'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE match_reviews SET candidates_json = 'nonsense' WHERE provider = 'musicbrainz'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let review = load(&pool, release.id).await.unwrap().unwrap();
+        assert!(matches!(review.groups[0].state, GroupState::Unreadable(_)));
+        assert_eq!(review.groups[1].state, GroupState::OutOfDate);
+
+        assert!(load(&pool, release.id + 100).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn card_text_lists_edition_details_and_weighted_scores() {
+        use crate::matcher::{Candidate, Evaluation, MatchScope};
+        use crate::test_support::local_release;
+        let local = local_release(1, "/music/a", "Blue", &["One"]);
+        let remote = remote_release(ReleaseId::Discogs(42), "Blue", &["One"]);
+        assert_eq!(
+            edition_details(&remote),
+            vec!["year 2001", "US", "Label", "catno CAT-1", "CD"]
+        );
+        let candidate = Candidate::new(&local, remote);
+        let mut evaluation = Evaluation {
+            auto_accept: false,
+            match_scope: MatchScope::Edition,
+            blockers: Vec::new(),
+            warnings: Vec::new(),
+            evidence: Vec::new(),
+        };
+        assert!(
+            score_parts(&candidate, &evaluation)
+                .iter()
+                .any(|part| part.starts_with("year "))
+        );
+        evaluation.match_scope = MatchScope::Album;
+        assert!(
+            !score_parts(&candidate, &evaluation)
+                .iter()
+                .any(|part| part.starts_with("year "))
         );
     }
 }

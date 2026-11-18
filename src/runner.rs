@@ -1643,16 +1643,7 @@ fn stored_candidates(attempt: &ProviderAttempt) -> Vec<StoredCandidate> {
         .iter()
         .zip(attempt.evaluations.iter())
         .take(REVIEW_CANDIDATE_LIMIT)
-        .map(|(candidate, evaluation)| StoredCandidate {
-            release: candidate.release.clone(),
-            mapping: candidate.mapping.clone(),
-            score: candidate.score,
-            auto_accept: evaluation.auto_accept,
-            match_scope: evaluation.match_scope,
-            blockers: evaluation.blockers.clone(),
-            warnings: evaluation.warnings.clone(),
-            evidence: evaluation.evidence.clone(),
-        })
+        .map(|(candidate, evaluation)| crate::review::stored_candidate(candidate, evaluation))
         .collect()
 }
 
@@ -1725,26 +1716,10 @@ fn review_groups(
     saved
         .iter()
         .map(|review| {
-            let candidates: Vec<Candidate> = review
-                .candidates
-                .iter()
-                .map(|stored| Candidate {
-                    release: stored.release.clone(),
-                    mapping: stored.mapping.clone(),
-                    score: stored.score,
-                })
-                .collect();
-            let evaluations: Vec<Evaluation> = review
-                .candidates
-                .iter()
-                .map(|stored| Evaluation {
-                    auto_accept: stored.auto_accept,
-                    match_scope: stored.match_scope,
-                    blockers: stored.blockers.clone(),
-                    warnings: stored.warnings.clone(),
-                    evidence: stored.evidence.clone(),
-                })
-                .collect();
+            let (candidates, evaluations): (Vec<Candidate>, Vec<Evaluation>) =
+                crate::review::candidate_pairs(&review.candidates)
+                    .into_iter()
+                    .unzip();
             (review.provider, candidates, evaluations)
         })
         .collect()
@@ -2087,25 +2062,7 @@ fn render_candidate(
     );
     let _ = writeln!(text, "      {}", Clean(&release.artist_display()));
     let _ = writeln!(text, "      {}", Clean(&release.url));
-    let mut details = Vec::new();
-    if let Some(year) = release.year {
-        details.push(format!("year {year}"));
-    }
-    if let Some(country) = &release.country {
-        details.push(country.clone());
-    }
-    if let Some(label) = release.label_display() {
-        details.push(label);
-    }
-    for catalog in &release.catalog_numbers {
-        details.push(format!("catno {catalog}"));
-    }
-    if let Some(format) = release.format_display() {
-        details.push(format);
-    }
-    if !release.edition_notes.is_empty() {
-        details.push(format!("edition: {}", release.edition_notes.join(", ")));
-    }
+    let details = crate::review::edition_details(release);
     if !details.is_empty() {
         let _ = writeln!(text, "      {}", Clean(&details.join(" · ")));
     }
@@ -2127,22 +2084,7 @@ fn render_candidate(
         );
     }
 
-    let components: Vec<String> = candidate
-        .score
-        .components()
-        .iter()
-        .filter_map(|(name, value, weight)| {
-            if evaluation.match_scope == MatchScope::Album && *name == "year" {
-                return None;
-            }
-            let weight = if evaluation.match_scope == MatchScope::Album {
-                weight / (1.0 - matcher::WEIGHT_YEAR)
-            } else {
-                *weight
-            };
-            Some(format!("{name} {value:.2}×{weight:.2}"))
-        })
-        .collect();
+    let components = crate::review::score_parts(candidate, evaluation);
     let _ = writeln!(text, "      score: {}", components.join("  "));
     let disc = candidate
         .mapping
