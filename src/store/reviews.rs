@@ -2,7 +2,11 @@
 //! candidate to a saved review.
 //!
 //! A release is *queued* when it is not matched and has at least one
-//! `match_reviews` row. [`add_review_candidate`] puts a release fetched by its
+//! `match_reviews` row. A [`QueueView`] picks a provider, an order (folder or
+//! lead score) and whether only releases with an acceptable top candidate
+//! count; [`queue_page`], [`queue_count`] and [`next_queued`] answer from the
+//! summary columns of `match_reviews`, never from the candidates' JSON.
+//! [`add_review_candidate`] puts a release fetched by its
 //! ID in front of a provider's saved candidates, in one write transaction so a
 //! concurrent `match` cannot interleave with it.
 
@@ -311,8 +315,57 @@ fn summary_of_row(release: Option<&LocalRelease>, row: &PendingRow) -> ReviewSum
     }
 }
 
-/// The condition that puts release `lr` in the review queue: not matched,
-/// with a saved review of provider `?1` (any provider when `?1` is `NULL`).
+/// How the review queue is ordered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QueueSort {
+    /// Folder order, as the releases listing.
+    #[default]
+    Folder,
+    /// By each release's lead score, highest first; no score last.
+    Score,
+}
+
+/// Which queued releases a queue page lists, and in what order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QueueView {
+    /// Only releases queued for this provider.
+    pub provider: Option<ProviderKind>,
+    /// The order.
+    pub sort: QueueSort,
+    /// Only releases with a current review whose top candidate can be accepted.
+    pub acceptable: bool,
+}
+
+/// The review that places a release in the queue: its best-scoring review
+/// among those the view allows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Lead {
+    /// The review's provider.
+    pub provider: ProviderKind,
+    /// Its top candidate's score.
+    pub score: Option<f64>,
+    /// Whether that candidate can be accepted.
+    pub can_apply: bool,
+    /// Why the release is queued: the candidate's first blocker, else the
+    /// review's first reason.
+    pub reason: Option<String>,
+    /// How many blockers the candidate has.
+    pub blockers: i64,
+}
+
+/// The condition on review `r` of release `lr` that a view allows: its
+/// provider (`?1`, any when `NULL`), and when acceptable only (`?2` is 1), a
+/// current review whose top candidate can be accepted. Answered from
+/// `idx_match_reviews_summary`.
+macro_rules! review_allowed {
+    () => {
+        "(?1 IS NULL OR r.provider = ?1)
+         AND (?2 = 0 OR (r.top_can_apply = 1 AND r.source_revision = lr.source_revision))"
+    };
+}
+
+/// The condition that puts release `lr` in a view (folder order): not
+/// matched, with a review the view allows.
 ///
 /// SQLite 3.51 (bundled through libsqlite3-sys 0.37) rewrites a plain
 /// correlated `EXISTS` into a join. Without the `LIMIT 1` that join yields a
@@ -322,21 +375,41 @@ fn summary_of_row(release: Option<&LocalRelease>, row: &PendingRow) -> ReviewSum
 /// the whole queue.
 macro_rules! queued_where {
     () => {
-        "lr.status <> 'matched'
-         AND EXISTS (SELECT 1 FROM match_reviews r
-                     WHERE r.local_release_id = lr.id AND (?1 IS NULL OR r.provider = ?1)
-                     LIMIT 1)"
+        concat!(
+            "lr.status <> 'matched'
+             AND EXISTS (SELECT 1 FROM match_reviews r
+                         WHERE r.local_release_id = lr.id AND ",
+            review_allowed!(),
+            " LIMIT 1)"
+        )
     };
 }
 
-/// [`queued_where!`] for counting, where the `IN` form is faster.
-///
-/// Keep the two in step: they must select the same releases.
-macro_rules! queued_count_where {
+/// Each release in a view with its lead score, for the score order: one
+/// `GROUP BY` over the summary index, no `EXISTS`. Releases with no score
+/// have a `NULL` score. The optional argument adds a condition, such as
+/// `"AND lr.id = ?3"` to read one release's lead alone.
+macro_rules! lead_scores {
     () => {
-        "lr.status <> 'matched'
-         AND lr.id IN (SELECT r.local_release_id FROM match_reviews r
-                       WHERE ?1 IS NULL OR r.provider = ?1)"
+        lead_scores!("")
+    };
+    ($extra:literal) => {
+        concat!(
+            "SELECT r.local_release_id AS id, MAX(r.top_score) AS score
+             FROM match_reviews r JOIN local_releases lr ON lr.id = r.local_release_id
+             WHERE lr.status <> 'matched' AND ",
+            review_allowed!(),
+            " ",
+            $extra,
+            " GROUP BY r.local_release_id"
+        )
+    };
+}
+
+/// The score order: lead score, highest first, no score last, then folder order.
+macro_rules! score_order {
+    () => {
+        "ORDER BY lead.score IS NULL, lead.score DESC, lr.directory_path, lr.album_title_norm"
     };
 }
 
@@ -362,146 +435,299 @@ pub struct QueuedRelease {
     /// The top candidate is the first in the saved list: after a fetch on the
     /// web, the release entered there, which need not be the best-scoring.
     pub top: Vec<(ProviderKind, Option<f64>)>,
+    /// The lead review; `None` when no review passes the view's filters,
+    /// which a listed release always has.
+    pub lead: Option<Lead>,
 }
 
 /// A queue row: ID, folder, unit, album title and artist, track count.
 type QueueRow = (i64, String, String, Option<String>, Option<String>, i64);
 
-/// One page of the review queue, in the order of the releases listing.
+/// One review's summary as the queue page reads it.
+#[derive(Debug, Clone, PartialEq)]
+struct SummaryRow {
+    provider: ProviderKind,
+    score: Option<f64>,
+    can_apply: bool,
+    reason: Option<String>,
+    blockers: i64,
+    current: bool,
+}
+
+/// The lead among one release's reviews under `view`: the highest score
+/// among the reviews the view allows, ties by provider order.
+fn lead_of(rows: &[SummaryRow], view: &QueueView) -> Option<Lead> {
+    rows.iter()
+        .filter(|row| {
+            view.provider
+                .is_none_or(|provider| provider == row.provider)
+        })
+        .filter(|row| !view.acceptable || (row.can_apply && row.current))
+        .min_by(|x, y| {
+            let rank =
+                |row: &SummaryRow| ProviderKind::CHAIN.iter().position(|p| *p == row.provider);
+            // `None` orders below every `Some`, so the highest score comes
+            // first and no score last.
+            y.score
+                .partial_cmp(&x.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| rank(x).cmp(&rank(y)))
+        })
+        .map(|row| Lead {
+            provider: row.provider,
+            score: row.score,
+            can_apply: row.can_apply,
+            reason: row.reason.clone(),
+            blockers: row.blockers,
+        })
+}
+
+/// A review's summary row from the database: release, provider, score,
+/// whether it can be accepted, reason, blockers, whether it is current.
+type SummaryRecord = (
+    i64,
+    String,
+    Option<f64>,
+    Option<i64>,
+    Option<String>,
+    Option<i64>,
+    bool,
+);
+
+/// One page of the review queue under `view`.
 ///
-/// `provider` keeps only releases queued for that provider. Only the first
-/// candidate of each review is read (`->`), so a page does not
-/// decode megabytes of snapshots.
+/// The folder order is that of the releases listing. The score order puts
+/// each release by its lead review's score, highest first and no score last,
+/// then by folder. `view.provider` keeps only releases queued for that
+/// provider, and `view.acceptable` only those with a current review whose top
+/// candidate can be accepted. Scores, reasons and blocker counts come from the
+/// summary columns of `match_reviews`, never from the candidates' JSON.
 ///
 /// # Errors
 ///
 /// When the database cannot be read.
 pub async fn queue_page(
     pool: &SqlitePool,
-    provider: Option<ProviderKind>,
+    view: &QueueView,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<QueuedRelease>> {
-    let filter = provider.map(ProviderKind::as_str);
+    let provider = view.provider.map(ProviderKind::as_str);
+    let acceptable = i64::from(view.acceptable);
     let mut tx = pool.begin().await?;
-    let rows: Vec<QueueRow> = sqlx::query_as(concat!(
-        "SELECT lr.id, lr.directory_path, lr.unit_path, lr.album_title, lr.album_artist,
-                    lr.track_count
-             FROM local_releases lr WHERE ",
-        queued_where!(),
-        " ORDER BY lr.directory_path, lr.album_title_norm LIMIT ?2 OFFSET ?3"
-    ))
-    .bind(filter)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(&mut *tx)
-    .await?;
+    let rows: Vec<QueueRow> = match view.sort {
+        QueueSort::Folder => {
+            sqlx::query_as(concat!(
+                "SELECT lr.id, lr.directory_path, lr.unit_path, lr.album_title, lr.album_artist,
+                        lr.track_count
+                 FROM local_releases lr WHERE ",
+                queued_where!(),
+                " ORDER BY lr.directory_path, lr.album_title_norm LIMIT ?3 OFFSET ?4"
+            ))
+            .bind(provider)
+            .bind(acceptable)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&mut *tx)
+            .await?
+        }
+        QueueSort::Score => {
+            sqlx::query_as(concat!(
+                "WITH lead AS (",
+                lead_scores!(),
+                ")
+                 SELECT lr.id, lr.directory_path, lr.unit_path, lr.album_title, lr.album_artist,
+                        lr.track_count
+                 FROM lead JOIN local_releases lr ON lr.id = lead.id ",
+                score_order!(),
+                " LIMIT ?3 OFFSET ?4"
+            ))
+            .bind(provider)
+            .bind(acceptable)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&mut *tx)
+            .await?
+        }
+    };
     let ids = serde_json::to_string(&rows.iter().map(|row| row.0).collect::<Vec<_>>())?;
-    // `->` fails the whole query on malformed JSON, so a corrupt snapshot is
-    // skipped (no score) instead of breaking the page. It returns the element
-    // as JSON text, so a first element that is not an object decodes (and
-    // fails) here, not in the query.
-    let firsts: Vec<(i64, String, i64, Option<String>)> = sqlx::query_as(
-        "SELECT local_release_id, provider, snapshot_version,
-                CASE WHEN json_valid(candidates_json)
-                     THEN candidates_json -> '$[0]' END
-         FROM match_reviews WHERE local_release_id IN (SELECT value FROM json_each(?1))",
+    let summaries: Vec<SummaryRecord> = sqlx::query_as(
+        "SELECT r.local_release_id, r.provider, r.top_score, r.top_can_apply, r.top_reason,
+                r.top_blockers, COALESCE(r.source_revision = lr.source_revision, 0)
+         FROM match_reviews r JOIN local_releases lr ON lr.id = r.local_release_id
+         WHERE r.local_release_id IN (SELECT value FROM json_each(?1))",
     )
     .bind(ids)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
 
-    let order = ProviderKind::CHAIN;
-    let mut top: HashMap<i64, Vec<(ProviderKind, Option<f64>)>> = HashMap::new();
-    for (id, provider, version, first) in firsts {
+    let mut by_release: HashMap<i64, Vec<SummaryRow>> = HashMap::new();
+    for (id, provider, score, can_apply, reason, blockers, current) in summaries {
         let Some(provider) = ProviderKind::parse(&provider) else {
             continue;
         };
-        let score = first
-            .and_then(|json| decode_stored_candidates(version, provider, &format!("[{json}]")).ok())
-            .and_then(|candidates| candidates.into_iter().next())
-            .map(|candidate| candidate.match_scope.score(&candidate.score));
-        top.entry(id).or_default().push((provider, score));
+        by_release.entry(id).or_default().push(SummaryRow {
+            provider,
+            score,
+            can_apply: can_apply == Some(1),
+            reason,
+            blockers: blockers.unwrap_or(0),
+            current,
+        });
     }
-    for scores in top.values_mut() {
-        scores.sort_by_key(|(provider, _)| order.iter().position(|ordered| ordered == provider));
+    for reviews in by_release.values_mut() {
+        reviews.sort_by_key(|row| {
+            ProviderKind::CHAIN
+                .iter()
+                .position(|ordered| *ordered == row.provider)
+        });
     }
     Ok(rows
         .into_iter()
         .map(
-            |(id, directory, unit, album_title, album_artist, track_count)| QueuedRelease {
-                id,
-                directory,
-                unit,
-                album_title,
-                album_artist,
-                track_count,
-                top: top.remove(&id).unwrap_or_default(),
+            |(id, directory, unit, album_title, album_artist, track_count)| {
+                let reviews = by_release.remove(&id).unwrap_or_default();
+                QueuedRelease {
+                    id,
+                    directory,
+                    unit,
+                    album_title,
+                    album_artist,
+                    track_count,
+                    top: reviews
+                        .iter()
+                        .map(|row| (row.provider, row.score))
+                        .collect(),
+                    lead: lead_of(&reviews, view),
+                }
             },
         )
         .collect())
 }
 
-/// How many releases are queued, for `provider` or for any.
+/// How many releases `view` lists.
 ///
 /// # Errors
 ///
 /// When the database cannot be read.
-pub async fn queue_count(pool: &SqlitePool, provider: Option<ProviderKind>) -> Result<i64> {
+pub async fn queue_count(pool: &SqlitePool, view: &QueueView) -> Result<i64> {
     Ok(sqlx::query_scalar(concat!(
         "SELECT COUNT(*) FROM local_releases lr WHERE ",
-        queued_count_where!()
+        queued_where!()
     ))
-    .bind(provider.map(ProviderKind::as_str))
+    .bind(view.provider.map(ProviderKind::as_str))
+    .bind(i64::from(view.acceptable))
     .fetch_one(pool)
     .await?)
 }
 
-/// The first queued release after release `after`, in queue order.
+/// The first release after release `after` in `view`'s order.
 ///
-/// `after` need not be queued itself. When it no longer exists, the queue
-/// starts again from the top.
+/// `after` need not be in the view. In folder order, the next release after
+/// its folder position is returned, and when it no longer exists the queue
+/// starts again from the top. In score order, a release outside the view (or
+/// one that is gone) also starts again from the top; otherwise the next is the
+/// first below its lead score, ties in folder order.
 ///
 /// # Errors
 ///
 /// When the database cannot be read.
-pub async fn next_queued(
-    pool: &SqlitePool,
-    after: i64,
-    provider: Option<ProviderKind>,
-) -> Result<Option<i64>> {
-    let filter = provider.map(ProviderKind::as_str);
+pub async fn next_queued(pool: &SqlitePool, after: i64, view: &QueueView) -> Result<Option<i64>> {
+    let provider = view.provider.map(ProviderKind::as_str);
+    let acceptable = i64::from(view.acceptable);
     let position: Option<(String, String)> =
         sqlx::query_as("SELECT directory_path, album_title_norm FROM local_releases WHERE id = ?1")
             .bind(after)
             .fetch_optional(pool)
             .await?;
-    let next = match position {
+    let next = match (view.sort, position) {
         // Directory paths compare without case, as the listing orders them;
         // (directory, title) is unique, so the order is total.
-        Some((directory, title)) => {
+        (QueueSort::Folder, Some((directory, title))) => {
             sqlx::query_scalar(concat!(
                 "SELECT lr.id FROM local_releases lr WHERE ",
                 queued_where!(),
-                " AND (lr.directory_path, lr.album_title_norm) > (?2, ?3)
+                " AND (lr.directory_path, lr.album_title_norm) > (?3, ?4)
                  ORDER BY lr.directory_path, lr.album_title_norm LIMIT 1"
             ))
-            .bind(filter)
+            .bind(provider)
+            .bind(acceptable)
             .bind(directory)
             .bind(title)
             .fetch_optional(pool)
             .await?
         }
-        None => {
+        (QueueSort::Folder, None) => {
             sqlx::query_scalar(concat!(
                 "SELECT lr.id FROM local_releases lr WHERE ",
                 queued_where!(),
                 " ORDER BY lr.directory_path, lr.album_title_norm LIMIT 1"
             ))
-            .bind(filter)
+            .bind(provider)
+            .bind(acceptable)
             .fetch_optional(pool)
             .await?
+        }
+        (QueueSort::Score, position) => {
+            let lead: Option<(Option<f64>,)> = match position {
+                Some(_) => {
+                    sqlx::query_as(concat!(
+                        "SELECT score FROM (",
+                        lead_scores!("AND lr.id = ?3"),
+                        ")"
+                    ))
+                    .bind(provider)
+                    .bind(acceptable)
+                    .bind(after)
+                    .fetch_optional(pool)
+                    .await?
+                }
+                None => None,
+            };
+            match (lead, position) {
+                (Some((score,)), Some((directory, title))) => {
+                    sqlx::query_scalar(concat!(
+                        "WITH lead AS (",
+                        lead_scores!(),
+                        ")
+                         SELECT lr.id FROM lead JOIN local_releases lr ON lr.id = lead.id
+                         WHERE (lead.score IS NULL) > ?3
+                            OR ((lead.score IS NULL) = ?3 AND (
+                                  (?3 = 0 AND (lead.score < ?4
+                                               OR (lead.score = ?4
+                                                   AND (lr.directory_path, lr.album_title_norm)
+                                                       > (?5, ?6))))
+                               OR (?3 = 1 AND (lr.directory_path, lr.album_title_norm)
+                                              > (?5, ?6))))
+                         ",
+                        score_order!(),
+                        " LIMIT 1"
+                    ))
+                    .bind(provider)
+                    .bind(acceptable)
+                    .bind(i64::from(score.is_none()))
+                    .bind(score.unwrap_or(0.0))
+                    .bind(directory)
+                    .bind(title)
+                    .fetch_optional(pool)
+                    .await?
+                }
+                _ => {
+                    sqlx::query_scalar(concat!(
+                        "WITH lead AS (",
+                        lead_scores!(),
+                        ")
+                         SELECT lr.id FROM lead JOIN local_releases lr ON lr.id = lead.id ",
+                        score_order!(),
+                        " LIMIT 1"
+                    ))
+                    .bind(provider)
+                    .bind(acceptable)
+                    .fetch_optional(pool)
+                    .await?
+                }
+            }
         }
     };
     Ok(next)
@@ -565,11 +791,234 @@ mod tests {
             remote_release(mbid_release(FIXTURE_MBID), "Pink", &titles),
         )
         .await;
-        let page = queue_page(&pool, None, 10, 0).await.unwrap();
+        let page = queue_page(&pool, &folder(None), 10, 0).await.unwrap();
         assert_eq!(ids(&page), vec![a, b, mixed.id, d]);
-        assert_eq!(next_queued(&pool, b, None).await.unwrap(), Some(mixed.id));
-        assert_eq!(next_queued(&pool, mixed.id, None).await.unwrap(), Some(d));
-        assert_eq!(next_queued(&pool, c, None).await.unwrap(), Some(d));
+        assert_eq!(
+            next_queued(&pool, b, &folder(None)).await.unwrap(),
+            Some(mixed.id)
+        );
+        assert_eq!(
+            next_queued(&pool, mixed.id, &folder(None)).await.unwrap(),
+            Some(d)
+        );
+        assert_eq!(next_queued(&pool, c, &folder(None)).await.unwrap(), Some(d));
+    }
+
+    fn view(provider: Option<ProviderKind>, sort: QueueSort, acceptable: bool) -> QueueView {
+        QueueView {
+            provider,
+            sort,
+            acceptable,
+        }
+    }
+
+    fn folder(provider: Option<ProviderKind>) -> QueueView {
+        view(provider, QueueSort::Folder, false)
+    }
+
+    /// Sets one review's summary directly, so tests control the order.
+    async fn set_summary(
+        pool: &SqlitePool,
+        id: i64,
+        provider: &str,
+        score: Option<f64>,
+        can_apply: bool,
+    ) {
+        sqlx::query(
+            "UPDATE match_reviews SET top_score = ?1, top_can_apply = ?2, top_reason = 'why', top_blockers = 2
+             WHERE local_release_id = ?3 AND provider = ?4",
+        )
+        .bind(score)
+        .bind(i64::from(can_apply))
+        .bind(id)
+        .bind(provider)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn score_order_follows_each_releases_lead_review() {
+        let (pool, [a, b, _, d]) = library().await;
+        set_summary(&pool, a, "musicbrainz", Some(0.70), true).await;
+        set_summary(&pool, a, "discogs", Some(0.99), false).await;
+        set_summary(&pool, b, "musicbrainz", Some(0.95), true).await;
+        set_summary(&pool, d, "deezer", None, false).await;
+
+        let all = queue_page(&pool, &view(None, QueueSort::Score, false), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&all),
+            vec![a, b, d],
+            "a leads with discogs 0.99; no score comes last"
+        );
+        let lead = all[0].lead.as_ref().unwrap();
+        assert_eq!(
+            (
+                lead.provider,
+                lead.can_apply,
+                lead.reason.as_deref(),
+                lead.blockers
+            ),
+            (ProviderKind::Discogs, false, Some("why"), 2)
+        );
+        assert_eq!(all[0].top.len(), 2);
+
+        let acceptable = queue_page(&pool, &view(None, QueueSort::Score, true), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&acceptable),
+            vec![b, a],
+            "only applicable reviews count"
+        );
+        assert_eq!(
+            acceptable[1].lead.as_ref().unwrap().provider,
+            ProviderKind::MusicBrainz
+        );
+        assert_eq!(
+            queue_count(&pool, &view(None, QueueSort::Score, true))
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            queue_count(&pool, &view(None, QueueSort::Folder, false))
+                .await
+                .unwrap(),
+            3
+        );
+
+        // Out-of-date reviews never count as acceptable.
+        sqlx::query("UPDATE match_reviews SET source_revision = 'old' WHERE local_release_id = ?1")
+            .bind(b)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let acceptable = queue_page(&pool, &view(None, QueueSort::Score, true), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(ids(&acceptable), vec![a]);
+
+        // The provider filter combines with the others.
+        let musicbrainz = queue_page(
+            &pool,
+            &view(Some(ProviderKind::MusicBrainz), QueueSort::Score, false),
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ids(&musicbrainz), vec![b, a]);
+        // Folder order with the acceptable filter.
+        let folder_order = queue_page(&pool, &view(None, QueueSort::Folder, true), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(ids(&folder_order), vec![a]);
+        assert_eq!(
+            queue_count(&pool, &view(None, QueueSort::Folder, true))
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn score_pages_do_not_overlap() {
+        let (pool, [a, b, _, d]) = library().await;
+        set_summary(&pool, a, "musicbrainz", Some(0.9), true).await;
+        set_summary(&pool, a, "discogs", Some(0.8), true).await;
+        set_summary(&pool, b, "musicbrainz", Some(0.7), true).await;
+        set_summary(&pool, d, "deezer", Some(0.6), true).await;
+        let score = view(None, QueueSort::Score, false);
+        let mut seen = Vec::new();
+        for offset in 0..3 {
+            seen.extend(ids(&queue_page(&pool, &score, 1, offset).await.unwrap()));
+        }
+        assert_eq!(seen, vec![a, b, d]);
+    }
+
+    #[tokio::test]
+    async fn next_in_score_order_walks_down_the_view() {
+        let (pool, [a, b, c, d]) = library().await;
+        set_summary(&pool, a, "musicbrainz", Some(0.90), true).await;
+        set_summary(&pool, a, "discogs", Some(0.80), true).await;
+        set_summary(&pool, b, "musicbrainz", Some(0.95), true).await;
+        set_summary(&pool, d, "deezer", Some(0.90), false).await;
+        let score = view(None, QueueSort::Score, false);
+        // b 0.95, then a and d tie at 0.90 (folder order), then nothing.
+        assert_eq!(next_queued(&pool, b, &score).await.unwrap(), Some(a));
+        assert_eq!(next_queued(&pool, a, &score).await.unwrap(), Some(d));
+        assert_eq!(next_queued(&pool, d, &score).await.unwrap(), None);
+        // A release outside the view (c has no review) starts from the top.
+        assert_eq!(next_queued(&pool, c, &score).await.unwrap(), Some(b));
+        // With the acceptable filter, d drops out and a is last.
+        let acceptable = view(None, QueueSort::Score, true);
+        assert_eq!(next_queued(&pool, a, &acceptable).await.unwrap(), None);
+        // A release that just left the queue (its reviews deleted) restarts at the top.
+        sqlx::query("DELETE FROM match_reviews WHERE local_release_id = ?1")
+            .bind(b)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(next_queued(&pool, b, &score).await.unwrap(), Some(a));
+    }
+
+    #[tokio::test]
+    async fn next_in_score_order_places_releases_without_a_score_last() {
+        let (pool, [a, b, _, d]) = library().await;
+        set_summary(&pool, a, "musicbrainz", None, false).await;
+        set_summary(&pool, a, "discogs", None, false).await;
+        set_summary(&pool, b, "musicbrainz", Some(0.5), true).await;
+        set_summary(&pool, d, "deezer", None, false).await;
+        let score = view(None, QueueSort::Score, false);
+        // b scores; then a and d have no score and follow in folder order.
+        assert_eq!(next_queued(&pool, b, &score).await.unwrap(), Some(a));
+        assert_eq!(next_queued(&pool, a, &score).await.unwrap(), Some(d));
+        assert_eq!(next_queued(&pool, d, &score).await.unwrap(), None);
+    }
+
+    #[test]
+    fn the_lead_is_the_best_allowed_review() {
+        let row = |provider, score, can_apply, current| SummaryRow {
+            provider,
+            score,
+            can_apply,
+            reason: None,
+            blockers: 0,
+            current,
+        };
+        let rows = [
+            row(ProviderKind::MusicBrainz, Some(0.8), true, false),
+            row(ProviderKind::Discogs, Some(0.8), true, true),
+            row(ProviderKind::Deezer, None, true, true),
+        ];
+        let any = QueueView::default();
+        // A tie goes to the earlier provider; a missing score loses to any.
+        assert_eq!(
+            lead_of(&rows, &any).unwrap().provider,
+            ProviderKind::MusicBrainz
+        );
+        let acceptable = QueueView {
+            acceptable: true,
+            ..any
+        };
+        assert_eq!(
+            lead_of(&rows, &acceptable).unwrap().provider,
+            ProviderKind::Discogs
+        );
+        let deezer = QueueView {
+            provider: Some(ProviderKind::Deezer),
+            ..any
+        };
+        assert_eq!(lead_of(&rows, &deezer).unwrap().score, None);
+        let none = QueueView {
+            provider: Some(ProviderKind::Discogs),
+            acceptable: true,
+            ..any
+        };
+        assert!(lead_of(&rows[..1], &none).is_none());
     }
 
     fn ids(rows: &[QueuedRelease]) -> Vec<i64> {
@@ -579,7 +1028,7 @@ mod tests {
     #[tokio::test]
     async fn the_queue_lists_unmatched_releases_with_reviews_in_folder_order() {
         let (pool, [a, b, _, d]) = library().await;
-        let page = queue_page(&pool, None, 10, 0).await.unwrap();
+        let page = queue_page(&pool, &folder(None), 10, 0).await.unwrap();
         assert_eq!(ids(&page), vec![a, b, d]);
         let providers: Vec<ProviderKind> =
             page[0].top.iter().map(|(provider, _)| *provider).collect();
@@ -591,16 +1040,21 @@ mod tests {
         assert_eq!(page[0].album_title.as_deref(), Some("Blue"));
         assert_eq!(page[0].track_count, 2);
 
-        assert_eq!(ids(&queue_page(&pool, None, 1, 1).await.unwrap()), vec![b]);
         assert_eq!(
-            ids(&queue_page(&pool, Some(ProviderKind::Deezer), 10, 0)
-                .await
-                .unwrap()),
+            ids(&queue_page(&pool, &folder(None), 1, 1).await.unwrap()),
+            vec![b]
+        );
+        assert_eq!(
+            ids(
+                &queue_page(&pool, &folder(Some(ProviderKind::Deezer)), 10, 0)
+                    .await
+                    .unwrap()
+            ),
             vec![d]
         );
-        assert_eq!(queue_count(&pool, None).await.unwrap(), 3);
+        assert_eq!(queue_count(&pool, &folder(None)).await.unwrap(), 3);
         assert_eq!(
-            queue_count(&pool, Some(ProviderKind::MusicBrainz))
+            queue_count(&pool, &folder(Some(ProviderKind::MusicBrainz)))
                 .await
                 .unwrap(),
             2
@@ -613,40 +1067,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            ids(&queue_page(&pool, None, 10, 0).await.unwrap()),
+            ids(&queue_page(&pool, &folder(None), 10, 0).await.unwrap()),
             vec![a, d]
         );
 
-        // A snapshot with no candidate, a scalar one, or a corrupt one, reads as no score.
+        // The page reads the summary columns, not the snapshot: a corrupt
+        // snapshot changes nothing, and a summary without a score reads as none.
+        let before = queue_page(&pool, &folder(Some(ProviderKind::Deezer)), 10, 0)
+            .await
+            .unwrap();
+        assert!(before[0].top[0].1.is_some());
         for json in ["[]", "[1]", "nonsense"] {
             sqlx::query("UPDATE match_reviews SET candidates_json = ?1 WHERE provider = 'deezer'")
                 .bind(json)
                 .execute(&pool)
                 .await
                 .unwrap();
-            let page = queue_page(&pool, Some(ProviderKind::Deezer), 10, 0)
+            let page = queue_page(&pool, &folder(Some(ProviderKind::Deezer)), 10, 0)
                 .await
                 .unwrap();
-            assert_eq!(page[0].top, vec![(ProviderKind::Deezer, None)], "{json}");
+            assert_eq!(page, before, "{json}");
         }
+        set_summary(&pool, d, "deezer", None, false).await;
+        let page = queue_page(&pool, &folder(Some(ProviderKind::Deezer)), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(page[0].top, vec![(ProviderKind::Deezer, None)]);
     }
 
     #[tokio::test]
     async fn next_in_queue_follows_folder_order_and_the_filter() {
         let (pool, [a, b, c, d]) = library().await;
-        assert_eq!(next_queued(&pool, a, None).await.unwrap(), Some(b));
-        assert_eq!(next_queued(&pool, b, None).await.unwrap(), Some(d));
-        assert_eq!(next_queued(&pool, d, None).await.unwrap(), None);
+        assert_eq!(next_queued(&pool, a, &folder(None)).await.unwrap(), Some(b));
+        assert_eq!(next_queued(&pool, b, &folder(None)).await.unwrap(), Some(d));
+        assert_eq!(next_queued(&pool, d, &folder(None)).await.unwrap(), None);
         // From a release that is not queued, the next queued one after it.
-        assert_eq!(next_queued(&pool, c, None).await.unwrap(), Some(d));
+        assert_eq!(next_queued(&pool, c, &folder(None)).await.unwrap(), Some(d));
         assert_eq!(
-            next_queued(&pool, a, Some(ProviderKind::Deezer))
+            next_queued(&pool, a, &folder(Some(ProviderKind::Deezer)))
                 .await
                 .unwrap(),
             Some(d)
         );
         // A release that is gone starts the queue again from the top.
-        assert_eq!(next_queued(&pool, d + 100, None).await.unwrap(), Some(a));
+        assert_eq!(
+            next_queued(&pool, d + 100, &folder(None)).await.unwrap(),
+            Some(a)
+        );
     }
 
     fn stored(

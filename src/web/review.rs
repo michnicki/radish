@@ -99,11 +99,15 @@ pub(super) async fn queue_page(
     let page_number = params.page();
     let offset = (page_number - 1) * PAGE_SIZE as u64;
     // One row past the page tells us whether a next page exists.
+    let view = store::QueueView {
+        provider: filter,
+        ..store::QueueView::default()
+    };
     let mut rows =
-        store::queue_page(&state.pool, filter, PAGE_SIZE as i64 + 1, offset as i64).await?;
+        store::queue_page(&state.pool, &view, PAGE_SIZE as i64 + 1, offset as i64).await?;
     let has_next = rows.len() > PAGE_SIZE;
     rows.truncate(PAGE_SIZE);
-    let total = store::queue_count(&state.pool, filter).await?;
+    let total = store::queue_count(&state.pool, &view).await?;
     let accepted = accepted_status(&state, params.accepted()).await?;
     let body = render_queue(
         &rows,
@@ -285,7 +289,15 @@ async fn render_page(
     let Some(review) = saved::load(&state.pool, id).await? else {
         return Ok(no_release());
     };
-    let next = store::next_queued(&state.pool, id, filter).await?;
+    let next = store::next_queued(
+        &state.pool,
+        id,
+        &store::QueueView {
+            provider: filter,
+            ..store::QueueView::default()
+        },
+    )
+    .await?;
     let view = View {
         review: &review,
         filter,
@@ -647,7 +659,16 @@ async fn accept(
 ) -> Result<Response, AppError> {
     let (status, text) = match saved::accept_saved(&state.pool, release, candidate, shown).await? {
         AcceptOutcome::Accepted => {
-            let target = match store::next_queued(&state.pool, release, filter).await? {
+            let target = match store::next_queued(
+                &state.pool,
+                release,
+                &store::QueueView {
+                    provider: filter,
+                    ..store::QueueView::default()
+                },
+            )
+            .await?
+            {
                 Some(next) => review_href(next, filter, Some(release)),
                 None => queue_href(filter, Some(release)),
             };
@@ -750,6 +771,7 @@ mod tests {
                 (ProviderKind::MusicBrainz, Some(0.9314)),
                 (ProviderKind::Discogs, None),
             ],
+            lead: None,
         }
     }
 

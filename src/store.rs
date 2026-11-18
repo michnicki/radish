@@ -2384,7 +2384,7 @@ pub async fn library_status(pool: &SqlitePool) -> Result<LibraryStatus> {
     .fetch_all(pool)
     .await?;
 
-    let queued = queue_count(pool, None).await?;
+    let queued = queue_count(pool, &QueueView::default()).await?;
 
     let folders: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM (
