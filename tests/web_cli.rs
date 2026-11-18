@@ -1029,8 +1029,10 @@ fn serve_offline_starts_without_indexes_and_says_what_a_fetch_needs() {
     );
 }
 
+// The score order itself is covered by the store tests; this follows one view
+// through the pages, the form and the redirect of a running server.
 #[test]
-fn the_queue_sorts_by_score_and_hides_what_cannot_be_accepted() {
+fn the_score_sorted_acceptable_queue_keeps_its_view() {
     let (db, _music) = seeded_library("web-review-triage");
     let mock = MockServer::start(review_handler);
     let blue = release_id(&db, "Blue");
@@ -1042,13 +1044,17 @@ fn the_queue_sorts_by_score_and_hides_what_cannot_be_accepted() {
     let all = server.get("/reviews?sort=score");
     assert_eq!(all.status, 200, "{}", all.body);
     assert!(
-        all.body.contains("top candidate can&#39;t be accepted")
-            || all.body.contains("top candidate can't be accepted"),
+        all.body.contains("top candidate can't be accepted"),
         "{}",
         all.body
     );
 
     let acceptable = server.get("/reviews?sort=score&show=acceptable");
+    assert!(
+        !acceptable.body.contains("can't be accepted"),
+        "{}",
+        acceptable.body
+    );
     assert!(
         acceptable.body.contains("1 release can be accepted."),
         "{}",
@@ -1073,6 +1079,12 @@ fn the_queue_sorts_by_score_and_hides_what_cannot_be_accepted() {
     let page = server.get(&format!(
         "/review?release={blue}&sort=score&show=acceptable"
     ));
+    assert!(
+        page.body.contains("name=\"sort\" value=\"score\"")
+            && page.body.contains("name=\"show\" value=\"acceptable\""),
+        "{}",
+        page.body
+    );
     let token = between(&page.body, "name=\"token\" value=\"", "\"").to_string();
     let revision = unescape_html(between(&page.body, "name=\"revision\" value=\"", "\""));
     let body = format!(
