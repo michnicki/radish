@@ -288,6 +288,49 @@ async fn a_queued_run_matches_only_the_queued_releases() {
 }
 
 #[tokio::test]
+async fn a_release_queued_only_for_deezer_needs_deezer() {
+    let db = db_path("queued-deezer-only");
+    let blue = seed(&db, 2001).await;
+    let red = seed_red(&db).await;
+    let server = MockServer::start(handler);
+    queue_blue(&db, &server, blue);
+
+    // Red gets a Deezer-only review, copied from blue's MusicBrainz review.
+    let pool = radish::db::connect(&db).await.unwrap();
+    sqlx::query(
+        "INSERT INTO match_reviews (local_release_id, provider, snapshot_version,
+                expected_match_id, candidates_json, proposed_mapping_json, reasons_json,
+                source_revision)
+         SELECT ?1, 'deezer', snapshot_version, NULL, candidates_json,
+                proposed_mapping_json, reasons_json,
+                (SELECT source_revision FROM local_releases WHERE id = ?1)
+         FROM match_reviews WHERE local_release_id = ?2",
+    )
+    .bind(red)
+    .bind(blue)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let blue_line = format!("Matching local release {blue} (");
+    let red_line = format!("Matching local release {red} (");
+
+    // The Deezer stage may fail against the mock, so only stdout is checked.
+    let without = stdout(&run(&db, &server, &["match", "--queued", "--dry-run"]));
+    assert!(without.contains(&blue_line), "{without}");
+    assert!(!without.contains(&red_line), "{without}");
+
+    let with = stdout(&run(
+        &db,
+        &server,
+        &["match", "--queued", "--deezer", "--dry-run"],
+    ));
+    assert!(with.contains(&blue_line), "{with}");
+    assert!(with.contains(&red_line), "{with}");
+}
+
+#[tokio::test]
 async fn releases_lists_only_the_queued_ones_when_asked() {
     let db = db_path("queued-releases");
     let blue = seed(&db, 2001).await;
