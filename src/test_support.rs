@@ -1,5 +1,13 @@
 //! Helpers shared by unit tests: scratch directories and audio fixtures.
 
+use crate::matcher::{
+    self, ArtistKind, Candidate, DiscoveryEvidence, EmbeddedReleaseEvidence, LocalRelease,
+    LocalTrack, RemoteRelease, RemoteTrack, TrackEntryType,
+};
+use crate::providers::{ProviderKind, ReleaseId};
+use crate::scanner::{ObservedMusicBrainzIds, ScannedTrack};
+use crate::store::{self, StoredCandidate};
+use sqlx::SqlitePool;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -204,4 +212,190 @@ pub(crate) fn write_tagged_wav(path: &Path, album: &str, year: u16) {
     });
     file.insert_tag(tag);
     file.save_to_path(path, WriteOptions::default()).unwrap();
+}
+
+/// The length of every fixture track, in seconds, local and remote alike.
+pub(crate) const FIXTURE_SECS: f64 = 180.0;
+
+/// A valid MBID for fixtures.
+pub(crate) const FIXTURE_MBID: &str = "76df3287-6cda-33eb-8e9a-044b5e15ffdd";
+
+/// A second valid MBID, for a second candidate.
+pub(crate) const OTHER_MBID: &str = "11111111-1111-1111-1111-111111111111";
+
+/// The MusicBrainz release ID of `mbid`.
+pub(crate) fn mbid_release(mbid: &str) -> ReleaseId {
+    ReleaseId::MusicBrainz(mbid.parse().unwrap())
+}
+
+/// A local release of `titles` in `dir`, as matching sees it, without a database.
+pub(crate) fn local_release(id: i64, dir: &str, album: &str, titles: &[&str]) -> LocalRelease {
+    LocalRelease {
+        id,
+        directory: dir.to_string(),
+        album_title: Some(album.to_string()),
+        album_artist: Some("Artist".to_string()),
+        artist_kind: ArtistKind::AlbumArtist,
+        year: Some(2001),
+        barcode: None,
+        catalog_number: None,
+        embedded_discogs_id: None,
+        embedded_evidence: EmbeddedReleaseEvidence::default(),
+        is_compilation: false,
+        has_album_tag: true,
+        reads_directory: true,
+        revision: "rev".to_string(),
+        tracks: titles
+            .iter()
+            .enumerate()
+            .map(|(index, title)| LocalTrack {
+                id: index as i64 + 1,
+                path: format!("{dir}/{:02}.flac", index + 1),
+                title: Some((*title).to_string()),
+                disc: None,
+                track_number: Some(index as i64 + 1),
+                duration_secs: Some(FIXTURE_SECS),
+                release_track_id: None,
+                recording_id: None,
+                identifier_problems: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
+/// Stores a release of `titles` in `dir` and returns it as matching loads it.
+pub(crate) async fn seed_release(
+    pool: &SqlitePool,
+    dir: &str,
+    album: &str,
+    titles: &[&str],
+) -> LocalRelease {
+    let directory_id = store::upsert_directory(pool, Path::new(dir)).await.unwrap();
+    for (index, title) in titles.iter().enumerate() {
+        let number = index as i64 + 1;
+        let track = ScannedTrack {
+            path: Path::new(dir).join(format!("{number:02}.flac")),
+            title: Some((*title).to_string()),
+            artist: Some("Artist".to_string()),
+            album: Some(album.to_string()),
+            album_artist: Some("Artist".to_string()),
+            year: Some(2001),
+            track_number: Some(number),
+            disc_number: None,
+            barcode: None,
+            catalog_number: None,
+            discogs_release_id: None,
+            musicbrainz: ObservedMusicBrainzIds::default(),
+            duration_secs: Some(FIXTURE_SECS),
+            modified_at: 1,
+        };
+        store::upsert_track(pool, &track, directory_id)
+            .await
+            .unwrap();
+    }
+    store::rebuild_local_releases(pool, None).await.unwrap();
+    store::load_local_releases(pool, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|release| release.directory == dir)
+        .unwrap()
+}
+
+/// A provider release of `titles` under `id`, each track [`FIXTURE_SECS`] long.
+pub(crate) fn remote_release(id: ReleaseId, album: &str, titles: &[&str]) -> RemoteRelease {
+    let url = format!("https://example.invalid/release/{}", id.storage_id());
+    RemoteRelease {
+        id,
+        group_id: None,
+        title: album.to_string(),
+        artists: vec!["Artist".to_string()],
+        year: Some(2001),
+        country: Some("US".to_string()),
+        labels: vec!["Label".to_string()],
+        catalog_numbers: vec!["CAT-1".to_string()],
+        formats: vec!["CD".to_string()],
+        barcodes: Vec::new(),
+        tracklist: titles
+            .iter()
+            .enumerate()
+            .map(|(index, title)| RemoteTrack {
+                position: Some((index + 1).to_string()),
+                title: (*title).to_string(),
+                artists: Vec::new(),
+                duration_secs: Some(FIXTURE_SECS),
+                entry_type: TrackEntryType::Track,
+                medium_position: None,
+                track_position: None,
+                release_track_id: None,
+                recording_id: None,
+                artist_credit: None,
+            })
+            .collect(),
+        url,
+        lookup_aliases: Vec::new(),
+        artist_credit: None,
+        structure_issues: Vec::new(),
+        edition_notes: Vec::new(),
+        provider_metadata: serde_json::Value::Null,
+    }
+}
+
+/// Queues `release` for `remote`'s provider with `remote` as its one candidate,
+/// evaluated as a direct selection, under the release's current guard.
+pub(crate) async fn queue(pool: &SqlitePool, release: &LocalRelease, remote: RemoteRelease) {
+    let candidate = Candidate::new(release, remote);
+    let evaluation = matcher::evaluate(release, &candidate, None, &DiscoveryEvidence::default());
+    let guard = store::load_match_guard(pool, release.id).await.unwrap();
+    let stored = StoredCandidate {
+        release: candidate.release.clone(),
+        mapping: candidate.mapping.clone(),
+        score: candidate.score,
+        auto_accept: evaluation.auto_accept,
+        match_scope: evaluation.match_scope,
+        blockers: evaluation.blockers.clone(),
+        warnings: evaluation.warnings.clone(),
+        evidence: evaluation.evidence.clone(),
+    };
+    store::queue_review(
+        pool,
+        release.id,
+        candidate.release.provider(),
+        &guard.source_revision,
+        guard.accepted_match_id,
+        &[stored],
+        &candidate.mapping,
+        &["uncertain".to_string()],
+    )
+    .await
+    .unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fixtures_seed_a_release_and_queue_it() {
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let release = seed_release(&pool, "/music/a", "Blue", &["One", "Two"]).await;
+        assert_eq!(release.directory, "/music/a");
+        assert_eq!(release.tracks.len(), 2);
+
+        let remote = remote_release(mbid_release(FIXTURE_MBID), "Blue", &["One", "Two"]);
+        queue(&pool, &release, remote).await;
+        let review = store::load_review(&pool, release.id, ProviderKind::MusicBrainz)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(review.candidates.len(), 1);
+        assert!(review.candidates[0].mapping.complete);
+
+        let pure = local_release(7, "/music/b", "Red", &["One"]);
+        assert_eq!(pure.tracks[0].path, "/music/b/01.flac");
+        assert_eq!(
+            mbid_release(OTHER_MBID).provider(),
+            ProviderKind::MusicBrainz
+        );
+    }
 }
