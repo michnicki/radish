@@ -928,24 +928,28 @@ fn is_web_url(url: &str) -> bool {
 ///
 /// The search text is carried through both links.
 fn pager(path: &str, query: Option<&str>, page_number: u64, has_next: bool) -> String {
-    pager_with(path, query.map(|query| ("q", query)), page_number, has_next)
+    let params: Vec<(&str, &str)> = query.map(|query| ("q", query)).into_iter().collect();
+    pager_with(path, &params, page_number, has_next)
 }
 
-/// Previous and next links that carry one query parameter, such as a filter.
-fn pager_with(path: &str, param: Option<(&str, &str)>, page_number: u64, has_next: bool) -> String {
+/// Previous and next links that carry the given query parameters.
+fn pager_with(path: &str, params: &[(&str, &str)], page_number: u64, has_next: bool) -> String {
     if page_number == 1 && !has_next {
         return String::new();
     }
     let href = |target: u64| {
-        let mut href = path.to_string();
-        let mut separator = '?';
-        if let Some((key, value)) = param {
-            href.push_str(&format!("?{key}={}", percent_encode(value)));
-            separator = '&';
-        }
+        let mut parts: Vec<String> = params
+            .iter()
+            .map(|(key, value)| format!("{key}={}", percent_encode(value)))
+            .collect();
         if target > 1 {
-            href.push_str(&format!("{separator}page={target}"));
+            parts.push(format!("page={target}"));
         }
+        let href = if parts.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}?{}", parts.join("&"))
+        };
         escape_html(&href)
     };
     let previous = if page_number > 1 {
@@ -1186,8 +1190,8 @@ mod tests {
     }
 
     #[test]
-    fn the_pager_carries_any_one_parameter() {
-        let html = pager_with("/reviews", Some(("provider", "deezer")), 2, true);
+    fn the_pager_carries_its_parameters() {
+        let html = pager_with("/reviews", &[("provider", "deezer")], 2, true);
         assert!(html.contains("href=\"/reviews?provider=deezer\""), "{html}");
         assert!(
             html.contains("href=\"/reviews?provider=deezer&amp;page=3\""),
@@ -1195,8 +1199,23 @@ mod tests {
         );
         assert_eq!(
             pager("/tracks", Some("a b"), 1, true),
-            pager_with("/tracks", Some(("q", "a b")), 1, true)
+            pager_with("/tracks", &[("q", "a b")], 1, true)
         );
+        let html = pager_with(
+            "/reviews",
+            &[("sort", "score"), ("show", "acceptable")],
+            2,
+            true,
+        );
+        assert!(
+            html.contains("href=\"/reviews?sort=score&amp;show=acceptable\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("href=\"/reviews?sort=score&amp;show=acceptable&amp;page=3\""),
+            "{html}"
+        );
+        assert!(pager_with("/reviews", &[], 2, true).contains("href=\"/reviews\""));
     }
 
     #[test]
