@@ -58,8 +58,14 @@ pub fn parse_entered(provider: ProviderKind, raw: &str) -> Result<ReleaseId> {
     parse_bare(provider, raw)
 }
 
-/// A bare ID for `provider`, as the CLI flags take it.
-fn parse_bare(provider: ProviderKind, raw: &str) -> Result<ReleaseId> {
+/// A bare release ID for `provider`, as CLI flags and stored reviews hold it.
+///
+/// Unlike [`parse_entered`], it takes no link.
+///
+/// # Errors
+///
+/// When `raw` is not an ID of that provider.
+pub fn parse_bare(provider: ProviderKind, raw: &str) -> Result<ReleaseId> {
     match provider {
         ProviderKind::MusicBrainz => {
             let id = raw

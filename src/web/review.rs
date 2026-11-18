@@ -623,7 +623,7 @@ pub(super) async fn action(
             Err(_) => return Ok((StatusCode::BAD_REQUEST, "unknown match").into_response()),
         },
     };
-    let Some(candidate) = parse_stored_id(provider, form.candidate.trim()) else {
+    let Ok(candidate) = saved::parse_bare(provider, form.candidate.trim()) else {
         return Ok((StatusCode::BAD_REQUEST, "unknown candidate").into_response());
     };
     let shown = store::MatchGuard {
@@ -631,17 +631,6 @@ pub(super) async fn action(
         accepted_match_id,
     };
     accept(&state, release, &shown, filter, &candidate).await
-}
-
-/// The release a hidden `candidate` field names: the ID as the page wrote it.
-///
-/// Unlike text entered by hand, this takes no link.
-fn parse_stored_id(provider: ProviderKind, text: &str) -> Option<ReleaseId> {
-    match provider {
-        ProviderKind::MusicBrainz => text.parse().ok().map(ReleaseId::MusicBrainz),
-        ProviderKind::Discogs => text.parse().ok().map(ReleaseId::Discogs),
-        ProviderKind::Deezer => text.parse().ok().map(ReleaseId::Deezer),
-    }
 }
 
 /// Accepts saved release `candidate` and goes to the next queued release.
