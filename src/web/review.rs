@@ -130,7 +130,7 @@ fn render_accepted(status: &store::LocalReleaseStatus) -> String {
 fn render_filters(filter: Option<ProviderKind>) -> String {
     let link = |value: Option<ProviderKind>, label: &str| {
         let current = if value == filter {
-            " aria-current=\"page\""
+            " aria-current=\"true\""
         } else {
             ""
         };
@@ -146,7 +146,7 @@ fn render_filters(filter: Option<ProviderKind>) -> String {
             .into_iter()
             .map(|provider| link(Some(provider), provider.label())),
     );
-    format!("<p class=\"filters\">{}</p>", links.join(""))
+    format!("<p class=\"filters\">{}</p>", links.join(" "))
 }
 
 /// The queue page body: notice, filters, the table and the pager.
@@ -239,7 +239,7 @@ mod tests {
             "{html}"
         );
         assert!(
-            html.contains("<a href=\"/reviews?provider=deezer\" aria-current=\"page\">Deezer</a>"),
+            html.contains("<a href=\"/reviews?provider=deezer\" aria-current=\"true\">Deezer</a>"),
             "{html}"
         );
         assert!(html.contains("<a href=\"/reviews\">All</a>"), "{html}");
@@ -247,6 +247,57 @@ mod tests {
         assert!(
             html.contains("href=\"/folder?path=%2Fmusic%2F%3Cb%3E\""),
             "{html}"
+        );
+    }
+
+    #[test]
+    fn the_notice_shows_the_accepted_match_with_the_album_escaped() {
+        let status = store::LocalReleaseStatus {
+            id: 4,
+            directory: "/music/a".into(),
+            unit: "/music/a".into(),
+            album_title: Some("<b>Blue</b>".into()),
+            album_artist: Some("Artist".into()),
+            track_count: 2,
+            status: store::STATUS_MATCHED.into(),
+            provider: Some(ProviderKind::MusicBrainz),
+            remote_release_id: Some("abc".into()),
+            remote_url: None,
+            remote_title: None,
+            match_scope: None,
+            medium: None,
+            stale: false,
+            queued_providers: Vec::new(),
+            merged: None,
+        };
+        let html = render_queue(&[], 0, None, Some(&status), 1, false);
+        assert!(html.contains("Accepted musicbrainz abc"), "{html}");
+        assert!(html.contains("&lt;b&gt;Blue&lt;/b&gt;"), "{html}");
+        assert!(!html.contains("<b>"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn only_a_matched_release_is_reported_as_accepted() {
+        let pool = crate::db::connect_in_memory().await.unwrap();
+        let release = crate::test_support::seed_release(&pool, "/music/a", "Blue", &["One"]).await;
+        let state = AppState {
+            pool,
+            bind: "127.0.0.1:8787".parse().unwrap(),
+            token: "t".into(),
+            writable: true,
+        };
+        assert!(accepted_status(&state, None).await.unwrap().is_none());
+        assert!(
+            accepted_status(&state, Some(release.id))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            accepted_status(&state, Some(release.id + 100))
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

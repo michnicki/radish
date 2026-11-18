@@ -559,7 +559,10 @@ fn stat(label: &str, value: i64) -> String {
 
 /// One tile on the status page whose number links to `href`.
 fn stat_link(label: &str, value: i64, href: &str) -> String {
-    format!("<div><b><a href=\"{href}\">{value}</a></b><span>{label}</span></div>")
+    format!(
+        "<div><b><a href=\"{}\">{value}</a></b><span>{label}</span></div>",
+        escape_html(href)
+    )
 }
 
 fn render_status(status: &store::LibraryStatus) -> String {
