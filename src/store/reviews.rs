@@ -97,10 +97,23 @@ pub async fn add_review_candidate(
 /// The condition that puts release `lr` in the review queue: not matched,
 /// with a saved review of provider `?1` (any provider when `?1` is `NULL`).
 ///
-/// This is `IN`, not a correlated `EXISTS`: with `EXISTS` the bundled SQLite
-/// counts a release once per review row against `OFFSET`, so a release queued
-/// for two providers made `queue_page` skip it too late.
+/// SQLite 3.51 (bundled through libsqlite3-sys 0.37) rewrites a plain
+/// correlated `EXISTS` into a join. Without the `LIMIT 1` that join yields a
+/// release once per review row and uses up `OFFSET` on each of those rows, so
+/// pages start too early and overlap. The `LIMIT 1` keeps the subquery
+/// correlated, so the listing index still serves the order and no page sorts
+/// the whole queue.
 macro_rules! queued_where {
+    () => {
+        "lr.status <> 'matched'
+         AND EXISTS (SELECT 1 FROM match_reviews r
+                     WHERE r.local_release_id = lr.id AND (?1 IS NULL OR r.provider = ?1)
+                     LIMIT 1)"
+    };
+}
+
+/// [`queued_where!`] for counting, where the `IN` form is faster.
+macro_rules! queued_count_where {
     () => {
         "lr.status <> 'matched'
          AND lr.id IN (SELECT r.local_release_id FROM match_reviews r
@@ -124,7 +137,8 @@ pub struct QueuedRelease {
     /// How many tracks the release has.
     pub track_count: i64,
     /// Each queued provider with its first candidate's score, in the order
-    /// matching tries providers; `None` when that snapshot cannot be read.
+    /// matching tries providers; `None` when that snapshot cannot be read or
+    /// holds no candidate.
     pub best: Vec<(ProviderKind, Option<f64>)>,
 }
 
@@ -134,7 +148,7 @@ type QueueRow = (i64, String, String, Option<String>, Option<String>, i64);
 /// One page of the review queue, in the order of the releases listing.
 ///
 /// `provider` keeps only releases queued for that provider. Only the first
-/// candidate of each review is read (`json_extract`), so a page does not
+/// candidate of each review is read (`->`), so a page does not
 /// decode megabytes of snapshots.
 ///
 /// # Errors
@@ -161,12 +175,14 @@ pub async fn queue_page(
     .fetch_all(&mut *tx)
     .await?;
     let ids = serde_json::to_string(&rows.iter().map(|row| row.0).collect::<Vec<_>>())?;
-    // `json_extract` fails the whole query on malformed JSON, so a corrupt
-    // snapshot is skipped (no score) instead of breaking the page.
+    // `->` fails the whole query on malformed JSON, so a corrupt snapshot is
+    // skipped (no score) instead of breaking the page. It returns the element
+    // as JSON text, so a first element that is not an object decodes (and
+    // fails) here, not in the query.
     let firsts: Vec<(i64, String, i64, Option<String>)> = sqlx::query_as(
         "SELECT local_release_id, provider, snapshot_version,
                 CASE WHEN json_valid(candidates_json)
-                     THEN json_extract(candidates_json, '$[0]') END
+                     THEN candidates_json -> '$[0]' END
          FROM match_reviews WHERE local_release_id IN (SELECT value FROM json_each(?1))",
     )
     .bind(ids)
@@ -213,7 +229,7 @@ pub async fn queue_page(
 pub async fn queue_count(pool: &SqlitePool, provider: Option<ProviderKind>) -> Result<i64> {
     Ok(sqlx::query_scalar(concat!(
         "SELECT COUNT(*) FROM local_releases lr WHERE ",
-        queued_where!()
+        queued_count_where!()
     ))
     .bind(provider.map(ProviderKind::as_str))
     .fetch_one(pool)
@@ -311,6 +327,25 @@ mod tests {
         (pool, [a.id, b.id, c.id, d.id])
     }
 
+    #[tokio::test]
+    async fn folders_order_without_regard_to_case() {
+        let (pool, [a, b, c, d]) = library().await;
+        let titles = ["One", "Two"];
+        // Sorts between /music/b and /music/c only when case is ignored.
+        let mixed = seed_release(&pool, "/music/B2", "Pink", &titles).await;
+        queue(
+            &pool,
+            &mixed,
+            remote_release(mbid_release(FIXTURE_MBID), "Pink", &titles),
+        )
+        .await;
+        let page = queue_page(&pool, None, 10, 0).await.unwrap();
+        assert_eq!(ids(&page), vec![a, b, mixed.id, d]);
+        assert_eq!(next_queued(&pool, b, None).await.unwrap(), Some(mixed.id));
+        assert_eq!(next_queued(&pool, mixed.id, None).await.unwrap(), Some(d));
+        assert_eq!(next_queued(&pool, c, None).await.unwrap(), Some(d));
+    }
+
     fn ids(rows: &[QueuedRelease]) -> Vec<i64> {
         rows.iter().map(|row| row.id).collect()
     }
@@ -356,8 +391,8 @@ mod tests {
             vec![a, d]
         );
 
-        // A snapshot with no candidate, or a corrupt one, reads as no score.
-        for json in ["[]", "nonsense"] {
+        // A snapshot with no candidate, a scalar one, or a corrupt one, reads as no score.
+        for json in ["[]", "[1]", "nonsense"] {
             sqlx::query("UPDATE match_reviews SET candidates_json = ?1 WHERE provider = 'deezer'")
                 .bind(json)
                 .execute(&pool)

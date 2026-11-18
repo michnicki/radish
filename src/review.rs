@@ -497,8 +497,10 @@ impl std::error::Error for FetchError {}
 ///
 /// Each provider's client is built the first time a release of that provider
 /// is fetched, so a server where nobody enters an ID contacts and opens
-/// nothing. A client that cannot be built is not remembered: adding the token
-/// or building the index and trying again works without a restart. Deezer has
+/// nothing. A client that cannot be built is not remembered, so an index that
+/// is built after a failed fetch is used by the next one. A new Discogs token
+/// or a rebuilt index needs a restart of `serve`: the token is read from the
+/// process environment, and a client that opened an index keeps it. Deezer has
 /// no dump, so it always uses the network.
 pub struct Fetcher {
     source: Source,
@@ -1036,6 +1038,22 @@ mod tests {
         let review = load(&pool, release.id).await.unwrap().unwrap();
         assert_eq!(ids(&review, 0), vec![OTHER_MBID]);
         assert_eq!(review.groups[0].state, GroupState::Current);
+        assert_eq!(review.groups[0].reasons, vec![ENTERED_REASON.to_string()]);
+
+        // An unreadable group is replaced too, with the entered reason.
+        sqlx::query(
+            "UPDATE match_reviews SET candidates_json = 'nonsense' WHERE provider = 'musicbrainz'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        add_fetched(&pool, release.id, &release.revision, other())
+            .await
+            .unwrap();
+        let review = load(&pool, release.id).await.unwrap().unwrap();
+        assert_eq!(ids(&review, 0), vec![OTHER_MBID]);
+        assert_eq!(review.groups[0].state, GroupState::Current);
+        assert_eq!(review.groups[0].reasons, vec![ENTERED_REASON.to_string()]);
 
         // A release that cannot be applied is still stored, so the page can say why.
         let short = remote_release(mbid_release(FIXTURE_MBID), "Blue", &["One"]);
@@ -1077,6 +1095,7 @@ mod tests {
                 "{error}"
             );
             assert!(error.to_string().contains("index is missing"), "{error}");
+            assert!(fetcher.musicbrainz.get().is_none(), "the failure was kept");
         }
     }
 
