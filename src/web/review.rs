@@ -181,7 +181,7 @@ fn render_queue(
     format!(
         "<h1>Review</h1>{notice}{filters}<p class=\"muted\">{} queued for review.</p>\
          <div class=\"table\"><table><thead><tr><th class=\"num\">ID</th><th>Artist</th>\
-         <th>Album</th><th class=\"num\">Tracks</th><th>Best</th><th>Folder</th></tr></thead>\
+         <th>Album</th><th class=\"num\">Tracks</th><th>Top</th><th>Folder</th></tr></thead>\
          <tbody>{body}</tbody></table></div>{}",
         plural(total.max(0) as u64, "release", "releases"),
         pager_with(
@@ -195,8 +195,8 @@ fn render_queue(
 
 /// One queued release as a table row; its ID links to its review page.
 fn queue_row(row: &store::QueuedRelease, filter: Option<ProviderKind>) -> String {
-    let best: Vec<String> = row
-        .best
+    let top: Vec<String> = row
+        .top
         .iter()
         .map(|(provider, score)| match score {
             Some(score) => format!("{provider} {score:.3}"),
@@ -211,7 +211,7 @@ fn queue_row(row: &store::QueuedRelease, filter: Option<ProviderKind>) -> String
         escape_html(row.album_artist.as_deref().unwrap_or("(unknown artist)")),
         escape_html(row.album_title.as_deref().unwrap_or("(no album tag)")),
         row.track_count,
-        best.join(" · "),
+        top.join(" · "),
         escape_html(&folder_href(&row.unit)),
         escape_html(&row.directory),
     )
@@ -746,7 +746,7 @@ mod tests {
             album_title: Some("<i>Blue</i>".into()),
             album_artist: Some("Mallory".into()),
             track_count: 2,
-            best: vec![
+            top: vec![
                 (ProviderKind::MusicBrainz, Some(0.9314)),
                 (ProviderKind::Discogs, None),
             ],

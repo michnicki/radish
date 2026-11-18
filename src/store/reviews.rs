@@ -138,10 +138,13 @@ pub struct QueuedRelease {
     pub album_artist: Option<String>,
     /// How many tracks the release has.
     pub track_count: i64,
-    /// Each queued provider with its first candidate's score, in the order
+    /// Each queued provider with its top candidate's score, in the order
     /// matching tries providers; `None` when that snapshot cannot be read or
     /// holds no candidate.
-    pub best: Vec<(ProviderKind, Option<f64>)>,
+    ///
+    /// The top candidate is the first in the saved list: after a fetch on the web, the
+    /// release entered there, which need not be the best scoring.
+    pub top: Vec<(ProviderKind, Option<f64>)>,
 }
 
 /// A queue row: ID, folder, unit, album title and artist, track count.
@@ -193,7 +196,7 @@ pub async fn queue_page(
     tx.commit().await?;
 
     let order = ProviderKind::CHAIN;
-    let mut best: HashMap<i64, Vec<(ProviderKind, Option<f64>)>> = HashMap::new();
+    let mut top: HashMap<i64, Vec<(ProviderKind, Option<f64>)>> = HashMap::new();
     for (id, provider, version, first) in firsts {
         let Some(provider) = ProviderKind::parse(&provider) else {
             continue;
@@ -202,9 +205,9 @@ pub async fn queue_page(
             .and_then(|json| decode_stored_candidates(version, provider, &format!("[{json}]")).ok())
             .and_then(|candidates| candidates.into_iter().next())
             .map(|candidate| candidate.match_scope.score(&candidate.score));
-        best.entry(id).or_default().push((provider, score));
+        top.entry(id).or_default().push((provider, score));
     }
-    for scores in best.values_mut() {
+    for scores in top.values_mut() {
         scores.sort_by_key(|(provider, _)| order.iter().position(|ordered| ordered == provider));
     }
     Ok(rows
@@ -217,7 +220,7 @@ pub async fn queue_page(
                 album_title,
                 album_artist,
                 track_count,
-                best: best.remove(&id).unwrap_or_default(),
+                top: top.remove(&id).unwrap_or_default(),
             },
         )
         .collect())
@@ -358,12 +361,12 @@ mod tests {
         let page = queue_page(&pool, None, 10, 0).await.unwrap();
         assert_eq!(ids(&page), vec![a, b, d]);
         let providers: Vec<ProviderKind> =
-            page[0].best.iter().map(|(provider, _)| *provider).collect();
+            page[0].top.iter().map(|(provider, _)| *provider).collect();
         assert_eq!(
             providers,
             vec![ProviderKind::MusicBrainz, ProviderKind::Discogs]
         );
-        assert!(page[0].best.iter().all(|(_, score)| score.is_some()));
+        assert!(page[0].top.iter().all(|(_, score)| score.is_some()));
         assert_eq!(page[0].album_title.as_deref(), Some("Blue"));
         assert_eq!(page[0].track_count, 2);
 
@@ -403,7 +406,7 @@ mod tests {
             let page = queue_page(&pool, Some(ProviderKind::Deezer), 10, 0)
                 .await
                 .unwrap();
-            assert_eq!(page[0].best, vec![(ProviderKind::Deezer, None)], "{json}");
+            assert_eq!(page[0].top, vec![(ProviderKind::Deezer, None)], "{json}");
         }
     }
 
