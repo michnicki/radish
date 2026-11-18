@@ -590,7 +590,11 @@ impl Fetcher {
 }
 
 /// The release's current guard, or `None` when the release is gone.
-async fn current_guard(pool: &SqlitePool, local_id: i64) -> Result<Option<MatchGuard>> {
+///
+/// # Errors
+///
+/// When the database cannot be read.
+pub async fn current_guard(pool: &SqlitePool, local_id: i64) -> Result<Option<MatchGuard>> {
     match store::load_match_guard(pool, local_id).await {
         Ok(guard) => Ok(Some(guard)),
         Err(error) if error.downcast_ref::<store::SnapshotChanged>().is_some() => Ok(None),

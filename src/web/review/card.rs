@@ -4,11 +4,12 @@
 
 // Rust guideline compliant 2026-08-14
 
-use super::{View, escape_html, hidden_fields, is_web_url};
+use super::{View, hidden_fields};
 use crate::layout::{format_duration, plural, track_number};
 use crate::matcher::{self, Candidate, Evaluation, LocalRelease, RemoteTrack};
 use crate::providers::{ProviderKind, ReleaseId};
 use crate::review as saved;
+use crate::web::{escape_html, is_web_url};
 
 /// One candidate as a card. Only a `current` card has a track table and an
 /// accept section: an out-of-date mapping indexes files that may have moved.

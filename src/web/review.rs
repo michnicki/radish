@@ -13,8 +13,8 @@ mod card;
 
 use self::card::{cannot_apply_text, render_card};
 use super::{
-    AppError, AppState, Nav, PAGE_SIZE, cross_site, escape_html, folder_href, is_web_url, page,
-    page_param, pager_with, relative_path, render_match, same_token,
+    AppError, AppState, Nav, PAGE_SIZE, cross_site, escape_html, folder_href, page, page_param,
+    pager_with, relative_path, render_match, same_token,
 };
 use crate::layout::{format_duration, plural, track_number};
 use crate::matcher::LocalRelease;
@@ -321,6 +321,11 @@ fn render_release(view: &View<'_>) -> String {
             escape_html(&queue_href(view.filter, None))
         ),
     };
+    let jump = if view.token.is_some() {
+        " · <a href=\"#enter\">Enter a release by ID</a>"
+    } else {
+        ""
+    };
     let accepted = view.accepted.map(render_accepted).unwrap_or_default();
     let problems: String = release
         .embedded_evidence
@@ -361,7 +366,7 @@ fn render_release(view: &View<'_>) -> String {
             .collect()
     };
     format!(
-        "<p class=\"pager\">{next}</p>{accepted}<h1>#{} {} — {}</h1>\
+        "<p class=\"pager\">{next}{jump}</p>{accepted}<h1>#{} {} — {}</h1>\
          <p class=\"path\"><a href=\"{}\">{}</a></p><p>{} · {}</p>{problems}{current}{notice}\
          <h2>Files</h2>{}{groups}{}",
         release.id,
@@ -425,7 +430,11 @@ fn render_group(view: &View<'_>, group: &ReviewGroup) -> String {
             escape_html(&group.reasons.join("; "))
         )
     };
-    let heading = format!("<h2>{}</h2>{reasons}", group.provider.label());
+    let heading = format!(
+        "<h2 id=\"group-{}\">{}</h2>{reasons}",
+        group.provider,
+        group.provider.label()
+    );
     let cards = |current: bool| -> String {
         group
             .candidates
@@ -514,10 +523,10 @@ fn render_entry(view: &View<'_>) -> String {
         })
         .collect();
     format!(
-        "<h2>Enter a release</h2>{notice}<form method=\"post\" action=\"/review\">{}\
+        "<h2 id=\"enter\">Enter a release</h2>{notice}<form method=\"post\" action=\"/review#enter\">{}\
          <input type=\"hidden\" name=\"action\" value=\"fetch\">\
          <select name=\"provider\" aria-label=\"Provider\">{options}</select>\
-         <input type=\"text\" name=\"id\" value=\"{}\" maxlength=\"{MAX_ENTERED_CHARS}\" \
+         <input type=\"text\" name=\"id\" value=\"{}\" maxlength=\"{MAX_ENTERED_CHARS}\" required \
          placeholder=\"ID or link\" aria-label=\"Release ID or link\"><button>Fetch</button></form>",
         hidden_fields(view, token),
         escape_html(text),
@@ -529,10 +538,11 @@ const CHANGED: &str = "This release changed after the page was loaded; review it
 
 /// How long a fetch from the review page may take before the page gives up.
 ///
-/// The adapters pace MusicBrainz to about a request a second and retry
-/// transient failures, honoring a `Retry-After` of up to two minutes; a
-/// browser request should not hang that long. Thirty seconds covers a retried
-/// lookup. A fetch cut off here changes nothing: the release was not stored.
+/// MusicBrainz's own per-request timeout is also thirty seconds, so one
+/// stalled request uses the whole budget. The adapters pace MusicBrainz and
+/// retry transient failures, honoring a `Retry-After` of up to two minutes;
+/// the limit exists so the browser request does not hang for minutes. A fetch
+/// cut off here answers `504` and changes nothing: the release was not stored.
 const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The review form's fields; which ones matter depends on `action`.
@@ -615,7 +625,7 @@ pub(super) async fn action(
             Err(_) => return Ok((StatusCode::BAD_REQUEST, "unknown match").into_response()),
         },
     };
-    let Ok(candidate) = saved::parse_entered(provider, form.candidate.trim()) else {
+    let Some(candidate) = parse_stored_id(provider, form.candidate.trim()) else {
         return Ok((StatusCode::BAD_REQUEST, "unknown candidate").into_response());
     };
     let shown = store::MatchGuard {
@@ -623,6 +633,17 @@ pub(super) async fn action(
         accepted_match_id,
     };
     accept(&state, release, &shown, filter, &candidate).await
+}
+
+/// The release a hidden `candidate` field names: the ID as the page wrote it.
+///
+/// Unlike text entered by hand, this takes no link.
+fn parse_stored_id(provider: ProviderKind, text: &str) -> Option<ReleaseId> {
+    match provider {
+        ProviderKind::MusicBrainz => text.parse().ok().map(ReleaseId::MusicBrainz),
+        ProviderKind::Discogs => text.parse().ok().map(ReleaseId::Discogs),
+        ProviderKind::Deezer => text.parse().ok().map(ReleaseId::Deezer),
+    }
 }
 
 /// Accepts saved release `candidate` and goes to the next queued release.
@@ -666,8 +687,10 @@ async fn accept(
 ///
 /// The page is checked before any provider is asked: `404` for a release that
 /// is gone, `409` for one that changed. Then `400` for text that names no
-/// release of `provider`, and `502` when the fetch fails (the provider's
-/// message, or a missing token or index). A success goes back to the page.
+/// release of `provider`, `502` when the fetch fails (the provider's message,
+/// or a missing token or index) and `504` when it takes too long. Text longer
+/// than [`MAX_ENTERED_CHARS`] is not echoed in full. A success goes back to the
+/// page, at the provider's group of candidates.
 async fn fetch(
     state: &AppState,
     release: i64,
@@ -678,18 +701,15 @@ async fn fetch(
 ) -> Result<Response, AppError> {
     let again = |status: StatusCode, text: String| {
         let notice = Notice {
-            entered: Some((provider, entered.to_string())),
+            entered: Some((provider, entered.chars().take(MAX_ENTERED_CHARS).collect())),
             text,
         };
         render_page(state, release, filter, None, Some(notice), status)
     };
-    match store::load_match_guard(&state.pool, release).await {
-        Ok(guard) if guard.source_revision == revision => {}
-        Ok(_) => return again(StatusCode::CONFLICT, CHANGED.to_string()).await,
-        Err(error) if error.downcast_ref::<store::SnapshotChanged>().is_some() => {
-            return Ok(no_release());
-        }
-        Err(error) => return Err(error.into()),
+    match saved::current_guard(&state.pool, release).await? {
+        Some(guard) if guard.source_revision == revision => {}
+        Some(_) => return again(StatusCode::CONFLICT, CHANGED.to_string()).await,
+        None => return Ok(no_release()),
     }
     if entered.chars().count() > MAX_ENTERED_CHARS {
         let text = format!("A release ID or link has at most {MAX_ENTERED_CHARS} characters.");
@@ -708,11 +728,14 @@ async fn fetch(
                 provider.label(),
                 FETCH_TIMEOUT.as_secs()
             );
-            return again(StatusCode::BAD_GATEWAY, text).await;
+            return again(StatusCode::GATEWAY_TIMEOUT, text).await;
         }
     };
     match saved::add_fetched(&state.pool, release, revision, remote).await? {
-        AddOutcome::Added => Ok(Redirect::to(&review_href(release, filter, None)).into_response()),
+        AddOutcome::Added => {
+            let target = format!("{}#group-{provider}", review_href(release, filter, None));
+            Ok(Redirect::to(&target).into_response())
+        }
         AddOutcome::Changed => again(StatusCode::CONFLICT, CHANGED.to_string()).await,
     }
 }
@@ -722,7 +745,7 @@ mod tests {
     use super::*;
     use crate::matcher::{Candidate, Evaluation, MatchScope, RemoteRelease};
     use crate::test_support::{
-        FIXTURE_MBID, local_release, mbid_release, queue, remote_release, seed_release,
+        FIXTURE_MBID, OTHER_MBID, local_release, mbid_release, queue, remote_release, seed_release,
     };
     use axum::extract::rejection::FormRejection;
     use axum::http::{HeaderValue, header};
@@ -1265,6 +1288,130 @@ mod tests {
             html.contains(&format!("value=\"{FIXTURE_MBID}\"")),
             "{html}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unsaved_candidate_is_a_409_and_a_second_submit_is_refused() {
+        let (state, release) = queued_state().await;
+        let Ok(Form(mut other)) = form("accept", release.id, &release.revision, "t") else {
+            unreachable!()
+        };
+        other.candidate = OTHER_MBID.into();
+        let response = post(&state, HeaderMap::new(), Ok(Form(other))).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(body(response).await.contains("no longer saved"));
+
+        let send = || form("accept", release.id, &release.revision, "t");
+        let first = post(&state, HeaderMap::new(), send()).await;
+        assert_eq!(first.status(), StatusCode::SEE_OTHER);
+        let second = post(&state, HeaderMap::new(), send()).await;
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+        assert!(
+            body(second)
+                .await
+                .contains("changed after the page was loaded")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mapping_that_cannot_be_applied_is_a_422() {
+        let state = state(true).await;
+        let release = seed_release(&state.pool, "/music/a", "Blue", &["One", "Two", "Three"]).await;
+        queue(
+            &state.pool,
+            &release,
+            remote_release(mbid_release(FIXTURE_MBID), "Blue", &["One", "Two"]),
+        )
+        .await;
+        let response = post(
+            &state,
+            HeaderMap::new(),
+            form("accept", release.id, &release.revision, "t"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body(response).await.contains("Cannot accept:"));
+    }
+
+    #[tokio::test]
+    async fn text_that_a_page_never_writes_is_a_400() {
+        let (state, release) = queued_state().await;
+        for (matched, candidate) in [
+            ("x", FIXTURE_MBID),
+            ("", "nope"),
+            ("", "https://musicbrainz.org/release/x"),
+        ] {
+            let Ok(Form(mut fields)) = form("accept", release.id, &release.revision, "t") else {
+                unreachable!()
+            };
+            fields.accepted_match = matched.into();
+            fields.candidate = candidate.into();
+            let response = post(&state, HeaderMap::new(), Ok(Form(fields))).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{matched} {candidate}"
+            );
+        }
+        // A link is for the fetch form only: the candidate field holds an ID.
+        let link = format!("https://musicbrainz.org/release/{FIXTURE_MBID}");
+        let Ok(Form(mut fields)) = form("accept", release.id, &release.revision, "t") else {
+            unreachable!()
+        };
+        fields.candidate = link;
+        let response = post(&state, HeaderMap::new(), Ok(Form(fields))).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn an_over_long_entry_is_refused_and_echoed_only_in_part() {
+        let (state, release) = queued_state().await;
+        let Ok(Form(mut fields)) = form("fetch", release.id, &release.revision, "t") else {
+            unreachable!()
+        };
+        fields.id = "é".repeat(MAX_ENTERED_CHARS + 50);
+        let response = post(&state, HeaderMap::new(), Ok(Form(fields))).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let html = body(response).await;
+        assert!(html.contains("at most 200 characters"), "{html}");
+        assert!(
+            html.contains(&format!("value=\"{}\"", "é".repeat(MAX_ENTERED_CHARS))),
+            "{html}"
+        );
+        assert!(!html.contains(&"é".repeat(MAX_ENTERED_CHARS + 1)), "{html}");
+    }
+
+    #[test]
+    fn the_fetch_form_and_its_notice_can_be_jumped_to() {
+        let review = review_of(vec![group(
+            GroupState::Current,
+            vec![(exact(), Vec::new())],
+        )]);
+        let html = render_release(&view(&review, Some("tok")));
+        assert!(
+            html.contains("<h2 id=\"enter\">Enter a release</h2>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<h2 id=\"group-musicbrainz\">MusicBrainz</h2>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<form method=\"post\" action=\"/review#enter\">"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<a href=\"#enter\">Enter a release by ID</a>"),
+            "{html}"
+        );
+        assert!(html.contains(" required "), "{html}");
+        // Accept forms leave the page, so they keep the plain action.
+        assert!(
+            html.contains("<form method=\"post\" action=\"/review\">"),
+            "{html}"
+        );
+        let html = render_release(&view(&review, None));
+        assert!(!html.contains("href=\"#enter\""), "{html}");
     }
 
     #[test]
