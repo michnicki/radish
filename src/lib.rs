@@ -13,6 +13,7 @@
 //! - [`scene`]: artist and album read from a scene release directory name.
 //! - [`grouping`]: which files of a folder form one local release (merging).
 //! - [`store`]: grouping, revisions, review queue, and transactional overlay.
+//! - [`review`]: saved reviews shared by the review prompt and the web page.
 //! - [`runner`]: CLI orchestration and the interactive review screen.
 //! - [`web`]: the web interface behind `radish serve`.
 
@@ -29,6 +30,7 @@ pub mod musicbrainz;
 pub mod output;
 pub mod progress;
 pub mod providers;
+pub mod review;
 pub mod runner;
 pub mod scanner;
 pub mod scene;

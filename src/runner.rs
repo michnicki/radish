@@ -2263,29 +2263,6 @@ fn chosen_provider(providers: &[ProviderKind], reply: &str) -> ProviderKind {
         .unwrap_or(ProviderKind::MusicBrainz)
 }
 
-fn parse_entered_id(provider: ProviderKind, raw: &str) -> Result<ReleaseId> {
-    match provider {
-        ProviderKind::MusicBrainz => {
-            let id = raw
-                .parse()
-                .with_context(|| format!("'{raw}' is not a MusicBrainz MBID"))?;
-            Ok(ReleaseId::MusicBrainz(id))
-        }
-        ProviderKind::Discogs => {
-            let id = raw
-                .parse::<u64>()
-                .with_context(|| format!("'{raw}' is not a Discogs release ID"))?;
-            Ok(ReleaseId::Discogs(id))
-        }
-        ProviderKind::Deezer => {
-            let id = raw
-                .parse::<u64>()
-                .with_context(|| format!("'{raw}' is not a Deezer album ID"))?;
-            Ok(ReleaseId::Deezer(id))
-        }
-    }
-}
-
 async fn fetch_entered<M, D, Z>(
     provider: ProviderKind,
     id: ReleaseId,
@@ -2400,7 +2377,7 @@ where
                     groups[0].0
                 };
                 let raw = prompt("release ID > ")?;
-                let id = match parse_entered_id(provider, &raw) {
+                let id = match crate::review::parse_entered(provider, &raw) {
                     Ok(id) => id,
                     Err(error) => {
                         outln!("invalid release ID: {}", Clean(&error.to_string()));
