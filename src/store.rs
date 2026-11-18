@@ -1757,6 +1757,75 @@ pub async fn load_queued_releases(
     load_releases(pool, scope, None, Some(providers)).await
 }
 
+// The SQL of `load_releases`, once with the ID as its own condition and once
+// with the optional `?2 IS NULL OR` form. SQLite reads a release by its primary
+// key and its tracks by `idx_tracks_local_release` only from the first form;
+// the second hides the key from the planner and scans every row.
+macro_rules! release_sql {
+    ($id_filter:literal) => {
+        concat!(
+            "SELECT lr.id, lr.directory_path, lr.album_title_norm, lr.album_title, lr.album_artist,
+                lr.artist_kind, lr.year, lr.barcode, lr.catalog_number, lr.embedded_discogs_id,
+                lr.embedded_musicbrainz_release_id, lr.embedded_musicbrainz_release_group_id,
+                lr.musicbrainz_problems_json, lr.is_compilation, lr.has_album_tag,
+                lr.source_revision
+         FROM local_releases lr
+         WHERE ((?1 IS NULL
+                 OR replace(lr.directory_path, '\\', '/') = ?1 COLLATE NOCASE
+                 OR substr(replace(lr.directory_path, '\\', '/'), 1, length(?1) + 1)
+                     = (?1 || '/') COLLATE NOCASE)
+                OR (lr.album_title_norm = '*'
+                    AND replace(lr.directory_path, '\\', '/') = ?3 COLLATE NOCASE
+                    AND EXISTS (SELECT 1 FROM tracks m
+                                WHERE m.local_release_id = lr.id
+                                  AND substr(replace(m.path, '\\', '/'), 1, length(?1) + 1)
+                                      = (?1 || '/') COLLATE NOCASE)))
+",
+            "           AND ",
+            $id_filter,
+            "\n",
+            "           AND (?4 IS NULL
+                OR (lr.status <> 'matched'
+                    AND EXISTS (SELECT 1 FROM match_reviews r
+                                WHERE r.local_release_id = lr.id
+                                  AND r.provider IN (SELECT value FROM json_each(?4)))))
+         ORDER BY lr.directory_path, lr.album_title_norm"
+        )
+    };
+}
+
+macro_rules! track_sql {
+    ($id_filter:literal) => {
+        concat!(
+            "SELECT t.id, t.path, t.title, t.disc_number, t.track_number, t.duration_secs,
+                t.local_release_id, t.musicbrainz_ids_json, a.title AS album
+         FROM tracks t
+         JOIN local_releases lr ON lr.id = t.local_release_id
+         LEFT JOIN albums a ON a.id = t.album_id
+         WHERE ((?1 IS NULL
+                 OR replace(lr.directory_path, '\\', '/') = ?1 COLLATE NOCASE
+                 OR substr(replace(lr.directory_path, '\\', '/'), 1, length(?1) + 1)
+                     = (?1 || '/') COLLATE NOCASE)
+                OR (lr.album_title_norm = '*'
+                    AND replace(lr.directory_path, '\\', '/') = ?3 COLLATE NOCASE
+                    AND EXISTS (SELECT 1 FROM tracks m
+                                WHERE m.local_release_id = lr.id
+                                  AND substr(replace(m.path, '\\', '/'), 1, length(?1) + 1)
+                                      = (?1 || '/') COLLATE NOCASE)))
+",
+            "           AND ",
+            $id_filter,
+            "\n",
+            "           AND (?4 IS NULL
+                OR (lr.status <> 'matched'
+                    AND EXISTS (SELECT 1 FROM match_reviews r
+                                WHERE r.local_release_id = lr.id
+                                  AND r.provider IN (SELECT value FROM json_each(?4)))))
+         ORDER BY t.path"
+        )
+    };
+}
+
 /// Loads releases and their tracks in one read transaction.
 ///
 /// `queued` limits the result to unmatched releases with a saved review from
@@ -1787,31 +1856,11 @@ async fn load_releases(
     // snapshot even while an import or rebuild commits in between.
     let mut tx = pool.begin().await?;
 
-    let release_rows = sqlx::query_as::<_, LocalReleaseRow>(
-        "SELECT lr.id, lr.directory_path, lr.album_title_norm, lr.album_title, lr.album_artist,
-                lr.artist_kind, lr.year, lr.barcode, lr.catalog_number, lr.embedded_discogs_id,
-                lr.embedded_musicbrainz_release_id, lr.embedded_musicbrainz_release_group_id,
-                lr.musicbrainz_problems_json, lr.is_compilation, lr.has_album_tag,
-                lr.source_revision
-         FROM local_releases lr
-         WHERE ((?1 IS NULL
-                 OR replace(lr.directory_path, '\\', '/') = ?1 COLLATE NOCASE
-                 OR substr(replace(lr.directory_path, '\\', '/'), 1, length(?1) + 1)
-                     = (?1 || '/') COLLATE NOCASE)
-                OR (lr.album_title_norm = '*'
-                    AND replace(lr.directory_path, '\\', '/') = ?3 COLLATE NOCASE
-                    AND EXISTS (SELECT 1 FROM tracks m
-                                WHERE m.local_release_id = lr.id
-                                  AND substr(replace(m.path, '\\', '/'), 1, length(?1) + 1)
-                                      = (?1 || '/') COLLATE NOCASE)))
-           AND (?2 IS NULL OR lr.id = ?2)
-           AND (?4 IS NULL
-                OR (lr.status <> 'matched'
-                    AND EXISTS (SELECT 1 FROM match_reviews r
-                                WHERE r.local_release_id = lr.id
-                                  AND r.provider IN (SELECT value FROM json_each(?4)))))
-         ORDER BY lr.directory_path, lr.album_title_norm",
-    )
+    let release_rows = sqlx::query_as::<_, LocalReleaseRow>(if id.is_some() {
+        release_sql!("lr.id = ?2")
+    } else {
+        release_sql!("(?2 IS NULL OR lr.id = ?2)")
+    })
     .bind(scope)
     .bind(id)
     .bind(merged_parent.as_deref())
@@ -1819,30 +1868,11 @@ async fn load_releases(
     .fetch_all(&mut *tx)
     .await?;
 
-    let track_rows = sqlx::query_as::<_, LocalTrackRow>(
-        "SELECT t.id, t.path, t.title, t.disc_number, t.track_number, t.duration_secs,
-                t.local_release_id, t.musicbrainz_ids_json, a.title AS album
-         FROM tracks t
-         JOIN local_releases lr ON lr.id = t.local_release_id
-         LEFT JOIN albums a ON a.id = t.album_id
-         WHERE ((?1 IS NULL
-                 OR replace(lr.directory_path, '\\', '/') = ?1 COLLATE NOCASE
-                 OR substr(replace(lr.directory_path, '\\', '/'), 1, length(?1) + 1)
-                     = (?1 || '/') COLLATE NOCASE)
-                OR (lr.album_title_norm = '*'
-                    AND replace(lr.directory_path, '\\', '/') = ?3 COLLATE NOCASE
-                    AND EXISTS (SELECT 1 FROM tracks m
-                                WHERE m.local_release_id = lr.id
-                                  AND substr(replace(m.path, '\\', '/'), 1, length(?1) + 1)
-                                      = (?1 || '/') COLLATE NOCASE)))
-           AND (?2 IS NULL OR lr.id = ?2)
-           AND (?4 IS NULL
-                OR (lr.status <> 'matched'
-                    AND EXISTS (SELECT 1 FROM match_reviews r
-                                WHERE r.local_release_id = lr.id
-                                  AND r.provider IN (SELECT value FROM json_each(?4)))))
-         ORDER BY t.path",
-    )
+    let track_rows = sqlx::query_as::<_, LocalTrackRow>(if id.is_some() {
+        track_sql!("t.local_release_id = ?2")
+    } else {
+        track_sql!("(?2 IS NULL OR lr.id = ?2)")
+    })
     .bind(scope)
     .bind(id)
     .bind(merged_parent.as_deref())
@@ -5458,6 +5488,67 @@ mod tests {
         );
         let release = load_local_releases(&pool, None).await.unwrap().remove(0);
         assert_eq!(release.album_title.as_deref(), Some("augmented"));
+    }
+
+    #[tokio::test]
+    async fn loading_one_release_by_id_matches_its_entry_in_the_full_load() {
+        let pool = test_pool().await;
+        // A merged release and two plain ones.
+        let mut files = augmented_files();
+        for (dir, album, tracks) in [("/music/a", "Blue", 3), ("/music/b", "Red", 2)] {
+            for track in (1..=tracks).rev() {
+                files.push(scanned(
+                    &format!("{dir}/0{track}.flac"),
+                    Some(album),
+                    Some("Artist"),
+                    track,
+                ));
+            }
+        }
+        insert(&pool, "/music", &files).await;
+
+        let all = load_local_releases(&pool, None).await.unwrap();
+        assert_eq!(all.len(), 3);
+        for expected in &all {
+            let loaded = load_selected_releases(&pool, None, Some(expected.id))
+                .await
+                .unwrap();
+            assert_eq!(loaded.len(), 1, "release {}", expected.id);
+            let loaded = &loaded[0];
+            assert_eq!(loaded.id, expected.id);
+            assert_eq!(loaded.directory, expected.directory);
+            assert_eq!(loaded.album_title, expected.album_title);
+            assert!(!loaded.tracks.is_empty());
+            assert_eq!(
+                format!("{:?}", loaded.tracks),
+                format!("{:?}", expected.tracks),
+                "tracks of release {}",
+                expected.id
+            );
+        }
+
+        // An ID that names nothing loads nothing; a scope that does not hold
+        // the release still excludes it.
+        assert!(
+            load_selected_releases(&pool, None, Some(9999))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let blue = all.iter().find(|r| r.directory == "/music/a").unwrap();
+        assert!(
+            load_selected_releases(&pool, Some(Path::new("/music/b")), Some(blue.id))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            load_selected_releases(&pool, Some(Path::new("/music/a")), Some(blue.id))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
