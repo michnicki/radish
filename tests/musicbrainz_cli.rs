@@ -288,6 +288,26 @@ async fn a_queued_run_matches_only_the_queued_releases() {
 }
 
 #[tokio::test]
+async fn releases_lists_only_the_queued_ones_when_asked() {
+    let db = db_path("queued-releases");
+    let blue = seed(&db, 2001).await;
+    seed_red(&db).await;
+    let server = MockServer::start(handler);
+    queue_blue(&db, &server, blue);
+
+    let listed = stdout(&run(&db, &server, &["releases", "--queued"]));
+    assert!(listed.contains("— Blue"), "{listed}");
+    assert!(!listed.contains("— Red"), "{listed}");
+    assert!(listed.contains("1 local release."), "{listed}");
+    assert!(stdout(&run(&db, &server, &["releases"])).contains("— Red"));
+
+    let empty = db_path("queued-releases-none");
+    seed_red(&empty).await;
+    let listed = stdout(&run(&empty, &server, &["releases", "--queued"]));
+    assert_eq!(listed.trim(), "No local releases are queued for review.");
+}
+
+#[tokio::test]
 async fn equivalent_editions_match_automatically_without_edition_identifiers() {
     let db = db_path("album-auto");
     seed_without_edition_ids(&db).await;

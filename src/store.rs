@@ -1986,6 +1986,11 @@ impl LocalReleaseStatus {
         !self.queued_providers.is_empty()
     }
 
+    /// Whether the release waits in the review queue: not matched, with a saved review.
+    pub fn awaits_review(&self) -> bool {
+        self.queued() && self.status != STATUS_MATCHED
+    }
+
     /// The status with its qualifiers, as `releases` and the web UI show it:
     /// `matched, album match; edition unconfirmed, stale, queued (musicbrainz)`.
     pub fn status_label(&self) -> String {
@@ -1996,7 +2001,7 @@ impl LocalReleaseStatus {
         if self.stale && self.status != STATUS_STALE {
             label.push_str(", stale");
         }
-        if self.queued() && self.status != STATUS_MATCHED {
+        if self.awaits_review() {
             let providers: Vec<&str> = self
                 .queued_providers
                 .iter()
@@ -5762,6 +5767,32 @@ mod tests {
             vec![Target::New, Target::New, Target::Existing(3)]
         );
         assert_eq!(plan.removed, vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn only_an_unmatched_release_with_a_review_awaits_review() {
+        let status = |status: &str, queued: Vec<ProviderKind>| LocalReleaseStatus {
+            id: 1,
+            directory: "/music/a".into(),
+            unit: "/music/a".into(),
+            album_title: None,
+            album_artist: None,
+            track_count: 1,
+            status: status.into(),
+            provider: None,
+            remote_release_id: None,
+            remote_url: None,
+            remote_title: None,
+            match_scope: None,
+            medium: None,
+            stale: false,
+            queued_providers: queued,
+            merged: None,
+        };
+        assert!(status(STATUS_UNMATCHED, vec![ProviderKind::Deezer]).awaits_review());
+        assert!(status(STATUS_STALE, vec![ProviderKind::Discogs]).awaits_review());
+        assert!(!status(STATUS_MATCHED, vec![ProviderKind::Discogs]).awaits_review());
+        assert!(!status(STATUS_UNMATCHED, Vec::new()).awaits_review());
     }
 
     #[tokio::test]

@@ -81,6 +81,9 @@ enum Command {
         /// Restrict output to this directory tree
         #[arg(long, value_name = "PATH")]
         path: Option<PathBuf>,
+        /// Only releases queued for review
+        #[arg(long)]
+        queued: bool,
     },
     /// Merge a folder's releases into one, keep them apart, or let Radish decide
     Folder {
@@ -635,9 +638,17 @@ async fn run() -> Result<()> {
         },
         Command::List => print_tracks(&store::list_tracks(&pool).await?),
         Command::Search { query } => print_tracks(&store::search_tracks(&pool, &query).await?),
-        Command::Releases { path } => {
+        Command::Releases { path, queued } => {
             let scope = canonical_scope(path.as_deref())?;
-            print_releases(&store::list_local_releases(&pool, scope.as_deref()).await?);
+            let mut rows = store::list_local_releases(&pool, scope.as_deref()).await?;
+            if queued {
+                rows.retain(store::LocalReleaseStatus::awaits_review);
+            }
+            if queued && rows.is_empty() {
+                outln!("No local releases are queued for review.");
+            } else {
+                print_releases(&rows);
+            }
         }
         Command::Folder { action } => match action {
             FolderCommand::List { path } => {
