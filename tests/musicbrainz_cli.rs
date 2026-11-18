@@ -72,6 +72,8 @@ fn run(db: &Path, server: &MockServer, args: &[&str]) -> Output {
         .arg("--db")
         .arg(db)
         .args(args)
+        // The checkout's `.env` must not reach the binary.
+        .current_dir(db.parent().unwrap())
         .env("RADISH_MUSICBRAINZ_BASE_URL", &server.url)
         .env("RADISH_DISCOGS_BASE_URL", &server.url)
         .env("RADISH_DEEZER_BASE_URL", &server.url)
@@ -276,6 +278,7 @@ async fn a_queued_run_matches_only_the_queued_releases() {
     queue_blue(&db, &server, blue);
 
     let output = run(&db, &server, &["match", "--queued", "--dry-run"]);
+    assert!(output.status.success(), "{output:?}");
     let text = stdout(&output);
     assert!(
         text.contains(&format!("Matching local release {blue} (")),
@@ -292,7 +295,14 @@ async fn a_release_queued_only_for_deezer_needs_deezer() {
     let db = db_path("queued-deezer-only");
     let blue = seed(&db, 2001).await;
     let red = seed_red(&db).await;
-    let server = MockServer::start(handler);
+    // Deezer answers "no data" at once, so the Deezer stage ends without retries.
+    let server = MockServer::start(|target| {
+        if target.starts_with("/search/album") || target.starts_with("/album/") {
+            (200, deezer_no_data())
+        } else {
+            handler(target)
+        }
+    });
     queue_blue(&db, &server, blue);
 
     // Red gets a Deezer-only review, copied from blue's MusicBrainz review.
@@ -316,16 +326,19 @@ async fn a_release_queued_only_for_deezer_needs_deezer() {
     let blue_line = format!("Matching local release {blue} (");
     let red_line = format!("Matching local release {red} (");
 
-    // The Deezer stage may fail against the mock, so only stdout is checked.
-    let without = stdout(&run(&db, &server, &["match", "--queued", "--dry-run"]));
+    let output = run(&db, &server, &["match", "--queued", "--dry-run"]);
+    assert!(output.status.success(), "{output:?}");
+    let without = stdout(&output);
     assert!(without.contains(&blue_line), "{without}");
     assert!(!without.contains(&red_line), "{without}");
 
-    let with = stdout(&run(
+    let output = run(
         &db,
         &server,
         &["match", "--queued", "--deezer", "--dry-run"],
-    ));
+    );
+    assert!(output.status.success(), "{output:?}");
+    let with = stdout(&output);
     assert!(with.contains(&blue_line), "{with}");
     assert!(with.contains(&red_line), "{with}");
 }

@@ -1,4 +1,5 @@
-//! Helpers shared by unit tests: scratch directories and audio fixtures.
+//! Helpers shared by unit tests: scratch directories, audio fixtures, and
+//! release and review fixtures.
 
 use crate::matcher::{
     self, ArtistKind, Candidate, DiscoveryEvidence, EmbeddedReleaseEvidence, LocalRelease,

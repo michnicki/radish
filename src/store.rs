@@ -1741,8 +1741,8 @@ pub async fn load_selected_releases(
 /// The releases under `scope` that wait for review by one of `providers`.
 ///
 /// A release waits for review when it is not matched and has a saved review.
-/// Only reviews of `providers` count, so a run that could not load a release's
-/// only review does not select it and search again.
+/// Only reviews of `providers` select a release. A release whose files changed
+/// since it was queued is still selected, and a run searches it again.
 ///
 /// # Errors
 ///
@@ -5842,6 +5842,14 @@ mod tests {
             .unwrap();
         assert_eq!(scoped[0].tracks.len(), 2, "tracks come with the release");
         assert_eq!(ids(scoped), vec![b.id]);
+
+        // Reviews of other providers select nothing.
+        assert!(
+            load_queued_releases(&pool, None, &[ProviderKind::Discogs])
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         // A matched release with a leftover review is not queued.
         sqlx::query("UPDATE local_releases SET status = 'matched' WHERE id = ?1")

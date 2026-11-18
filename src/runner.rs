@@ -600,6 +600,9 @@ where
     if options.direct_release.is_some() && options.local_release.is_none() {
         bail!("a direct release selector requires --local-release");
     }
+    if options.queued && options.local_release.is_some() {
+        bail!("--queued cannot be combined with --local-release");
+    }
 
     // Grouping is derived identity, not a matching result, so it is refreshed
     // even for a dry run. Matching results and overlays are never written.
