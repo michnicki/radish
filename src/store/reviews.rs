@@ -621,6 +621,27 @@ pub async fn queue_count(pool: &SqlitePool, view: &QueueView) -> Result<i64> {
     .await?)
 }
 
+/// Where a release sat in the score-sorted queue when the user found it.
+///
+/// Entering a release by ID rewrites its review summary and so moves it; a
+/// place keeps "next" counted from where the user came from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QueuePlace {
+    /// The lead score the release had there; `None` is the block of releases
+    /// with no score.
+    pub score: Option<f64>,
+}
+
+/// The release that follows another in a view, with its lead score under it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QueueNext {
+    /// The release's ID.
+    pub id: i64,
+    /// Its lead score under the view. Read in score order only; in folder
+    /// order it is `None`, whatever the release's score.
+    pub score: Option<f64>,
+}
+
 /// The first release after release `after` in `view`'s order.
 ///
 /// `after` need not be in the view. In folder order, the next release after
@@ -629,10 +650,20 @@ pub async fn queue_count(pool: &SqlitePool, view: &QueueView) -> Result<i64> {
 /// one that is gone) also starts again from the top; otherwise the next is the
 /// first below its lead score, ties in folder order.
 ///
+/// `at` pins the score order's starting point: with `Some`, `after` is taken
+/// to sit at that lead score, with its own folder position, wherever its
+/// reviews put it now. A release that is gone still starts again from the top.
+/// Folder order ignores `at`.
+///
 /// # Errors
 ///
 /// When the database cannot be read.
-pub async fn next_queued(pool: &SqlitePool, after: i64, view: &QueueView) -> Result<Option<i64>> {
+pub async fn next_queued(
+    pool: &SqlitePool,
+    after: i64,
+    view: &QueueView,
+    at: Option<QueuePlace>,
+) -> Result<Option<QueueNext>> {
     let provider = view.provider.map(ProviderKind::as_str);
     let acceptable = i64::from(view.acceptable);
     let next = match view.sort {
@@ -643,7 +674,7 @@ pub async fn next_queued(pool: &SqlitePool, after: i64, view: &QueueView) -> Res
             .bind(after)
             .fetch_optional(pool)
             .await?;
-            match position {
+            let id: Option<i64> = match position {
                 // Directory paths compare without case, as the listing orders
                 // them; (directory, title) is unique, so the order is total.
                 Some((directory, title)) => {
@@ -671,32 +702,48 @@ pub async fn next_queued(pool: &SqlitePool, after: i64, view: &QueueView) -> Res
                     .fetch_optional(pool)
                     .await?
                 }
-            }
+            };
+            id.map(|id| QueueNext { id, score: None })
         }
         QueueSort::Score => {
             // `after`'s place in the view: its lead score and folder key. No
             // row means it is not in the view (or is gone).
-            let position: Option<(Option<f64>, String, String)> = sqlx::query_as(concat!(
-                "SELECT lead.score, lr.directory_path, lr.album_title_norm
-                 FROM (",
-                lead_scores!("AND lr.id = ?3"),
-                ") lead JOIN local_releases lr ON lr.id = lead.id"
-            ))
-            .bind(provider)
-            .bind(acceptable)
-            .bind(after)
-            .fetch_optional(pool)
-            .await?;
+            let position: Option<(Option<f64>, String, String)> = match at {
+                Some(place) => {
+                    let folder: Option<(String, String)> = sqlx::query_as(
+                        "SELECT directory_path, album_title_norm FROM local_releases
+                         WHERE id = ?1",
+                    )
+                    .bind(after)
+                    .fetch_optional(pool)
+                    .await?;
+                    folder.map(|(directory, title)| (place.score, directory, title))
+                }
+                None => {
+                    sqlx::query_as(concat!(
+                        "SELECT lead.score, lr.directory_path, lr.album_title_norm
+                         FROM (",
+                        lead_scores!("AND lr.id = ?3"),
+                        ") lead JOIN local_releases lr ON lr.id = lead.id"
+                    ))
+                    .bind(provider)
+                    .bind(acceptable)
+                    .bind(after)
+                    .fetch_optional(pool)
+                    .await?
+                }
+            };
             match position {
                 // After `after`: no score sorts last, so a scored release is
                 // followed by every release with no score, by lower scores,
                 // and by equal scores later in folder order.
                 Some((score, directory, title)) => {
-                    sqlx::query_scalar(concat!(
+                    sqlx::query_as(concat!(
                         "WITH lead AS (",
                         lead_scores!(),
                         ")
-                         SELECT lr.id FROM lead JOIN local_releases lr ON lr.id = lead.id
+                         SELECT lr.id, lead.score
+                         FROM lead JOIN local_releases lr ON lr.id = lead.id
                          WHERE (lead.score IS NULL) > (?3 IS NULL)
                             OR (lead.score IS ?3
                                 AND (lr.directory_path, lr.album_title_norm) > (?4, ?5))
@@ -713,11 +760,12 @@ pub async fn next_queued(pool: &SqlitePool, after: i64, view: &QueueView) -> Res
                     .await?
                 }
                 None => {
-                    sqlx::query_scalar(concat!(
+                    sqlx::query_as(concat!(
                         "WITH lead AS (",
                         lead_scores!(),
                         ")
-                         SELECT lr.id FROM lead JOIN local_releases lr ON lr.id = lead.id ",
+                         SELECT lr.id, lead.score
+                         FROM lead JOIN local_releases lr ON lr.id = lead.id ",
                         score_order!(),
                         " LIMIT 1"
                     ))
@@ -727,6 +775,7 @@ pub async fn next_queued(pool: &SqlitePool, after: i64, view: &QueueView) -> Res
                     .await?
                 }
             }
+            .map(|(id, score)| QueueNext { id, score })
         }
     };
     Ok(next)
@@ -792,15 +841,17 @@ mod tests {
         .await;
         let page = queue_page(&pool, &folder(None), 10, 0).await.unwrap();
         assert_eq!(ids(&page), vec![a, b, mixed.id, d]);
-        assert_eq!(
-            next_queued(&pool, b, &folder(None)).await.unwrap(),
-            Some(mixed.id)
-        );
-        assert_eq!(
-            next_queued(&pool, mixed.id, &folder(None)).await.unwrap(),
-            Some(d)
-        );
-        assert_eq!(next_queued(&pool, c, &folder(None)).await.unwrap(), Some(d));
+        assert_eq!(next_id(&pool, b, &folder(None)).await, Some(mixed.id));
+        assert_eq!(next_id(&pool, mixed.id, &folder(None)).await, Some(d));
+        assert_eq!(next_id(&pool, c, &folder(None)).await, Some(d));
+    }
+
+    /// The release after `after`, as `next_queued` finds it from where `after` sits now.
+    async fn next_id(pool: &SqlitePool, after: i64, view: &QueueView) -> Option<i64> {
+        next_queued(pool, after, view, None)
+            .await
+            .unwrap()
+            .map(|next| next.id)
     }
 
     fn view(provider: Option<ProviderKind>, sort: QueueSort, acceptable: bool) -> QueueView {
@@ -970,21 +1021,21 @@ mod tests {
         set_summary(&pool, d, "deezer", Some(0.90), false).await;
         let score = view(None, QueueSort::Score, false);
         // b 0.95, then a and d tie at 0.90 (folder order), then nothing.
-        assert_eq!(next_queued(&pool, b, &score).await.unwrap(), Some(a));
-        assert_eq!(next_queued(&pool, a, &score).await.unwrap(), Some(d));
-        assert_eq!(next_queued(&pool, d, &score).await.unwrap(), None);
+        assert_eq!(next_id(&pool, b, &score).await, Some(a));
+        assert_eq!(next_id(&pool, a, &score).await, Some(d));
+        assert_eq!(next_id(&pool, d, &score).await, None);
         // A release outside the view (c has no review) starts from the top.
-        assert_eq!(next_queued(&pool, c, &score).await.unwrap(), Some(b));
+        assert_eq!(next_id(&pool, c, &score).await, Some(b));
         // With the acceptable filter, d drops out and a is last.
         let acceptable = view(None, QueueSort::Score, true);
-        assert_eq!(next_queued(&pool, a, &acceptable).await.unwrap(), None);
+        assert_eq!(next_id(&pool, a, &acceptable).await, None);
         // A release that just left the queue (its reviews deleted) restarts at the top.
         sqlx::query("DELETE FROM match_reviews WHERE local_release_id = ?1")
             .bind(b)
             .execute(&pool)
             .await
             .unwrap();
-        assert_eq!(next_queued(&pool, b, &score).await.unwrap(), Some(a));
+        assert_eq!(next_id(&pool, b, &score).await, Some(a));
     }
 
     #[tokio::test]
@@ -996,9 +1047,9 @@ mod tests {
         set_summary(&pool, d, "deezer", None, false).await;
         let score = view(None, QueueSort::Score, false);
         // b scores; then a and d have no score and follow in folder order.
-        assert_eq!(next_queued(&pool, b, &score).await.unwrap(), Some(a));
-        assert_eq!(next_queued(&pool, a, &score).await.unwrap(), Some(d));
-        assert_eq!(next_queued(&pool, d, &score).await.unwrap(), None);
+        assert_eq!(next_id(&pool, b, &score).await, Some(a));
+        assert_eq!(next_id(&pool, a, &score).await, Some(d));
+        assert_eq!(next_id(&pool, d, &score).await, None);
     }
 
     #[tokio::test]
@@ -1021,8 +1072,106 @@ mod tests {
         let score = view(None, QueueSort::Score, false);
         let page = queue_page(&pool, &score, 10, 0).await.unwrap();
         assert_eq!(ids(&page), vec![b2.id, c.id]);
-        assert_eq!(next_queued(&pool, b2.id, &score).await.unwrap(), Some(c.id));
-        assert_eq!(next_queued(&pool, c.id, &score).await.unwrap(), None);
+        assert_eq!(next_id(&pool, b2.id, &score).await, Some(c.id));
+        assert_eq!(next_id(&pool, c.id, &score).await, None);
+    }
+
+    /// The release after `after` when it is taken to sit at `score`.
+    async fn next_at(
+        pool: &SqlitePool,
+        after: i64,
+        view: &QueueView,
+        score: Option<f64>,
+    ) -> Option<QueueNext> {
+        next_queued(pool, after, view, Some(QueuePlace { score }))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn next_from_a_pinned_place_ignores_where_the_release_sits_now() {
+        let (pool, [a, b, _, d]) = library().await;
+        set_summary(&pool, b, "musicbrainz", Some(0.9), true).await;
+        set_summary(&pool, a, "musicbrainz", Some(0.8), true).await;
+        set_summary(&pool, a, "discogs", Some(0.7), true).await;
+        set_summary(&pool, d, "deezer", Some(0.7), true).await;
+        let score = view(None, QueueSort::Score, false);
+        // A fetch rewrites a's summary: it now leads the queue.
+        sqlx::query("UPDATE match_reviews SET top_score = 0.95 WHERE local_release_id = ?1")
+            .bind(a)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // From where it sits now, a is followed by b; from where it was found, by d.
+        assert_eq!(next_id(&pool, a, &score).await, Some(b));
+        assert_eq!(
+            next_at(&pool, a, &score, Some(0.8)).await,
+            Some(QueueNext {
+                id: d,
+                score: Some(0.7)
+            })
+        );
+        // Without a pin the answer is the same as from `None`, with its score.
+        assert_eq!(
+            next_queued(&pool, a, &score, None).await.unwrap(),
+            Some(QueueNext {
+                id: b,
+                score: Some(0.9)
+            })
+        );
+        // A pin works for a release the view no longer holds, too.
+        sqlx::query("DELETE FROM match_reviews WHERE local_release_id = ?1")
+            .bind(a)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            next_at(&pool, a, &score, Some(0.8)).await.map(|n| n.id),
+            Some(d)
+        );
+        // A release that is gone starts again from the top.
+        assert_eq!(
+            next_at(&pool, d + 100, &score, Some(0.8))
+                .await
+                .map(|n| n.id),
+            Some(b)
+        );
+    }
+
+    #[tokio::test]
+    async fn next_from_the_no_score_place_continues_in_that_block() {
+        let (pool, [a, b, _, d]) = library().await;
+        set_summary(&pool, b, "musicbrainz", Some(0.5), true).await;
+        set_summary(&pool, a, "musicbrainz", None, false).await;
+        set_summary(&pool, a, "discogs", None, false).await;
+        set_summary(&pool, d, "deezer", None, false).await;
+        let score = view(None, QueueSort::Score, false);
+        // b was found with no score (a fetch has since given it one): the
+        // releases with no score after it in folder order still follow it,
+        // and nothing above it comes back.
+        assert_eq!(
+            next_at(&pool, b, &score, None).await,
+            Some(QueueNext { id: d, score: None })
+        );
+        assert_eq!(next_at(&pool, a, &score, None).await.map(|n| n.id), Some(d));
+        assert_eq!(next_at(&pool, d, &score, None).await, None);
+    }
+
+    #[tokio::test]
+    async fn folder_order_ignores_a_pinned_place() {
+        let (pool, [a, b, _, d]) = library().await;
+        set_summary(&pool, a, "musicbrainz", Some(0.1), true).await;
+        let folder_view = folder(None);
+        for score in [None, Some(0.1), Some(0.99)] {
+            assert_eq!(
+                next_at(&pool, a, &folder_view, score).await.map(|n| n.id),
+                Some(b)
+            );
+            assert_eq!(
+                next_at(&pool, b, &folder_view, score).await.map(|n| n.id),
+                Some(d)
+            );
+        }
     }
 
     #[tokio::test]
@@ -1033,8 +1182,8 @@ mod tests {
         set_summary(&pool, d, "deezer", Some(0.5), true).await;
         let acceptable = view(None, QueueSort::Folder, true);
         // b cannot be accepted, so a is followed by d.
-        assert_eq!(next_queued(&pool, a, &acceptable).await.unwrap(), Some(d));
-        assert_eq!(next_queued(&pool, d, &acceptable).await.unwrap(), None);
+        assert_eq!(next_id(&pool, a, &acceptable).await, Some(d));
+        assert_eq!(next_id(&pool, d, &acceptable).await, None);
     }
 
     #[tokio::test]
@@ -1046,10 +1195,10 @@ mod tests {
         set_summary(&pool, d, "deezer", Some(0.95), true).await;
         let musicbrainz = view(Some(ProviderKind::MusicBrainz), QueueSort::Score, false);
         // Only the MusicBrainz reviews count: b 0.80, then a 0.60.
-        assert_eq!(next_queued(&pool, b, &musicbrainz).await.unwrap(), Some(a));
-        assert_eq!(next_queued(&pool, a, &musicbrainz).await.unwrap(), None);
+        assert_eq!(next_id(&pool, b, &musicbrainz).await, Some(a));
+        assert_eq!(next_id(&pool, a, &musicbrainz).await, None);
         // d has no MusicBrainz review, so it is outside the view.
-        assert_eq!(next_queued(&pool, d, &musicbrainz).await.unwrap(), Some(b));
+        assert_eq!(next_id(&pool, d, &musicbrainz).await, Some(b));
     }
 
     #[tokio::test]
@@ -1064,14 +1213,14 @@ mod tests {
         let page = queue_page(&pool, &acceptable, 10, 0).await.unwrap();
         assert_eq!(ids(&page), vec![b, a, d]);
         assert_eq!(page[1].lead.as_ref().unwrap().score, Some(0.70));
-        assert_eq!(next_queued(&pool, b, &acceptable).await.unwrap(), Some(a));
-        assert_eq!(next_queued(&pool, a, &acceptable).await.unwrap(), Some(d));
+        assert_eq!(next_id(&pool, b, &acceptable).await, Some(a));
+        assert_eq!(next_id(&pool, a, &acceptable).await, Some(d));
 
         // A release with reviews but none the view allows restarts at the top.
         set_summary(&pool, d, "deezer", Some(0.60), false).await;
-        assert_eq!(next_queued(&pool, d, &acceptable).await.unwrap(), Some(b));
+        assert_eq!(next_id(&pool, d, &acceptable).await, Some(b));
         // So does one with no reviews at all.
-        assert_eq!(next_queued(&pool, c, &acceptable).await.unwrap(), Some(b));
+        assert_eq!(next_id(&pool, c, &acceptable).await, Some(b));
     }
 
     #[test]
@@ -1199,22 +1348,17 @@ mod tests {
     #[tokio::test]
     async fn next_in_queue_follows_folder_order_and_the_filter() {
         let (pool, [a, b, c, d]) = library().await;
-        assert_eq!(next_queued(&pool, a, &folder(None)).await.unwrap(), Some(b));
-        assert_eq!(next_queued(&pool, b, &folder(None)).await.unwrap(), Some(d));
-        assert_eq!(next_queued(&pool, d, &folder(None)).await.unwrap(), None);
+        assert_eq!(next_id(&pool, a, &folder(None)).await, Some(b));
+        assert_eq!(next_id(&pool, b, &folder(None)).await, Some(d));
+        assert_eq!(next_id(&pool, d, &folder(None)).await, None);
         // From a release that is not queued, the next queued one after it.
-        assert_eq!(next_queued(&pool, c, &folder(None)).await.unwrap(), Some(d));
+        assert_eq!(next_id(&pool, c, &folder(None)).await, Some(d));
         assert_eq!(
-            next_queued(&pool, a, &folder(Some(ProviderKind::Deezer)))
-                .await
-                .unwrap(),
+            next_id(&pool, a, &folder(Some(ProviderKind::Deezer))).await,
             Some(d)
         );
         // A release that is gone starts the queue again from the top.
-        assert_eq!(
-            next_queued(&pool, d + 100, &folder(None)).await.unwrap(),
-            Some(a)
-        );
+        assert_eq!(next_id(&pool, d + 100, &folder(None)).await, Some(a));
     }
 
     fn stored(

@@ -1062,7 +1062,7 @@ fn the_score_sorted_acceptable_queue_keeps_its_view() {
     );
     assert!(
         acceptable.body.contains(&format!(
-            "href=\"/review?release={blue}&amp;sort=score&amp;show=acceptable\""
+            "href=\"/review?release={blue}&amp;sort=score&amp;show=acceptable&amp;at=1\""
         )),
         "{}",
         acceptable.body

@@ -40,6 +40,8 @@ pub(super) struct ReviewParams {
     show: Option<String>,
     accepted: Option<String>,
     page: Option<String>,
+    /// The lead score the release had in the queue: see [`parse_place`].
+    at: Option<String>,
 }
 
 impl ReviewParams {
@@ -66,6 +68,32 @@ impl ReviewParams {
     fn page(&self) -> u64 {
         page_param(self.page.as_deref())
     }
+
+    /// The place the release was found at, when the query names one.
+    fn at(&self) -> Option<store::QueuePlace> {
+        parse_place(self.at.as_deref()?)
+    }
+}
+
+/// The `at` value that names `place`: the lead score as Rust prints it, which
+/// reads back as the same number, or `none` for the block with no score.
+fn place_text(place: store::QueuePlace) -> String {
+    place
+        .score
+        .map_or_else(|| "none".to_string(), |score| score.to_string())
+}
+
+/// The place `text` names; anything that is not `none` or a finite number is
+/// no place.
+fn parse_place(text: &str) -> Option<store::QueuePlace> {
+    let text = text.trim();
+    if text.eq_ignore_ascii_case("none") {
+        return Some(store::QueuePlace { score: None });
+    }
+    let score: f64 = text.parse().ok()?;
+    score
+        .is_finite()
+        .then_some(store::QueuePlace { score: Some(score) })
 }
 
 /// The queue view named by `provider`, `sort` and `show`; unknown values fall back to the default.
@@ -111,14 +139,17 @@ fn view_params(view: &store::QueueView) -> Vec<(&'static str, &'static str)> {
     params
 }
 
-/// `path`, then the release (when given), the view's parameters and the
-/// release just accepted, as a query string.
+/// `path`, then the release (when given), the view's parameters, the place
+/// the release was found at and the release just accepted, as a query string.
 ///
-/// Every value is a static string or an integer, so none needs encoding.
+/// The place is written only in score order, where it means something. Every
+/// value is a static string, an integer, a number or `none`, so none needs
+/// encoding.
 fn href_with(
     path: &str,
     release: Option<i64>,
     view: &store::QueueView,
+    at: Option<store::QueuePlace>,
     accepted: Option<i64>,
 ) -> String {
     let mut parts: Vec<String> = release
@@ -130,6 +161,9 @@ fn href_with(
             .into_iter()
             .map(|(key, value)| format!("{key}={value}")),
     );
+    if let Some(place) = at.filter(|_| view.sort == store::QueueSort::Score) {
+        parts.push(format!("at={}", place_text(place)));
+    }
     if let Some(id) = accepted {
         parts.push(format!("accepted={id}"));
     }
@@ -140,14 +174,20 @@ fn href_with(
     }
 }
 
-/// `/review?release=N`, with the queue view and the release just accepted.
-fn review_href(release: i64, view: &store::QueueView, accepted: Option<i64>) -> String {
-    href_with("/review", Some(release), view, accepted)
+/// `/review?release=N`, with the queue view, the place the release was found
+/// at (score order only) and the release just accepted.
+fn review_href(
+    release: i64,
+    view: &store::QueueView,
+    at: Option<store::QueuePlace>,
+    accepted: Option<i64>,
+) -> String {
+    href_with("/review", Some(release), view, at, accepted)
 }
 
 /// `/reviews`, with the queue view and the release just accepted.
 fn queue_href(view: &store::QueueView, accepted: Option<i64>) -> String {
-    href_with("/reviews", None, view, accepted)
+    href_with("/reviews", None, view, None, accepted)
 }
 
 /// `/reviews`: the queue of releases waiting for a decision.
@@ -194,7 +234,7 @@ fn render_accepted(status: &store::LocalReleaseStatus, view: &store::QueueView) 
     format!(
         "<p class=\"notice\">Accepted {} for <a href=\"{}\">#{} {} — {}</a>.</p>",
         render_match(status),
-        escape_html(&review_href(status.id, view, None)),
+        escape_html(&review_href(status.id, view, None, None)),
         status.id,
         escape_html(status.album_artist.as_deref().unwrap_or("(unknown artist)")),
         escape_html(status.album_title.as_deref().unwrap_or("(no album tag)")),
@@ -332,11 +372,16 @@ fn queue_row(row: &store::QueuedRelease, view: &store::QueueView) -> String {
         }
         None => String::new(),
     };
+    // Where the release stands in this view, which its page counts "next" from.
+    let at = row
+        .lead
+        .as_ref()
+        .map(|lead| store::QueuePlace { score: lead.score });
     format!(
         "<tr><td class=\"num\"><a href=\"{}\">{}</a></td><td>{}</td><td>{}</td>\
          <td class=\"num\">{}</td><td>{}</td><td>{reason}</td>\
          <td class=\"path\"><a href=\"{}\">{}</a></td></tr>",
-        escape_html(&review_href(row.id, view, None)),
+        escape_html(&review_href(row.id, view, at, None)),
         row.id,
         escape_html(row.album_artist.as_deref().unwrap_or("(unknown artist)")),
         escape_html(row.album_title.as_deref().unwrap_or("(no album tag)")),
@@ -369,7 +414,10 @@ struct View<'a> {
     /// The queue view carried from `/reviews`; it decides `Next in queue`.
     view: store::QueueView,
     /// The release `Next in queue` leads to, if the queue has another.
-    next: Option<i64>,
+    next: Option<store::QueueNext>,
+    /// The place the release was found at in the score order; the forms send
+    /// it back, so a fetch does not change what comes next.
+    at: Option<store::QueuePlace>,
     /// The release accepted just before, now matched.
     accepted: Option<&'a store::LocalReleaseStatus>,
     /// This process's form token, on a server that takes writes.
@@ -391,6 +439,7 @@ pub(super) async fn release_page(
         &state,
         id,
         params.view(),
+        params.at(),
         accepted.as_ref(),
         None,
         StatusCode::OK,
@@ -408,6 +457,7 @@ async fn render_page(
     state: &AppState,
     id: i64,
     view: store::QueueView,
+    at: Option<store::QueuePlace>,
     accepted: Option<&store::LocalReleaseStatus>,
     notice: Option<Notice>,
     status: StatusCode,
@@ -415,11 +465,12 @@ async fn render_page(
     let Some(review) = saved::load(&state.pool, id).await? else {
         return Ok(no_release());
     };
-    let next = store::next_queued(&state.pool, id, &view).await?;
+    let next = store::next_queued(&state.pool, id, &view, at).await?;
     let view = View {
         review: &review,
         view,
         next,
+        at,
         accepted,
         token: state.writable.then_some(&*state.token),
         notice: notice.as_ref(),
@@ -441,10 +492,13 @@ fn render_release(view: &View<'_>) -> String {
     let release = &review.release;
     let status = &review.status;
     let next = match view.next {
-        Some(next) => format!(
-            "<a href=\"{}\">Next in queue →</a>",
-            escape_html(&review_href(next, &view.view, None))
-        ),
+        Some(next) => {
+            let place = store::QueuePlace { score: next.score };
+            format!(
+                "<a href=\"{}\">Next in queue →</a>",
+                escape_html(&review_href(next.id, &view.view, Some(place), None))
+            )
+        }
         None => format!(
             "<a href=\"{}\">Back to the queue</a>",
             escape_html(&queue_href(&view.view, None))
@@ -597,6 +651,17 @@ fn render_group(view: &View<'_>, group: &ReviewGroup) -> String {
 /// empty for none), so a decision on an outdated page is refused.
 fn hidden_fields(view: &View<'_>, token: &str) -> String {
     let guard = &view.review.guard;
+    // The place means something only in score order.
+    let at = view
+        .at
+        .filter(|_| view.view.sort == store::QueueSort::Score)
+        .map(|place| {
+            format!(
+                "<input type=\"hidden\" name=\"at\" value=\"{}\">",
+                escape_html(&place_text(place))
+            )
+        })
+        .unwrap_or_default();
     format!(
         "<input type=\"hidden\" name=\"token\" value=\"{}\">\
          <input type=\"hidden\" name=\"release\" value=\"{}\">\
@@ -604,7 +669,7 @@ fn hidden_fields(view: &View<'_>, token: &str) -> String {
          <input type=\"hidden\" name=\"match\" value=\"{}\">\
          <input type=\"hidden\" name=\"filter\" value=\"{}\">\
          <input type=\"hidden\" name=\"sort\" value=\"{}\">\
-         <input type=\"hidden\" name=\"show\" value=\"{}\">",
+         <input type=\"hidden\" name=\"show\" value=\"{}\">{at}",
         escape_html(token),
         view.review.release.id,
         escape_html(&guard.source_revision),
@@ -701,6 +766,9 @@ pub(super) struct ReviewForm {
     sort: String,
     /// See `filter`: `acceptable` or empty.
     show: String,
+    /// The place the release was found at, as `at` in the query: a score,
+    /// `none` or empty.
+    at: String,
     /// The provider of the candidate accepted or the release fetched.
     provider: String,
     candidate: String,
@@ -754,9 +822,19 @@ pub(super) async fn action(
         return Ok((StatusCode::BAD_REQUEST, "unknown provider").into_response());
     };
     let view = view_of(Some(&form.filter), Some(&form.sort), Some(&form.show));
+    let at = parse_place(&form.at);
     let revision = form.revision.trim();
     if !accepting {
-        return fetch(&state, release, revision, view, provider, form.id.trim()).await;
+        return fetch(
+            &state,
+            release,
+            revision,
+            view,
+            at,
+            provider,
+            form.id.trim(),
+        )
+        .await;
     }
     // The page writes these fields itself, so text that does not read is not
     // from a review page.
@@ -774,7 +852,7 @@ pub(super) async fn action(
         source_revision: revision.to_string(),
         accepted_match_id,
     };
-    accept(&state, release, &shown, view, &candidate).await
+    accept(&state, release, &shown, view, at, &candidate).await
 }
 
 /// Accepts saved release `candidate` and goes to the next queued release.
@@ -787,16 +865,20 @@ async fn accept(
     release: i64,
     shown: &store::MatchGuard,
     view: store::QueueView,
+    at: Option<store::QueuePlace>,
     candidate: &ReleaseId,
 ) -> Result<Response, AppError> {
     // Found before accepting: accepting deletes the release's reviews, and in
     // score order the release could then not be placed, so the queue would
     // start again from the top and bring back releases already skipped.
-    let next = store::next_queued(&state.pool, release, &view).await?;
+    let next = store::next_queued(&state.pool, release, &view, at).await?;
     let (status, text) = match saved::accept_saved(&state.pool, release, candidate, shown).await? {
         AcceptOutcome::Accepted => {
             let target = match next {
-                Some(next) => review_href(next, &view, Some(release)),
+                Some(next) => {
+                    let place = store::QueuePlace { score: next.score };
+                    review_href(next.id, &view, Some(place), Some(release))
+                }
                 None => queue_href(&view, Some(release)),
             };
             return Ok(Redirect::to(&target).into_response());
@@ -815,7 +897,7 @@ async fn accept(
         entered: None,
         text,
     };
-    render_page(state, release, view, None, Some(notice), status).await
+    render_page(state, release, view, at, None, Some(notice), status).await
 }
 
 /// Fetches the release `entered` names and puts it first in its provider's review.
@@ -831,6 +913,7 @@ async fn fetch(
     release: i64,
     revision: &str,
     view: store::QueueView,
+    at: Option<store::QueuePlace>,
     provider: ProviderKind,
     entered: &str,
 ) -> Result<Response, AppError> {
@@ -839,7 +922,7 @@ async fn fetch(
             entered: Some((provider, entered.chars().take(MAX_ENTERED_CHARS).collect())),
             text,
         };
-        render_page(state, release, view, None, Some(notice), status)
+        render_page(state, release, view, at, None, Some(notice), status)
     };
     match saved::current_guard(&state.pool, release).await? {
         Some(guard) if guard.source_revision == revision => {}
@@ -868,7 +951,7 @@ async fn fetch(
     };
     match saved::add_fetched(&state.pool, release, revision, remote).await? {
         AddOutcome::Added => {
-            let target = format!("{}#group-{provider}", review_href(release, &view, None));
+            let target = format!("{}#group-{provider}", review_href(release, &view, at, None));
             Ok(Redirect::to(&target).into_response())
         }
         AddOutcome::Changed => again(StatusCode::CONFLICT, CHANGED.to_string()).await,
@@ -1021,7 +1104,7 @@ mod tests {
     #[test]
     fn review_links_keep_the_view_and_the_accepted_release() {
         let default = store::QueueView::default();
-        assert_eq!(review_href(3, &default, None), "/review?release=3");
+        assert_eq!(review_href(3, &default, None, None), "/review?release=3");
         assert_eq!(queue_href(&default, None), "/reviews");
         assert_eq!(queue_href(&default, Some(2)), "/reviews?accepted=2");
         let params = ReviewParams {
@@ -1086,9 +1169,18 @@ mod tests {
     fn links_carry_the_whole_view() {
         let view = view_of(Some("discogs"), Some("score"), Some("acceptable"));
         assert_eq!(
-            review_href(3, &view, Some(2)),
+            review_href(3, &view, None, Some(2)),
             "/review?release=3&provider=discogs&sort=score&show=acceptable&accepted=2"
         );
+        let at = Some(store::QueuePlace { score: Some(0.97) });
+        assert_eq!(
+            review_href(3, &view, at, Some(2)),
+            "/review?release=3&provider=discogs&sort=score&show=acceptable&at=0.97&accepted=2"
+        );
+        // The place means nothing in folder order, and the queue never carries it.
+        let folder = store::QueueView::default();
+        assert_eq!(review_href(3, &folder, at, None), "/review?release=3");
+        assert!(!queue_href(&view, None).contains("at="));
         assert_eq!(
             queue_href(&view, None),
             "/reviews?provider=discogs&sort=score&show=acceptable"
@@ -1152,9 +1244,98 @@ mod tests {
             "{html}"
         );
         assert!(
-            html.contains("href=\"/review?release=7&amp;sort=score&amp;show=acceptable\""),
+            html.contains(
+                "href=\"/review?release=7&amp;sort=score&amp;show=acceptable&amp;at=0.97\""
+            ),
             "{html}"
         );
+    }
+
+    #[test]
+    fn a_place_reads_a_score_or_none_and_nothing_else() {
+        let place = |score| Some(store::QueuePlace { score });
+        assert_eq!(parse_place("0.97"), place(Some(0.97)));
+        assert_eq!(parse_place(" 1 "), place(Some(1.0)));
+        assert_eq!(parse_place("none"), place(None));
+        assert_eq!(parse_place("NONE"), place(None));
+        for bad in ["", "abc", "nan", "inf", "-inf", "0,9"] {
+            assert_eq!(parse_place(bad), None, "{bad}");
+        }
+        // What the page writes reads back as the same score.
+        for score in [0.97, 0.1 + 0.2, 1.0, 0.0, 1e-9, 0.123_456_789_012_345_68] {
+            let text = place_text(store::QueuePlace { score: Some(score) });
+            assert_eq!(parse_place(&text), place(Some(score)), "{text}");
+        }
+        let params = ReviewParams {
+            at: Some("0.5".into()),
+            ..ReviewParams::default()
+        };
+        assert_eq!(params.at(), place(Some(0.5)));
+        assert_eq!(ReviewParams::default().at(), None);
+    }
+
+    #[test]
+    fn a_score_view_links_each_id_with_its_place() {
+        let lead = |score| {
+            Some(store::Lead {
+                provider: ProviderKind::Discogs,
+                score,
+                can_apply: true,
+                reason: None,
+                blockers: 0,
+            })
+        };
+        let mut scored = queued(7);
+        scored.lead = lead(Some(0.97));
+        let mut unscored = queued(8);
+        unscored.lead = lead(None);
+        let rows = [scored, unscored];
+        let by_score = view_of(None, Some("score"), None);
+        let html = render_queue(&rows, 2, &by_score, None, 1, true);
+        assert!(
+            html.contains("href=\"/review?release=7&amp;sort=score&amp;at=0.97\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("href=\"/review?release=8&amp;sort=score&amp;at=none\""),
+            "{html}"
+        );
+        // Controls and pager do not carry a place.
+        assert!(!html.contains("/reviews?sort=score&amp;at"), "{html}");
+        assert!(!html.contains("/reviews?at"), "{html}");
+        assert_eq!(html.matches("at=").count(), 2, "{html}");
+        // Folder order never writes one.
+        let html = render_queue(&rows, 2, &store::QueueView::default(), None, 1, true);
+        assert!(!html.contains("at="), "{html}");
+    }
+
+    #[test]
+    fn next_in_queue_carries_the_next_releases_place() {
+        let review = review_of(Vec::new());
+        let mut shown = view(&review, Some("tok"));
+        shown.view = view_of(None, Some("score"), None);
+        shown.at = Some(store::QueuePlace { score: Some(0.8) });
+        shown.next = Some(store::QueueNext {
+            id: 9,
+            score: Some(0.7),
+        });
+        let html = render_release(&shown);
+        assert!(
+            html.contains("<a href=\"/review?release=9&amp;sort=score&amp;at=0.7\">Next in queue"),
+            "{html}"
+        );
+        // The forms carry this page's own place.
+        assert!(html.contains("name=\"at\" value=\"0.8\""), "{html}");
+        shown.next = Some(store::QueueNext { id: 9, score: None });
+        assert!(
+            render_release(&shown)
+                .contains("href=\"/review?release=9&amp;sort=score&amp;at=none\""),
+        );
+        // Folder order writes no place anywhere on the page.
+        shown.view = store::QueueView::default();
+        let html = render_release(&shown);
+        assert!(!html.contains("at="), "{html}");
+        assert!(!html.contains("name=\"at\""), "{html}");
     }
 
     #[test]
@@ -1242,6 +1423,7 @@ mod tests {
             review,
             view: store::QueueView::default(),
             next: None,
+            at: None,
             accepted: None,
             token,
             notice: None,
@@ -1276,13 +1458,13 @@ mod tests {
     fn a_release_without_saved_candidates_says_how_to_get_some() {
         let review = review_of(Vec::new());
         let mut shown = view(&review, Some("tok"));
-        shown.next = Some(9);
+        shown.next = Some(store::QueueNext { id: 9, score: None });
         shown.view = view_of(Some("musicbrainz"), Some("score"), Some("acceptable"));
         let html = render_release(&shown);
         assert!(html.contains("No saved candidates."), "{html}");
         assert!(
             html.contains(
-                "href=\"/review?release=9&amp;provider=musicbrainz&amp;sort=score&amp;show=acceptable\""
+                "href=\"/review?release=9&amp;provider=musicbrainz&amp;sort=score&amp;show=acceptable&amp;at=none\""
             ),
             "{html}"
         );
@@ -1414,6 +1596,7 @@ mod tests {
             filter: String::new(),
             sort: String::new(),
             show: String::new(),
+            at: String::new(),
             provider: "musicbrainz".into(),
             candidate: FIXTURE_MBID.into(),
             id: String::new(),
@@ -1579,12 +1762,62 @@ mod tests {
         assert_eq!(
             response.headers()[header::LOCATION],
             format!(
-                "/review?release={}&sort=score&accepted={}",
+                "/review?release={}&sort=score&at=0.7&accepted={}",
                 low.id, middle.id
             )
             .as_str(),
             "{} is the release above",
             high.id
+        );
+    }
+
+    #[tokio::test]
+    async fn accepting_after_a_fetch_moved_the_release_still_goes_on_from_its_place() {
+        let state = state(true).await;
+        let titles = ["One", "Two"];
+        let mut releases = Vec::new();
+        for (dir, score) in [("/music/a", 0.9), ("/music/b", 0.8), ("/music/c", 0.7)] {
+            let release = seed_release(&state.pool, dir, "Blue", &titles).await;
+            queue(
+                &state.pool,
+                &release,
+                remote_release(mbid_release(FIXTURE_MBID), "Blue", &titles),
+            )
+            .await;
+            sqlx::query(
+                "UPDATE match_reviews SET top_score = ?1, top_can_apply = 1 WHERE local_release_id = ?2",
+            )
+            .bind(score)
+            .bind(release.id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+            releases.push(release);
+        }
+        let [top, middle, bottom] = [&releases[0], &releases[1], &releases[2]];
+        // A fetch on the 0.8 page rewrote its summary: it now leads the queue.
+        sqlx::query("UPDATE match_reviews SET top_score = 0.95 WHERE local_release_id = ?1")
+            .bind(middle.id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let Ok(Form(mut fields)) = form("accept", middle.id, &middle.revision, "t") else {
+            unreachable!()
+        };
+        fields.sort = "score".into();
+        fields.at = "0.8".into();
+        let response = post(&state, HeaderMap::new(), Ok(Form(fields))).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        // The release below where the page was found, not the one above it.
+        assert_eq!(
+            response.headers()[header::LOCATION],
+            format!(
+                "/review?release={}&sort=score&at=0.7&accepted={}",
+                bottom.id, middle.id
+            )
+            .as_str(),
+            "{} is the release above",
+            top.id
         );
     }
 
@@ -1600,9 +1833,11 @@ mod tests {
                 fields.id = id.into();
                 fields.sort = "score".into();
                 fields.show = "acceptable".into();
+                fields.at = "0.8".into();
                 Ok(Form(fields))
             };
         let kept_view = |html: &str| {
+            assert!(html.contains("name=\"at\" value=\"0.8\""), "{html}");
             assert!(html.contains("name=\"sort\" value=\"score\""), "{html}");
             assert!(
                 html.contains("name=\"show\" value=\"acceptable\""),
