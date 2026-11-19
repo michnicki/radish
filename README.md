@@ -508,6 +508,7 @@ Other defaults to keep in mind:
 - It listens on loopback only. Binding any other address works but prints a warning, because the pages show the library's file paths to anyone who can connect.
 - Requests whose `Host` header is not `localhost`, a loopback address, or the bind address get `403`, which stops a web page from reaching the server through DNS rebinding. A wildcard bind (`0.0.0.0`) accepts any host.
 - Tags, paths and provider titles are untrusted. Control and bidirectional characters are escaped as in terminal output, then HTML escaping is applied. Every response carries a `Content-Security-Policy` that allows nothing but the page's own inline style.
+- Errors are pages with the usual header and a link back. Only the `403` for a foreign `Host` and requests the pages never send (a repeated query parameter, an unsupported method) get axum's bare answer instead.
 
 ## Storage and output
 

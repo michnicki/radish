@@ -13,8 +13,8 @@ mod card;
 
 use self::card::{cannot_apply_text, render_card};
 use super::{
-    AppError, AppState, Nav, PAGE_SIZE, cross_site, escape_html, folder_href, page, page_param,
-    pager_with, relative_path, render_match, same_token,
+    AppError, AppState, NOT_WRITABLE, Nav, PAGE_SIZE, cross_site, error_page, escape_html,
+    folder_href, page, page_param, pager_with, relative_path, render_match, same_token,
 };
 use crate::layout::{format_duration, plural, track_number};
 use crate::matcher::LocalRelease;
@@ -456,7 +456,17 @@ pub(super) async fn release_page(
 
 /// The `404` for a release that does not exist.
 fn no_release() -> Response {
-    (StatusCode::NOT_FOUND, "no such release").into_response()
+    queue_error(StatusCode::NOT_FOUND, "No such release.")
+}
+
+/// An error page that links back to the review queue.
+fn queue_error(status: StatusCode, message: &str) -> Response {
+    error_page(
+        status,
+        Some(Nav::Review),
+        message,
+        ("/reviews", "Back to the queue"),
+    )
 }
 
 /// The review page of release `id`, answered with `status`.
@@ -781,11 +791,10 @@ pub(super) struct ReviewForm {
 /// A tab left open across a server restart holds the old process's token, so
 /// the body says what to do.
 fn stale_review() -> Response {
-    (
+    queue_error(
         StatusCode::FORBIDDEN,
-        "forbidden: reload the review page and try again",
+        "Reload the review page and try again.",
     )
-        .into_response()
 }
 
 /// Accepts a saved candidate, or fetches a release by its ID into the review.
@@ -799,14 +808,16 @@ pub(super) async fn action(
     form: Result<Form<ReviewForm>, FormRejection>,
 ) -> Result<Response, AppError> {
     if !state.writable {
-        return Ok((StatusCode::FORBIDDEN, "forbidden").into_response());
+        return Ok(queue_error(StatusCode::FORBIDDEN, NOT_WRITABLE));
     }
     if cross_site(&headers) {
         return Ok(stale_review());
     }
     let Form(form) = match form {
         Ok(form) => form,
-        Err(rejection) => return Ok(rejection.into_response()),
+        Err(rejection) => {
+            return Ok(queue_error(rejection.status(), &rejection.body_text()));
+        }
     };
     if !same_token(&state.token, &form.token) {
         return Ok(stale_review());
@@ -814,13 +825,13 @@ pub(super) async fn action(
     let accepting = match form.action.as_str() {
         "accept" => true,
         "fetch" => false,
-        _ => return Ok((StatusCode::BAD_REQUEST, "unknown action").into_response()),
+        _ => return Ok(queue_error(StatusCode::BAD_REQUEST, "Unknown action.")),
     };
     let Ok(release) = form.release.trim().parse::<i64>() else {
         return Ok(no_release());
     };
     let Some(provider) = ProviderKind::parse(&form.provider) else {
-        return Ok((StatusCode::BAD_REQUEST, "unknown provider").into_response());
+        return Ok(queue_error(StatusCode::BAD_REQUEST, "Unknown provider."));
     };
     let view = view_of(Some(&form.filter), Some(&form.sort), Some(&form.show));
     let at = parse_place(&form.at);
@@ -843,11 +854,11 @@ pub(super) async fn action(
         "" => None,
         id => match id.parse::<i64>() {
             Ok(id) => Some(id),
-            Err(_) => return Ok((StatusCode::BAD_REQUEST, "unknown match").into_response()),
+            Err(_) => return Ok(queue_error(StatusCode::BAD_REQUEST, "Unknown match.")),
         },
     };
     let Ok(candidate) = saved::parse_bare(provider, form.candidate.trim()) else {
-        return Ok((StatusCode::BAD_REQUEST, "unknown candidate").into_response());
+        return Ok(queue_error(StatusCode::BAD_REQUEST, "Unknown candidate."));
     };
     let shown = store::MatchGuard {
         source_revision: revision.to_string(),
@@ -1660,9 +1671,10 @@ mod tests {
         for (headers, token) in [(foreign, "t"), (HeaderMap::new(), "old")] {
             let response = post(&on, headers, form("accept", 1, "rev", token)).await;
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
-            assert_eq!(
-                body(response).await,
-                "forbidden: reload the review page and try again"
+            let html = body(response).await;
+            assert!(
+                html.contains("Reload the review page and try again"),
+                "{html}"
             );
         }
         assert_eq!(

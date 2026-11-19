@@ -629,7 +629,13 @@ fn a_folder_form_merges_only_with_the_token_from_this_site() {
         &["Sec-Fetch-Site: same-origin"],
     );
     assert_eq!(missing.status, 403, "{}", missing.body);
-    assert!(missing.body.contains("reload"), "{}", missing.body);
+    assert!(
+        missing
+            .body
+            .contains("Reload the folder page and try again"),
+        "{}",
+        missing.body
+    );
     let foreign = server.post(
         "/folder",
         &body("merge", &token, &path),
@@ -659,7 +665,11 @@ fn a_folder_form_merges_only_with_the_token_from_this_site() {
     // the body. With the token, a missing action or path answers as an empty one.
     let empty = server.post("/folder", "", SAME_SITE);
     assert_eq!(empty.status, 403, "{}", empty.body);
-    assert!(empty.body.contains("reload"), "{}", empty.body);
+    assert!(
+        empty.body.contains("Reload the folder page and try again"),
+        "{}",
+        empty.body
+    );
     let no_action = server.post("/folder", &format!("token={token}"), SAME_SITE);
     assert_eq!(no_action.status, 400, "{}", no_action.body);
     let no_path = server.post("/folder", &format!("token={token}&action=merge"), SAME_SITE);
@@ -716,7 +726,7 @@ fn a_browser_that_sends_no_fetch_metadata_still_posts_with_the_token() {
     );
     assert_eq!(wrong.status, 403);
     assert!(
-        wrong.body.contains("reload the folder page"),
+        wrong.body.contains("Reload the folder page and try again"),
         "{}",
         wrong.body
     );
@@ -736,6 +746,64 @@ fn an_unknown_folder_page_is_not_found() {
     let server = Server::start(&db);
     assert_eq!(server.get("/folder?path=%2Fnowhere").status, 404);
     assert_eq!(server.get("/folder").status, 404);
+}
+
+#[test]
+fn error_pages_keep_the_header() {
+    let (db, _music) = seeded_library("web-error-pages");
+    let server = Server::start(&db);
+
+    let missing = server.get("/nope");
+    assert_eq!(missing.status, 404);
+    assert!(missing.body.contains("<nav>"), "{}", missing.body);
+    assert!(missing.body.contains("Not Found"), "{}", missing.body);
+    assert!(
+        missing
+            .body
+            .contains("<a href=\"/\">Go to the status page</a>"),
+        "{}",
+        missing.body
+    );
+    assert!(
+        !missing.body.contains("aria-current=\"page\""),
+        "{}",
+        missing.body
+    );
+
+    let release = server.get("/review?release=999999");
+    assert_eq!(release.status, 404);
+    assert!(release.body.contains("No such release"), "{}", release.body);
+    assert!(
+        release
+            .body
+            .contains("<a href=\"/reviews\">Back to the queue</a>"),
+        "{}",
+        release.body
+    );
+    assert!(
+        release
+            .body
+            .contains("href=\"/reviews\" aria-current=\"page\""),
+        "{}",
+        release.body
+    );
+
+    let folder = server.get("/folder");
+    assert_eq!(folder.status, 404);
+    assert!(
+        folder
+            .body
+            .contains("<a href=\"/folders\">Back to the folders</a>"),
+        "{}",
+        folder.body
+    );
+    assert!(
+        folder
+            .body
+            .contains("href=\"/folders\" aria-current=\"page\""),
+        "{}",
+        folder.body
+    );
 }
 
 #[test]
@@ -913,14 +981,24 @@ fn a_release_entered_on_the_web_is_fetched_and_accepted() {
         assert!(!body.contains("token="), "{body}");
         let refused = server.post("/review", &body, SAME_SITE);
         assert_eq!(refused.status, 403, "{}", refused.body);
-        assert!(refused.body.contains("reload"), "{}", refused.body);
+        assert!(
+            refused
+                .body
+                .contains("Reload the review page and try again"),
+            "{}",
+            refused.body
+        );
     }
 
     // So is a body with no fields at all; with the token, a missing action or
     // release answers as an empty one.
     let empty = server.post("/review", "", SAME_SITE);
     assert_eq!(empty.status, 403, "{}", empty.body);
-    assert!(empty.body.contains("reload"), "{}", empty.body);
+    assert!(
+        empty.body.contains("Reload the review page and try again"),
+        "{}",
+        empty.body
+    );
     let no_action = server.post("/review", &format!("token={token}"), SAME_SITE);
     assert_eq!(no_action.status, 400, "{}", no_action.body);
     let no_release = server.post("/review", &format!("token={token}&action=fetch"), SAME_SITE);

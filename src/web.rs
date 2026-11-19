@@ -14,13 +14,20 @@
 //! - It binds to loopback unless told otherwise, and only a loopback server
 //!   takes writes.
 //! - A request whose `Host` header is not a loopback name or the bind address
-//!   gets `403`, which stops DNS-rebinding pages from reading the library.
+//!   gets a plain-text `403`, which stops DNS-rebinding pages from reading the
+//!   library.
 //! - A `POST` needs this process's random form token and must not come from
 //!   another site (`Sec-Fetch-Site`).
 //! - Tags, paths and provider titles are untrusted. Each value goes through
 //!   [`Clean`](crate::output::Clean) and then HTML escaping before it is
 //!   written into a page.
 //! - Every response carries a strict `Content-Security-Policy`.
+//!
+//! An error is a page with the usual header and a link back, so a reader who
+//! hits one keeps the navigation. Only the `403` for a foreign `Host` and
+//! requests the pages never send (a repeated query parameter, an unsupported
+//! method) get axum's bare answer instead. A failure's detail goes to stderr,
+//! not to the page.
 
 // Rust guideline compliant 2026-08-14
 
@@ -62,6 +69,9 @@ const MAX_QUERY_CHARS: usize = 200;
 /// Keeps `page * PAGE_SIZE` far from overflow, whatever the URL says. A real
 /// library never has a million pages.
 const MAX_PAGE: u64 = 1_000_000;
+
+/// The message of the `403` a server that takes no writes gives to a form.
+const NOT_WRITABLE: &str = "This server listens on a non-loopback address, so it changes nothing.";
 
 /// The largest form body accepted, in bytes. A folder form holds a path, an
 /// action and a token; a review form a few short fields and an entered ID of
@@ -168,6 +178,7 @@ fn router(
                 .post(folder_action)
                 .layer(DefaultBodyLimit::max(MAX_FORM_BYTES)),
         )
+        .fallback(not_found)
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
 }
@@ -256,7 +267,8 @@ fn host_allowed(bind: SocketAddr, host: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback() || ip == bind.ip())
 }
 
-/// A handler failure: logged on stderr, reported to the browser without detail.
+/// A handler failure: logged on stderr, reported to the browser as an error
+/// page whose message says nothing about the cause.
 struct AppError(anyhow::Error);
 
 impl<E: Into<anyhow::Error>> From<E> for AppError {
@@ -268,8 +280,54 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         eprintln!("error: {}", Clean(&format!("{:#}", self.0)));
-        (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            None,
+            "Internal error; the server log says why.",
+            ("/", "Go to the status page"),
+        )
     }
+}
+
+/// An error as a page with the usual header, a message and one link back.
+///
+/// So a reader who hits an error keeps the navigation. `back` is
+/// `(href, text)`; `message` is plain text.
+fn error_page(
+    status: StatusCode,
+    active: Option<Nav>,
+    message: &str,
+    back: (&str, &str),
+) -> Response {
+    let title = status.canonical_reason().unwrap_or("Error");
+    let body = format!(
+        "<h1>{}</h1><p class=\"notice error\" role=\"alert\">{}</p><p><a href=\"{}\">{}</a></p>",
+        escape_html(title),
+        escape_html(message),
+        escape_html(back.0),
+        escape_html(back.1),
+    );
+    (status, Html(page(title, active, &body))).into_response()
+}
+
+/// Any path the server does not serve.
+async fn not_found() -> Response {
+    error_page(
+        StatusCode::NOT_FOUND,
+        None,
+        "No page here.",
+        ("/", "Go to the status page"),
+    )
+}
+
+/// An error page that links back to the folder list.
+fn folders_error(status: StatusCode, message: &str) -> Response {
+    error_page(
+        status,
+        Some(Nav::Folders),
+        message,
+        ("/folders", "Back to the folders"),
+    )
 }
 
 /// Query parameters shared by the paged pages.
@@ -379,10 +437,10 @@ async fn folder_page(
         .map(str::trim)
         .filter(|path| !path.is_empty())
     else {
-        return Ok((StatusCode::NOT_FOUND, "no such folder").into_response());
+        return Ok(folders_error(StatusCode::NOT_FOUND, "No such folder."));
     };
     let Some(view) = store::folder_view(&state.pool, path).await? else {
-        return Ok((StatusCode::NOT_FOUND, "no such folder").into_response());
+        return Ok(folders_error(StatusCode::NOT_FOUND, "No such folder."));
     };
     let token = state.writable.then_some(&*state.token);
     Ok(Html(page(
@@ -398,11 +456,10 @@ async fn folder_page(
 /// A tab left open across a server restart holds the old process's token, so
 /// the body says what to do.
 fn stale_form() -> Response {
-    (
+    folders_error(
         StatusCode::FORBIDDEN,
-        "forbidden: reload the folder page and try again",
+        "Reload the folder page and try again.",
     )
-        .into_response()
 }
 
 /// The folder form's fields.
@@ -431,27 +488,29 @@ async fn folder_action(
     form: Result<Form<FolderForm>, FormRejection>,
 ) -> Result<Response, AppError> {
     if !state.writable {
-        return Ok((StatusCode::FORBIDDEN, "forbidden").into_response());
+        return Ok(folders_error(StatusCode::FORBIDDEN, NOT_WRITABLE));
     }
     if cross_site(&headers) {
         return Ok(stale_form());
     }
     let Form(form) = match form {
         Ok(form) => form,
-        Err(rejection) => return Ok(rejection.into_response()),
+        Err(rejection) => {
+            return Ok(folders_error(rejection.status(), &rejection.body_text()));
+        }
     };
     if !same_token(&state.token, &form.token) {
         return Ok(stale_form());
     }
     let Some(action) = FolderAction::parse(&form.action) else {
-        return Ok((StatusCode::BAD_REQUEST, "unknown action").into_response());
+        return Ok(folders_error(StatusCode::BAD_REQUEST, "Unknown action."));
     };
     let path = form.path.trim().trim_end_matches(['/', '\\']);
     let unit = store::resolve_folder(&state.pool, &store::FolderTarget::Path(path.to_string()))
         .await?
         .filter(|unit| unit.eq_ignore_ascii_case(path));
     let Some(unit) = unit else {
-        return Ok((StatusCode::NOT_FOUND, "no such folder").into_response());
+        return Ok(folders_error(StatusCode::NOT_FOUND, "No such folder."));
     };
     store::set_folder_mode(&state.pool, &unit, action.mode()).await?;
     Ok(Redirect::to(&folder_href(&unit)).into_response())
@@ -1307,6 +1366,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_internal_error_page_keeps_the_header_and_hides_the_cause() {
+        let response = AppError(anyhow::anyhow!("/secret/db <path>")).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(html.contains("<nav>"), "{html}");
+        assert!(
+            html.contains("Internal error; the server log says why."),
+            "{html}"
+        );
+        assert!(!html.contains("secret"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn an_error_page_keeps_the_header_and_escapes_its_message() {
+        let response = error_page(
+            StatusCode::NOT_FOUND,
+            None,
+            "no <b>such</b> folder",
+            ("/folders", "Back to the folders"),
+        );
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(html.contains("<nav>"), "{html}");
+        assert!(html.contains("<h1>Not Found</h1>"), "{html}");
+        assert!(html.contains("no &lt;b&gt;such&lt;/b&gt; folder"), "{html}");
+        assert!(
+            html.contains("<a href=\"/folders\">Back to the folders</a>"),
+            "{html}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_stale_token_or_another_site_is_told_to_reload() {
         let state = AppState {
             pool: crate::db::connect_in_memory().await.unwrap(),
@@ -1330,12 +1427,13 @@ mod tests {
                 panic!("the handler failed");
             };
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
-            let body = axum::body::to_bytes(response.into_body(), 1024)
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
                 .await
                 .unwrap();
-            assert_eq!(
-                &body[..],
-                b"forbidden: reload the folder page and try again"
+            let html = String::from_utf8(body.to_vec()).unwrap();
+            assert!(
+                html.contains("Reload the folder page and try again"),
+                "{html}"
             );
         }
     }
