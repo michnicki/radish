@@ -220,7 +220,7 @@ pub(super) async fn queue_page(
         page_number,
         has_next,
     );
-    Ok(Html(page("Review", Nav::Review, &body)))
+    Ok(Html(page("Review", Some(Nav::Review), &body)))
 }
 
 /// The release accepted just before, when it is matched now.
@@ -486,7 +486,7 @@ async fn render_page(
         status,
         Html(page(
             &format!("Review #{id}"),
-            Nav::Review,
+            Some(Nav::Review),
             &render_release(&view),
         )),
     )

@@ -80,41 +80,9 @@ const RELEASE_HEADER: &str = "<tr><th class=\"num\">ID</th><th>Artist</th><th>Al
 const CONTENT_SECURITY_POLICY: &str =
     "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'";
 
-/// The page stylesheet, inlined so the server never serves a second file.
-const STYLE: &str = "\
-:root{color-scheme:light dark;--bg:#fff;--fg:#1c1c1e;--muted:#6b6b70;--line:#e2e2e6;--accent:#2f6f3e;--card:#f6f6f8;--warn:#a3341f}\
-@media(prefers-color-scheme:dark){:root{--bg:#161618;--fg:#e8e8ea;--muted:#9a9aa0;--line:#2e2e33;--accent:#7bc98d;--card:#1f1f23;--warn:#f2a38f}}\
-body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,sans-serif}\
-header,main{max-width:72rem;margin:0 auto;padding:0 1rem}\
-header{display:flex;gap:1.5rem;align-items:baseline;border-bottom:1px solid var(--line);padding-top:.75rem;padding-bottom:.5rem}\
-header b{color:var(--accent)}\
-nav a{color:var(--muted);text-decoration:none;margin-right:1rem}\
-nav a[aria-current]{color:var(--fg);font-weight:600}\
-h1{font-size:1.25rem;margin:1.25rem 0 .75rem}\
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(9rem,1fr));gap:.75rem;margin:0 0 1.5rem}\
-.stats div{background:var(--card);border-radius:.5rem;padding:.6rem .8rem}\
-.stats b{display:block;font-size:1.4rem}\
-.stats span,.muted{color:var(--muted);font-size:.85rem}\
-.table{overflow-x:auto}\
-table{border-collapse:collapse;width:100%}\
-th,td{text-align:left;padding:.35rem .6rem;border-bottom:1px solid var(--line);vertical-align:top}\
-th{color:var(--muted);font-size:.8rem;text-transform:uppercase}\
-.num{text-align:right;font-variant-numeric:tabular-nums}\
-.path{color:var(--muted);word-break:break-all}\
-form{display:flex;gap:.5rem;margin-bottom:1rem}\
-input[type=search]{flex:1;padding:.4rem .6rem;font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:.4rem}\
-button{font:inherit;padding:.4rem .9rem;border:0;border-radius:.4rem;background:var(--accent);color:var(--bg)}\
-.pager{display:flex;gap:1rem;margin:1rem 0;color:var(--muted)}\
-h2{font-size:1.05rem;margin:1.25rem 0 .5rem}\
-h3{font-size:.95rem;margin:0 0 .4rem}\
-.card{border:1px solid var(--line);border-radius:.5rem;padding:.6rem .8rem;margin:0 0 1rem}\
-.card ul{margin:.25rem 0;padding-left:1.2rem}\
-.notice{background:var(--card);border-left:3px solid var(--accent);padding:.4rem .6rem}\
-.blocker{color:var(--warn)}\
-.filters a[aria-current]{font-weight:600;color:var(--fg)}\
-select,input[type=text]{padding:.4rem .6rem;font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:.4rem}\
-input[type=text]{flex:1}\
-a{color:var(--accent)}";
+/// The page stylesheet, embedded at compile time and inlined into every page,
+/// so the server never serves a second file.
+const STYLE: &str = include_str!("web/style.css");
 
 /// Shared state for the handlers and the request guard.
 #[derive(Clone)]
@@ -337,7 +305,11 @@ fn page_param(value: Option<&str>) -> u64 {
 
 async fn status_page(State(state): State<AppState>) -> Result<Html<String>, AppError> {
     let status = store::library_status(&state.pool).await?;
-    Ok(Html(page("Status", Nav::Status, &render_status(&status))))
+    Ok(Html(page(
+        "Status",
+        Some(Nav::Status),
+        &render_status(&status),
+    )))
 }
 
 async fn tracks_page(
@@ -358,7 +330,7 @@ async fn tracks_page(
     let has_next = rows.len() > PAGE_SIZE;
     rows.truncate(PAGE_SIZE);
     let body = render_tracks(&rows, query.as_deref(), page_number, has_next);
-    Ok(Html(page("Tracks", Nav::Tracks, &body)))
+    Ok(Html(page("Tracks", Some(Nav::Tracks), &body)))
 }
 
 async fn releases_page(
@@ -373,7 +345,7 @@ async fn releases_page(
         .get(start.min(all.len())..end.min(all.len()))
         .unwrap_or(&[]);
     let body = render_releases(rows, page_number, all.len() > end);
-    Ok(Html(page("Releases", Nav::Releases, &body)))
+    Ok(Html(page("Releases", Some(Nav::Releases), &body)))
 }
 
 async fn folders_page(
@@ -388,7 +360,7 @@ async fn folders_page(
         .get(start.min(all.len())..end.min(all.len()))
         .unwrap_or(&[]);
     let body = render_folders(units, page_number, all.len() > end);
-    Ok(Html(page("Folders", Nav::Folders, &body)))
+    Ok(Html(page("Folders", Some(Nav::Folders), &body)))
 }
 
 /// The `/folder` query: which unit.
@@ -413,7 +385,12 @@ async fn folder_page(
         return Ok((StatusCode::NOT_FOUND, "no such folder").into_response());
     };
     let token = state.writable.then_some(&*state.token);
-    Ok(Html(page("Folder", Nav::Folders, &render_folder(&view, token))).into_response())
+    Ok(Html(page(
+        "Folder",
+        Some(Nav::Folders),
+        &render_folder(&view, token),
+    ))
+    .into_response())
 }
 
 /// The `403` for a form that is from another site or carries the wrong token.
@@ -492,10 +469,11 @@ enum Nav {
 
 /// Wraps `body` in the document shell with the header navigation.
 ///
-/// `body` must already be escaped HTML.
-fn page(title: &str, active: Nav, body: &str) -> String {
+/// `title` is plain text; `body` must already be escaped HTML. `active` marks
+/// the current section, if any.
+fn page(title: &str, active: Option<Nav>, body: &str) -> String {
     let link = |nav: Nav, href: &str, label: &str| {
-        let current = if nav == active {
+        let current = if Some(nav) == active {
             " aria-current=\"page\""
         } else {
             ""
@@ -505,8 +483,10 @@ fn page(title: &str, active: Nav, body: &str) -> String {
     format!(
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-         <title>{title} · Radish</title><style>{STYLE}</style></head><body>\
-         <header><b>Radish</b><nav>{}{}{}{}{}</nav></header><main>{body}</main></body></html>\n",
+         <title>{} · Radish</title><style>{STYLE}</style></head><body>\
+         <header><div class=\"bar\"><b>Radish</b><nav>{}{}{}{}{}</nav></div></header>\
+         <main>{body}</main></body></html>\n",
+        escape_html(title),
         link(Nav::Status, "/", "Status"),
         link(Nav::Tracks, "/tracks", "Tracks"),
         link(Nav::Releases, "/releases", "Releases"),
@@ -1171,8 +1151,35 @@ mod tests {
     }
 
     #[test]
+    fn the_header_bar_sits_inside_a_full_width_header() {
+        let html = page("Status", Some(Nav::Status), "");
+        assert!(
+            html.contains("<header><div class=\"bar\"><b>Radish</b><nav>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn the_title_is_escaped() {
+        let html = page("<b>x</b>", None, "");
+        assert!(
+            html.contains("<title>&lt;b&gt;x&lt;/b&gt; · Radish</title>"),
+            "{html}"
+        );
+        assert!(!html.contains("aria-current=\"page\""), "{html}");
+    }
+
+    #[test]
+    fn the_stylesheet_wraps_the_nav_has_focus_rings_and_no_break_all() {
+        assert!(STYLE.contains("nav{display:flex;flex-wrap:wrap"), "{STYLE}");
+        assert!(!STYLE.contains("break-all"), "{STYLE}");
+        assert!(STYLE.contains(":focus-visible"), "{STYLE}");
+        assert!(STYLE.contains("scrollbar-gutter:stable"), "{STYLE}");
+    }
+
+    #[test]
     fn every_page_links_the_review_queue() {
-        let html = page("Status", Nav::Status, "");
+        let html = page("Status", Some(Nav::Status), "");
         assert!(
             html.contains("<a href=\"/releases\">Releases</a><a href=\"/reviews\">Review</a>"),
             "{html}"
