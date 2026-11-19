@@ -32,7 +32,7 @@
 // Rust guideline compliant 2026-08-14
 
 use crate::grouping::FolderAction;
-use crate::layout::{format_duration, plural, track_number};
+use crate::layout::{format_duration, grouped, plural, track_number};
 use crate::output::Clean;
 use crate::{outln, store};
 use anyhow::{Context, Result};
@@ -574,6 +574,44 @@ fn escape_html(text: &str) -> String {
     escaped
 }
 
+/// What an empty table cell shows: a muted dash.
+const MISSING: &str = "<span class=\"muted\">—</span>";
+
+/// A path for display: escaped, with a break opportunity after each separator
+/// so a long path wraps between folders rather than inside a name.
+///
+/// Only for visible text; attributes keep [`escape_html`].
+fn path_html(path: &str) -> String {
+    escape_html(path)
+        .replace('/', "/<wbr>")
+        .replace('\\', "\\<wbr>")
+}
+
+/// A track position for a cell (`3`, `2-1`); [`MISSING`] without a number.
+fn position_cell(disc: Option<i64>, track: Option<i64>) -> String {
+    if track.is_some() {
+        track_number(disc, track)
+    } else {
+        MISSING.to_string()
+    }
+}
+
+/// A length for a cell (`3:45`); [`MISSING`] when unknown.
+fn duration_cell(secs: Option<f64>) -> String {
+    if secs.is_some() {
+        format_duration(secs)
+    } else {
+        MISSING.to_string()
+    }
+}
+
+/// Untrusted text for a cell, trimmed and escaped; [`MISSING`] when empty.
+fn text_cell(text: Option<&str>) -> String {
+    text.map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map_or_else(|| MISSING.to_string(), escape_html)
+}
+
 /// Percent-encodes `text` for use as a URL query value.
 fn percent_encode(text: &str) -> String {
     let mut encoded = String::with_capacity(text.len());
@@ -618,14 +656,18 @@ fn format_utc(secs: i64) -> String {
 
 /// One tile on the status page.
 fn stat(label: &str, value: i64) -> String {
-    format!("<div><b>{value}</b><span>{label}</span></div>")
+    format!(
+        "<div><b>{}</b><span>{label}</span></div>",
+        grouped(value.max(0) as u64)
+    )
 }
 
 /// One tile on the status page whose number links to `href`.
 fn stat_link(label: &str, value: i64, href: &str) -> String {
     format!(
-        "<div><b><a href=\"{}\">{value}</a></b><span>{label}</span></div>",
-        escape_html(href)
+        "<div><b><a href=\"{}\">{}</a></b><span>{label}</span></div>",
+        escape_html(href),
+        grouped(value.max(0) as u64)
     )
 }
 
@@ -645,7 +687,7 @@ fn render_status(status: &store::LibraryStatus) -> String {
         format!(
             "<p>Folders with several releases, a merged release or a grouping decision: \
              <a href=\"/folders\">{}</a></p>",
-            status.folders
+            grouped(status.folders.max(0) as u64)
         )
     } else {
         String::new()
@@ -668,8 +710,8 @@ fn render_status(status: &store::LibraryStatus) -> String {
             .map(|dir| {
                 format!(
                     "<tr><td class=\"path\">{}</td><td class=\"num\">{}</td></tr>",
-                    escape_html(&dir.path),
-                    dir.tracks
+                    path_html(&dir.path),
+                    grouped(dir.tracks.max(0) as u64)
                 )
             })
             .collect();
@@ -710,9 +752,9 @@ fn render_tracks(
                      <td class=\"num\">{}</td><td class=\"muted\">{}</td></tr>",
                     escape_html(row.artist.as_deref().unwrap_or("(unknown artist)")),
                     escape_html(&row.display_title()),
-                    escape_html(row.album.as_deref().unwrap_or("-")),
-                    track_number(row.disc_number, row.track_number),
-                    format_duration(row.duration_secs),
+                    escape_html(row.album.as_deref().unwrap_or("(no album tag)")),
+                    position_cell(row.disc_number, row.track_number),
+                    duration_cell(row.duration_secs),
                     if row.stale { "stale match" } else { "" },
                 )
             })
@@ -768,7 +810,7 @@ fn release_row(row: &store::LocalReleaseStatus) -> String {
         escape_html(&row.status_label()),
         render_match(row),
         escape_html(&folder_href(&row.unit)),
-        escape_html(&row.directory),
+        path_html(&row.directory),
     )
 }
 
@@ -811,12 +853,13 @@ fn render_folders(units: &[store::FolderUnit], page_number: u64, has_next: bool)
                 .count();
             format!(
                 "<tr><td class=\"path\"><a href=\"{}\">{}</a></td><td>{}</td>\
-                 <td class=\"num\">{}</td><td class=\"num\">{tracks}</td>\
+                 <td class=\"num\">{}</td><td class=\"num\">{}</td>\
                  <td class=\"num\">{matched}</td></tr>",
                 escape_html(&folder_href(&unit.path)),
-                escape_html(&unit.path),
+                path_html(&unit.path),
                 unit.state.label(),
                 unit.releases.len(),
+                grouped(tracks.max(0) as u64),
             )
         })
         .collect();
@@ -842,11 +885,11 @@ fn render_folder(view: &store::FolderView, token: Option<&str>) -> String {
             format!(
                 "<tr><td class=\"path\">{}</td><td class=\"num\">{}</td><td>{}</td><td>{}</td>\
                  <td class=\"num\">{}</td></tr>",
-                escape_html(relative_path(&unit.path, &file.path)),
-                track_number(file.disc, file.track_number),
+                path_html(relative_path(&unit.path, &file.path)),
+                position_cell(file.disc, file.track_number),
                 escape_html(file.album.as_deref().unwrap_or("(no album tag)")),
-                escape_html(file.title.as_deref().unwrap_or("")),
-                format_duration(file.duration_secs),
+                text_cell(file.title.as_deref()),
+                duration_cell(file.duration_secs),
             )
         })
         .collect();
@@ -857,7 +900,7 @@ fn render_folder(view: &store::FolderView, token: Option<&str>) -> String {
          <h1>Files</h1><div class=\"table\"><table><thead><tr><th>File</th>\
          <th class=\"num\">#</th><th>Album tag</th><th>Title</th><th class=\"num\">Time</th>\
          </tr></thead><tbody>{files}</tbody></table></div>",
-        escape_html(&unit.path),
+        path_html(&unit.path),
         unit.state.label(),
         render_choices(view, token),
     )
@@ -951,7 +994,7 @@ fn render_match(row: &store::LocalReleaseStatus) -> String {
     } else {
         format!(" ({})", detail.join(", "))
     };
-    format!("{provider} {id}{detail}")
+    format!("{} {id}{detail}", provider.label())
 }
 
 /// Whether `url` starts with an `http` or `https` scheme.
@@ -1153,7 +1196,7 @@ mod tests {
     #[test]
     fn release_rows_escape_values_and_skip_unsafe_links() {
         let html = render_releases(&[release(12)], 1, false);
-        assert!(html.contains("/music/&lt;b&gt;"), "{html}");
+        assert!(html.contains("/<wbr>music/<wbr>&lt;b&gt;"), "{html}");
         assert!(html.contains("(&lt;i&gt;Blue&lt;/i&gt;)"), "{html}");
         assert!(!html.contains("<i>"), "{html}");
         assert!(!html.contains("href=\"javascript"), "{html}");
@@ -1186,7 +1229,7 @@ mod tests {
     }
 
     #[test]
-    fn track_rows_use_cli_fallbacks_and_escape_values() {
+    fn track_rows_use_page_fallbacks_and_escape_values() {
         let row = store::TrackRow {
             path: "/m/<x>.wav".into(),
             title: None,
@@ -1199,12 +1242,27 @@ mod tests {
         };
         let html = render_tracks(&[row], Some("<q>"), 1, false);
         assert!(html.contains("(unknown artist)"), "{html}");
+        assert!(html.contains("(no album tag)"), "{html}");
         assert!(html.contains("&lt;x&gt;.wav"), "{html}");
         assert!(html.contains("2-1"), "{html}");
         assert!(html.contains("1:05"), "{html}");
         assert!(html.contains("stale match"), "{html}");
         assert!(html.contains("value=\"&lt;q&gt;\""), "{html}");
         assert!(!html.contains("<x>") && !html.contains("<q>"), "{html}");
+
+        let bare = store::TrackRow {
+            path: "/m/bare.wav".into(),
+            title: None,
+            artist: None,
+            album: None,
+            track_number: None,
+            disc_number: None,
+            duration_secs: None,
+            stale: false,
+        };
+        let html = render_tracks(&[bare], None, 1, false);
+        assert_eq!(html.matches(MISSING).count(), 2, "{html}");
+        assert!(!html.contains("?:??"), "{html}");
 
         assert!(render_tracks(&[], None, 1, false).contains("No tracks found."));
     }
@@ -1291,7 +1349,7 @@ mod tests {
         let status = store::LibraryStatus {
             directories: vec![store::DirectorySummary {
                 path: "/music/<a>".into(),
-                tracks: 7,
+                tracks: 12_345,
             }],
             tracks: 7,
             releases: 2,
@@ -1303,7 +1361,8 @@ mod tests {
             newest_modified: Some(1_700_000_000),
         };
         let html = render_status(&status);
-        assert!(html.contains("/music/&lt;a&gt;"), "{html}");
+        assert!(html.contains("/<wbr>music/<wbr>&lt;a&gt;"), "{html}");
+        assert!(html.contains("<td class=\"num\">12,345</td>"), "{html}");
         assert!(html.contains("<b>7</b><span>Tracks</span>"), "{html}");
         assert!(
             html.contains("<b><a href=\"/reviews\">1</a></b><span>Queued for review</span>"),
@@ -1492,7 +1551,7 @@ mod tests {
             html.contains("Merge into one release: 1 accepted match becomes stale."),
             "{html}"
         );
-        assert!(html.contains("cd2/01.wav"), "{html}");
+        assert!(html.contains("cd2/<wbr>01.wav"), "{html}");
         assert!(html.contains("&lt;i&gt;Blue&lt;/i&gt;"), "{html}");
         assert!(!html.contains("<i>"), "{html}");
     }
@@ -1521,6 +1580,7 @@ mod tests {
     fn the_folders_page_lists_units_and_their_state() {
         let mut first = release(12);
         first.unit = "/music/<b>".into();
+        first.track_count = 1_500;
         let unit = store::FolderUnit {
             path: "/music/<b>".into(),
             state: store::FolderState::MergedByUser,
@@ -1528,7 +1588,54 @@ mod tests {
         };
         let html = render_folders(&[unit], 1, false);
         assert!(html.contains("merged by you"), "{html}");
-        assert!(html.contains("/music/&lt;b&gt;</a>"), "{html}");
+        assert!(html.contains("<td class=\"num\">1,500</td>"), "{html}");
+        assert!(html.contains("/<wbr>music/<wbr>&lt;b&gt;</a>"), "{html}");
         assert!(render_folders(&[], 1, false).contains("No folder holds"));
+    }
+
+    #[test]
+    fn paths_break_after_separators_and_stay_escaped() {
+        assert_eq!(path_html("/m/<b>/x"), "/<wbr>m/<wbr>&lt;b&gt;/<wbr>x");
+        assert_eq!(path_html("C:\\m\\x"), "C:\\<wbr>m\\<wbr>x");
+    }
+
+    #[test]
+    fn empty_cells_show_a_muted_dash() {
+        assert_eq!(position_cell(None, None), MISSING);
+        assert_eq!(position_cell(Some(2), Some(1)), "2-1");
+        assert_eq!(duration_cell(None), MISSING);
+        assert_eq!(duration_cell(Some(65.0)), "1:05");
+        assert_eq!(text_cell(Some("  ")), MISSING);
+        assert_eq!(text_cell(None), MISSING);
+        assert_eq!(text_cell(Some("  x  ")), "x");
+        assert_eq!(text_cell(Some("<i>")), "&lt;i&gt;");
+    }
+
+    #[test]
+    fn status_counts_have_thousands_separators() {
+        let status = store::LibraryStatus {
+            tracks: 2_762_328,
+            queued: 86_988,
+            folders: 1_234,
+            ..Default::default()
+        };
+        let html = render_status(&status);
+        assert!(
+            html.contains("<b>2,762,328</b><span>Tracks</span>"),
+            "{html}"
+        );
+        assert!(html.contains(">86,988</a>"), "{html}");
+        assert!(html.contains(">1,234</a>"), "{html}");
+    }
+
+    #[test]
+    fn a_match_names_its_provider_by_label() {
+        let mut row = release(12);
+        row.remote_url = None;
+        assert!(
+            render_match(&row).starts_with("MusicBrainz "),
+            "{}",
+            render_match(&row)
+        );
     }
 }

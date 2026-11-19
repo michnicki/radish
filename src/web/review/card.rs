@@ -5,11 +5,11 @@
 // Rust guideline compliant 2026-08-14
 
 use super::{View, hidden_fields};
-use crate::layout::{format_duration, plural, track_number};
+use crate::layout::plural;
 use crate::matcher::{self, Candidate, Evaluation, LocalRelease, RemoteTrack};
 use crate::providers::{ProviderKind, ReleaseId};
 use crate::review as saved;
-use crate::web::{escape_html, is_web_url};
+use crate::web::{MISSING, duration_cell, escape_html, is_web_url, position_cell, text_cell};
 
 /// One candidate as a card. Only a `current` card has a track table and an
 /// accept section: an out-of-date mapping indexes files that may have moved.
@@ -112,15 +112,16 @@ pub(super) fn render_card(
         (String::new(), String::new())
     };
     format!(
-        "<section class=\"card\"><h3>[{}] {provider} {id} — score {:.3} \
+        "<section class=\"card\"><h3>[{}] {} {id} — score {:.3} \
          <span class=\"muted\">{verdict}</span></h3><p>{} — {}</p>{details}\
          <p class=\"muted\">score: {}</p><p class=\"muted\">mapping: {}/{} files mapped</p>\
          <ul>{notes}</ul>{disc}{tracks}{action}</section>",
         index + 1,
+        provider.label(),
         evaluation.match_scope.score(&candidate.score),
         escape_html(&release.artist_display()),
         escape_html(&release.title),
-        escape_html(&saved::score_parts(candidate, evaluation).join("  ")),
+        escape_html(&saved::score_parts(candidate, evaluation).join(" · ")),
         candidate.mapping.assigned_count(),
         local.tracks.len(),
     )
@@ -163,11 +164,11 @@ fn render_mapping(local: &LocalRelease, candidate: &Candidate) -> String {
         }
         rows.push_str(&format!(
             "<tr><td class=\"num\">{}</td><td>{}</td><td class=\"num\">{}</td>{}</tr>",
-            track_number(track.disc, track.track_number),
-            escape_html(track.title.as_deref().unwrap_or("")),
-            format_duration(track.duration_secs),
+            position_cell(track.disc, track.track_number),
+            text_cell(track.title.as_deref()),
+            duration_cell(track.duration_secs),
             paired.map_or_else(
-                || "<td>—</td><td class=\"muted\">not mapped</td><td></td>".to_string(),
+                || format!("<td>{MISSING}</td><td class=\"muted\">not mapped</td><td class=\"num\">{MISSING}</td>"),
                 cells
             ),
         ));
@@ -221,9 +222,9 @@ fn remote_cells(track: &RemoteTrack, medium: Option<u32>) -> String {
     };
     format!(
         "<td>{}</td><td>{}</td><td class=\"num\">{}</td>",
-        escape_html(&position),
-        escape_html(&track.title),
-        format_duration(track.duration_secs),
+        text_cell(Some(&position)),
+        text_cell(Some(&track.title)),
+        duration_cell(track.duration_secs),
     )
 }
 
@@ -287,8 +288,9 @@ fn render_accept(
          <input type=\"hidden\" name=\"action\" value=\"accept\">\
          <input type=\"hidden\" name=\"provider\" value=\"{provider}\">\
          <input type=\"hidden\" name=\"candidate\" value=\"{id}\">\
-         <button aria-label=\"{label}: {provider} {id}\">{label}</button></form>",
+         <button aria-label=\"{label}: {} {id}\">{label}</button></form>",
         hidden_fields(view, token),
+        provider.label(),
     )
 }
 
@@ -330,7 +332,7 @@ mod tests {
         );
         assert!(
             html.contains(&format!(
-                "<button aria-label=\"Accept, overriding 1 check: musicbrainz {FIXTURE_MBID}\">"
+                "<button aria-label=\"Accept, overriding 1 check: MusicBrainz {FIXTURE_MBID}\">"
             )),
             "{html}"
         );
@@ -440,7 +442,9 @@ mod tests {
         review.groups[0].candidates[0].0.mapping.pairs.truncate(1);
         let html = render_release(&view(&review, Some("tok")));
         assert!(
-            html.contains("<td>Two</td><td class=\"num\">3:00</td><td>—</td>"),
+            html.contains(&format!(
+                "<td>Two</td><td class=\"num\">3:00</td><td>{MISSING}</td>"
+            )),
             "{html}"
         );
         assert!(html.contains("not mapped"), "{html}");
@@ -510,7 +514,7 @@ mod tests {
         assert!(html.contains(">Accept</button>"), "{html}");
         assert!(
             html.contains(&format!(
-                "aria-label=\"Accept: musicbrainz {FIXTURE_MBID}\""
+                "aria-label=\"Accept: MusicBrainz {FIXTURE_MBID}\""
             )),
             "{html}"
         );
@@ -565,7 +569,22 @@ mod tests {
         review.groups[0].candidates[0].0.mapping.pairs[0] = Some(99);
         let html = render_release(&view(&review, Some("tok")));
         assert!(
-            html.contains("<td>—</td><td class=\"muted\">not mapped</td>"),
+            html.contains(&format!(
+                "<td>{MISSING}</td><td class=\"muted\">not mapped</td>\
+                 <td class=\"num\">{MISSING}</td>"
+            )),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_provider_track_without_a_title_shows_a_dash() {
+        let mut remote = exact();
+        remote.tracklist[1].title = String::new();
+        let review = review_of(vec![group(GroupState::Current, vec![(remote, Vec::new())])]);
+        let html = render_release(&view(&review, Some("tok")));
+        assert!(
+            html.contains(&format!("<td>2</td><td>{MISSING}</td>")),
             "{html}"
         );
     }
@@ -591,5 +610,33 @@ mod tests {
             at("warning: warned"),
         ];
         assert!(order.is_sorted(), "{order:?} in {html}");
+    }
+
+    #[test]
+    fn a_candidate_heading_names_its_provider_by_label() {
+        let review = review_of(vec![group(
+            GroupState::Current,
+            vec![(exact(), Vec::new())],
+        )]);
+        let html = render_release(&view(&review, Some("tok")));
+        assert!(html.contains("[1] MusicBrainz "), "{html}");
+        assert!(!html.contains("[1] musicbrainz"), "{html}");
+    }
+
+    #[test]
+    fn the_score_line_separates_its_parts_with_a_visible_dot() {
+        let review = review_of(vec![group(
+            GroupState::Current,
+            vec![(exact(), Vec::new())],
+        )]);
+        let parts = saved::score_parts(
+            &review.groups[0].candidates[0].0,
+            &review.groups[0].candidates[0].1,
+        );
+        assert!(parts.len() >= 2, "{parts:?}");
+        let html = render_release(&view(&review, Some("tok")));
+        let line = format!("score: {}", parts.join(" · "));
+        assert!(html.contains(&line), "{line} in {html}");
+        assert!(!html.contains(&parts.join("  ")), "{html}");
     }
 }

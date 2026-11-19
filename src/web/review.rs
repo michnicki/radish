@@ -13,10 +13,11 @@ mod card;
 
 use self::card::{cannot_apply_text, render_card};
 use super::{
-    AppError, AppState, NOT_WRITABLE, Nav, PAGE_SIZE, cross_site, error_page, escape_html,
-    folder_href, page, page_param, pager_with, relative_path, render_match, same_token,
+    AppError, AppState, MISSING, NOT_WRITABLE, Nav, PAGE_SIZE, cross_site, duration_cell,
+    error_page, escape_html, folder_href, page, page_param, pager_with, path_html, position_cell,
+    relative_path, render_match, same_token, text_cell,
 };
-use crate::layout::{format_duration, plural, track_number};
+use crate::layout::plural;
 use crate::matcher::LocalRelease;
 use crate::providers::{ProviderKind, ReleaseId};
 use crate::review::{
@@ -236,7 +237,7 @@ async fn accepted_status(
         .filter(|status| status.status == store::STATUS_MATCHED))
 }
 
-/// `Accepted musicbrainz <id> (title) for #12 Artist — Album.`
+/// `Accepted MusicBrainz <id> (title) for #12 Artist — Album.`
 fn render_accepted(status: &store::LocalReleaseStatus, view: &store::QueueView) -> String {
     format!(
         "<p class=\"notice\">Accepted {} for <a href=\"{}\">#{} {} — {}</a>.</p>",
@@ -355,8 +356,8 @@ fn queue_row(row: &store::QueuedRelease, view: &store::QueueView) -> String {
         .top
         .iter()
         .map(|(provider, score)| match score {
-            Some(score) => format!("{provider} {score:.3}"),
-            None => format!("{provider} —"),
+            Some(score) => format!("{} {score:.3}", provider.label()),
+            None => format!("{} {MISSING}", provider.label()),
         })
         .collect();
     let reason = match &row.lead {
@@ -373,7 +374,7 @@ fn queue_row(row: &store::QueuedRelease, view: &store::QueueView) -> String {
             };
             format!(
                 "{}: {}{more}{mark}",
-                lead.provider,
+                lead.provider.label(),
                 escape_html(lead.reason.as_deref().unwrap_or(""))
             )
         }
@@ -395,7 +396,7 @@ fn queue_row(row: &store::QueuedRelease, view: &store::QueueView) -> String {
         row.track_count,
         top.join(" · "),
         escape_html(&folder_href(&row.unit)),
-        escape_html(&row.directory),
+        path_html(&row.directory),
     )
 }
 
@@ -578,7 +579,7 @@ fn render_release(view: &View<'_>) -> String {
         ),
         escape_html(release.album_title.as_deref().unwrap_or("(no album tag)")),
         escape_html(&folder_href(&status.unit)),
-        escape_html(&release.directory),
+        path_html(&release.directory),
         plural(release.tracks.len() as u64, "file", "files"),
         escape_html(&status.status_label()),
         render_files(release),
@@ -595,10 +596,10 @@ fn render_files(release: &LocalRelease) -> String {
             format!(
                 "<tr><td class=\"num\">{}</td><td>{}</td><td class=\"num\">{}</td>\
                  <td class=\"path\">{}</td></tr>",
-                track_number(track.disc, track.track_number),
-                escape_html(track.title.as_deref().unwrap_or("")),
-                format_duration(track.duration_secs),
-                escape_html(relative_path(&release.directory, &track.path)),
+                position_cell(track.disc, track.track_number),
+                text_cell(track.title.as_deref()),
+                duration_cell(track.duration_secs),
+                path_html(relative_path(&release.directory, &track.path)),
             )
         })
         .collect();
@@ -1008,11 +1009,16 @@ mod tests {
             html.contains("&lt;i&gt;Blue&lt;/i&gt;") && !html.contains("<i>"),
             "{html}"
         );
+        assert!(html.contains("/<wbr>music/<wbr>&lt;b&gt;"), "{html}");
+        assert!(!html.contains("<b>"), "{html}");
         assert!(
             html.contains("href=\"/review?release=7&amp;provider=deezer\""),
             "{html}"
         );
-        assert!(html.contains("musicbrainz 0.931 · discogs —"), "{html}");
+        assert!(
+            html.contains("MusicBrainz 0.931 · Discogs <span class=\"muted\">—</span>"),
+            "{html}"
+        );
         assert!(
             html.contains("href=\"/reviews?provider=deezer&amp;page=2\""),
             "{html}"
@@ -1057,7 +1063,7 @@ mod tests {
             1,
             false,
         );
-        assert!(html.contains("Accepted musicbrainz abc"), "{html}");
+        assert!(html.contains("Accepted MusicBrainz abc"), "{html}");
         assert!(html.contains("&lt;b&gt;Blue&lt;/b&gt;"), "{html}");
         assert!(!html.contains("<b>"), "{html}");
     }
@@ -1219,7 +1225,7 @@ mod tests {
         });
         let html = render_queue(&[row], 1, &view, None, 1, true);
         assert!(
-            html.contains("discogs: &lt;b&gt;edition&lt;/b&gt; qualifiers differ (+2 more)"),
+            html.contains("Discogs: &lt;b&gt;edition&lt;/b&gt; qualifiers differ (+2 more)"),
             "{html}"
         );
         assert!(
@@ -1367,7 +1373,7 @@ mod tests {
             blockers: 0,
         });
         let html = render_queue(&[row], 1, &store::QueueView::default(), None, 1, false);
-        assert!(html.contains("musicbrainz: uncertain</td>"), "{html}");
+        assert!(html.contains("MusicBrainz: uncertain</td>"), "{html}");
         assert!(!html.contains("can't be accepted"), "{html}");
         assert!(html.contains("1 release queued for review."), "{html}");
         let view = view_of(None, None, Some("acceptable"));
@@ -1513,7 +1519,7 @@ mod tests {
         );
         assert!(
             html.contains(
-                "Accepted now: musicbrainz abc. Accepting another candidate replaces it."
+                "Accepted now: MusicBrainz abc. Accepting another candidate replaces it."
             ),
             "{html}"
         );

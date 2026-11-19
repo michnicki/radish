@@ -226,7 +226,7 @@ fn status_page_shows_library_counts_and_security_headers() {
     assert!(reply.body.contains("<b>2</b><span>Local releases</span>"));
     assert!(reply.body.contains("<b>2</b><span>Unmatched</span>"));
     assert!(
-        reply.body.contains(music.to_str().unwrap()),
+        reply.body.contains(&shown(music.to_str().unwrap())),
         "{}",
         reply.body
     );
@@ -297,7 +297,11 @@ fn releases_page_lists_each_local_release() {
         "{}",
         reply.body
     );
-    assert!(reply.body.contains(music.join("Blue").to_str().unwrap()));
+    assert!(
+        reply
+            .body
+            .contains(&shown(music.join("Blue").to_str().unwrap()))
+    );
     assert!(
         reply.body.contains("2 releases on this page."),
         "{}",
@@ -550,10 +554,17 @@ fn release_state(db: &Path, id: i64) -> String {
     panic!("no release #{id} in {text}");
 }
 
+/// A path as the pages show it, with a break opportunity after each separator.
+///
+/// It only adds `<wbr>`, so use it for paths without HTML-special characters.
+fn shown(path: &str) -> String {
+    path.replace('/', "/<wbr>")
+}
+
 /// The start of the notice a page shows for an accepted MusicBrainz release;
 /// the ID is a link to the release.
 fn accepted_notice(mbid: &str) -> String {
-    format!("Accepted musicbrainz <a href=\"https://musicbrainz.org/release/{mbid}\"")
+    format!("Accepted MusicBrainz <a href=\"https://musicbrainz.org/release/{mbid}\"")
 }
 
 /// Queues release `id` for review with a direct MusicBrainz selection.
