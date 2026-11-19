@@ -520,7 +520,7 @@ fn render_release(view: &View<'_>) -> String {
         ),
     };
     let jump = if view.token.is_some() {
-        " · <a href=\"#enter\">Enter a release by ID</a>"
+        "<a href=\"#enter\">Enter a release by ID</a>"
     } else {
         ""
     };
@@ -567,8 +567,9 @@ fn render_release(view: &View<'_>) -> String {
             .collect()
     };
     format!(
-        "<p class=\"pager\">{next}{jump}</p>{accepted}<h1>#{} {} — {}</h1>\
-         <p class=\"path\"><a href=\"{}\">{}</a></p><p>{} · {}</p>{problems}{current}{notice}\
+        "{accepted}<h1>#{} {} — {}</h1>\
+         <p class=\"path\"><a href=\"{}\">{}</a></p><p>{} · {}</p>\
+         <p class=\"actions\">{next}{jump}</p>{problems}{current}{notice}\
          <h2>Files</h2>{}{groups}{}",
         release.id,
         escape_html(
@@ -2131,6 +2132,25 @@ mod tests {
             "{html}"
         );
         assert!(!html.contains(&"é".repeat(MAX_ENTERED_CHARS + 1)), "{html}");
+    }
+
+    #[test]
+    fn the_queue_links_sit_under_the_heading() {
+        let review = review_of(Vec::new());
+        let html = render_release(&view(&review, Some("tok")));
+        let heading = html.find("<h1>").expect("a heading");
+        let actions = html.find("class=\"actions\"").expect("an actions row");
+        assert!(heading < actions, "{html}");
+        assert!(actions < html.find("<h2>Files</h2>").unwrap(), "{html}");
+        assert!(
+            html.contains(
+                "</p><p class=\"actions\"><a href=\"/reviews\">Back to the queue</a>\
+                 <a href=\"#enter\">Enter a release by ID</a></p>"
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("<p class=\"pager\">"), "{html}");
+        assert!(!html.contains(" · <a href=\"#enter\">"), "{html}");
     }
 
     #[test]

@@ -246,7 +246,7 @@ impl FolderState {
             Self::MergedByUser => "merged by you",
             Self::SeparateByUser => "kept separate by you",
             Self::MergedAutomatically => "merged automatically",
-            Self::Automatic => "automatic: separate",
+            Self::Automatic => "kept separate automatically",
         }
     }
 }

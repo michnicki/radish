@@ -1459,7 +1459,7 @@ mod tests {
             render_folder_units(&[unit]),
             vec![
                 "/music/box",
-                "  automatic: separate",
+                "  kept separate automatically",
                 "  #12  Test Artist — Blue · 2 tracks · unmatched",
                 "  #13  Test Artist — Vision Thing · 2 tracks · unmatched",
                 "",

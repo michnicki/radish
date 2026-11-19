@@ -116,11 +116,11 @@ async fn folder_list_shows_the_box_and_the_merged_typo() {
         "{text}"
     );
     assert!(
-        text.contains("/library/box\n  automatic: separate"),
+        text.contains("/library/box\n  kept separate automatically"),
         "{text}"
     );
     assert!(
-        text.contains("/library/dm\n  automatic: separate"),
+        text.contains("/library/dm\n  kept separate automatically"),
         "{text}"
     );
     assert!(text.ends_with("3 folders.\n"), "{text}");
@@ -231,7 +231,7 @@ async fn list_path_widens_a_disc_folder_to_its_unit() {
     assert!(output.status.success(), "{output:?}");
     let text = stdout(&output);
     assert!(
-        text.starts_with("/library/dm\n  automatic: separate\n"),
+        text.starts_with("/library/dm\n  kept separate automatically\n"),
         "{text}"
     );
     assert!(

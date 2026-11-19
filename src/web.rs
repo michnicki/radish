@@ -444,7 +444,7 @@ async fn folder_page(
     };
     let token = state.writable.then_some(&*state.token);
     Ok(Html(page(
-        "Folder",
+        &format!("Folder {}", folder_name(&view.unit.path)),
         Some(Nav::Folders),
         &render_folder(&view, token),
     ))
@@ -723,7 +723,7 @@ fn render_status(status: &store::LibraryStatus) -> String {
 
     format!(
         "<h1>Library status</h1><div class=\"stats\">{tiles}</div>{folders}{newest}\
-         <h1>Imported directories</h1>{directories}"
+         <h2>Imported directories</h2>{directories}"
     )
 }
 
@@ -748,20 +748,24 @@ fn render_tracks(
             .iter()
             .map(|row| {
                 format!(
-                    "<tr><td>{}</td><td>{}</td><td>{}</td><td class=\"num\">{}</td>\
-                     <td class=\"num\">{}</td><td class=\"muted\">{}</td></tr>",
+                    "<tr><td>{}</td><td>{}{}</td><td>{}</td><td class=\"num\">{}</td>\
+                     <td class=\"num\">{}</td></tr>",
                     escape_html(row.artist.as_deref().unwrap_or("(unknown artist)")),
                     escape_html(&row.display_title()),
+                    if row.stale {
+                        " <span class=\"badge stale\">stale match</span>"
+                    } else {
+                        ""
+                    },
                     escape_html(row.album.as_deref().unwrap_or("(no album tag)")),
                     position_cell(row.disc_number, row.track_number),
                     duration_cell(row.duration_secs),
-                    if row.stale { "stale match" } else { "" },
                 )
             })
             .collect();
         format!(
             "<div class=\"table\"><table><thead><tr><th>Artist</th><th>Title</th>\
-             <th>Album</th><th class=\"num\">#</th><th class=\"num\">Time</th><th></th>\
+             <th>Album</th><th class=\"num\">#</th><th class=\"num\">Time</th>\
              </tr></thead><tbody>{body}</tbody></table></div>"
         )
     };
@@ -873,6 +877,16 @@ fn render_folders(units: &[store::FolderUnit], page_number: u64, has_next: bool)
     )
 }
 
+/// The last folder name of `path`, for the folder page's heading and title;
+/// the whole path when nothing is left (`/`).
+fn folder_name(path: &str) -> &str {
+    path.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path)
+}
+
 /// One unit: its state, the choices, its releases and its files. `token` is
 /// `None` on a server that takes no writes, which shows commands instead.
 fn render_folder(view: &store::FolderView, token: Option<&str>) -> String {
@@ -883,23 +897,24 @@ fn render_folder(view: &store::FolderView, token: Option<&str>) -> String {
         .iter()
         .map(|file| {
             format!(
-                "<tr><td class=\"path\">{}</td><td class=\"num\">{}</td><td>{}</td><td>{}</td>\
-                 <td class=\"num\">{}</td></tr>",
-                path_html(relative_path(&unit.path, &file.path)),
+                "<tr><td class=\"num\">{}</td><td>{}</td><td>{}</td><td class=\"num\">{}</td>\
+                 <td class=\"path\">{}</td></tr>",
                 position_cell(file.disc, file.track_number),
-                escape_html(file.album.as_deref().unwrap_or("(no album tag)")),
                 text_cell(file.title.as_deref()),
+                escape_html(file.album.as_deref().unwrap_or("(no album tag)")),
                 duration_cell(file.duration_secs),
+                path_html(relative_path(&unit.path, &file.path)),
             )
         })
         .collect();
     format!(
-        "<h1>Folder</h1><p class=\"path\">{}</p><p>Grouping: {}</p>{}\
-         <h1>Releases</h1><div class=\"table\"><table><thead>{RELEASE_HEADER}</thead>\
+        "<h1>{}</h1><p class=\"path\">{}</p><p>Grouping: {}</p>{}\
+         <h2>Releases</h2><div class=\"table\"><table><thead>{RELEASE_HEADER}</thead>\
          <tbody>{releases}</tbody></table></div>\
-         <h1>Files</h1><div class=\"table\"><table><thead><tr><th>File</th>\
-         <th class=\"num\">#</th><th>Album tag</th><th>Title</th><th class=\"num\">Time</th>\
+         <h2>Files</h2><div class=\"table\"><table><thead><tr><th class=\"num\">#</th>\
+         <th>Title</th><th>Album tag</th><th class=\"num\">Time</th><th>File</th>\
          </tr></thead><tbody>{files}</tbody></table></div>",
+        escape_html(folder_name(&unit.path)),
         path_html(&unit.path),
         unit.state.label(),
         render_choices(view, token),
@@ -1246,7 +1261,10 @@ mod tests {
         assert!(html.contains("&lt;x&gt;.wav"), "{html}");
         assert!(html.contains("2-1"), "{html}");
         assert!(html.contains("1:05"), "{html}");
-        assert!(html.contains("stale match"), "{html}");
+        assert!(
+            html.contains("<span class=\"badge stale\">stale match</span>"),
+            "{html}"
+        );
         assert!(html.contains("value=\"&lt;q&gt;\""), "{html}");
         assert!(!html.contains("<x>") && !html.contains("<q>"), "{html}");
 
@@ -1261,6 +1279,7 @@ mod tests {
             stale: false,
         };
         let html = render_tracks(&[bare], None, 1, false);
+        assert!(!html.contains("badge"), "{html}");
         assert_eq!(html.matches(MISSING).count(), 2, "{html}");
         assert!(!html.contains("?:??"), "{html}");
 
@@ -1525,6 +1544,74 @@ mod tests {
                 (FolderAction::Separate, store::MatchEffects::default()),
             ],
         }
+    }
+
+    #[test]
+    fn each_page_has_one_h1_and_h2_sections() {
+        let status = store::LibraryStatus {
+            directories: vec![store::DirectorySummary {
+                path: "/music".into(),
+                tracks: 3,
+            }],
+            ..Default::default()
+        };
+        let html = render_status(&status);
+        assert!(html.contains("<h2>Imported directories</h2>"), "{html}");
+        assert_eq!(html.matches("<h1>").count(), 1, "{html}");
+
+        let html = render_folder(&folder_view(), Some("t"));
+        assert!(html.starts_with("<h1>&lt;b&gt;</h1>"), "{html}");
+        assert!(html.contains("<h2>Releases</h2>"), "{html}");
+        assert!(html.contains("<h2>Files</h2>"), "{html}");
+        assert_eq!(html.matches("<h1>").count(), 1, "{html}");
+        assert!(
+            html.contains(
+                "<th class=\"num\">#</th><th>Title</th><th>Album tag</th>\
+                 <th class=\"num\">Time</th><th>File</th>"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains("Grouping: kept separate automatically"),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "<tr><td class=\"num\">2-1</td><td><span class=\"muted\">—</span></td>\
+                 <td>&lt;i&gt;Blue&lt;/i&gt;</td><td class=\"num\">1:01</td>\
+                 <td class=\"path\">cd2/<wbr>01.wav</td></tr>"
+            ),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_folder_name_is_the_last_path_component() {
+        assert_eq!(folder_name("/a/b/"), "b");
+        assert_eq!(folder_name("C:\\x\\y"), "y");
+        assert_eq!(folder_name("/"), "/");
+        assert_eq!(folder_name("C:\\"), "C:");
+        assert_eq!(folder_name("box"), "box");
+    }
+
+    #[test]
+    fn a_stale_track_is_marked_in_its_title_cell() {
+        let row = store::TrackRow {
+            path: "/m/a.wav".into(),
+            title: Some("Song".into()),
+            artist: None,
+            album: None,
+            track_number: None,
+            disc_number: None,
+            duration_secs: None,
+            stale: true,
+        };
+        let html = render_tracks(&[row], None, 1, false);
+        assert!(!html.contains("<th></th>"), "{html}");
+        assert!(
+            html.contains("Song <span class=\"badge stale\">stale match</span>"),
+            "{html}"
+        );
     }
 
     #[test]

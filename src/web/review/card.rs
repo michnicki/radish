@@ -202,7 +202,7 @@ fn render_mapping(local: &LocalRelease, candidate: &Candidate) -> String {
     }
     format!(
         "<div class=\"table\"><table><thead><tr><th class=\"num\">#</th><th>File title</th>\
-         <th class=\"num\">File time</th><th>Pos</th><th>{label} title</th>\
+         <th class=\"num\">File time</th><th>{label} #</th><th>{label} title</th>\
          <th class=\"num\">{label} time</th></tr></thead><tbody>{rows}</tbody></table></div>",
         label = candidate.release.provider().label()
     )
@@ -309,6 +309,17 @@ mod tests {
             "Blue",
             &["<script>x</script>", "Two", "Bonus"],
         )
+    }
+
+    #[test]
+    fn the_mapping_header_names_the_provider_position() {
+        let review = review_of(vec![group(
+            GroupState::Current,
+            vec![(exact(), Vec::new())],
+        )]);
+        let html = render_release(&view(&review, Some("tok")));
+        assert!(html.contains("<th>MusicBrainz #</th>"), "{html}");
+        assert!(!html.contains(">Pos<"), "{html}");
     }
 
     #[test]

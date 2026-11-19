@@ -611,7 +611,7 @@ fn a_folder_form_merges_only_with_the_token_from_this_site() {
     let folders = server.get("/folders");
     assert_eq!(folders.status, 200);
     assert!(
-        folders.body.contains("automatic: separate"),
+        folders.body.contains("kept separate automatically"),
         "{}",
         folders.body
     );
@@ -622,6 +622,12 @@ fn a_folder_form_merges_only_with_the_token_from_this_site() {
 
     let page = server.get(&link);
     assert_eq!(page.status, 200);
+    assert!(
+        page.body.contains("<title>Folder Mixed · Radish</title>"),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains("<h1>Mixed</h1>"), "{}", page.body);
     let token = between(&page.body, "name=\"token\" value=\"", "\"").to_string();
     let path = unescape_html(between(&page.body, "name=\"path\" value=\"", "\""));
     let body = |action: &str, token: &str, path: &str| {
@@ -699,7 +705,12 @@ fn a_folder_form_merges_only_with_the_token_from_this_site() {
         form_encode(&path)
     ));
     assert_eq!(get.status, 200);
-    assert!(server.get("/folders").body.contains("automatic: separate"));
+    assert!(
+        server
+            .get("/folders")
+            .body
+            .contains("kept separate automatically")
+    );
     // Nor did any of the refusals.
     assert!(!server.get("/folders").body.contains("merged by you"));
 

@@ -7204,6 +7204,25 @@ mod tests {
         assert_eq!(library_status(&pool).await.unwrap().folders, 3);
     }
 
+    #[test]
+    fn folder_state_labels_are_parallel() {
+        assert_eq!(
+            [
+                FolderState::MergedByUser,
+                FolderState::SeparateByUser,
+                FolderState::MergedAutomatically,
+                FolderState::Automatic,
+            ]
+            .map(FolderState::label),
+            [
+                "merged by you",
+                "kept separate by you",
+                "merged automatically",
+                "kept separate automatically",
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn a_folder_view_previews_what_each_choice_does_to_matches() {
         let pool = test_pool().await;
