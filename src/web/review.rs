@@ -13,7 +13,7 @@ mod card;
 
 use self::card::{cannot_apply_text, render_card};
 use super::{
-    AppError, AppState, MISSING, NOT_WRITABLE, Nav, PAGE_SIZE, count_line, cross_site,
+    AppError, AppState, MISSING, NOT_WRITABLE, Nav, PAGE_SIZE, count, count_line, cross_site,
     duration_cell, error_page, escape_html, folder_href, last_page, page, page_param, pager_with,
     past_end, path_html, position_cell, relative_path, render_match, same_token, status_html,
     text_cell,
@@ -349,7 +349,7 @@ fn render_queue(
          <th>Album</th><th class=\"num\">Tracks</th><th>Top</th><th>Reason</th><th>Folder</th>\
          </tr></thead><tbody>{body}</tbody></table></div>{}",
         count_line(&sentence, page_number, rows.len(), total),
-        pager_with("/reviews", &params, page_number, false, Some(last),)
+        pager_with("/reviews", &params, page_number, false, Some(last))
     )
 }
 
@@ -396,7 +396,7 @@ fn queue_row(row: &store::QueuedRelease, view: &store::QueueView) -> String {
         row.id,
         escape_html(row.album_artist.as_deref().unwrap_or("(unknown artist)")),
         escape_html(row.album_title.as_deref().unwrap_or("(no album tag)")),
-        row.track_count,
+        count(row.track_count),
         top.join(" · "),
         escape_html(&folder_href(&row.unit)),
         path_html(&row.directory),
@@ -708,9 +708,8 @@ fn render_entry(view: &View<'_>) -> String {
     let id = view.review.release.id;
     let Some(token) = view.token else {
         return format!(
-            "<h2>Enter a release</h2><p class=\"muted\">This server listens on a non-loopback \
-             address, so it changes nothing. Run one of these with the same <code>--db</code> as \
-             this server:</p><ul>\
+            "<h2>Enter a release</h2><p class=\"muted\">{NOT_WRITABLE} Run one of these with the \
+             same <code>--db</code> as this server:</p><ul>\
              <li><code>radish match --review --local-release {id} --musicbrainz-release MBID</code></li>\
              <li><code>radish match --review --local-release {id} --discogs-release ID</code></li>\
              <li><code>radish match --review --local-release {id} --deezer-release ID</code></li></ul>"
@@ -1010,6 +1009,16 @@ mod tests {
             ],
             lead: None,
         }
+    }
+
+    #[test]
+    fn queue_rows_group_the_track_count_and_break_paths_at_underscores() {
+        let mut row = queued(7);
+        row.track_count = 1_500;
+        row.directory = "/music/Me_First".into();
+        let html = queue_row(&row, &view_of(None, None, None));
+        assert!(html.contains("<td class=\"num\">1,500</td>"), "{html}");
+        assert!(html.contains("/<wbr>music/<wbr>Me_<wbr>First"), "{html}");
     }
 
     #[test]

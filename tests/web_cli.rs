@@ -371,7 +371,8 @@ fn foreign_hosts_unknown_paths_and_writes_are_refused() {
     let rebound = server.request("GET", "/", Some("evil.example"));
     assert_eq!(rebound.status, 403, "{}", rebound.body);
     assert!(rebound.headers.contains("content-security-policy"));
-    assert!(!rebound.body.contains("Library status"));
+    assert_eq!(rebound.body.trim(), "forbidden host");
+    assert!(!rebound.body.contains("<nav>"));
     assert_eq!(server.request("GET", "/", Some("localhost:1")).status, 200);
 
     let missing = server.get("/nope");
@@ -554,11 +555,12 @@ fn release_state(db: &Path, id: i64) -> String {
     panic!("no release #{id} in {text}");
 }
 
-/// A path as the pages show it, with a break opportunity after each separator.
+/// A path as the pages show it, with a break opportunity after each separator
+/// and underscore.
 ///
 /// It only adds `<wbr>`, so use it for paths without HTML-special characters.
 fn shown(path: &str) -> String {
-    path.replace('/', "/<wbr>")
+    path.replace('/', "/<wbr>").replace('_', "_<wbr>")
 }
 
 /// The start of the notice a page shows for an accepted MusicBrainz release;

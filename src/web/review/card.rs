@@ -5,11 +5,13 @@
 // Rust guideline compliant 2026-08-14
 
 use super::{View, hidden_fields};
-use crate::layout::plural;
+use crate::layout::{grouped, plural};
 use crate::matcher::{self, Candidate, Evaluation, LocalRelease, RemoteTrack};
 use crate::providers::{ProviderKind, ReleaseId};
 use crate::review as saved;
-use crate::web::{MISSING, duration_cell, escape_html, is_web_url, position_cell, text_cell};
+use crate::web::{
+    MISSING, NOT_WRITABLE, duration_cell, escape_html, is_web_url, position_cell, text_cell,
+};
 
 /// The kinds of note a card lists under its scores.
 #[derive(Clone, Copy)]
@@ -163,6 +165,10 @@ fn render_mapping(local: &LocalRelease, candidate: &Candidate) -> String {
             media[remote_index].filter(|_| several_media),
         )
     };
+    let not_mapped = format!(
+        "<td>{MISSING}</td><td class=\"muted\">not mapped</td>\
+         <td class=\"num\">{MISSING}</td>"
+    );
     let mut shown = vec![false; remote.len()];
     let mut rows = String::new();
     for (index, track) in local.tracks.iter().enumerate() {
@@ -181,10 +187,7 @@ fn render_mapping(local: &LocalRelease, candidate: &Candidate) -> String {
             position_cell(track.disc, track.track_number),
             text_cell(track.title.as_deref()),
             duration_cell(track.duration_secs),
-            paired.map_or_else(
-                || format!("<td>{MISSING}</td><td class=\"muted\">not mapped</td><td class=\"num\">{MISSING}</td>"),
-                cells
-            ),
+            paired.map_or_else(|| not_mapped.clone(), cells),
         ));
     }
     let mut unmapped = 0_usize;
@@ -199,7 +202,8 @@ fn render_mapping(local: &LocalRelease, candidate: &Candidate) -> String {
         unmapped += 1;
         if unmapped <= MAX_UNMAPPED_ROWS {
             rows.push_str(&format!(
-                "<tr><td></td><td class=\"muted\">not in the files</td><td></td>{}</tr>",
+                "<tr><td class=\"num\">{MISSING}</td><td class=\"muted\">not in the files</td>\
+                 <td class=\"num\">{MISSING}</td>{}</tr>",
                 cells(remote_index)
             ));
         }
@@ -209,8 +213,9 @@ fn render_mapping(local: &LocalRelease, candidate: &Candidate) -> String {
         .filter(|&more| more > 0)
     {
         rows.push_str(&format!(
-            "<tr><td></td><td class=\"muted\" colspan=\"5\">… and {more} more provider \
+            "<tr><td></td><td class=\"muted\" colspan=\"5\">… and {} more provider \
              {} not in the files</td></tr>",
+            grouped(more as u64),
             if more == 1 { "track" } else { "tracks" }
         ));
     }
@@ -283,9 +288,9 @@ fn render_accept(
     };
     let Some(token) = view.token else {
         return format!(
-            "{blockers}<p class=\"muted\">This server listens on a non-loopback address, so it \
-             changes nothing. Run <code>radish match --review --local-release {}</code> with the \
-             same <code>--db</code> as this server.</p>",
+            "{blockers}<p class=\"muted\">{NOT_WRITABLE} Run \
+             <code>radish match --review --local-release {}</code> with the same \
+             <code>--db</code> as this server.</p>",
             local.id
         );
     };
@@ -381,7 +386,13 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("Cannot accept:"), "{html}");
-        assert!(html.contains("not in the files"), "{html}");
+        assert!(
+            html.contains(&format!(
+                "<tr><td class=\"num\">{MISSING}</td><td class=\"muted\">not in the files</td>\
+                 <td class=\"num\">{MISSING}</td>"
+            )),
+            "{html}"
+        );
         assert!(html.contains("name=\"revision\" value=\"rev\""), "{html}");
         assert!(html.contains("name=\"match\" value=\"\""), "{html}");
         assert!(html.contains("name=\"token\" value=\"tok\""), "{html}");
@@ -441,6 +452,16 @@ mod tests {
         );
         assert!(html.contains("Extra 0"), "{html}");
         assert!(!html.contains("Extra 37"), "{html}");
+
+        let review = review_of(vec![group(
+            GroupState::Current,
+            vec![(remote_with_extra(MAX_UNMAPPED_ROWS + 1_200), Vec::new())],
+        )]);
+        let html = render_release(&view(&review, Some("tok")));
+        assert!(
+            html.contains("… and 1,200 more provider tracks not in the files"),
+            "{html}"
+        );
 
         // Exactly at the limit there is nothing to count.
         let review = review_of(vec![group(

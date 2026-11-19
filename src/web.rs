@@ -70,7 +70,8 @@ const MAX_QUERY_CHARS: usize = 200;
 /// library never has a million pages.
 const MAX_PAGE: u64 = 1_000_000;
 
-/// The message of the `403` a server that takes no writes gives to a form.
+/// What a server that takes no writes says: the message of its `403` to a
+/// form, and the first sentence of the notice shown in place of each form.
 const NOT_WRITABLE: &str = "This server listens on a non-loopback address, so it changes nothing.";
 
 /// The largest form body accepted, in bytes. A folder form holds a path, an
@@ -291,7 +292,7 @@ impl IntoResponse for AppError {
 
 /// An error as a page with the usual header, a message and one link back.
 ///
-/// So a reader who hits an error keeps the navigation. `back` is
+/// A reader who hits an error therefore keeps the navigation. `back` is
 /// `(href, text)`; `message` is plain text.
 fn error_page(
     status: StatusCode,
@@ -584,13 +585,19 @@ fn escape_html(text: &str) -> String {
 const MISSING: &str = "<span class=\"muted\">—</span>";
 
 /// A path for display: escaped, with a break opportunity after each separator
-/// so a long path wraps between folders rather than inside a name.
+/// and underscore, so a long path wraps between folders and words rather than
+/// inside a word.
+///
+/// Scene-style folder names use `_` for spaces and often have no other break
+/// opportunity. The path is escaped first, and none of `/`, `\` or `_` occurs
+/// inside an entity, so inserting `<wbr>` cannot split one.
 ///
 /// Only for visible text; attributes keep [`escape_html`].
 fn path_html(path: &str) -> String {
     escape_html(path)
         .replace('/', "/<wbr>")
         .replace('\\', "\\<wbr>")
+        .replace('_', "_<wbr>")
 }
 
 /// A track position for a cell (`3`, `2-1`); [`MISSING`] without a number.
@@ -930,7 +937,7 @@ fn release_row(row: &store::LocalReleaseStatus) -> String {
         row.id,
         escape_html(row.album_artist.as_deref().unwrap_or("(unknown artist)")),
         escape_html(row.album_title.as_deref().unwrap_or("(no album tag)")),
-        row.track_count,
+        count(row.track_count),
         status_html(row),
         render_match(row),
         escape_html(&folder_href(&row.unit)),
@@ -1026,12 +1033,13 @@ fn render_folders(units: &[store::FolderUnit], page_number: u64, total: usize) -
             format!(
                 "<tr><td class=\"path\"><a href=\"{}\">{}</a></td><td>{}</td>\
                  <td class=\"num\">{}</td><td class=\"num\">{}</td>\
-                 <td class=\"num\">{matched}</td></tr>",
+                 <td class=\"num\">{}</td></tr>",
                 escape_html(&folder_href(&unit.path)),
                 path_html(&unit.path),
                 unit.state.label(),
-                unit.releases.len(),
+                grouped(unit.releases.len() as u64),
                 count(tracks),
+                grouped(matched as u64),
             )
         })
         .collect();
@@ -1149,9 +1157,8 @@ fn render_choices(view: &store::FolderView, token: Option<&str>) -> String {
                 })
                 .collect();
             format!(
-                "<p class=\"muted\">This server listens on a non-loopback address, so it \
-                 changes nothing. Run one of these with the same <code>--db</code> as this \
-                 server:</p><ul>{commands}</ul>"
+                "<p class=\"muted\">{NOT_WRITABLE} Run one of these with the same \
+                 <code>--db</code> as this server:</p><ul>{commands}</ul>"
             )
         }
     }
@@ -1251,7 +1258,7 @@ fn pager_with(
         Some(last) => format!("Page {} of {}", grouped(page_number), grouped(last)),
         None => format!("Page {}", grouped(page_number)),
     };
-    format!("<div class=\"pager\">{previous}<span>{place}</span>{next}</div>")
+    format!("<div class=\"pager\">{previous} <span>{place}</span> {next}</div>")
 }
 
 #[cfg(test)]
@@ -1583,6 +1590,44 @@ mod tests {
             count_line("101 folders", 2, 1, 101),
             "<p class=\"muted\">101 folders. Showing 101.</p>"
         );
+    }
+
+    #[test]
+    fn the_pager_parts_are_separated_by_spaces() {
+        assert_eq!(
+            pager_with("/releases", &[], 2, true, Some(3)),
+            "<div class=\"pager\"><a href=\"/releases\">Previous</a> \
+             <span>Page 2 of 3</span> <a href=\"/releases?page=3\">Next</a></div>"
+        );
+    }
+
+    #[test]
+    fn release_rows_and_folder_rows_group_their_counts() {
+        let mut big = release(1);
+        big.track_count = 1_500;
+        assert!(
+            release_row(&big).contains("<td class=\"num\">1,500</td>"),
+            "{}",
+            release_row(&big)
+        );
+
+        let mut releases: Vec<_> = (0..1_200).map(release).collect();
+        releases[0].status = store::STATUS_UNMATCHED.into();
+        let unit = store::FolderUnit {
+            path: "/music/a_b".into(),
+            state: store::FolderState::Automatic,
+            releases,
+        };
+        let html = render_folders(&[unit], 1, 1);
+        // Releases, Tracks and Matched, in column order; one release is unmatched.
+        assert!(
+            html.contains(
+                "<td class=\"num\">1,200</td><td class=\"num\">2,400</td>\
+                 <td class=\"num\">1,199</td></tr>"
+            ),
+            "{html}"
+        );
+        assert!(html.contains("/<wbr>music/<wbr>a_<wbr>b"), "{html}");
     }
 
     #[test]
@@ -2086,6 +2131,8 @@ mod tests {
     fn paths_break_after_separators_and_stay_escaped() {
         assert_eq!(path_html("/m/<b>/x"), "/<wbr>m/<wbr>&lt;b&gt;/<wbr>x");
         assert_eq!(path_html("C:\\m\\x"), "C:\\<wbr>m\\<wbr>x");
+        assert_eq!(path_html("/a_b/c"), "/<wbr>a_<wbr>b/<wbr>c");
+        assert_eq!(path_html("/a_<b>"), "/<wbr>a_<wbr>&lt;b&gt;");
     }
 
     #[test]
