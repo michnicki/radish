@@ -545,14 +545,18 @@ fn page(title: &str, active: Option<Nav>, body: &str) -> String {
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
          <title>{} · Radish</title><style>{STYLE}</style></head><body>\
-         <header><div class=\"bar\"><b>Radish</b><nav>{}{}{}{}{}</nav></div></header>\
+         <header><div class=\"bar\"><b>Radish</b><nav>{}</nav></div></header>\
          <main>{body}</main></body></html>\n",
         escape_html(title),
-        link(Nav::Status, "/", "Status"),
-        link(Nav::Tracks, "/tracks", "Tracks"),
-        link(Nav::Releases, "/releases", "Releases"),
-        link(Nav::Review, "/reviews", "Review"),
-        link(Nav::Folders, "/folders", "Folders"),
+        // Spaces between the links keep them apart where no stylesheet applies.
+        [
+            link(Nav::Status, "/", "Status"),
+            link(Nav::Tracks, "/tracks", "Tracks"),
+            link(Nav::Releases, "/releases", "Releases"),
+            link(Nav::Review, "/reviews", "Review"),
+            link(Nav::Folders, "/folders", "Folders"),
+        ]
+        .join(" "),
     )
 }
 
@@ -927,11 +931,52 @@ fn release_row(row: &store::LocalReleaseStatus) -> String {
         escape_html(row.album_artist.as_deref().unwrap_or("(unknown artist)")),
         escape_html(row.album_title.as_deref().unwrap_or("(no album tag)")),
         row.track_count,
-        escape_html(&row.status_label()),
+        status_html(row),
         render_match(row),
         escape_html(&folder_href(&row.unit)),
         path_html(&row.directory),
     )
+}
+
+/// The status as a badge, followed by its qualifiers in muted text.
+///
+/// The badge class comes from the three known statuses, never from the stored
+/// value, so an unexpected status is shown (escaped) as unmatched.
+fn status_html(row: &store::LocalReleaseStatus) -> String {
+    let class = match row.status.as_str() {
+        store::STATUS_MATCHED => "matched",
+        store::STATUS_STALE => "stale",
+        _ => "unmatched",
+    };
+    let notes: Vec<String> = row
+        .status_notes()
+        .iter()
+        .map(|note| match note {
+            store::StatusNote::AlbumMatch => "album match, edition unconfirmed".to_string(),
+            store::StatusNote::Stale => "stale match".to_string(),
+            store::StatusNote::Queued(providers) => {
+                // In the order the queue and review pages list providers.
+                let labels: Vec<&str> = crate::providers::ProviderKind::CHAIN
+                    .iter()
+                    .filter(|provider| providers.contains(provider))
+                    .map(|provider| provider.label())
+                    .collect();
+                format!("queued: {}", labels.join(", "))
+            }
+        })
+        .collect();
+    let badge = format!(
+        "<span class=\"badge {class}\">{}</span>",
+        escape_html(&row.status)
+    );
+    if notes.is_empty() {
+        badge
+    } else {
+        format!(
+            "{badge} <span class=\"muted\">{}</span>",
+            escape_html(&notes.join("; "))
+        )
+    }
 }
 
 /// The page of the unit at `unit`.
@@ -1355,8 +1400,55 @@ mod tests {
     }
 
     #[test]
+    fn status_html_is_a_badge_followed_by_muted_details() {
+        let mut matched = release(1);
+        matched.match_scope = Some("album".into());
+        matched.stale = true;
+        assert_eq!(
+            status_html(&matched),
+            "<span class=\"badge matched\">matched</span> \
+             <span class=\"muted\">album match, edition unconfirmed; stale match</span>"
+        );
+
+        let mut queued = release(2);
+        queued.status = store::STATUS_UNMATCHED.into();
+        queued.queued_providers = vec![
+            crate::providers::ProviderKind::Discogs,
+            crate::providers::ProviderKind::MusicBrainz,
+        ];
+        assert_eq!(
+            status_html(&queued),
+            "<span class=\"badge unmatched\">unmatched</span> \
+             <span class=\"muted\">queued: MusicBrainz, Discogs</span>"
+        );
+
+        assert_eq!(
+            status_html(&release(3)),
+            "<span class=\"badge matched\">matched</span>"
+        );
+
+        let mut stale = release(4);
+        stale.status = store::STATUS_STALE.into();
+        assert_eq!(
+            status_html(&stale),
+            "<span class=\"badge stale\">stale</span>"
+        );
+
+        let mut weird = release(5);
+        weird.status = "weird<b>".into();
+        assert_eq!(
+            status_html(&weird),
+            "<span class=\"badge unmatched\">weird&lt;b&gt;</span>"
+        );
+    }
+
+    #[test]
     fn release_rows_escape_values_and_skip_unsafe_links() {
         let html = render_releases(&[release(12)], 1, 1);
+        assert!(
+            html.contains("<span class=\"badge matched\">matched</span>"),
+            "{html}"
+        );
         assert!(html.contains("/<wbr>music/<wbr>&lt;b&gt;"), "{html}");
         assert!(html.contains("(&lt;i&gt;Blue&lt;/i&gt;)"), "{html}");
         assert!(!html.contains("<i>"), "{html}");
@@ -1461,7 +1553,7 @@ mod tests {
     fn every_page_links_the_review_queue() {
         let html = page("Status", Some(Nav::Status), "");
         assert!(
-            html.contains("<a href=\"/releases\">Releases</a><a href=\"/reviews\">Review</a>"),
+            html.contains("<a href=\"/releases\">Releases</a> <a href=\"/reviews\">Review</a>"),
             "{html}"
         );
     }

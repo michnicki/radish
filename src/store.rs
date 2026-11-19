@@ -2066,6 +2066,18 @@ impl MergeInfo {
     }
 }
 
+/// One qualifier of a release's status, worded by `status_label` for the CLI
+/// and by the web pages as they like.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusNote {
+    /// Accepted at album scope: the exact edition is not confirmed.
+    AlbumMatch,
+    /// The accepted match is stale (only when the status itself is not `stale`).
+    Stale,
+    /// Saved reviews from these providers wait for a decision.
+    Queued(Vec<ProviderKind>),
+}
+
 impl LocalReleaseStatus {
     pub fn queued(&self) -> bool {
         !self.queued_providers.is_empty()
@@ -2079,23 +2091,36 @@ impl LocalReleaseStatus {
         self.queued() && self.status != STATUS_MATCHED
     }
 
-    /// The status with its qualifiers, as `releases` and the web UI show it:
-    /// `matched, album match; edition unconfirmed, stale, queued (musicbrainz)`.
-    pub fn status_label(&self) -> String {
-        let mut label = self.status.clone();
+    /// The qualifiers of the status, in the order `status_label` words them.
+    pub fn status_notes(&self) -> Vec<StatusNote> {
+        let mut notes = Vec::new();
         if self.match_scope.as_deref() == Some("album") {
-            label.push_str(", album match; edition unconfirmed");
+            notes.push(StatusNote::AlbumMatch);
         }
         if self.stale && self.status != STATUS_STALE {
-            label.push_str(", stale");
+            notes.push(StatusNote::Stale);
         }
         if self.awaits_review() {
-            let providers: Vec<&str> = self
-                .queued_providers
-                .iter()
-                .map(|provider| provider.as_str())
-                .collect();
-            label.push_str(&format!(", queued ({})", providers.join(", ")));
+            notes.push(StatusNote::Queued(self.queued_providers.clone()));
+        }
+        notes
+    }
+
+    /// The status with its qualifiers, as `releases` shows it:
+    /// `matched, album match; edition unconfirmed, stale` or
+    /// `unmatched, queued (discogs, musicbrainz)`.
+    pub fn status_label(&self) -> String {
+        let mut label = self.status.clone();
+        for note in self.status_notes() {
+            match note {
+                StatusNote::AlbumMatch => label.push_str(", album match; edition unconfirmed"),
+                StatusNote::Stale => label.push_str(", stale"),
+                StatusNote::Queued(providers) => {
+                    let providers: Vec<&str> =
+                        providers.iter().map(|provider| provider.as_str()).collect();
+                    label.push_str(&format!(", queued ({})", providers.join(", ")));
+                }
+            }
         }
         label
     }
@@ -4406,6 +4431,65 @@ mod tests {
             listed[0].status_label(),
             "unmatched, queued (discogs, musicbrainz, deezer)"
         );
+    }
+
+    fn status_fixture(status: &str) -> LocalReleaseStatus {
+        LocalReleaseStatus {
+            id: 1,
+            directory: "/music/a".into(),
+            unit: "/music/a".into(),
+            album_title: None,
+            album_artist: None,
+            track_count: 1,
+            status: status.into(),
+            provider: None,
+            remote_release_id: None,
+            remote_url: None,
+            remote_title: None,
+            match_scope: None,
+            medium: None,
+            stale: false,
+            queued_providers: Vec::new(),
+            merged: None,
+        }
+    }
+
+    #[test]
+    fn status_notes_carry_each_qualifier_and_the_label_words_them() {
+        let mut matched = status_fixture(STATUS_MATCHED);
+        matched.match_scope = Some("album".into());
+        matched.stale = true;
+        // A matched release never awaits review, so its queue is not noted.
+        matched.queued_providers = vec![ProviderKind::MusicBrainz];
+        assert_eq!(
+            matched.status_notes(),
+            vec![StatusNote::AlbumMatch, StatusNote::Stale]
+        );
+        assert_eq!(
+            matched.status_label(),
+            "matched, album match; edition unconfirmed, stale"
+        );
+
+        let mut queued = status_fixture(STATUS_UNMATCHED);
+        queued.queued_providers = vec![ProviderKind::MusicBrainz, ProviderKind::Discogs];
+        assert_eq!(
+            queued.status_notes(),
+            vec![StatusNote::Queued(vec![
+                ProviderKind::MusicBrainz,
+                ProviderKind::Discogs
+            ])]
+        );
+        assert_eq!(
+            queued.status_label(),
+            "unmatched, queued (musicbrainz, discogs)"
+        );
+
+        // A stale status is not repeated as a stale note.
+        let mut stale = status_fixture(STATUS_STALE);
+        stale.stale = true;
+        assert!(stale.status_notes().is_empty());
+        assert_eq!(stale.status_label(), "stale");
+        assert!(status_fixture(STATUS_UNMATCHED).status_notes().is_empty());
     }
 
     #[tokio::test]

@@ -15,7 +15,8 @@ use self::card::{cannot_apply_text, render_card};
 use super::{
     AppError, AppState, MISSING, NOT_WRITABLE, Nav, PAGE_SIZE, count_line, cross_site,
     duration_cell, error_page, escape_html, folder_href, last_page, page, page_param, pager_with,
-    past_end, path_html, position_cell, relative_path, render_match, same_token, text_cell,
+    past_end, path_html, position_cell, relative_path, render_match, same_token, status_html,
+    text_cell,
 };
 use crate::layout::plural_grouped;
 use crate::matcher::LocalRelease;
@@ -253,9 +254,9 @@ fn render_controls(view: &store::QueueView) -> String {
             })
             .collect();
         format!(
-            "<p class=\"filters\" role=\"group\" aria-label=\"{label}\">\
+            "<p role=\"group\" aria-label=\"{label}\">\
              <span class=\"muted\">{label}:</span> {}</p>",
-            links.join(" · ")
+            links.join(" ")
         )
     };
     let with_sort = |sort| queue_href(&store::QueueView { sort, ..*view }, None);
@@ -299,7 +300,10 @@ fn render_controls(view: &store::QueueView) -> String {
             provider.label(),
         )
     }));
-    format!("{sort}{show}{}", row("Provider", providers))
+    format!(
+        "<div class=\"filters\">{sort}{show}{}</div>",
+        row("Provider", providers)
+    )
 }
 
 /// The queue page body: notice, controls, the table and the pager.
@@ -354,9 +358,9 @@ fn queue_row(row: &store::QueuedRelease, view: &store::QueueView) -> String {
     let top: Vec<String> = row
         .top
         .iter()
-        .map(|(provider, score)| match score {
-            Some(score) => format!("{} {score:.3}", provider.label()),
-            None => format!("{} {MISSING}", provider.label()),
+        .map(|(provider, score)| {
+            let score = score.map_or_else(|| MISSING.to_string(), |score| format!("{score:.3}"));
+            format!("<span class=\"nowrap\">{} {score}</span>", provider.label())
         })
         .collect();
     let reason = match &row.lead {
@@ -519,7 +523,7 @@ fn render_release(view: &View<'_>) -> String {
         ),
     };
     let jump = if view.token.is_some() {
-        "<a href=\"#enter\">Enter a release by ID</a>"
+        " <a href=\"#enter\">Enter a release by ID</a>"
     } else {
         ""
     };
@@ -581,7 +585,7 @@ fn render_release(view: &View<'_>) -> String {
         escape_html(&folder_href(&status.unit)),
         path_html(&release.directory),
         plural_grouped(release.tracks.len() as u64, "file", "files"),
-        escape_html(&status.status_label()),
+        status_html(status),
         render_files(release),
         render_entry(view),
     )
@@ -1016,7 +1020,10 @@ mod tests {
             "{html}"
         );
         assert!(
-            html.contains("MusicBrainz 0.931 · Discogs <span class=\"muted\">—</span>"),
+            html.contains(
+                "<span class=\"nowrap\">MusicBrainz 0.931</span> · \
+                 <span class=\"nowrap\">Discogs <span class=\"muted\">—</span></span>"
+            ),
             "{html}"
         );
         assert!(
@@ -1260,15 +1267,22 @@ mod tests {
         assert!(!html.contains("<b>edition"), "{html}");
         assert!(html.contains("150 releases can be accepted."), "{html}");
         assert!(html.contains("<th>Reason</th>"), "{html}");
+        assert!(html.contains("<div class=\"filters\">"), "{html}");
+        assert!(
+            render_controls(&view).starts_with("<div class=\"filters\">"),
+            "{html}"
+        );
         for label in ["Sort", "Show", "Provider"] {
             assert!(
                 html.contains(&format!(
-                    "<p class=\"filters\" role=\"group\" aria-label=\"{label}\">"
+                    "<p role=\"group\" aria-label=\"{label}\">\
+                     <span class=\"muted\">{label}:</span> <a href="
                 )),
                 "{html}"
             );
         }
-        assert!(html.contains("Folder</a> · <a"), "{html}");
+        assert!(html.contains("Folder</a> <a"), "{html}");
+        assert!(!html.contains("Folder</a> · <a"), "{html}");
         assert!(
             html.contains(
                 "<a href=\"/reviews?sort=score&amp;show=acceptable\" aria-current=\"true\">Can be accepted</a>"
@@ -2168,13 +2182,15 @@ mod tests {
         assert!(actions < html.find("<h2>Files</h2>").unwrap(), "{html}");
         assert!(
             html.contains(
-                "</p><p class=\"actions\"><a href=\"/reviews\">Back to the queue</a>\
+                "</p><p class=\"actions\"><a href=\"/reviews\">Back to the queue</a> \
                  <a href=\"#enter\">Enter a release by ID</a></p>"
             ),
             "{html}"
         );
         assert!(!html.contains("<p class=\"pager\">"), "{html}");
         assert!(!html.contains(" · <a href=\"#enter\">"), "{html}");
+        // The status line is the badge, not the CLI's text.
+        assert!(html.contains("<span class=\"badge "), "{html}");
     }
 
     #[test]
