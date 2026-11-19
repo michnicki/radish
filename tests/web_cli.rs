@@ -242,12 +242,12 @@ fn an_empty_library_says_so() {
         "{}",
         reply.body
     );
-    assert!(server.get("/tracks").body.contains("No tracks found."));
+    assert!(server.get("/tracks").body.contains("Nothing imported yet"));
     assert!(
         server
             .get("/releases")
             .body
-            .contains("No local releases found.")
+            .contains("Nothing imported yet")
     );
 }
 
@@ -302,11 +302,11 @@ fn releases_page_lists_each_local_release() {
             .body
             .contains(&shown(music.join("Blue").to_str().unwrap()))
     );
-    assert!(
-        reply.body.contains("2 releases on this page."),
-        "{}",
-        reply.body
-    );
+    assert!(reply.body.contains("2 releases."), "{}", reply.body);
+    let past = server.get("/releases?page=99");
+    assert_eq!(past.status, 200);
+    assert!(past.body.contains("is past the end"), "{}", past.body);
+    assert!(past.body.contains("Go to page 1"), "{}", past.body);
 }
 
 #[test]

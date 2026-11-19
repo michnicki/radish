@@ -13,11 +13,11 @@ mod card;
 
 use self::card::{cannot_apply_text, render_card};
 use super::{
-    AppError, AppState, MISSING, NOT_WRITABLE, Nav, PAGE_SIZE, cross_site, duration_cell,
-    error_page, escape_html, folder_href, page, page_param, pager_with, path_html, position_cell,
-    relative_path, render_match, same_token, text_cell,
+    AppError, AppState, MISSING, NOT_WRITABLE, Nav, PAGE_SIZE, count_line, cross_site,
+    duration_cell, error_page, escape_html, folder_href, last_page, page, page_param, pager_with,
+    past_end, path_html, position_cell, relative_path, render_match, same_token, text_cell,
 };
-use crate::layout::plural;
+use crate::layout::plural_grouped;
 use crate::matcher::LocalRelease;
 use crate::providers::{ProviderKind, ReleaseId};
 use crate::review::{
@@ -206,21 +206,10 @@ pub(super) async fn queue_page(
     let view = params.view();
     let page_number = params.page();
     let offset = (page_number - 1) * PAGE_SIZE as u64;
-    // One row past the page tells us whether a next page exists.
-    let mut rows =
-        store::queue_page(&state.pool, &view, PAGE_SIZE as i64 + 1, offset as i64).await?;
-    let has_next = rows.len() > PAGE_SIZE;
-    rows.truncate(PAGE_SIZE);
+    let rows = store::queue_page(&state.pool, &view, PAGE_SIZE as i64, offset as i64).await?;
     let total = store::queue_count(&state.pool, &view).await?;
     let accepted = accepted_status(&state, params.accepted()).await?;
-    let body = render_queue(
-        &rows,
-        total,
-        &view,
-        accepted.as_ref(),
-        page_number,
-        has_next,
-    );
+    let body = render_queue(&rows, total, &view, accepted.as_ref(), page_number);
     Ok(Html(page("Review", Some(Nav::Review), &body)))
 }
 
@@ -320,12 +309,12 @@ fn render_queue(
     view: &store::QueueView,
     accepted: Option<&store::LocalReleaseStatus>,
     page_number: u64,
-    has_next: bool,
 ) -> String {
     let notice = accepted
         .map(|status| render_accepted(status, view))
         .unwrap_or_default();
     let controls = render_controls(view);
+    let total = u64::try_from(total).unwrap_or(0);
     if total == 0 {
         let empty = if view.acceptable {
             "No queued release can be accepted."
@@ -334,19 +323,29 @@ fn render_queue(
         };
         return format!("<h1>Review</h1>{notice}{controls}<p>{empty}</p>");
     }
+    let params = view_params(view);
+    let last = last_page(total);
+    if rows.is_empty() && page_number > 1 {
+        let gone = past_end("/reviews", &params, page_number, Some(last));
+        return format!("<h1>Review</h1>{notice}{controls}{gone}");
+    }
     let body: String = rows.iter().map(|row| queue_row(row, view)).collect();
-    let what = if view.acceptable {
-        "can be accepted"
+    let sentence = if view.acceptable {
+        plural_grouped(total, "release can be accepted", "releases can be accepted")
     } else {
-        "queued for review"
+        plural_grouped(
+            total,
+            "release queued for review",
+            "releases queued for review",
+        )
     };
     format!(
-        "<h1>Review</h1>{notice}{controls}<p class=\"muted\">{} {what}.</p>\
+        "<h1>Review</h1>{notice}{controls}{}\
          <div class=\"table\"><table><thead><tr><th class=\"num\">ID</th><th>Artist</th>\
          <th>Album</th><th class=\"num\">Tracks</th><th>Top</th><th>Reason</th><th>Folder</th>\
          </tr></thead><tbody>{body}</tbody></table></div>{}",
-        plural(total.max(0) as u64, "release", "releases"),
-        pager_with("/reviews", &view_params(view), page_number, has_next)
+        count_line(&sentence, page_number, rows.len(), total),
+        pager_with("/reviews", &params, page_number, false, Some(last),)
     )
 }
 
@@ -581,7 +580,7 @@ fn render_release(view: &View<'_>) -> String {
         escape_html(release.album_title.as_deref().unwrap_or("(no album tag)")),
         escape_html(&folder_href(&status.unit)),
         path_html(&release.directory),
-        plural(release.tracks.len() as u64, "file", "files"),
+        plural_grouped(release.tracks.len() as u64, "file", "files"),
         escape_html(&status.status_label()),
         render_files(release),
         render_entry(view),
@@ -1005,7 +1004,7 @@ mod tests {
     #[test]
     fn queue_rows_escape_values_and_carry_the_filter() {
         let view = view_of(Some("deezer"), None, None);
-        let html = render_queue(&[queued(7)], 1, &view, None, 1, true);
+        let html = render_queue(&[queued(7)], 150, &view, None, 1);
         assert!(
             html.contains("&lt;i&gt;Blue&lt;/i&gt;") && !html.contains("<i>"),
             "{html}"
@@ -1029,7 +1028,7 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("<a href=\"/reviews\">All</a>"), "{html}");
-        assert!(html.contains("1 release queued for review."), "{html}");
+        assert!(html.contains("150 releases queued for review."), "{html}");
         assert!(
             html.contains("href=\"/folder?path=%2Fmusic%2F%3Cb%3E\""),
             "{html}"
@@ -1056,14 +1055,7 @@ mod tests {
             queued_providers: Vec::new(),
             merged: None,
         };
-        let html = render_queue(
-            &[],
-            0,
-            &store::QueueView::default(),
-            Some(&status),
-            1,
-            false,
-        );
+        let html = render_queue(&[], 0, &store::QueueView::default(), Some(&status), 1);
         assert!(html.contains("Accepted MusicBrainz abc"), "{html}");
         assert!(html.contains("&lt;b&gt;Blue&lt;/b&gt;"), "{html}");
         assert!(!html.contains("<b>"), "{html}");
@@ -1119,8 +1111,40 @@ mod tests {
 
     #[test]
     fn an_empty_queue_says_so() {
-        let html = render_queue(&[], 0, &store::QueueView::default(), None, 1, false);
+        let html = render_queue(&[], 0, &store::QueueView::default(), None, 1);
         assert!(html.contains("Nothing is queued for review."), "{html}");
+    }
+
+    #[test]
+    fn a_long_queue_counts_its_pages_and_a_page_past_the_end_links_back() {
+        let rows: Vec<store::QueuedRelease> = (1..=100).map(queued).collect();
+        let view = store::QueueView::default();
+        let html = render_queue(&rows, 250, &view, None, 2);
+        assert!(
+            html.contains("250 releases queued for review. Showing 101–200."),
+            "{html}"
+        );
+        assert!(html.contains("Page 2 of 3"), "{html}");
+        assert!(html.contains("Next</a>"), "{html}");
+        let html = render_queue(&rows[..50], 250, &view, None, 3);
+        assert!(html.contains("Page 3 of 3"), "{html}");
+        assert!(html.contains("<span>Next</span>"), "{html}");
+
+        let acceptable = view_of(None, None, Some("acceptable"));
+        let html = render_queue(&rows, 250, &acceptable, None, 1);
+        assert!(
+            html.contains("250 releases can be accepted. Showing 1–100."),
+            "{html}"
+        );
+
+        let html = render_queue(&[], 250, &acceptable, None, 7);
+        assert!(html.contains("Page 7 is past the end."), "{html}");
+        assert!(
+            html.contains("href=\"/reviews?show=acceptable&amp;page=3\">Go to page 3</a>"),
+            "{html}"
+        );
+        assert!(!html.contains("<table>"), "{html}");
+        assert!(!html.contains("class=\"pager\""), "{html}");
     }
 
     #[test]
@@ -1224,7 +1248,7 @@ mod tests {
             reason: Some("<b>edition</b> qualifiers differ".into()),
             blockers: 3,
         });
-        let html = render_queue(&[row], 1, &view, None, 1, true);
+        let html = render_queue(&[row], 150, &view, None, 1);
         assert!(
             html.contains("Discogs: &lt;b&gt;edition&lt;/b&gt; qualifiers differ (+2 more)"),
             "{html}"
@@ -1234,7 +1258,7 @@ mod tests {
             "{html}"
         );
         assert!(!html.contains("<b>edition"), "{html}");
-        assert!(html.contains("1 release can be accepted."), "{html}");
+        assert!(html.contains("150 releases can be accepted."), "{html}");
         assert!(html.contains("<th>Reason</th>"), "{html}");
         for label in ["Sort", "Show", "Provider"] {
             assert!(
@@ -1313,7 +1337,7 @@ mod tests {
         unscored.lead = lead(None);
         let rows = [scored, unscored];
         let by_score = view_of(None, Some("score"), None);
-        let html = render_queue(&rows, 2, &by_score, None, 1, true);
+        let html = render_queue(&rows, 2, &by_score, None, 1);
         assert!(
             html.contains("href=\"/review?release=7&amp;sort=score&amp;at=0.97\""),
             "{html}"
@@ -1327,7 +1351,7 @@ mod tests {
         assert!(!html.contains("/reviews?at"), "{html}");
         assert_eq!(html.matches("at=").count(), 2, "{html}");
         // Folder order never writes one.
-        let html = render_queue(&rows, 2, &store::QueueView::default(), None, 1, true);
+        let html = render_queue(&rows, 2, &store::QueueView::default(), None, 1);
         assert!(!html.contains("at="), "{html}");
     }
 
@@ -1373,12 +1397,12 @@ mod tests {
             reason: Some("uncertain".into()),
             blockers: 0,
         });
-        let html = render_queue(&[row], 1, &store::QueueView::default(), None, 1, false);
+        let html = render_queue(&[row], 1, &store::QueueView::default(), None, 1);
         assert!(html.contains("MusicBrainz: uncertain</td>"), "{html}");
         assert!(!html.contains("can't be accepted"), "{html}");
         assert!(html.contains("1 release queued for review."), "{html}");
         let view = view_of(None, None, Some("acceptable"));
-        let html = render_queue(&[], 0, &view, None, 1, false);
+        let html = render_queue(&[], 0, &view, None, 1);
         assert!(
             html.contains("No queued release can be accepted."),
             "{html}"

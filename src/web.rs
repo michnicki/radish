@@ -32,7 +32,7 @@
 // Rust guideline compliant 2026-08-14
 
 use crate::grouping::FolderAction;
-use crate::layout::{format_duration, grouped, plural, track_number};
+use crate::layout::{format_duration, grouped, plural_grouped, track_number};
 use crate::output::Clean;
 use crate::{outln, store};
 use anyhow::{Context, Result};
@@ -377,17 +377,19 @@ async fn tracks_page(
     let page_number = params.page();
     let query = params.query();
     let offset = (page_number - 1) * PAGE_SIZE as u64;
-    // One row past the page tells us whether a next page exists.
-    let mut rows = store::track_page(
-        &state.pool,
-        query.as_deref(),
-        PAGE_SIZE as i64 + 1,
-        offset as i64,
-    )
-    .await?;
+    // The library total decides "next" without a search. A search is not
+    // counted (that would scan every track a second time), so it fetches one
+    // row past the page to learn whether a next page exists.
+    let total = match query {
+        None => Some(u64::try_from(store::track_count(&state.pool).await?).unwrap_or(0)),
+        Some(_) => None,
+    };
+    let fetch = PAGE_SIZE + usize::from(total.is_none());
+    let mut rows =
+        store::track_page(&state.pool, query.as_deref(), fetch as i64, offset as i64).await?;
     let has_next = rows.len() > PAGE_SIZE;
     rows.truncate(PAGE_SIZE);
-    let body = render_tracks(&rows, query.as_deref(), page_number, has_next);
+    let body = render_tracks(&rows, query.as_deref(), page_number, has_next, total);
     Ok(Html(page("Tracks", Some(Nav::Tracks), &body)))
 }
 
@@ -402,7 +404,7 @@ async fn releases_page(
     let rows = all
         .get(start.min(all.len())..end.min(all.len()))
         .unwrap_or(&[]);
-    let body = render_releases(rows, page_number, all.len() > end);
+    let body = render_releases(rows, page_number, all.len());
     Ok(Html(page("Releases", Some(Nav::Releases), &body)))
 }
 
@@ -417,7 +419,7 @@ async fn folders_page(
     let units = all
         .get(start.min(all.len())..end.min(all.len()))
         .unwrap_or(&[]);
-    let body = render_folders(units, page_number, all.len() > end);
+    let body = render_folders(units, page_number, all.len());
     Ok(Html(page("Folders", Some(Nav::Folders), &body)))
 }
 
@@ -654,12 +656,67 @@ fn format_utc(secs: i64) -> String {
     )
 }
 
+/// The empty-library text of the Status, Tracks and Releases pages.
+const NOTHING_IMPORTED: &str = "<p>Nothing imported yet. Run <code>radish import PATH</code>.</p>";
+
+/// A count from the store, with thousands separators; a negative count shows
+/// as 0.
+fn count(value: i64) -> String {
+    grouped(u64::try_from(value).unwrap_or(0))
+}
+
+/// The number of the last page of `total` rows (at least 1).
+fn last_page(total: u64) -> u64 {
+    total.div_ceil(PAGE_SIZE as u64).max(1)
+}
+
+/// The rows a page shows, as `101–200`, or `101` for a single row.
+///
+/// `shown` is the number of rows on the page, at least 1.
+fn range(page_number: u64, shown: usize) -> String {
+    let first = (page_number - 1) * PAGE_SIZE as u64 + 1;
+    match shown {
+        0 | 1 => grouped(first),
+        _ => format!(
+            "{}\u{2013}{}",
+            grouped(first),
+            grouped(first + shown as u64 - 1)
+        ),
+    }
+}
+
+/// The count line of a list page.
+///
+/// `sentence` is trusted markup: static words and grouped counts
+/// (`262,650 releases`, `1 release queued for review`), without a full stop.
+/// Never pass untrusted text. The range shown is added only when there is
+/// more than one page and the page has rows.
+fn count_line(sentence: &str, page_number: u64, shown: usize, total: u64) -> String {
+    if total <= PAGE_SIZE as u64 || shown == 0 {
+        return format!("<p class=\"muted\">{sentence}.</p>");
+    }
+    format!(
+        "<p class=\"muted\">{sentence}. Showing {}.</p>",
+        range(page_number, shown)
+    )
+}
+
+/// What a page past the last one shows instead of an empty table.
+///
+/// It links to page `last`, or to page 1 when the last page is unknown.
+fn past_end(path: &str, params: &[(&str, &str)], page_number: u64, last: Option<u64>) -> String {
+    let target = last.unwrap_or(1);
+    format!(
+        "<p>Page {} is past the end. <a href=\"{}\">Go to page {}</a>.</p>",
+        grouped(page_number),
+        page_href(path, params, target),
+        grouped(target)
+    )
+}
+
 /// One tile on the status page.
 fn stat(label: &str, value: i64) -> String {
-    format!(
-        "<div><b>{}</b><span>{label}</span></div>",
-        grouped(value.max(0) as u64)
-    )
+    format!("<div><b>{}</b><span>{label}</span></div>", count(value))
 }
 
 /// One tile on the status page whose number links to `href`.
@@ -667,7 +724,7 @@ fn stat_link(label: &str, value: i64, href: &str) -> String {
     format!(
         "<div><b><a href=\"{}\">{}</a></b><span>{label}</span></div>",
         escape_html(href),
-        grouped(value.max(0) as u64)
+        count(value)
     )
 }
 
@@ -687,7 +744,7 @@ fn render_status(status: &store::LibraryStatus) -> String {
         format!(
             "<p>Folders with several releases, a merged release or a grouping decision: \
              <a href=\"/folders\">{}</a></p>",
-            grouped(status.folders.max(0) as u64)
+            count(status.folders)
         )
     } else {
         String::new()
@@ -702,7 +759,7 @@ fn render_status(status: &store::LibraryStatus) -> String {
     };
 
     let directories = if status.directories.is_empty() {
-        "<p>Nothing imported yet. Run <code>radish import PATH</code>.</p>".to_string()
+        NOTHING_IMPORTED.to_string()
     } else {
         let rows: String = status
             .directories
@@ -711,7 +768,7 @@ fn render_status(status: &store::LibraryStatus) -> String {
                 format!(
                     "<tr><td class=\"path\">{}</td><td class=\"num\">{}</td></tr>",
                     path_html(&dir.path),
-                    grouped(dir.tracks.max(0) as u64)
+                    count(dir.tracks)
                 )
             })
             .collect();
@@ -727,11 +784,18 @@ fn render_status(status: &store::LibraryStatus) -> String {
     )
 }
 
+/// The Tracks page body.
+///
+/// `total` is `None` exactly when searching: the library total is shown (and
+/// the pager follows it, `has_next` ignored) only without a search. A search
+/// has no total, so `has_next`, whether a row was fetched past the page, is
+/// what offers a next page.
 fn render_tracks(
     rows: &[store::TrackRow],
     query: Option<&str>,
     page_number: u64,
     has_next: bool,
+    total: Option<u64>,
 ) -> String {
     let form = format!(
         "<form method=\"get\" action=\"/tracks\"><input type=\"search\" name=\"q\" \
@@ -741,8 +805,25 @@ fn render_tracks(
         escape_html(query.unwrap_or_default())
     );
 
-    let table = if rows.is_empty() {
-        "<p>No tracks found.</p>".to_string()
+    let params: Vec<(&str, &str)> = query.map(|query| ("q", query)).into_iter().collect();
+    let table = if let Some(total) = total.filter(|_| rows.is_empty()) {
+        // Without a search the total is known: an empty page is an empty
+        // library, or a page past the last one.
+        if total == 0 {
+            NOTHING_IMPORTED.to_string()
+        } else {
+            past_end("/tracks", &params, page_number, Some(last_page(total)))
+        }
+    } else if rows.is_empty() {
+        match query {
+            Some(query) if page_number == 1 => {
+                format!(
+                    "<p>No tracks match \u{201c}{}\u{201d}.</p>",
+                    escape_html(query)
+                )
+            }
+            _ => past_end("/tracks", &params, page_number, None),
+        }
     } else {
         let body: String = rows
             .iter()
@@ -770,23 +851,58 @@ fn render_tracks(
         )
     };
 
-    format!(
-        "<h1>Tracks</h1>{form}{table}{}",
-        pager("/tracks", query, page_number, has_next)
-    )
+    let counted = match (total, query) {
+        (Some(total), _) if !rows.is_empty() => count_line(
+            &plural_grouped(total, "track", "tracks"),
+            page_number,
+            rows.len(),
+            total,
+        ),
+        (None, Some(query)) if !rows.is_empty() && (page_number > 1 || has_next) => format!(
+            "<p class=\"muted\">Showing {} of the tracks matching \u{201c}{}\u{201d}.</p>",
+            range(page_number, rows.len()),
+            escape_html(query)
+        ),
+        _ => String::new(),
+    };
+    // A page past the end carries its own link back, not a pager.
+    let pager = if rows.is_empty() {
+        String::new()
+    } else {
+        pager_with(
+            "/tracks",
+            &params,
+            page_number,
+            has_next,
+            total.map(last_page),
+        )
+    };
+    format!("<h1>Tracks</h1>{form}{counted}{table}{pager}")
 }
 
-fn render_releases(rows: &[store::LocalReleaseStatus], page_number: u64, has_next: bool) -> String {
+fn render_releases(rows: &[store::LocalReleaseStatus], page_number: u64, total: usize) -> String {
+    if total == 0 {
+        return format!("<h1>Releases</h1>{NOTHING_IMPORTED}");
+    }
+    let total = total as u64;
     if rows.is_empty() {
-        return "<h1>Releases</h1><p>No local releases found.</p>".to_string();
+        return format!(
+            "<h1>Releases</h1>{}",
+            past_end("/releases", &[], page_number, Some(last_page(total)))
+        );
     }
     let body: String = rows.iter().map(release_row).collect();
     format!(
-        "<h1>Releases</h1><p class=\"muted\">{} on this page.</p>\
+        "<h1>Releases</h1>{}\
          <div class=\"table\"><table><thead>{RELEASE_HEADER}</thead><tbody>{body}</tbody>\
          </table></div>{}",
-        plural(rows.len() as u64, "release", "releases"),
-        pager("/releases", None, page_number, has_next)
+        count_line(
+            &plural_grouped(total, "release", "releases"),
+            page_number,
+            rows.len(),
+            total
+        ),
+        pager_with("/releases", &[], page_number, false, Some(last_page(total)))
     )
 }
 
@@ -836,7 +952,14 @@ fn relative_path<'a>(unit: &str, path: &'a str) -> &'a str {
         .unwrap_or(path)
 }
 
-fn render_folders(units: &[store::FolderUnit], page_number: u64, has_next: bool) -> String {
+fn render_folders(units: &[store::FolderUnit], page_number: u64, total: usize) -> String {
+    let total = total as u64;
+    if total > 0 && units.is_empty() {
+        return format!(
+            "<h1>Folders</h1>{}",
+            past_end("/folders", &[], page_number, Some(last_page(total)))
+        );
+    }
     if units.is_empty() {
         return "<h1>Folders</h1><p>No folder holds several releases, a merged release or a \
                 grouping decision.</p>"
@@ -863,17 +986,22 @@ fn render_folders(units: &[store::FolderUnit], page_number: u64, has_next: bool)
                 path_html(&unit.path),
                 unit.state.label(),
                 unit.releases.len(),
-                grouped(tracks.max(0) as u64),
+                count(tracks),
             )
         })
         .collect();
     format!(
-        "<h1>Folders</h1><p class=\"muted\">{} on this page.</p>\
+        "<h1>Folders</h1>{}\
          <div class=\"table\"><table><thead><tr><th>Folder</th><th>Grouping</th>\
          <th class=\"num\">Releases</th><th class=\"num\">Tracks</th>\
          <th class=\"num\">Matched</th></tr></thead><tbody>{body}</tbody></table></div>{}",
-        plural(units.len() as u64, "folder", "folders"),
-        pager("/folders", None, page_number, has_next)
+        count_line(
+            &plural_grouped(total, "folder", "folders"),
+            page_number,
+            units.len(),
+            total
+        ),
+        pager_with("/folders", &[], page_number, false, Some(last_page(total)))
     )
 }
 
@@ -1020,45 +1148,63 @@ fn is_web_url(url: &str) -> bool {
     lower.starts_with("https://") || lower.starts_with("http://")
 }
 
-/// Previous and next links for a paged page, or nothing when there is one page.
+/// The link to page `target` of `path`, with the given query parameters.
 ///
-/// The search text is carried through both links.
-fn pager(path: &str, query: Option<&str>, page_number: u64, has_next: bool) -> String {
-    let params: Vec<(&str, &str)> = query.map(|query| ("q", query)).into_iter().collect();
-    pager_with(path, &params, page_number, has_next)
+/// Page 1 omits `page=`. The result is HTML-escaped.
+fn page_href(path: &str, params: &[(&str, &str)], target: u64) -> String {
+    let mut parts: Vec<String> = params
+        .iter()
+        .map(|(key, value)| format!("{key}={}", percent_encode(value)))
+        .collect();
+    if target > 1 {
+        parts.push(format!("page={target}"));
+    }
+    let href = if parts.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{}", parts.join("&"))
+    };
+    escape_html(&href)
 }
 
-/// Previous and next links that carry the given query parameters.
-fn pager_with(path: &str, params: &[(&str, &str)], page_number: u64, has_next: bool) -> String {
+/// Previous and next links that carry the given query parameters, or nothing
+/// when there is one page.
+///
+/// When the last page `last` is known the page is shown as `Page N of L` and
+/// Next is offered below it, so the two always agree; `has_next` is then
+/// ignored. Without it (a search), `has_next` decides.
+fn pager_with(
+    path: &str,
+    params: &[(&str, &str)],
+    page_number: u64,
+    has_next: bool,
+    last: Option<u64>,
+) -> String {
+    let has_next = last.map_or(has_next, |last| page_number < last);
     if page_number == 1 && !has_next {
         return String::new();
     }
-    let href = |target: u64| {
-        let mut parts: Vec<String> = params
-            .iter()
-            .map(|(key, value)| format!("{key}={}", percent_encode(value)))
-            .collect();
-        if target > 1 {
-            parts.push(format!("page={target}"));
-        }
-        let href = if parts.is_empty() {
-            path.to_string()
-        } else {
-            format!("{path}?{}", parts.join("&"))
-        };
-        escape_html(&href)
-    };
     let previous = if page_number > 1 {
-        format!("<a href=\"{}\">Previous</a>", href(page_number - 1))
+        format!(
+            "<a href=\"{}\">Previous</a>",
+            page_href(path, params, page_number - 1)
+        )
     } else {
         "<span>Previous</span>".to_string()
     };
     let next = if has_next {
-        format!("<a href=\"{}\">Next</a>", href(page_number + 1))
+        format!(
+            "<a href=\"{}\">Next</a>",
+            page_href(path, params, page_number + 1)
+        )
     } else {
         "<span>Next</span>".to_string()
     };
-    format!("<div class=\"pager\">{previous}<span>Page {page_number}</span>{next}</div>")
+    let place = match last {
+        Some(last) => format!("Page {} of {}", grouped(page_number), grouped(last)),
+        None => format!("Page {}", grouped(page_number)),
+    };
+    format!("<div class=\"pager\">{previous}<span>{place}</span>{next}</div>")
 }
 
 #[cfg(test)]
@@ -1154,23 +1300,23 @@ mod tests {
 
     #[test]
     fn pager_links_keep_the_search_and_stop_at_the_ends() {
-        assert_eq!(pager("/tracks", None, 1, false), "");
+        assert_eq!(pager_with("/tracks", &[], 1, false, None), "");
 
-        let first = pager("/tracks", Some("a&b \"c\""), 1, true);
+        let first = pager_with("/tracks", &[("q", "a&b \"c\"")], 1, true, None);
         assert!(first.contains("<span>Previous</span>"), "{first}");
         assert!(
             first.contains("href=\"/tracks?q=a%26b%20%22c%22&amp;page=2\""),
             "{first}"
         );
 
-        let middle = pager("/releases", None, 2, true);
+        let middle = pager_with("/releases", &[], 2, true, None);
         assert!(middle.contains("href=\"/releases\">Previous"), "{middle}");
         assert!(
             middle.contains("href=\"/releases?page=3\">Next"),
             "{middle}"
         );
 
-        let last = pager("/tracks", Some("blue"), 3, false);
+        let last = pager_with("/tracks", &[("q", "blue")], 3, false, None);
         assert!(
             last.contains("href=\"/tracks?q=blue&amp;page=2\">Previous"),
             "{last}"
@@ -1210,22 +1356,22 @@ mod tests {
 
     #[test]
     fn release_rows_escape_values_and_skip_unsafe_links() {
-        let html = render_releases(&[release(12)], 1, false);
+        let html = render_releases(&[release(12)], 1, 1);
         assert!(html.contains("/<wbr>music/<wbr>&lt;b&gt;"), "{html}");
         assert!(html.contains("(&lt;i&gt;Blue&lt;/i&gt;)"), "{html}");
         assert!(!html.contains("<i>"), "{html}");
         assert!(!html.contains("href=\"javascript"), "{html}");
-        assert!(html.contains("1 release on this page."), "{html}");
+        assert!(html.contains("1 release."), "{html}");
 
         let mut linked = release(13);
         linked.remote_url = Some("https://musicbrainz.org/release/x?a=1&b=2".into());
-        let html = render_releases(&[linked], 1, false);
+        let html = render_releases(&[linked], 1, 1);
         assert!(
             html.contains("href=\"https://musicbrainz.org/release/x?a=1&amp;b=2\""),
             "{html}"
         );
 
-        assert!(render_releases(&[], 1, false).contains("No local releases found."));
+        assert!(render_releases(&[], 1, 0).contains("Nothing imported yet"));
     }
 
     #[test]
@@ -1255,7 +1401,7 @@ mod tests {
             duration_secs: Some(65.0),
             stale: true,
         };
-        let html = render_tracks(&[row], Some("<q>"), 1, false);
+        let html = render_tracks(&[row], Some("<q>"), 1, false, None);
         assert!(html.contains("(unknown artist)"), "{html}");
         assert!(html.contains("(no album tag)"), "{html}");
         assert!(html.contains("&lt;x&gt;.wav"), "{html}");
@@ -1278,12 +1424,10 @@ mod tests {
             duration_secs: None,
             stale: false,
         };
-        let html = render_tracks(&[bare], None, 1, false);
+        let html = render_tracks(&[bare], None, 1, false, Some(1));
         assert!(!html.contains("badge"), "{html}");
         assert_eq!(html.matches(MISSING).count(), 2, "{html}");
         assert!(!html.contains("?:??"), "{html}");
-
-        assert!(render_tracks(&[], None, 1, false).contains("No tracks found."));
     }
 
     #[test]
@@ -1324,7 +1468,7 @@ mod tests {
 
     #[test]
     fn release_ids_link_to_their_review_page() {
-        let html = render_releases(&[release(12)], 1, false);
+        let html = render_releases(&[release(12)], 1, 1);
         assert!(
             html.contains("<a href=\"/review?release=12\">12</a>"),
             "{html}"
@@ -1332,22 +1476,164 @@ mod tests {
     }
 
     #[test]
+    fn count_lines_show_the_range_only_when_there_are_several_pages() {
+        assert_eq!(
+            count_line("2 releases", 1, 2, 2),
+            "<p class=\"muted\">2 releases.</p>"
+        );
+        assert_eq!(
+            count_line("262,650 releases", 2, 100, 262_650),
+            "<p class=\"muted\">262,650 releases. Showing 101–200.</p>"
+        );
+        assert_eq!(
+            count_line("101 folders", 2, 1, 101),
+            "<p class=\"muted\">101 folders. Showing 101.</p>"
+        );
+    }
+
+    #[test]
+    fn the_pager_names_the_last_page_when_known() {
+        let html = pager_with("/releases", &[], 2, true, Some(2_627));
+        assert!(html.contains("<span>Page 2 of 2,627</span>"), "{html}");
+        assert!(
+            pager_with("/tracks", &[("q", "x")], 2, true, None).contains("<span>Page 2</span>")
+        );
+    }
+
+    #[test]
+    fn a_page_past_the_end_links_back() {
+        let html = past_end("/releases", &[], 9_999, Some(3));
+        assert!(html.contains("Page 9,999 is past the end."), "{html}");
+        assert!(
+            html.contains("href=\"/releases?page=3\">Go to page 3</a>"),
+            "{html}"
+        );
+        assert!(
+            past_end("/tracks", &[("q", "x")], 5, None)
+                .contains("href=\"/tracks?q=x\">Go to page 1</a>")
+        );
+    }
+
+    #[test]
+    fn the_last_page_rounds_up_and_is_at_least_one() {
+        assert_eq!(last_page(0), 1);
+        assert_eq!(last_page(100), 1);
+        assert_eq!(last_page(101), 2);
+        assert_eq!(last_page(262_650), 2_627);
+    }
+
+    #[test]
+    fn counts_show_thousands_and_clamp_negatives() {
+        assert_eq!(count(1_234_567), "1,234,567");
+        assert_eq!(count(-5), "0");
+    }
+
+    #[test]
+    fn empty_lists_say_whether_the_library_or_the_search_is_empty() {
+        assert!(render_tracks(&[], None, 1, false, Some(0)).contains("Nothing imported yet"));
+        assert!(
+            render_tracks(&[], Some("moon"), 1, false, None).contains("No tracks match “moon”.")
+        );
+        assert!(
+            render_tracks(&[], Some("<b>"), 1, false, None)
+                .contains("No tracks match “&lt;b&gt;”.")
+        );
+        assert!(render_releases(&[], 1, 0).contains("Nothing imported yet"));
+    }
+
+    #[test]
+    fn list_pages_count_page_and_end_themselves() {
+        let rows: Vec<store::LocalReleaseStatus> = (1..=100).map(release).collect();
+        let html = render_releases(&rows, 2, 250);
+        assert!(html.contains("250 releases. Showing 101–200."), "{html}");
+        assert!(html.contains("Page 2 of 3"), "{html}");
+        let html = render_releases(&[], 9, 250);
+        assert!(html.contains("Page 9 is past the end."), "{html}");
+        assert!(
+            html.contains("href=\"/releases?page=3\">Go to page 3"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("<table>") && !html.contains("class=\"pager\""),
+            "{html}"
+        );
+        let html = render_folders(&[], 4, 250);
+        assert!(
+            html.contains("href=\"/folders?page=3\">Go to page 3"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn track_pages_count_the_library_but_not_a_search() {
+        let row = || store::TrackRow {
+            path: "/m/a.wav".into(),
+            title: Some("Song".into()),
+            artist: None,
+            album: None,
+            track_number: None,
+            disc_number: None,
+            duration_secs: None,
+            stale: false,
+        };
+        let rows: Vec<store::TrackRow> = (0..100).map(|_| row()).collect();
+        let html = render_tracks(&rows, None, 2, true, Some(2_762_328));
+        assert!(
+            html.contains("2,762,328 tracks. Showing 101–200."),
+            "{html}"
+        );
+        assert!(html.contains("Page 2 of 27,624"), "{html}");
+        assert!(render_tracks(&[row()], None, 1, false, Some(1)).contains("1 track."));
+        let html = render_tracks(&rows, Some("m<oon"), 2, true, None);
+        assert!(
+            html.contains("Showing 101–200 of the tracks matching “m&lt;oon”."),
+            "{html}"
+        );
+        assert!(html.contains("<span>Page 2</span>"), "{html}");
+        let html = render_tracks(&rows, Some("moon"), 1, true, None);
+        assert!(
+            html.contains("Showing 1–100 of the tracks matching “moon”."),
+            "{html}"
+        );
+        // The pager follows the total, not the row fetched past the page.
+        let html = render_tracks(&rows, None, 1, false, Some(250));
+        assert!(
+            html.contains("Page 1 of 3") && html.contains("Next</a>"),
+            "{html}"
+        );
+        let html = render_tracks(&rows[..50], None, 3, true, Some(250));
+        assert!(html.contains("<span>Next</span>"), "{html}");
+        assert!(html.contains("250 tracks. Showing 201–250."), "{html}");
+        // One page of search results needs no range.
+        let html = render_tracks(&[row()], Some("moon"), 1, false, None);
+        assert!(!html.contains("Showing"), "{html}");
+        let html = render_tracks(&[], Some("moon"), 3, false, None);
+        assert!(html.contains("Page 3 is past the end."), "{html}");
+        assert!(
+            html.contains("href=\"/tracks?q=moon\">Go to page 1"),
+            "{html}"
+        );
+        let html = render_tracks(&[], None, 9, false, Some(250));
+        assert!(
+            html.contains("href=\"/tracks?page=3\">Go to page 3"),
+            "{html}"
+        );
+    }
+
+    #[test]
     fn the_pager_carries_its_parameters() {
-        let html = pager_with("/reviews", &[("provider", "deezer")], 2, true);
+        let html = pager_with("/reviews", &[("provider", "deezer")], 2, true, None);
         assert!(html.contains("href=\"/reviews?provider=deezer\""), "{html}");
         assert!(
             html.contains("href=\"/reviews?provider=deezer&amp;page=3\""),
             "{html}"
-        );
-        assert_eq!(
-            pager("/tracks", Some("a b"), 1, true),
-            pager_with("/tracks", &[("q", "a b")], 1, true)
         );
         let html = pager_with(
             "/reviews",
             &[("sort", "score"), ("show", "acceptable")],
             2,
             true,
+            None,
         );
         assert!(
             html.contains("href=\"/reviews?sort=score&amp;show=acceptable\""),
@@ -1357,7 +1643,7 @@ mod tests {
             html.contains("href=\"/reviews?sort=score&amp;show=acceptable&amp;page=3\""),
             "{html}"
         );
-        assert!(pager_with("/reviews", &[], 2, true).contains("href=\"/reviews\""));
+        assert!(pager_with("/reviews", &[], 2, true, None).contains("href=\"/reviews\""));
     }
 
     #[test]
@@ -1606,7 +1892,7 @@ mod tests {
             duration_secs: None,
             stale: true,
         };
-        let html = render_tracks(&[row], None, 1, false);
+        let html = render_tracks(&[row], None, 1, false, Some(1));
         assert!(!html.contains("<th></th>"), "{html}");
         assert!(
             html.contains("Song <span class=\"badge stale\">stale match</span>"),
@@ -1656,7 +1942,7 @@ mod tests {
 
     #[test]
     fn release_rows_link_their_folder() {
-        let html = render_releases(&[release(12)], 1, false);
+        let html = render_releases(&[release(12)], 1, 1);
         assert!(
             html.contains("href=\"/folder?path=%2Fmusic%2F%3Cb%3E\""),
             "{html}"
@@ -1673,11 +1959,11 @@ mod tests {
             state: store::FolderState::MergedByUser,
             releases: vec![first],
         };
-        let html = render_folders(&[unit], 1, false);
+        let html = render_folders(&[unit], 1, 1);
         assert!(html.contains("merged by you"), "{html}");
         assert!(html.contains("<td class=\"num\">1,500</td>"), "{html}");
         assert!(html.contains("/<wbr>music/<wbr>&lt;b&gt;</a>"), "{html}");
-        assert!(render_folders(&[], 1, false).contains("No folder holds"));
+        assert!(render_folders(&[], 1, 0).contains("No folder holds"));
     }
 
     #[test]

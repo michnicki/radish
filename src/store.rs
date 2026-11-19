@@ -3183,6 +3183,13 @@ pub async fn track_page(
     track_rows(pool, query.map(like_contains), limit, offset).await
 }
 
+/// How many tracks the library holds: the total of an unfiltered track page.
+pub async fn track_count(pool: &SqlitePool) -> Result<i64> {
+    Ok(sqlx::query_scalar("SELECT COUNT(*) FROM tracks")
+        .fetch_one(pool)
+        .await?)
+}
+
 /// The one query behind `list`, `search` and the web track page.
 ///
 /// `pattern` is a `LIKE` pattern from [`like_contains`], or `None` for every
@@ -4522,6 +4529,24 @@ mod tests {
         assert_eq!(status.stale, 0);
         assert_eq!(status.queued, 1);
         assert_eq!(status.newest_modified, Some(1));
+    }
+
+    #[tokio::test]
+    async fn track_count_counts_every_track() {
+        let pool = test_pool().await;
+        assert_eq!(track_count(&pool).await.unwrap(), 0);
+        let tracks: Vec<ScannedTrack> = (1..=2)
+            .map(|n| {
+                scanned(
+                    &format!("/music/a/{n:02}.flac"),
+                    Some("Blue"),
+                    Some("Artist"),
+                    n,
+                )
+            })
+            .collect();
+        insert(&pool, "/music/a", &tracks).await;
+        assert_eq!(track_count(&pool).await.unwrap(), 2);
     }
 
     #[tokio::test]
