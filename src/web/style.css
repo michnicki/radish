@@ -39,7 +39,7 @@ button.secondary{background:transparent;color:var(--accent)}
 button.warn{background:transparent;color:var(--warn);border-color:var(--warn)}
 button.secondary:hover,button.warn:hover{background:var(--card);filter:none}
 button.secondary:active,button.warn:active{background:var(--line)}
-.choice{display:flex;flex-direction:column;gap:.25rem;max-width:22rem}
+.choice{display:flex;flex-direction:column;align-items:flex-start;gap:.25rem;max-width:22rem}
 .choice p{margin:0;font-size:.9rem}
 .pager{display:flex;flex-wrap:wrap;gap:1rem;margin:1rem 0;color:var(--muted)}
 .actions{display:flex;flex-wrap:wrap;gap:.5rem 1.25rem;margin:.75rem 0}

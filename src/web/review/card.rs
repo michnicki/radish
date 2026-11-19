@@ -11,6 +11,35 @@ use crate::providers::{ProviderKind, ReleaseId};
 use crate::review as saved;
 use crate::web::{MISSING, duration_cell, escape_html, is_web_url, position_cell, text_cell};
 
+/// The kinds of note a card lists under its scores.
+#[derive(Clone, Copy)]
+enum NoteKind {
+    Structure,
+    Aliases,
+    Evidence,
+    /// Only on a card that is not current; see [`render_card`].
+    Blocker,
+    Warning,
+    Mapping,
+}
+
+impl NoteKind {
+    /// The note as a list item with `text` escaped: warnings stand out,
+    /// blockers take the warning color and the rest are muted.
+    fn render(self, text: &str) -> String {
+        let text = escape_html(text);
+        let muted = |kind: &str| format!("<li class=\"muted\">{kind}: {text}</li>");
+        match self {
+            Self::Warning => format!("<li><strong>Warning:</strong> {text}</li>"),
+            Self::Blocker => format!("<li class=\"blocker\">blocker: {text}</li>"),
+            Self::Structure => muted("structure"),
+            Self::Aliases => muted("aliases"),
+            Self::Evidence => muted("evidence"),
+            Self::Mapping => muted("mapping"),
+        }
+    }
+}
+
 /// One candidate as a card. Only a `current` card has a track table and an
 /// accept section: an out-of-date mapping indexes files that may have moved.
 pub(super) fn render_card(
@@ -33,9 +62,9 @@ pub(super) fn render_card(
         id
     };
     let verdict = if evaluation.auto_accept {
-        "auto-acceptable"
+        "<span class=\"badge auto\">auto-acceptable</span>"
     } else {
-        "review"
+        "<span class=\"badge review\">needs review</span>"
     };
     let details = saved::edition_details(release);
     let details = if details.is_empty() {
@@ -46,53 +75,38 @@ pub(super) fn render_card(
             escape_html(&details.join(" · "))
         )
     };
-    let mut notes: Vec<String> = Vec::new();
-    notes.extend(
-        release
-            .structure_issues
-            .iter()
-            .map(|note| format!("structure: {note}")),
-    );
+    let mut notes = String::new();
+    for note in &release.structure_issues {
+        notes.push_str(&NoteKind::Structure.render(note));
+    }
     if !release.lookup_aliases.is_empty() {
         let aliases: Vec<String> = release
             .lookup_aliases
             .iter()
             .map(ReleaseId::storage_id)
             .collect();
-        notes.push(format!("aliases: {}", aliases.join(", ")));
+        notes.push_str(&NoteKind::Aliases.render(&aliases.join(", ")));
     }
-    notes.extend(
-        evaluation
-            .evidence
-            .iter()
-            .map(|note| format!("evidence: {note}")),
-    );
+    for note in &evaluation.evidence {
+        notes.push_str(&NoteKind::Evidence.render(note));
+    }
     if !current {
         // A current card shows its blockers above the Accept button instead.
-        notes.extend(
-            evaluation
-                .blockers
-                .iter()
-                .map(|note| format!("blocker: {note}")),
-        );
+        for note in &evaluation.blockers {
+            notes.push_str(&NoteKind::Blocker.render(note));
+        }
     }
-    notes.extend(
-        evaluation
-            .warnings
-            .iter()
-            .map(|note| format!("warning: {note}")),
-    );
-    notes.extend(
-        candidate
-            .mapping
-            .notes
-            .iter()
-            .map(|note| format!("mapping: {note}")),
-    );
-    let notes: String = notes
-        .iter()
-        .map(|note| format!("<li>{}</li>", escape_html(note)))
-        .collect();
+    for note in &evaluation.warnings {
+        notes.push_str(&NoteKind::Warning.render(note));
+    }
+    for note in &candidate.mapping.notes {
+        notes.push_str(&NoteKind::Mapping.render(note));
+    }
+    let notes = if notes.is_empty() {
+        String::new()
+    } else {
+        format!("<ul>{notes}</ul>")
+    };
     let disc = candidate
         .mapping
         .medium
@@ -113,9 +127,9 @@ pub(super) fn render_card(
     };
     format!(
         "<section class=\"card\"><h3>[{}] {} {id} — score {:.3} \
-         <span class=\"muted\">{verdict}</span></h3><p>{} — {}</p>{details}\
+         {verdict}</h3><p>{} — {}</p>{details}\
          <p class=\"muted\">score: {}</p><p class=\"muted\">mapping: {}/{} files mapped</p>\
-         <ul>{notes}</ul>{disc}{tracks}{action}</section>",
+         {notes}{disc}{tracks}{action}</section>",
         index + 1,
         provider.label(),
         evaluation.match_scope.score(&candidate.score),
@@ -282,13 +296,19 @@ fn render_accept(
             plural(count as u64, "check", "checks")
         ),
     };
+    // Overriding checks is a consequence the plain Accept does not have.
+    let class = if evaluation.blockers.is_empty() {
+        ""
+    } else {
+        " class=\"warn\""
+    };
     let id = escape_html(&candidate.release.id.storage_id());
     format!(
         "{blockers}<form method=\"post\" action=\"/review\">{}\
          <input type=\"hidden\" name=\"action\" value=\"accept\">\
          <input type=\"hidden\" name=\"provider\" value=\"{provider}\">\
          <input type=\"hidden\" name=\"candidate\" value=\"{id}\">\
-         <button aria-label=\"{label}: {} {id}\">{label}</button></form>",
+         <button{class} aria-label=\"{label}: {} {id}\">{label}</button></form>",
         hidden_fields(view, token),
         provider.label(),
     )
@@ -343,7 +363,7 @@ mod tests {
         );
         assert!(
             html.contains(&format!(
-                "<button aria-label=\"Accept, overriding 1 check: MusicBrainz {FIXTURE_MBID}\">"
+                "<button class=\"warn\" aria-label=\"Accept, overriding 1 check: MusicBrainz {FIXTURE_MBID}\">"
             )),
             "{html}"
         );
@@ -502,10 +522,11 @@ mod tests {
         )]);
         let html = render_release(&view(&review, Some("tok")));
         assert!(
-            html.contains("<li>blocker: &lt;b&gt;close&lt;/b&gt;</li>"),
+            html.contains("<li class=\"blocker\">blocker: &lt;b&gt;close&lt;/b&gt;</li>"),
             "{html}"
         );
-        assert!(!html.contains("<button aria-label"), "{html}");
+        // The Accept button carries this label whatever its class.
+        assert!(!html.contains("aria-label=\"Accept"), "{html}");
 
         // A current card keeps them above its button instead.
         let review = review_of(vec![group(
@@ -618,7 +639,7 @@ mod tests {
         let order = [
             at("evidence: "),
             at("blocker: blocked"),
-            at("warning: warned"),
+            at("<strong>Warning:</strong> warned"),
         ];
         assert!(order.is_sorted(), "{order:?} in {html}");
     }
@@ -649,5 +670,94 @@ mod tests {
         let line = format!("score: {}", parts.join(" · "));
         assert!(html.contains(&line), "{line} in {html}");
         assert!(!html.contains(&parts.join("  ")), "{html}");
+    }
+
+    #[test]
+    fn an_accept_that_overrides_checks_is_a_warning_button() {
+        let review = review_of(vec![group(
+            GroupState::Current,
+            vec![(exact(), vec!["close".into()])],
+        )]);
+        let html = render_release(&view(&review, Some("tok")));
+        assert!(
+            html.contains("<button class=\"warn\" aria-label="),
+            "{html}"
+        );
+
+        let review = review_of(vec![group(
+            GroupState::Current,
+            vec![(exact(), Vec::new())],
+        )]);
+        let html = render_release(&view(&review, Some("tok")));
+        assert!(html.contains("<button aria-label="), "{html}");
+        assert!(!html.contains("<button class="), "{html}");
+    }
+
+    #[test]
+    fn the_card_heading_has_a_verdict_badge() {
+        let mut review = review_of(vec![group(
+            GroupState::Current,
+            vec![(exact(), Vec::new())],
+        )]);
+        let html = render_release(&view(&review, Some("tok")));
+        assert!(
+            html.contains("<span class=\"badge review\">needs review</span>"),
+            "{html}"
+        );
+        assert!(!html.contains("badge auto"), "{html}");
+
+        review.groups[0].candidates[0].1.auto_accept = true;
+        let html = render_release(&view(&review, Some("tok")));
+        assert!(
+            html.contains("<span class=\"badge auto\">auto-acceptable</span>"),
+            "{html}"
+        );
+        assert!(!html.contains("needs review"), "{html}");
+    }
+
+    #[test]
+    fn notes_are_told_apart_by_kind() {
+        let mut review = review_of(vec![group(
+            GroupState::Current,
+            vec![(exact(), Vec::new())],
+        )]);
+        review.groups[0].candidates[0]
+            .1
+            .warnings
+            .push("<i>careful</i>".into());
+        let html = render_release(&view(&review, Some("tok")));
+        assert!(
+            html.contains("<li><strong>Warning:</strong> &lt;i&gt;careful&lt;/i&gt;</li>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<li class=\"muted\">evidence: &lt;u&gt;barcode&lt;/u&gt;</li>"),
+            "{html}"
+        );
+        assert!(!html.contains("warning: "), "{html}");
+
+        // Out-of-date cards show their blockers as notes.
+        let review = review_of(vec![group(
+            GroupState::OutOfDate,
+            vec![(exact(), vec!["blocked".into()])],
+        )]);
+        let html = render_release(&view(&review, Some("tok")));
+        assert!(
+            html.contains("<li class=\"blocker\">blocker: blocked</li>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_card_without_notes_has_no_list() {
+        let mut review = review_of(vec![group(
+            GroupState::OutOfDate,
+            vec![(exact(), Vec::new())],
+        )]);
+        review.groups[0].candidates[0].1.evidence.clear();
+        let html = render_release(&view(&review, Some("tok")));
+        let card = &html[html.find("<section class=\"card\">").expect("a card")..];
+        let card = &card[..card.find("</section>").expect("the end of the card")];
+        assert!(!card.contains("<ul"), "{card}");
     }
 }

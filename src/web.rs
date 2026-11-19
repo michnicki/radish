@@ -1099,29 +1099,25 @@ fn render_choices(view: &store::FolderView, token: Option<&str>) -> String {
     if view.choices.is_empty() {
         return String::new();
     }
-    let notes: String = view
-        .choices
-        .iter()
-        .filter_map(|(action, effects)| {
-            effects
-                .describe()
-                .map(|text| format!("<li>{}: {text}.</li>", action.label()))
-        })
-        .collect();
-    let notes = if notes.is_empty() {
-        String::new()
-    } else {
-        format!("<ul class=\"muted\">{notes}</ul>")
-    };
     match token {
         Some(token) => {
             let buttons: String = view
                 .choices
                 .iter()
-                .map(|(action, _)| {
+                .map(|(action, effects)| {
+                    let value = action.as_str();
+                    // The effect is tied to its button for screen readers.
+                    let (class, described, effect) = match effects.describe() {
+                        Some(text) => (
+                            "warn",
+                            format!(" aria-describedby=\"effect-{value}\""),
+                            format!("<p id=\"effect-{value}\" class=\"blocker\">{text}.</p>"),
+                        ),
+                        None => ("secondary", String::new(), String::new()),
+                    };
                     format!(
-                        "<button name=\"action\" value=\"{}\">{}</button>",
-                        action.as_str(),
+                        "<div class=\"choice\"><button class=\"{class}\" name=\"action\" \
+                         value=\"{value}\"{described}>{}</button>{effect}</div>",
                         action.label()
                     )
                 })
@@ -1129,7 +1125,7 @@ fn render_choices(view: &store::FolderView, token: Option<&str>) -> String {
             format!(
                 "<form method=\"post\" action=\"/folder\">\
                  <input type=\"hidden\" name=\"path\" value=\"{}\">\
-                 <input type=\"hidden\" name=\"token\" value=\"{}\">{buttons}</form>{notes}",
+                 <input type=\"hidden\" name=\"token\" value=\"{}\">{buttons}</form>",
                 escape_html(&view.unit.path),
                 escape_html(token)
             )
@@ -1138,9 +1134,15 @@ fn render_choices(view: &store::FolderView, token: Option<&str>) -> String {
             let commands: String = view
                 .choices
                 .iter()
-                .map(|(action, _)| {
+                .map(|(action, effects)| {
+                    let effect = effects.describe().map_or_else(String::new, |text| {
+                        format!(
+                            "<br><span class=\"blocker\">{}: {text}.</span>",
+                            action.label()
+                        )
+                    });
                     format!(
-                        "<li><code>radish folder {} {}</code></li>",
+                        "<li><code>radish folder {} {}</code>{effect}</li>",
                         action.cli_verb(),
                         escape_html(&shell_quote(&view.unit.path))
                     )
@@ -1149,7 +1151,7 @@ fn render_choices(view: &store::FolderView, token: Option<&str>) -> String {
             format!(
                 "<p class=\"muted\">This server listens on a non-loopback address, so it \
                  changes nothing. Run one of these with the same <code>--db</code> as this \
-                 server:</p><ul>{commands}</ul>{notes}"
+                 server:</p><ul>{commands}</ul>"
             )
         }
     }
@@ -2005,17 +2007,23 @@ mod tests {
             "{html}"
         );
         assert!(
-            html.contains("value=\"merge\">Merge into one release</button>"),
+            html.contains(
+                "<div class=\"choice\"><button class=\"warn\" name=\"action\" value=\"merge\" \
+                 aria-describedby=\"effect-merge\">Merge into one release</button>\
+                 <p id=\"effect-merge\" class=\"blocker\">1 accepted match becomes stale.</p></div>"
+            ),
             "{html}"
         );
         assert!(
-            html.contains("value=\"separate\">Keep separate</button>"),
+            html.contains(
+                "<div class=\"choice\"><button class=\"secondary\" name=\"action\" \
+                 value=\"separate\">Keep separate</button></div>"
+            ),
             "{html}"
         );
-        assert!(
-            html.contains("Merge into one release: 1 accepted match becomes stale."),
-            "{html}"
-        );
+        assert!(!html.contains("<ul class=\"muted\">"), "{html}");
+        // Only the button with an effect points at it.
+        assert_eq!(html.matches("aria-describedby").count(), 1, "{html}");
         assert!(html.contains("cd2/<wbr>01.wav"), "{html}");
         assert!(html.contains("&lt;i&gt;Blue&lt;/i&gt;"), "{html}");
         assert!(!html.contains("<i>"), "{html}");
@@ -2030,6 +2038,22 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("radish folder split"), "{html}");
+        assert!(!html.contains("<ul class=\"muted\">"), "{html}");
+        let items: Vec<&str> = html
+            .split("<li>")
+            .skip(1)
+            .map(|item| item.split("</li>").next().unwrap_or(""))
+            .collect();
+        assert_eq!(items.len(), 2, "{html}");
+        assert!(
+            items[0].ends_with(
+                "<br><span class=\"blocker\">Merge into one release: \
+                 1 accepted match becomes stale.</span>"
+            ),
+            "{}",
+            items[0]
+        );
+        assert!(!items[1].contains("blocker"), "{}", items[1]);
     }
 
     #[test]

@@ -230,7 +230,7 @@ async fn accepted_status(
 /// `Accepted MusicBrainz <id> (title) for #12 Artist — Album.`
 fn render_accepted(status: &store::LocalReleaseStatus, view: &store::QueueView) -> String {
     format!(
-        "<p class=\"notice\">Accepted {} for <a href=\"{}\">#{} {} — {}</a>.</p>",
+        "<p class=\"notice\" role=\"status\">Accepted {} for <a href=\"{}\">#{} {} — {}</a>.</p>",
         render_match(status),
         escape_html(&review_href(status.id, view, None, None)),
         status.id,
@@ -409,7 +409,8 @@ fn queue_row(row: &store::QueuedRelease, view: &store::QueueView) -> String {
 /// anything longer is not an ID, and the limit keeps the echoed field small.
 const MAX_ENTERED_CHARS: usize = 200;
 
-/// A message shown next to the form that caused it.
+/// An error message shown on the page that sent it: a failed accept or a
+/// failed fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Notice {
     /// Set for the fetch form, which then shows the message and keeps the
@@ -552,7 +553,10 @@ fn render_release(view: &View<'_>) -> String {
     };
     let notice = match view.notice {
         Some(notice) if notice.entered.is_none() => {
-            format!("<p class=\"notice\">{}</p>", escape_html(&notice.text))
+            format!(
+                "<p class=\"notice error\" role=\"alert\">{}</p>",
+                escape_html(&notice.text)
+            )
         }
         _ => String::new(),
     };
@@ -720,7 +724,10 @@ fn render_entry(view: &View<'_>) -> String {
     };
     let notice = match view.notice {
         Some(notice) if notice.entered.is_some() => {
-            format!("<p class=\"notice\">{}</p>", escape_html(&notice.text))
+            format!(
+                "<p class=\"notice error\" role=\"alert\">{}</p>",
+                escape_html(&notice.text)
+            )
         }
         _ => String::new(),
     };
@@ -1216,6 +1223,12 @@ mod tests {
             html.contains("href=\"/review?release=4&amp;sort=score\""),
             "{html}"
         );
+        // A success is a status message, not an alert.
+        assert!(
+            html.starts_with("<p class=\"notice\" role=\"status\">Accepted "),
+            "{html}"
+        );
+        assert!(!html.contains("notice error"), "{html}");
     }
 
     #[test]
@@ -2247,10 +2260,34 @@ mod tests {
         );
         assert!(html.contains("value=\"&lt;b&gt;x&lt;/b&gt;\""), "{html}");
         assert!(
-            html.contains("<p class=\"notice\">bad &lt;i&gt;id&lt;/i&gt;</p>"),
+            html.contains("<p class=\"notice error\" role=\"alert\">bad &lt;i&gt;id&lt;/i&gt;</p>"),
             "{html}"
         );
         // A notice from the fetch form is shown once, beside that form.
-        assert_eq!(html.matches("class=\"notice\"").count(), 1, "{html}");
+        assert_eq!(html.matches("class=\"notice error\"").count(), 1, "{html}");
+    }
+
+    #[test]
+    fn a_failed_accept_shows_an_error_notice_above_the_candidates() {
+        let review = review_of(vec![group(
+            GroupState::Current,
+            vec![(exact(), Vec::new())],
+        )]);
+        let notice = Notice {
+            entered: None,
+            text: "changed <i>meanwhile</i>".into(),
+        };
+        let mut shown = view(&review, Some("tok"));
+        shown.notice = Some(&notice);
+        let html = render_release(&shown);
+        assert!(
+            html.contains(
+                "<p class=\"notice error\" role=\"alert\">changed &lt;i&gt;meanwhile&lt;/i&gt;</p>"
+            ),
+            "{html}"
+        );
+        let notice_at = html.find("class=\"notice error\"").expect("the notice");
+        let card_at = html.find("class=\"card\"").expect("a card");
+        assert!(notice_at < card_at, "{html}");
     }
 }
