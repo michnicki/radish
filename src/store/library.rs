@@ -9,6 +9,7 @@
 use super::{like_contains, shown_tag};
 use anyhow::Result;
 use sqlx::SqlitePool;
+use std::collections::HashSet;
 use std::path::Path;
 
 /// The name a release without any artist is listed under. `release_artist!`
@@ -58,6 +59,29 @@ macro_rules! release_select {
                         AS musicbrainz_id
              FROM local_releases lr
              LEFT JOIN release_matches m ON m.local_release_id = lr.id "
+        )
+    };
+}
+
+/// One page of releases in `$order`, selected by ID first.
+///
+/// The inner query sorts and pages the IDs alone. Sorting complete rows would
+/// compute the duration subquery of every row it skips, which makes deep
+/// pages slow. The outer query then reads the columns of the page's releases
+/// and repeats `$order` to keep the page's order. `$filter` is empty or a
+/// `WHERE` clause. The limit is `?1` and the offset `?2`.
+macro_rules! release_page {
+    ($filter:expr, $order:expr) => {
+        concat!(
+            release_select!(),
+            "WHERE lr.id IN (SELECT lr.id FROM local_releases lr
+                             LEFT JOIN release_matches m ON m.local_release_id = lr.id ",
+            $filter,
+            " ORDER BY ",
+            $order,
+            " LIMIT ?1 OFFSET ?2)
+             ORDER BY ",
+            $order
         )
     };
 }
@@ -219,13 +243,18 @@ fn clean_track(mut track: LibraryTrack) -> LibraryTrack {
 /// whole selection instead.
 const SAMPLE_ROUNDS: usize = 4;
 
+/// The most tracks [`random_tracks`] returns, whatever `count` asks for. The
+/// API limits a request to the same number.
+pub const MAX_RANDOM_TRACKS: usize = 500;
+
 /// How a page of releases is ordered. Every order ends with the release ID,
 /// so pages never overlap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReleaseOrder {
     /// Oldest stored first: stable while the library grows.
     Id,
-    /// Most recently stored first.
+    /// Most recently stored first. A release's ID grows with the time it was
+    /// stored, so this is the highest ID first.
     Newest,
     /// By title, ignoring ASCII case.
     Name,
@@ -267,54 +296,65 @@ pub async fn library_releases(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<LibraryRelease>> {
-    const BY_ID: &str = concat!(release_select!(), "ORDER BY lr.id LIMIT ?1 OFFSET ?2");
-    const NEWEST: &str = concat!(
-        release_select!(),
-        "ORDER BY lr.created_at DESC, lr.id DESC LIMIT ?1 OFFSET ?2"
+    const BY_ID: &str = release_page!("", "lr.id");
+    // `created_at` is set only by its column default when a release is
+    // inserted, and IDs are AUTOINCREMENT, so the newest release is the one
+    // with the highest ID. Sorting by ID can use the primary key.
+    const NEWEST: &str = release_page!("", "lr.id DESC");
+    const BY_NAME: &str = release_page!("", concat!(release_name!(), " COLLATE NOCASE, lr.id"));
+    const BY_ARTIST: &str = release_page!(
+        "",
+        concat!(
+            release_artist!(),
+            " COLLATE NOCASE, ",
+            release_year!(),
+            ", ",
+            release_name!(),
+            " COLLATE NOCASE, lr.id"
+        )
     );
-    const BY_NAME: &str = concat!(
-        release_select!(),
-        "ORDER BY ",
-        release_name!(),
-        " COLLATE NOCASE, lr.id LIMIT ?1 OFFSET ?2"
+    const YEARS_UP: &str = release_page!(
+        concat!("WHERE ", release_year!(), " BETWEEN ?3 AND ?4"),
+        concat!(
+            release_year!(),
+            ", ",
+            release_name!(),
+            " COLLATE NOCASE, lr.id"
+        )
     );
-    const BY_ARTIST: &str = concat!(
-        release_select!(),
-        "ORDER BY ",
-        release_artist!(),
-        " COLLATE NOCASE, ",
-        release_year!(),
-        ", ",
-        release_name!(),
-        " COLLATE NOCASE, lr.id LIMIT ?1 OFFSET ?2"
+    const YEARS_DOWN: &str = release_page!(
+        concat!("WHERE ", release_year!(), " BETWEEN ?4 AND ?3"),
+        concat!(
+            release_year!(),
+            " DESC, ",
+            release_name!(),
+            " COLLATE NOCASE, lr.id"
+        )
     );
-    const RANDOM: &str = concat!(release_select!(), "ORDER BY RANDOM() LIMIT ?1 OFFSET ?2");
-    const YEARS_UP: &str = concat!(
+    // A random page can't repeat its order, so it draws the IDs first and
+    // reads their rows in that order.
+    const RANDOM_IDS: &str = "SELECT id FROM local_releases ORDER BY RANDOM() LIMIT ?1 OFFSET ?2";
+    const RANDOM: &str = concat!(
         release_select!(),
-        "WHERE ",
-        release_year!(),
-        " BETWEEN ?3 AND ?4 ORDER BY ",
-        release_year!(),
-        ", ",
-        release_name!(),
-        " COLLATE NOCASE, lr.id LIMIT ?1 OFFSET ?2"
-    );
-    const YEARS_DOWN: &str = concat!(
-        release_select!(),
-        "WHERE ",
-        release_year!(),
-        " BETWEEN ?4 AND ?3 ORDER BY ",
-        release_year!(),
-        " DESC, ",
-        release_name!(),
-        " COLLATE NOCASE, lr.id LIMIT ?1 OFFSET ?2"
+        "JOIN json_each(?1) j ON j.value = lr.id ORDER BY j.key"
     );
     let (sql, years) = match order {
         ReleaseOrder::Id => (BY_ID, None),
         ReleaseOrder::Newest => (NEWEST, None),
         ReleaseOrder::Name => (BY_NAME, None),
         ReleaseOrder::Artist => (BY_ARTIST, None),
-        ReleaseOrder::Random => (RANDOM, None),
+        ReleaseOrder::Random => {
+            let ids: Vec<i64> = sqlx::query_scalar(RANDOM_IDS)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
+                .await?;
+            let rows = sqlx::query_as::<_, LibraryRelease>(RANDOM)
+                .bind(serde_json::to_string(&ids)?)
+                .fetch_all(pool)
+                .await?;
+            return Ok(rows.into_iter().map(clean_release).collect());
+        }
         ReleaseOrder::Years { from, to } if from <= to => (YEARS_UP, Some((from, to))),
         ReleaseOrder::Years { from, to } => (YEARS_DOWN, Some((from, to))),
     };
@@ -366,21 +406,23 @@ pub async fn search_library_releases(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<LibraryRelease>> {
-    let rows = sqlx::query_as::<_, LibraryRelease>(concat!(
-        release_select!(),
-        "WHERE ",
-        release_name!(),
-        " LIKE ?1 COLLATE NOCASE ESCAPE '\\' OR ",
-        release_artist!(),
-        " LIKE ?1 COLLATE NOCASE ESCAPE '\\' ORDER BY ",
-        release_name!(),
-        " COLLATE NOCASE, lr.id LIMIT ?2 OFFSET ?3"
-    ))
-    .bind(like_contains(query))
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(pool)
-    .await?;
+    // The limit is `?1` and the offset `?2`, as `release_page!` expects.
+    const SQL: &str = release_page!(
+        concat!(
+            "WHERE ",
+            release_name!(),
+            " LIKE ?3 COLLATE NOCASE ESCAPE '\\' OR ",
+            release_artist!(),
+            " LIKE ?3 COLLATE NOCASE ESCAPE '\\'"
+        ),
+        concat!(release_name!(), " COLLATE NOCASE, lr.id")
+    );
+    let rows = sqlx::query_as::<_, LibraryRelease>(SQL)
+        .bind(limit)
+        .bind(offset)
+        .bind(like_contains(query))
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().map(clean_release).collect())
 }
 
@@ -467,16 +509,23 @@ pub async fn library_tracks(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<LibraryTrack>> {
+    // The IDs are paged alone, so the joins and the columns are read for one
+    // page of tracks only, not for every track the offset skips. Tracks
+    // without a release have no place in the library.
     const ALL: &str = concat!(
         track_select!(),
         "FROM tracks t ",
         track_joins!(),
-        "ORDER BY t.id LIMIT ?1 OFFSET ?2"
+        "WHERE t.id IN (SELECT id FROM tracks WHERE local_release_id IS NOT NULL
+                        ORDER BY id LIMIT ?1 OFFSET ?2)
+         ORDER BY t.id"
     );
     // Two steps, because the effective values can't use an index: first the
     // tracks whose tag or overlay contains the text (plain table scans), then
     // the ones whose effective value still does. On 2.76M tracks this takes
-    // 0.9 s where filtering the joined rows takes 3 s.
+    // 0.9 s where filtering the joined rows takes 3 s. The union yields IDs in
+    // order, so ordering by `h.id` (not `t.id`) lets the limit stop the scan
+    // early instead of walking every track.
     const SEARCH: &str = concat!(
         "WITH hits(id) AS (
              SELECT id FROM tracks
@@ -495,7 +544,7 @@ pub async fn library_tracks(
         " LIKE ?1 COLLATE NOCASE ESCAPE '\\' OR ",
         effective_track_artist!(),
         " LIKE ?1 COLLATE NOCASE ESCAPE '\\'
-         ORDER BY t.id LIMIT ?2 OFFSET ?3"
+         ORDER BY h.id LIMIT ?2 OFFSET ?3"
     );
     let rows = match query {
         None => {
@@ -518,7 +567,8 @@ pub async fn library_tracks(
 }
 
 /// Up to `count` different tracks in random order, from releases of `from`
-/// or later and `to` or earlier when given.
+/// or later and `to` or earlier when given. `count` is capped at
+/// [`MAX_RANDOM_TRACKS`], and the result is empty when `from` is after `to`.
 ///
 /// It samples track IDs: `ORDER BY RANDOM()` would sort every track of a
 /// large library. It falls back to that when sampling keeps missing,
@@ -556,7 +606,8 @@ pub async fn random_tracks(
         " <= ?3)
          ORDER BY RANDOM() LIMIT ?1"
     );
-    if count == 0 {
+    let count = count.min(MAX_RANDOM_TRACKS);
+    if count == 0 || matches!((from, to), (Some(from), Some(to)) if from > to) {
         return Ok(Vec::new());
     }
     let (low, high): (Option<i64>, Option<i64>) =
@@ -566,21 +617,26 @@ pub async fn random_tracks(
     let (Some(low), Some(high)) = (low, high) else {
         return Ok(Vec::new());
     };
-    let span = u64::try_from(high - low).unwrap_or(0) + 1;
+    let span = high.abs_diff(low).saturating_add(1);
     let mut picked: Vec<LibraryTrack> = Vec::with_capacity(count);
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     for _ in 0..SAMPLE_ROUNDS {
         let wanted = count - picked.len();
         if wanted == 0 {
             break;
         }
-        let mut ids = Vec::with_capacity(wanted * 3);
-        for _ in 0..wanted * 3 {
-            let draw = getrandom::u64()
-                .map_err(|error| anyhow::anyhow!("cannot draw a random number: {error}"))?;
-            // `span` is at most `i64::MAX + 1`, so the offset fits.
-            ids.push(low + (draw % span) as i64);
-        }
+        // Three draws per wanted track, from one call to the system.
+        let mut bytes = vec![0u8; wanted * 3 * 8];
+        getrandom::fill(&mut bytes)
+            .map_err(|error| anyhow::anyhow!("cannot draw random numbers: {error}"))?;
+        let (draws, _) = bytes.as_chunks::<8>();
+        let ids: Vec<i64> = draws
+            .iter()
+            .map(|chunk| {
+                // The offset is below `span`, so the sum is an ID in range.
+                low.wrapping_add((u64::from_le_bytes(*chunk) % span) as i64)
+            })
+            .collect();
         let rows = sqlx::query_as::<_, LibraryTrack>(SAMPLED)
             .bind(serde_json::to_string(&ids)?)
             .bind(from)
@@ -617,7 +673,6 @@ mod tests {
         FIXTURE_MBID, OTHER_MBID, accept, mbid_release, remote_release, scanned, seed_release,
         store_tracks,
     };
-    use std::collections::HashSet;
 
     #[tokio::test]
     async fn a_release_shows_its_tags_until_a_match_is_accepted() {
@@ -691,16 +746,41 @@ mod tests {
                 ),
                 scanned("/music/c/01.mp3", "Tabs", Some("Tabbed\t"), "Tab", 1, 2000),
                 scanned("/music/d/01.mp3", "Arrival", Some("Abba"), "Song", 1, 1975),
+                // SQL `TRIM` leaves a no-break space.
+                scanned(
+                    "/music/e/01.mp3",
+                    "Nbsp",
+                    Some("Nbsp\u{a0}"),
+                    "Gap",
+                    1,
+                    2010,
+                ),
+                scanned("/music/f/01.mp3", "Nobody", None, "Anon", 1, 2011),
             ],
         )
         .await;
+        // A key that comes from an accepted match, not from the tags.
+        let matched = seed_release(&pool, "/other/g", "Tagged", &["One", "Two"]).await;
+        let mut remote = remote_release(mbid_release(FIXTURE_MBID), "Tagged", &["One", "Two"]);
+        remote.artists = vec!["Remote Artist".to_string()];
+        accept(&pool, &matched, remote).await;
 
         let artists = library_artists(&pool, None, -1, 0).await.unwrap();
         let shown: Vec<(&str, i64)> = artists
             .iter()
             .map(|artist| (display_artist(&artist.artist), artist.album_count))
             .collect();
-        assert_eq!(shown, [("Abba", 1), ("NIRVANA", 2), ("Tabbed", 1)]);
+        assert_eq!(
+            shown,
+            [
+                (UNKNOWN_ARTIST, 1),
+                ("Abba", 1),
+                ("Nbsp", 1),
+                ("NIRVANA", 2),
+                ("Remote Artist", 1),
+                ("Tabbed", 1),
+            ]
+        );
         for artist in &artists {
             let releases = artist_releases(&pool, &artist.artist.to_ascii_lowercase())
                 .await
@@ -716,7 +796,7 @@ mod tests {
         let found = library_artists(&pool, Some("nirv"), -1, 0).await.unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].album_count, 2);
-        let page = library_artists(&pool, None, 1, 1).await.unwrap();
+        let page = library_artists(&pool, None, 1, 3).await.unwrap();
         assert_eq!(display_artist(&page[0].artist), "NIRVANA");
 
         let nirvana = artist_releases(&pool, "nirvana").await.unwrap();
@@ -806,6 +886,45 @@ mod tests {
         let found = search_library_releases(&pool, "a", 10, 0).await.unwrap();
         assert_eq!(found.len(), 2, "title A, title a (Zed's title is b)");
     }
+
+    #[tokio::test]
+    async fn release_orders_and_search_use_the_accepted_match() {
+        let pool = connect_in_memory().await.unwrap();
+        seed_release(&pool, "/music/a", "Alpha", &["One"]).await;
+        seed_release(&pool, "/music/b", "Beta", &["One"]).await;
+        let gamma = seed_release(&pool, "/music/c", "Gamma", &["One"]).await;
+        let mut remote = remote_release(mbid_release(FIXTURE_MBID), "Aaa Remote Title", &["One"]);
+        remote.artists = vec!["Aaa Remote Artist".to_string()];
+        accept(&pool, &gamma, remote).await;
+        let names = |rows: Vec<LibraryRelease>| {
+            rows.iter()
+                .map(LibraryRelease::display_name)
+                .collect::<Vec<_>>()
+        };
+
+        // By the tags, Gamma would sort last in both orders.
+        let by_name = library_releases(&pool, ReleaseOrder::Name, 10, 0).await;
+        assert_eq!(
+            names(by_name.unwrap()),
+            ["Aaa Remote Title", "Alpha", "Beta"]
+        );
+        let by_artist = library_releases(&pool, ReleaseOrder::Artist, 10, 0).await;
+        assert_eq!(
+            names(by_artist.unwrap()),
+            ["Aaa Remote Title", "Alpha", "Beta"]
+        );
+
+        let found = search_library_releases(&pool, "remote title", 10, 0).await;
+        assert_eq!(names(found.unwrap()), ["Aaa Remote Title"]);
+        let found = search_library_releases(&pool, "remote artist", 10, 0).await;
+        assert_eq!(names(found.unwrap()), ["Aaa Remote Title"]);
+        let found = search_library_releases(&pool, "gamma", 10, 0).await;
+        assert!(
+            found.unwrap().is_empty(),
+            "the replaced tag is not searched"
+        );
+    }
+
     #[tokio::test]
     async fn tracks_show_the_overlay_and_their_release() {
         let pool = connect_in_memory().await.unwrap();
@@ -880,12 +999,16 @@ mod tests {
             titles(library_tracks(&pool, None, 1, 2).await.unwrap()),
             ["Three"]
         );
-        assert!(
-            library_tracks(&pool, Some("100%"), 10, 0)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        // `%` and `_` are plain text: unescaped, each would match every track.
+        for wildcard in ["%", "_"] {
+            assert!(
+                library_tracks(&pool, Some(wildcard), 10, 0)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{wildcard:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -930,5 +1053,36 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn random_tracks_are_capped_and_empty_for_a_reversed_year_range() {
+        let pool = connect_in_memory().await.unwrap();
+        let tracks: Vec<_> = (1..=MAX_RANDOM_TRACKS as i64 + 100)
+            .map(|number| {
+                let path = format!("/music/big/{number:04}.mp3");
+                scanned(&path, "Big", Some("X"), "Song", number, 2000)
+            })
+            .collect();
+        store_tracks(&pool, "/music", &tracks).await;
+
+        let capped = random_tracks(&pool, MAX_RANDOM_TRACKS + 50, None, None)
+            .await
+            .unwrap();
+        assert_eq!(capped.len(), MAX_RANDOM_TRACKS);
+        let distinct: HashSet<i64> = capped.iter().map(|track| track.id).collect();
+        assert_eq!(distinct.len(), MAX_RANDOM_TRACKS);
+        assert_eq!(
+            random_tracks(&pool, usize::MAX, None, None)
+                .await
+                .unwrap()
+                .len(),
+            MAX_RANDOM_TRACKS
+        );
+
+        let reversed = random_tracks(&pool, 10, Some(2010), Some(1990)).await;
+        assert!(reversed.unwrap().is_empty());
+        let same_year = random_tracks(&pool, 10, Some(2000), Some(2000)).await;
+        assert_eq!(same_year.unwrap().len(), 10);
     }
 }
