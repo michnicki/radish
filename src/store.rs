@@ -11,6 +11,52 @@ use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
+// ---------------------------------------------------------------------------
+// Effective-track SQL fragments
+// ---------------------------------------------------------------------------
+//
+// Defined above the submodules so `library` can use them too: a
+// `macro_rules!` macro is visible only below its definition. Each one expands
+// to a string literal, for use inside `concat!`.
+
+/// The joins every effective-track expression reads, after `tracks t`: `m` is
+/// the accepted match of the track's release and `tm` the track's row of it.
+macro_rules! overlay_joins {
+    () => {
+        "LEFT JOIN release_matches m ON m.local_release_id = t.local_release_id
+         LEFT JOIN release_track_matches tm ON tm.track_id = t.id AND tm.match_id = m.id"
+    };
+}
+
+/// A track's effective title: the accepted overlay, else the tag.
+macro_rules! effective_track_title {
+    () => {
+        "COALESCE(tm.remote_title, t.title)"
+    };
+}
+
+/// A track's effective artist: the accepted overlay, else the tag.
+macro_rules! effective_track_artist {
+    () => {
+        "COALESCE(tm.remote_artist, t.artist)"
+    };
+}
+
+/// A track's effective number. An album-scope match keeps the file's own.
+macro_rules! effective_track_number {
+    () => {
+        "CASE WHEN m.match_scope = 'album' THEN t.track_number
+              ELSE COALESCE(tm.track_position, tm.remote_ordinal, t.track_number) END"
+    };
+}
+
+/// A track's effective disc number: the overlay's medium, else the tag.
+macro_rules! effective_disc_number {
+    () => {
+        "COALESCE(tm.medium_position, t.disc_number)"
+    };
+}
+
 mod folders;
 pub use folders::*;
 mod reviews;
@@ -3225,27 +3271,34 @@ async fn track_rows(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<TrackRow>> {
-    let rows = sqlx::query_as::<_, TrackRow>(
-        "SELECT t.path AS path,
-                COALESCE(tm.remote_title, t.title) AS title,
-                COALESCE(tm.remote_artist, t.artist) AS artist,
-                COALESCE(m.title, a.title) AS album,
-                CASE WHEN m.match_scope = 'album' THEN t.track_number
-                     ELSE COALESCE(tm.track_position, tm.remote_ordinal, t.track_number) END AS track_number,
-                COALESCE(tm.medium_position, t.disc_number) AS disc_number,
+    let rows = sqlx::query_as::<_, TrackRow>(concat!(
+        "SELECT t.path AS path, ",
+        effective_track_title!(),
+        " AS title, ",
+        effective_track_artist!(),
+        " AS artist,
+                COALESCE(m.title, a.title) AS album, ",
+        effective_track_number!(),
+        " AS track_number, ",
+        effective_disc_number!(),
+        " AS disc_number,
                 t.duration_secs AS duration_secs,
                 (m.stale = 1) AS stale
          FROM tracks t
-         LEFT JOIN albums a ON a.id = t.album_id
-         LEFT JOIN release_matches m ON m.local_release_id = t.local_release_id
-         LEFT JOIN release_track_matches tm ON tm.track_id = t.id AND tm.match_id = m.id
+         LEFT JOIN albums a ON a.id = t.album_id ",
+        overlay_joins!(),
+        "
          WHERE ?1 IS NULL
-            OR COALESCE(tm.remote_title, t.title) LIKE ?1 COLLATE NOCASE ESCAPE '\\'
-            OR COALESCE(tm.remote_artist, t.artist) LIKE ?1 COLLATE NOCASE ESCAPE '\\'
+            OR ",
+        effective_track_title!(),
+        " LIKE ?1 COLLATE NOCASE ESCAPE '\\'
+            OR ",
+        effective_track_artist!(),
+        " LIKE ?1 COLLATE NOCASE ESCAPE '\\'
             OR COALESCE(m.title, a.title) LIKE ?1 COLLATE NOCASE ESCAPE '\\'
          ORDER BY album, disc_number, track_number, title, t.id
          LIMIT ?2 OFFSET ?3",
-    )
+    ))
     .bind(pattern)
     .bind(limit)
     .bind(offset)
