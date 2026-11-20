@@ -62,6 +62,48 @@ macro_rules! release_select {
     };
 }
 
+/// The columns of [`LibraryTrack`]. Follow with `FROM tracks t` and
+/// `track_joins!`.
+macro_rules! track_select {
+    () => {
+        concat!(
+            "SELECT t.id AS id, t.local_release_id AS release_id, t.path AS path, ",
+            effective_track_title!(),
+            " AS title, ",
+            effective_track_artist!(),
+            " AS artist, ",
+            effective_track_number!(),
+            " AS track_number, ",
+            effective_disc_number!(),
+            " AS disc_number,
+                    t.duration_secs AS duration_secs, ",
+            release_name!(),
+            " AS album, ",
+            release_artist!(),
+            " AS album_artist, ",
+            release_year!(),
+            " AS year,
+                    lr.created_at AS created_at,
+                    lr.directory_path AS directory,
+                    d.path AS root,
+                    CASE WHEN m.provider = 'musicbrainz' THEN tm.remote_recording_id END
+                        AS musicbrainz_id "
+        )
+    };
+}
+
+/// The joins `track_select!` reads, after `tracks t`. Ends with a space.
+macro_rules! track_joins {
+    () => {
+        concat!(
+            "JOIN local_releases lr ON lr.id = t.local_release_id
+             LEFT JOIN directories d ON d.id = t.directory_id ",
+            overlay_joins!(),
+            " "
+        )
+    };
+}
+
 /// A local release as the API shows it.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct LibraryRelease {
@@ -122,6 +164,60 @@ pub struct LibraryArtist {
     pub artist: String,
     pub album_count: i64,
 }
+
+/// A track as the API shows it, with the release values a song carries.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct LibraryTrack {
+    pub id: i64,
+    pub release_id: i64,
+    pub path: String,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub track_number: Option<i64>,
+    pub disc_number: Option<i64>,
+    pub duration_secs: Option<f64>,
+    /// The release's effective title.
+    pub album: Option<String>,
+    /// The release's artist key, as in [`LibraryRelease::artist`].
+    pub album_artist: String,
+    /// The release's effective year.
+    pub year: Option<i64>,
+    /// When the release was first stored.
+    pub created_at: String,
+    /// The release's folder.
+    pub directory: String,
+    /// The imported root the file is under.
+    pub root: Option<String>,
+    /// The recording MBID of an accepted MusicBrainz match.
+    pub musicbrainz_id: Option<String>,
+}
+
+impl LibraryTrack {
+    /// The title, or the file name when the track has none.
+    pub fn display_title(&self) -> String {
+        self.title
+            .clone()
+            .unwrap_or_else(|| folder_name(&self.path))
+    }
+
+    /// The release's title, or its folder name when it has none.
+    pub fn display_album(&self) -> String {
+        self.album
+            .clone()
+            .unwrap_or_else(|| folder_name(&self.directory))
+    }
+}
+
+fn clean_track(mut track: LibraryTrack) -> LibraryTrack {
+    track.title = shown_tag(track.title);
+    track.artist = shown_tag(track.artist);
+    track.album = shown_tag(track.album);
+    track
+}
+
+/// How many times [`random_tracks`] samples track IDs before it shuffles the
+/// whole selection instead.
+const SAMPLE_ROUNDS: usize = 4;
 
 /// How a page of releases is ordered. Every order ends with the release ID,
 /// so pages never overlap.
@@ -322,13 +418,206 @@ pub async fn library_artists(
     .await?)
 }
 
+/// One track, `None` when there is no track `id`.
+///
+/// # Errors
+///
+/// Returns an error when the database cannot be read.
+pub async fn library_track(pool: &SqlitePool, id: i64) -> Result<Option<LibraryTrack>> {
+    let row = sqlx::query_as::<_, LibraryTrack>(concat!(
+        track_select!(),
+        "FROM tracks t ",
+        track_joins!(),
+        "WHERE t.id = ?1"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(clean_track))
+}
+
+/// The tracks of a release, by disc, number, title and ID.
+///
+/// # Errors
+///
+/// Returns an error when the database cannot be read.
+pub async fn release_tracks(pool: &SqlitePool, release_id: i64) -> Result<Vec<LibraryTrack>> {
+    let rows = sqlx::query_as::<_, LibraryTrack>(concat!(
+        track_select!(),
+        "FROM tracks t ",
+        track_joins!(),
+        "WHERE t.local_release_id = ?1
+         ORDER BY disc_number, track_number, title, t.id"
+    ))
+    .bind(release_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(clean_track).collect())
+}
+
+/// A page of tracks by ID. With `query`, only tracks whose effective title or
+/// artist contains it.
+///
+/// # Errors
+///
+/// Returns an error when the database cannot be read.
+pub async fn library_tracks(
+    pool: &SqlitePool,
+    query: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<LibraryTrack>> {
+    const ALL: &str = concat!(
+        track_select!(),
+        "FROM tracks t ",
+        track_joins!(),
+        "ORDER BY t.id LIMIT ?1 OFFSET ?2"
+    );
+    // Two steps, because the effective values can't use an index: first the
+    // tracks whose tag or overlay contains the text (plain table scans), then
+    // the ones whose effective value still does. On 2.76M tracks this takes
+    // 0.9 s where filtering the joined rows takes 3 s.
+    const SEARCH: &str = concat!(
+        "WITH hits(id) AS (
+             SELECT id FROM tracks
+             WHERE title LIKE ?1 COLLATE NOCASE ESCAPE '\\'
+                OR artist LIKE ?1 COLLATE NOCASE ESCAPE '\\'
+             UNION
+             SELECT track_id FROM release_track_matches
+             WHERE remote_title LIKE ?1 COLLATE NOCASE ESCAPE '\\'
+                OR remote_artist LIKE ?1 COLLATE NOCASE ESCAPE '\\')
+         ",
+        track_select!(),
+        "FROM hits h JOIN tracks t ON t.id = h.id ",
+        track_joins!(),
+        "WHERE ",
+        effective_track_title!(),
+        " LIKE ?1 COLLATE NOCASE ESCAPE '\\' OR ",
+        effective_track_artist!(),
+        " LIKE ?1 COLLATE NOCASE ESCAPE '\\'
+         ORDER BY t.id LIMIT ?2 OFFSET ?3"
+    );
+    let rows = match query {
+        None => {
+            sqlx::query_as::<_, LibraryTrack>(ALL)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
+                .await?
+        }
+        Some(query) => {
+            sqlx::query_as::<_, LibraryTrack>(SEARCH)
+                .bind(like_contains(query))
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
+                .await?
+        }
+    };
+    Ok(rows.into_iter().map(clean_track).collect())
+}
+
+/// Up to `count` different tracks in random order, from releases of `from`
+/// or later and `to` or earlier when given.
+///
+/// It samples track IDs: `ORDER BY RANDOM()` would sort every track of a
+/// large library. It falls back to that when sampling keeps missing,
+/// which happens with a narrow year filter.
+///
+/// # Errors
+///
+/// Returns an error when the database cannot be read.
+pub async fn random_tracks(
+    pool: &SqlitePool,
+    count: usize,
+    from: Option<i64>,
+    to: Option<i64>,
+) -> Result<Vec<LibraryTrack>> {
+    // Sampled IDs keep their drawn order through `j.key`.
+    const SAMPLED: &str = concat!(
+        track_select!(),
+        "FROM json_each(?1) j JOIN tracks t ON t.id = j.value ",
+        track_joins!(),
+        "WHERE (?2 IS NULL OR ",
+        release_year!(),
+        " >= ?2) AND (?3 IS NULL OR ",
+        release_year!(),
+        " <= ?3)
+         ORDER BY j.key"
+    );
+    const SHUFFLED: &str = concat!(
+        track_select!(),
+        "FROM tracks t ",
+        track_joins!(),
+        "WHERE (?2 IS NULL OR ",
+        release_year!(),
+        " >= ?2) AND (?3 IS NULL OR ",
+        release_year!(),
+        " <= ?3)
+         ORDER BY RANDOM() LIMIT ?1"
+    );
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let (low, high): (Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT MIN(id), MAX(id) FROM tracks")
+            .fetch_one(pool)
+            .await?;
+    let (Some(low), Some(high)) = (low, high) else {
+        return Ok(Vec::new());
+    };
+    let span = u64::try_from(high - low).unwrap_or(0) + 1;
+    let mut picked: Vec<LibraryTrack> = Vec::with_capacity(count);
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..SAMPLE_ROUNDS {
+        let wanted = count - picked.len();
+        if wanted == 0 {
+            break;
+        }
+        let mut ids = Vec::with_capacity(wanted * 3);
+        for _ in 0..wanted * 3 {
+            let draw = getrandom::u64()
+                .map_err(|error| anyhow::anyhow!("cannot draw a random number: {error}"))?;
+            // `span` is at most `i64::MAX + 1`, so the offset fits.
+            ids.push(low + (draw % span) as i64);
+        }
+        let rows = sqlx::query_as::<_, LibraryTrack>(SAMPLED)
+            .bind(serde_json::to_string(&ids)?)
+            .bind(from)
+            .bind(to)
+            .fetch_all(pool)
+            .await?;
+        for row in rows {
+            if picked.len() < count && seen.insert(row.id) {
+                picked.push(clean_track(row));
+            }
+        }
+    }
+    if picked.len() < count {
+        let rows = sqlx::query_as::<_, LibraryTrack>(SHUFFLED)
+            .bind(i64::try_from(count)?)
+            .bind(from)
+            .bind(to)
+            .fetch_all(pool)
+            .await?;
+        for row in rows {
+            if picked.len() < count && seen.insert(row.id) {
+                picked.push(clean_track(row));
+            }
+        }
+    }
+    Ok(picked)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::connect_in_memory;
     use crate::test_support::{
-        FIXTURE_MBID, accept, mbid_release, remote_release, scanned, seed_release, store_tracks,
+        FIXTURE_MBID, OTHER_MBID, accept, mbid_release, remote_release, scanned, seed_release,
+        store_tracks,
     };
+    use std::collections::HashSet;
 
     #[tokio::test]
     async fn a_release_shows_its_tags_until_a_match_is_accepted() {
@@ -516,5 +805,130 @@ mod tests {
         assert_eq!(years(&found), [Some(2003)]);
         let found = search_library_releases(&pool, "a", 10, 0).await.unwrap();
         assert_eq!(found.len(), 2, "title A, title a (Zed's title is b)");
+    }
+    #[tokio::test]
+    async fn tracks_show_the_overlay_and_their_release() {
+        let pool = connect_in_memory().await.unwrap();
+        let release = seed_release(&pool, "/music/a", "Blue", &["One", "Two"]).await;
+        let mut remote = remote_release(mbid_release(FIXTURE_MBID), "Remote Blue", &["ONE", "Two"]);
+        remote.tracklist[0].artists = vec!["Guest".to_string()];
+        remote.tracklist[0].recording_id = Some(OTHER_MBID.parse().unwrap());
+        accept(&pool, &release, remote).await;
+
+        let tracks = release_tracks(&pool, release.id).await.unwrap();
+        let titles: Vec<String> = tracks.iter().map(LibraryTrack::display_title).collect();
+        assert_eq!(titles, ["ONE", "Two"]);
+        assert_eq!(tracks[0].artist.as_deref(), Some("Guest"));
+        assert_eq!(
+            tracks[1].artist.as_deref(),
+            Some("Artist"),
+            "the release artist"
+        );
+        assert_eq!(tracks[0].musicbrainz_id.as_deref(), Some(OTHER_MBID));
+        assert_eq!(tracks[0].album.as_deref(), Some("Remote Blue"));
+        assert_eq!(tracks[0].album_artist, "Artist");
+        assert_eq!(tracks[0].track_number, Some(1));
+        assert_eq!(tracks[0].duration_secs, Some(180.0));
+        assert_eq!(tracks[0].release_id, release.id);
+        assert_eq!(tracks[0].root.as_deref(), Some("/music/a"));
+        assert_eq!(tracks[0].path, "/music/a/01.flac");
+        assert_eq!(
+            library_track(&pool, tracks[1].id).await.unwrap(),
+            Some(tracks[1].clone())
+        );
+        assert_eq!(library_track(&pool, 999).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn song_search_matches_effective_titles_and_artists_only() {
+        let pool = connect_in_memory().await.unwrap();
+        let blue = seed_release(&pool, "/music/a", "Blue", &["One", "Two"]).await;
+        seed_release(&pool, "/music/b", "Red", &["Three"]).await;
+        let mut remote = remote_release(mbid_release(FIXTURE_MBID), "Blue", &["One", "Two"]);
+        remote.tracklist[1].artists = vec!["Overlay Guest".to_string()];
+        accept(&pool, &blue, remote).await;
+        let titles = |rows: Vec<LibraryTrack>| {
+            rows.iter()
+                .map(LibraryTrack::display_title)
+                .collect::<Vec<_>>()
+        };
+
+        // Found only through the overlay.
+        assert_eq!(
+            titles(
+                library_tracks(&pool, Some("overlay guest"), 10, 0)
+                    .await
+                    .unwrap()
+            ),
+            ["Two"]
+        );
+        // Found only through the tags.
+        assert_eq!(
+            titles(library_tracks(&pool, Some("three"), 10, 0).await.unwrap()),
+            ["Three"]
+        );
+        // "Two" is tagged "Artist", but its effective artist is the guest.
+        assert_eq!(
+            titles(library_tracks(&pool, Some("artist"), 10, 0).await.unwrap()),
+            ["One", "Three"]
+        );
+        assert_eq!(
+            titles(library_tracks(&pool, None, 10, 0).await.unwrap()),
+            ["One", "Two", "Three"]
+        );
+        assert_eq!(
+            titles(library_tracks(&pool, None, 1, 2).await.unwrap()),
+            ["Three"]
+        );
+        assert!(
+            library_tracks(&pool, Some("100%"), 10, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn random_tracks_respect_the_count_and_the_years() {
+        let pool = connect_in_memory().await.unwrap();
+        store_tracks(
+            &pool,
+            "/music",
+            &[
+                scanned("/music/a/01.mp3", "Old", Some("X"), "Old One", 1, 1980),
+                scanned("/music/a/02.mp3", "Old", Some("X"), "Old Two", 2, 1980),
+                scanned("/music/b/01.mp3", "New", Some("Y"), "New One", 1, 2020),
+            ],
+        )
+        .await;
+
+        let all = random_tracks(&pool, 10, None, None).await.unwrap();
+        assert_eq!(all.len(), 3);
+        let distinct: HashSet<i64> = all.iter().map(|track| track.id).collect();
+        assert_eq!(distinct.len(), 3);
+        assert_eq!(random_tracks(&pool, 2, None, None).await.unwrap().len(), 2);
+        let new = random_tracks(&pool, 10, Some(2000), None).await.unwrap();
+        let titles: Vec<String> = new.iter().map(LibraryTrack::display_title).collect();
+        assert_eq!(titles, ["New One"]);
+        assert_eq!(
+            random_tracks(&pool, 10, None, Some(1990))
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            random_tracks(&pool, 0, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let empty = connect_in_memory().await.unwrap();
+        assert!(
+            random_tracks(&empty, 5, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }
