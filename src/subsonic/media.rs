@@ -580,6 +580,17 @@ mod tests {
             assert_eq!(read(response).await, data, "{method}");
         }
 
+        // A `Range` header reaches the file through `dispatch`.
+        let mut ranged = HeaderMap::new();
+        ranged.insert(header::RANGE, HeaderValue::from_static("bytes=10-19"));
+        let response = call_raw(&state, "stream", &[("id", id.as_str())], &ranged).await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers()[header::CONTENT_RANGE],
+            format!("bytes 10-19/{}", data.len())
+        );
+        assert_eq!(read(response).await, &data[10..20]);
+
         std::fs::remove_file(&path).unwrap();
         assert_eq!(
             call_json(&state, "stream", &[("id", &id)]).await["error"]["code"],
