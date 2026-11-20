@@ -199,7 +199,7 @@ fn new_token() -> Result<String> {
 }
 
 /// Compares tokens in time that does not depend on where they differ.
-fn same_token(expected: &str, given: &str) -> bool {
+pub(crate) fn same_token(expected: &str, given: &str) -> bool {
     let (expected, given) = (expected.as_bytes(), given.as_bytes());
     expected.len() == given.len()
         && expected

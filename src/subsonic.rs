@@ -12,7 +12,10 @@
 //! credentials, as a password or as a salted MD5 token. Neither is encrypted
 //! on the wire, so the server belongs on a trusted network or a VPN.
 
+mod auth;
 mod response;
+
+pub use auth::Credentials;
 
 use crate::outln;
 use anyhow::{Context, Result};
@@ -27,6 +30,7 @@ use response::{ApiError, Format, Payload};
 use serde_json::json;
 use sqlx::SqlitePool;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 
 /// The largest form body accepted, in bytes. A POST carries the same few
@@ -61,6 +65,11 @@ impl Params {
             .map(|(_, value)| value.as_str())
     }
 
+    /// The first value of `name`, which the method needs.
+    pub(crate) fn required(&self, name: &str) -> Result<&str, ApiError> {
+        self.get(name).ok_or_else(|| ApiError::missing(name))
+    }
+
     #[cfg(test)]
     pub(crate) fn from_pairs(pairs: &[(&str, &str)]) -> Self {
         Self(
@@ -72,11 +81,28 @@ impl Params {
     }
 }
 
+/// `bytes` as lowercase hex.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The bytes of a hex string of either case; `None` when it is not hex.
+fn decode_hex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&text[at..at + 2], 16).ok())
+        .collect()
+}
+
 #[derive(Clone)]
 pub(crate) struct AppState {
     // Nothing reads it until Task 6's library methods; remove the allow then.
     #[allow(dead_code)]
     pool: SqlitePool,
+    credentials: Arc<Credentials>,
 }
 
 /// Serves the API on `bind` until Ctrl+C.
@@ -84,7 +110,7 @@ pub(crate) struct AppState {
 /// # Errors
 ///
 /// Returns an error when the address can't be bound or the server fails.
-pub async fn serve(pool: SqlitePool, bind: SocketAddr) -> Result<()> {
+pub async fn serve(pool: SqlitePool, bind: SocketAddr, credentials: Credentials) -> Result<()> {
     if !bind.ip().is_loopback() {
         eprintln!(
             "warning: {bind} is not a loopback address; Subsonic clients send the password, \
@@ -96,13 +122,19 @@ pub async fn serve(pool: SqlitePool, bind: SocketAddr) -> Result<()> {
         .with_context(|| format!("cannot listen on {bind}"))?;
     let bind = listener.local_addr()?;
     outln!("Serving http://{bind} (Subsonic API; Ctrl+C to stop)");
-    axum::serve(listener, router(AppState { pool }))
-        .with_graceful_shutdown(async {
-            // A failed signal handler leaves Ctrl+C to the default action.
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
-        .context("Subsonic server failed")
+    axum::serve(
+        listener,
+        router(AppState {
+            pool,
+            credentials: Arc::new(credentials),
+        }),
+    )
+    .with_graceful_shutdown(async {
+        // A failed signal handler leaves Ctrl+C to the default action.
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await
+    .context("Subsonic server failed")
 }
 
 fn router(state: AppState) -> Router {
@@ -170,6 +202,12 @@ async fn dispatch(
 ) -> Response {
     let format = Format::of(params);
     let method = method.strip_suffix(".view").unwrap_or(method);
+    // The extensions are public, so a client can learn them before logging in.
+    if method != "getOpenSubsonicExtensions"
+        && let Err(error) = state.credentials.authenticate(params)
+    {
+        return response::failed(format, &error);
+    }
     match call(state, method, params, headers).await {
         Ok(Answer::Payload(payload)) => response::ok(format, payload),
         Err(error) => response::failed(format, &error),
@@ -199,27 +237,42 @@ pub(crate) mod test_util {
     use super::*;
     use serde_json::Value;
 
+    /// A server over an empty in-memory library whose user is `u`, password `p`.
     pub(crate) async fn state() -> AppState {
         AppState {
             pool: crate::db::connect_in_memory().await.unwrap(),
+            credentials: Arc::new(Credentials::new(Some("u".into()), Some("p".into())).unwrap()),
         }
     }
 
-    /// Calls `method` with `f=json` and `pairs`, and returns the envelope.
+    /// Calls `method` as the user with `f=json` and `pairs`; returns the envelope.
     pub(crate) async fn call_json(state: &AppState, method: &str, pairs: &[(&str, &str)]) -> Value {
-        let pairs = [&[("f", "json")][..], pairs].concat();
-        let response = dispatch(
+        call_as(
             state,
             method,
-            &Params::from_pairs(&pairs),
-            &HeaderMap::new(),
+            &[&[("u", "u"), ("p", "p")][..], pairs].concat(),
         )
-        .await;
+        .await
+    }
+
+    /// Calls `method` with `f=json` and exactly `pairs`; returns the envelope.
+    pub(crate) async fn call_as(state: &AppState, method: &str, pairs: &[(&str, &str)]) -> Value {
+        let pairs = [&[("f", "json")][..], pairs].concat();
+        let response = send(state, method, &pairs, &HeaderMap::new()).await;
         let bytes = axum::body::to_bytes(response.into_body(), 64 << 20)
             .await
             .unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
         value["subsonic-response"].clone()
+    }
+
+    async fn send(
+        state: &AppState,
+        method: &str,
+        pairs: &[(&str, &str)],
+        headers: &HeaderMap,
+    ) -> Response {
+        dispatch(state, method, &Params::from_pairs(pairs), headers).await
     }
 }
 
@@ -236,6 +289,17 @@ mod tests {
         assert_eq!(params.get("p"), Some("sesame"));
         assert_eq!(params.get("q"), Some("a b"));
         assert_eq!(params.get("nope"), None);
+        assert_eq!(params.required("nope"), Err(ApiError::missing("nope")));
+    }
+
+    #[test]
+    fn hex_round_trips_and_rejects_anything_else() {
+        assert_eq!(hex("Björk".as_bytes()), "426ac3b6726b");
+        assert_eq!(decode_hex("426AC3B6726B").unwrap(), "Björk".as_bytes());
+        assert_eq!(decode_hex(""), Some(Vec::new()));
+        assert_eq!(decode_hex("abc"), None);
+        assert_eq!(decode_hex("+f"), None);
+        assert_eq!(decode_hex("zz"), None);
     }
 
     #[tokio::test]
@@ -260,5 +324,28 @@ mod tests {
         assert_eq!(reply["status"], "failed");
         assert_eq!(reply["error"]["code"], 0);
         assert_eq!(reply["error"]["message"], "getVideos is not supported");
+    }
+
+    #[tokio::test]
+    async fn every_method_but_the_extensions_needs_credentials() {
+        use super::test_util::call_as;
+        let state = state().await;
+        assert_eq!(call_as(&state, "ping", &[]).await["error"]["code"], 10);
+        assert_eq!(
+            call_as(&state, "ping", &[("u", "u"), ("p", "wrong")]).await["error"]["code"],
+            40
+        );
+        assert_eq!(
+            call_as(&state, "getLicense", &[("u", "u"), ("p", "enc:70")]).await["status"],
+            "ok"
+        );
+        assert_eq!(
+            call_as(&state, "getOpenSubsonicExtensions", &[]).await["status"],
+            "ok"
+        );
+        assert_eq!(
+            call_as(&state, "getOpenSubsonicExtensions.view", &[]).await["status"],
+            "ok"
+        );
     }
 }

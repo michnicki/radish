@@ -75,6 +75,26 @@ impl ApiError {
     pub(crate) fn unsupported(method: &str) -> Self {
         Self::with(0, format!("{method} is not supported"))
     }
+
+    /// Code 10: the method needs `name`.
+    pub(crate) fn missing(name: &str) -> Self {
+        Self::with(10, format!("Required parameter is missing: {name}"))
+    }
+
+    /// Code 40.
+    pub(crate) fn wrong_credentials() -> Self {
+        Self::with(40, "Wrong username or password")
+    }
+
+    /// Code 42: API keys are not supported.
+    pub(crate) fn unsupported_auth() -> Self {
+        Self::with(42, "API keys are not supported; use a password or a token")
+    }
+
+    /// Code 43: a password and a token in one request.
+    pub(crate) fn conflicting_auth() -> Self {
+        Self::with(43, "Send a password or a token and salt, not both")
+    }
 }
 
 impl From<anyhow::Error> for ApiError {
