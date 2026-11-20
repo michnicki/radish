@@ -15,6 +15,7 @@
 mod auth;
 mod ids;
 mod library;
+mod media;
 mod response;
 
 pub use auth::Credentials;
@@ -243,9 +244,10 @@ async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
-/// What a method returns: fields for the envelope. (Task 8 adds files.)
+/// What a method returns: fields for the envelope, or a file or picture.
 enum Answer {
     Payload(Payload),
+    Raw(Response),
 }
 
 /// Answers one API call. `method` may end in `.view`.
@@ -265,6 +267,7 @@ async fn dispatch(
     }
     match call(state, method, params, headers).await {
         Ok(Answer::Payload(payload)) => response::ok(format, payload),
+        Ok(Answer::Raw(response)) => response,
         Err(error) => response::failed(format, &error),
     }
 }
@@ -295,7 +298,7 @@ async fn call(
     state: &AppState,
     method: &str,
     params: &Params,
-    _headers: &HeaderMap,
+    headers: &HeaderMap,
 ) -> Result<Answer, ApiError> {
     if let Some((_, key)) = EMPTY_OBJECTS.iter().find(|(name, _)| *name == method) {
         return Ok(Answer::Payload(Payload::new(key, json!({}))));
@@ -330,6 +333,11 @@ async fn call(
         "getPlaylist" => return Err(ApiError::not_found("Playlist")),
         "star" | "unstar" | "setRating" | "createPlaylist" | "updatePlaylist"
         | "deletePlaylist" => return Err(ApiError::unsupported(method)),
+        "stream" | "download" => {
+            return media::track_file(&state.pool, params, headers)
+                .await
+                .map(Answer::Raw);
+        }
         other => return Err(ApiError::unsupported(other)),
     };
     Ok(Answer::Payload(payload))
@@ -402,6 +410,22 @@ pub(crate) mod test_util {
             .await
             .unwrap();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Calls `method` as the user with `pairs` and `headers`; returns the response.
+    pub(crate) async fn call_raw(
+        state: &AppState,
+        method: &str,
+        pairs: &[(&str, &str)],
+        headers: &HeaderMap,
+    ) -> Response {
+        send(
+            state,
+            method,
+            &[&[("u", "u"), ("p", "p")][..], pairs].concat(),
+            headers,
+        )
+        .await
     }
 
     async fn send(
