@@ -61,6 +61,8 @@ mod folders;
 pub use folders::*;
 mod reviews;
 pub use reviews::*;
+mod library;
+pub use library::*;
 
 pub const STATUS_UNMATCHED: &str = "unmatched";
 pub const STATUS_MATCHED: &str = "matched";

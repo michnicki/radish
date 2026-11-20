@@ -3,7 +3,7 @@
 
 use crate::matcher::{
     self, ArtistKind, Candidate, DiscoveryEvidence, EmbeddedReleaseEvidence, LocalRelease,
-    LocalTrack, RemoteRelease, RemoteTrack, TrackEntryType,
+    LocalTrack, MatchScope, RemoteRelease, RemoteTrack, TrackEntryType,
 };
 use crate::providers::{ProviderKind, ReleaseId};
 use crate::scanner::{ObservedMusicBrainzIds, ScannedTrack};
@@ -361,6 +361,64 @@ pub(crate) async fn queue(pool: &SqlitePool, release: &LocalRelease, remote: Rem
     )
     .await
     .unwrap();
+}
+
+/// Accepts `remote` for `release` as a manual edition-scope match. The mapping
+/// must be complete: give `remote` the same number of tracks as `release`.
+pub(crate) async fn accept(pool: &SqlitePool, release: &LocalRelease, remote: RemoteRelease) {
+    let candidate = Candidate::new(release, remote);
+    let guard = store::load_match_guard(pool, release.id).await.unwrap();
+    store::accept_match(
+        pool,
+        release,
+        &candidate,
+        store::AcceptanceMethod::Manual,
+        MatchScope::Edition,
+        &guard,
+    )
+    .await
+    .unwrap();
+}
+
+/// A scanned track with the tags the grouper reads: `album_artist` doubles as
+/// the track artist, and the track is [`FIXTURE_SECS`] long.
+pub(crate) fn scanned(
+    path: &str,
+    album: &str,
+    album_artist: Option<&str>,
+    title: &str,
+    number: i64,
+    year: i64,
+) -> ScannedTrack {
+    ScannedTrack {
+        path: PathBuf::from(path),
+        title: Some(title.to_string()),
+        artist: album_artist.map(str::to_string),
+        album: Some(album.to_string()),
+        album_artist: album_artist.map(str::to_string),
+        year: Some(year),
+        track_number: Some(number),
+        disc_number: None,
+        barcode: None,
+        catalog_number: None,
+        discogs_release_id: None,
+        musicbrainz: ObservedMusicBrainzIds::default(),
+        duration_secs: Some(FIXTURE_SECS),
+        modified_at: 1,
+    }
+}
+
+/// Stores `tracks` under the imported root `root` and regroups the library.
+pub(crate) async fn store_tracks(pool: &SqlitePool, root: &str, tracks: &[ScannedTrack]) {
+    let directory_id = store::upsert_directory(pool, Path::new(root))
+        .await
+        .unwrap();
+    for track in tracks {
+        store::upsert_track(pool, track, directory_id)
+            .await
+            .unwrap();
+    }
+    store::rebuild_local_releases(pool, None).await.unwrap();
 }
 
 #[cfg(test)]
