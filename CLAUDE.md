@@ -56,8 +56,10 @@ The providers run as a chain: MusicBrainz, then Discogs, then Deezer when the ru
 - **Login.** Every method but `getOpenSubsonicExtensions` authenticates against `RADISH_SUBSONIC_USER`/`RADISH_SUBSONIC_PASSWORD` (`subsonic::USER_VAR`, `subsonic::PASSWORD_VAR`, which `DOTENV_KEYS` uses), by password or salted MD5 token (`subsonic/auth.rs`). `main.rs::run` reads the credentials before it opens the database.
 - **Responses.** Payloads are serde values. `subsonic/response.rs` renders them as JSON or as Subsonic XML (scalars become attributes); its escaper replaces characters XML cannot carry. Errors are `status="failed"` with HTTP 200.
 - **IDs** are `tr-`/`al-`/`ar-` (`subsonic/ids.rs`). An artist ID is the hex of its key, ASCII-lowercased, to match `COLLATE NOCASE`.
-- **SQL.** All of it is in `store/library.rs`: effective releases, artists and tracks, run per request with no cache. It shares the effective-track fragments (`effective_track_title!` and the others, defined above `mod folders;` in `store.rs`) with `track_rows`, so the API and `list`/`search` agree. Its queries page release and track IDs first, then read the columns for that page (`release_page!`), so deep pages stay fast on 2.76M tracks.
+- **SQL.** The effective-metadata SQL is in `store/library.rs`: effective releases, artists and tracks, run per request with no cache. It shares the effective-track fragments (`effective_track_title!` and the others, defined above `mod folders;` in `store.rs`) with `track_rows`, so the API and `list`/`search` agree. Its queries page release and track IDs first, then read the columns for that page (`release_page!`), so deep pages stay fast on 2.76M tracks.
+- **Methods.** `subsonic/library.rs` holds the browse, list and search methods and their `Artist`/`Album`/`Song` objects.
 - **Files.** `subsonic/media.rs` streams files raw with single-range support and finds cover art.
+- **Security headers.** A middleware adds `X-Content-Type-Options`, a sandboxing `Content-Security-Policy`, `Referrer-Policy` and `Cross-Origin-Resource-Policy: same-origin` (so other sites can't probe `getCoverArt?...&p=guess` from an `<img>`) to every response. The server sends no CORS headers, so browser-based players can't use it.
 - **Read-only.** There is no per-user state and no transcoding.
 
 Layering rules:

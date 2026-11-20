@@ -55,7 +55,7 @@ radish serve
 # The same, fetching releases entered on the review page from the local dump indexes
 radish serve --offline
 
-# Stream to Subsonic players (Symfonium, Feishin, DSub, ...) on the local network
+# Stream to Subsonic players (Symfonium, DSub, Tempo, ...) on the local network
 radish subsonic --bind 0.0.0.0:4533
 ```
 
@@ -519,16 +519,26 @@ Other defaults to keep in mind:
 
 ## Subsonic server
 
-`radish subsonic` serves the library over the [OpenSubsonic API](https://opensubsonic.github.io) (Subsonic API 1.16.1), so Subsonic music players can browse, search and stream it: Symfonium, Feishin, DSub, Tempo, Substreamer and others. Point the player at `http://HOST:4533`, with the username and password below.
+`radish subsonic` serves the library over the [OpenSubsonic API](https://opensubsonic.github.io) (Subsonic API 1.16.1), so Subsonic music players can browse, search and stream it: Symfonium, DSub, Tempo, Substreamer and other native players. Point the player at `http://HOST:4533`, with the username and password below. Players that run in a web browser can't connect, because the server sends no CORS headers.
+
+Put the login in a `.env` file in the directory you run radish from. Use single quotes, so a `$` in the password stays as it is:
 
 ```bash
-# .env in the directory you run radish from, or the environment. Use single
-# quotes, so a `$` in the password stays as it is.
+# .env
 RADISH_SUBSONIC_USER=me
 RADISH_SUBSONIC_PASSWORD='a long random password'
+```
 
+Then start the server:
+
+```bash
 radish subsonic                        # this machine only: 127.0.0.1:4533
 radish subsonic --bind 0.0.0.0:4533    # players on other devices
+
+# Or set the login in the environment instead of a .env file
+export RADISH_SUBSONIC_USER=me
+export RADISH_SUBSONIC_PASSWORD='a long random password'
+radish subsonic
 ```
 
 The command refuses to start without both values, before it opens the database.
@@ -549,21 +559,28 @@ What players see:
   3. Any other picture in those folders.
 
   Only real JPEG, PNG, GIF and WebP data is sent, whatever the file name says, and at most 20 MB. For embedded pictures the tighter bound is Lofty's own allocation limit (16 MB by default). The `size` parameter is ignored: pictures are never resized.
-- **Search** matches album artists' names, albums' titles and artists, and songs' titles and artists. An empty query (also `""` or `*`) returns everything in a stable order, page by page, which players use to sync the library.
+- **Search** matches album artists' names, albums' titles and artists, and songs' titles and artists. An empty query (also `""` or `*`) returns everything in a stable order, page by page, which players use to sync the library. Search pages, album lists and random songs return at most 500 items per request, so asking for more returns 500.
 - **Song size and bit rate** are only in `getSong`, `getAlbum` and an album's `getMusicDirectory`, from the file on disk. The bit rate is estimated from the size and the duration. Lists and search results leave both out, so a full sync doesn't read the metadata of every file.
 - **No per-user state.**
   - `scrobble`, `savePlayQueue` and `getPlayQueue` are accepted and answer empty.
   - `star`, `unstar`, `setRating` and the playlist changes fail as not supported, and `getPlaylist` fails as not found.
   - Starred songs, playlists, now playing, bookmarks, shares, podcasts, radio stations, lyrics, and artist, album and similar-song information are empty.
 
-Methods: `ping`, `getLicense`, `getOpenSubsonicExtensions`, `getUser`, `getScanStatus`, `getMusicFolders`, `getIndexes`, `getMusicDirectory`, `getArtists`, `getArtist`, `getAlbum`, `getSong`, `getGenres`, `getAlbumList`, `getAlbumList2`, `getRandomSongs`, `search2`, `search3`, `stream`, `download`, `getCoverArt`, and the empty or no-op methods above. Anything else fails with error 0.
+Methods: `ping`, `getLicense`, `getOpenSubsonicExtensions`, `getUser`, `getScanStatus`, `getMusicFolders`, `getIndexes`, `getMusicDirectory`, `getArtists`, `getArtist`, `getAlbum`, `getSong`, `getGenres`, `getAlbumList`, `getAlbumList2`, `getRandomSongs`, `search2`, `search3`, `stream`, `download`, `getCoverArt`, and these, which keep nothing per user:
+
+- Accepted and answered empty: `scrobble`, `savePlayQueue`, `getPlayQueue`.
+- Answered with an empty result: `getStarred`, `getStarred2`, `getNowPlaying`, `getSongsByGenre`, `getPlaylists`, `getTopSongs`, `getSimilarSongs`, `getSimilarSongs2`, `getArtistInfo`, `getArtistInfo2`, `getAlbumInfo`, `getAlbumInfo2`, `getBookmarks`, `getInternetRadioStations`, `getPodcasts`, `getShares`, `getLyrics`.
+- Failed as not supported: `star`, `unstar`, `setRating`, `createPlaylist`, `updatePlaylist`, `deletePlaylist`. `getPlaylist` fails as not found.
+
+Anything else fails with error 0.
 
 Security:
 
 - Every method except `getOpenSubsonicExtensions` needs the login. A player can send it as `u` and `p` (plain, or `enc:` and its hex), or as `u`, a token `t` = md5(password + salt) and the salt `s`. API keys are not supported.
 - Neither form is encrypted, and the token can be replayed. Use the server on loopback, a trusted network, a VPN, or behind a reverse proxy that adds TLS. Pick a password you use nowhere else: the server has to keep it in plain text to check tokens.
 - It listens on loopback unless told otherwise, and any other address prints a warning. Failed logins are not rate-limited.
-- Responses carry `X-Content-Type-Options: nosniff`, a sandboxing `Content-Security-Policy` and `Referrer-Policy: no-referrer`. A request is answered only with the files of tracks in the database, chosen by ID, and with pictures next to them.
+- Responses carry `X-Content-Type-Options: nosniff`, a sandboxing `Content-Security-Policy`, `Referrer-Policy: no-referrer` and `Cross-Origin-Resource-Policy: same-origin`. The last one stops other web sites from loading the server's pictures into a page and using the load or error result to guess the password, even on loopback. Native players ignore it.
+- A request is answered only with the files of tracks in the database, chosen by ID, and with cover pictures: a cover-named file or other picture in the release's folder, or in its first track's folder, is read even when it is a symlink, and only real JPEG, PNG, GIF and WebP data is sent.
 
 ## Storage and output
 

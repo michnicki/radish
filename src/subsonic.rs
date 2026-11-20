@@ -1,6 +1,6 @@
 //! An OpenSubsonic API over the library for music players: `radish subsonic`.
 //!
-//! Subsonic clients (Symfonium, Feishin, DSub and others) browse, search and
+//! Subsonic clients (Symfonium, DSub, Tempo and others) browse, search and
 //! stream through `/rest/<method>`, also spelled `/rest/<method>.view`, by GET
 //! or by a form POST (the `formPost` extension). Albums are local releases
 //! and artists are album artists, with the effective metadata that `list` and
@@ -25,7 +25,7 @@ use anyhow::{Context, Result};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, RawQuery, Request, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
@@ -240,6 +240,13 @@ async fn security_headers(request: Request, next: Next) -> Response {
     headers.insert(
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
+    );
+    // Other sites can't load a picture into a page and read the outcome, which
+    // would let them guess the password from `p=` in the URL. Native players
+    // ignore the header.
+    headers.insert(
+        HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("same-origin"),
     );
     response
 }

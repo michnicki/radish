@@ -99,6 +99,11 @@ fn logins_are_checked_and_the_extensions_are_public() {
     assert!(xml.body.contains("<subsonic-response "));
     assert!(xml.body.contains("xmlns=\"http://subsonic.org/restapi\""));
     assert!(xml.headers.contains("x-content-type-options: nosniff"));
+    assert!(xml.headers.contains("referrer-policy: no-referrer"));
+    assert!(
+        xml.headers
+            .contains("cross-origin-resource-policy: same-origin")
+    );
     assert_eq!(server.get("/nope").status, 404);
 }
 
@@ -138,6 +143,12 @@ fn a_client_browses_to_a_track_streams_it_and_fetches_the_cover() {
             .headers
             .contains("content-security-policy: default-src 'none'; sandbox")
     );
+    assert!(whole.headers.contains("referrer-policy: no-referrer"));
+    assert!(
+        whole
+            .headers
+            .contains("cross-origin-resource-policy: same-origin")
+    );
     let part = server.request_with(
         "GET",
         &format!("/rest/stream?{AUTH}&id={song_id}"),
@@ -165,6 +176,12 @@ fn a_client_browses_to_a_track_streams_it_and_fetches_the_cover() {
         cover
             .headers
             .contains("content-security-policy: default-src 'none'; sandbox")
+    );
+    assert!(cover.headers.contains("referrer-policy: no-referrer"));
+    assert!(
+        cover
+            .headers
+            .contains("cross-origin-resource-policy: same-origin")
     );
 
     let everything = envelope(&server.get(&format!("/rest/search3?{AUTH}&query=")));
