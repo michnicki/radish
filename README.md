@@ -543,6 +543,14 @@ radish subsonic
 
 The command refuses to start without both values, before it opens the database.
 
+Players only report that a login failed. The server prints why on stderr, one line per refused request, with the username in quotes so a capital letter or a stray space shows:
+
+```text
+login refused: user "Me", token, from 192.168.1.20, client "Symfonium", method ping: wrong username (code 40)
+```
+
+The reason is `wrong username`, `wrong password` or both, or what the request left out. The line names how the player logged in (`password`, `hex password`, `token`, `API key`) but never shows the password, token or salt.
+
 What players see:
 
 - **Albums** are local releases and **artists** are their album artists. Values are effective: an accepted match's where there is one, the tags otherwise, as in `list` and `search`. Artists whose names differ only in the case of ASCII letters are one artist. A release without any artist is listed under `[Unknown Artist]`, and a release without a title under its folder name. There is one music folder, `Music`, and no genres.
@@ -578,7 +586,7 @@ Security:
 
 - Every method except `getOpenSubsonicExtensions` needs the login. A player can send it as `u` and `p` (plain, or `enc:` and its hex), or as `u`, a token `t` = md5(password + salt) and the salt `s`. API keys are not supported.
 - Neither form is encrypted, and the token can be replayed. Use the server on loopback, a trusted network, a VPN, or behind a reverse proxy that adds TLS. Pick a password you use nowhere else: the server has to keep it in plain text to check tokens.
-- It listens on loopback unless told otherwise, and any other address prints a warning. Failed logins are not rate-limited.
+- It listens on loopback unless told otherwise, and any other address prints a warning. Failed logins are not rate-limited; each one prints a line on stderr.
 - Responses carry `X-Content-Type-Options: nosniff`, a sandboxing `Content-Security-Policy`, `Referrer-Policy: no-referrer` and `Cross-Origin-Resource-Policy: same-origin`. The last one stops other web sites from loading the server's pictures into a page and using the load or error result to guess the password, even on loopback. Native players ignore it.
 - A request is answered only with the files of tracks in the database, chosen by ID, and with cover pictures: a cover-named file or other picture in the release's folder, or in its first track's folder, is read even when it is a symlink, and only real JPEG, PNG, GIF and WebP data is sent.
 

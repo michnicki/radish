@@ -588,6 +588,17 @@ impl Server {
     pub fn get(&self, path: &str) -> Reply {
         self.request("GET", path, None)
     }
+
+    /// Stops the server and returns everything it wrote to stderr.
+    pub fn stop(&mut self) -> String {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let mut stderr = String::new();
+        if let Some(mut pipe) = self.child.stderr.take() {
+            pipe.read_to_string(&mut stderr).unwrap();
+        }
+        stderr
+    }
 }
 
 /// Reads a whole reply. The servers send `Content-Length`, never chunks.

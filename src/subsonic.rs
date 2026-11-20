@@ -22,9 +22,10 @@ pub use auth::{Credentials, PASSWORD_VAR, USER_VAR};
 
 use crate::outln;
 use anyhow::{Context, Result};
+use axum::Extension;
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, RawQuery, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
@@ -33,7 +34,7 @@ use response::{ApiError, Format, Payload};
 use serde_json::json;
 use sqlx::SqlitePool;
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
@@ -170,10 +171,12 @@ pub async fn serve(pool: SqlitePool, bind: SocketAddr, credentials: Credentials)
     outln!("Serving http://{bind} (Subsonic API; Ctrl+C to stop)");
     axum::serve(
         listener,
+        // The caller's address goes into the log line of a refused login.
         router(AppState {
             pool,
             credentials: Arc::new(credentials),
-        }),
+        })
+        .into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async {
         // A failed signal handler leaves Ctrl+C to the default action.
@@ -202,12 +205,14 @@ async fn rest(
     Path(method): Path<String>,
     http_method: Method,
     headers: HeaderMap,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     RawQuery(query): RawQuery,
     body: Bytes,
 ) -> Response {
     let form = http_method == Method::POST && is_form(&headers);
     let params = Params::parse(query.as_deref(), form.then_some(&body[..]));
-    dispatch(&state, &method, &params, &headers).await
+    let peer = peer.map(|Extension(ConnectInfo(addr))| addr.ip());
+    dispatch(&state, &method, &params, &headers, peer).await
 }
 
 /// Whether the request's `Content-Type` is a URL-encoded form. The media type
@@ -257,20 +262,24 @@ enum Answer {
     Raw(Response),
 }
 
-/// Answers one API call. `method` may end in `.view`.
+/// Answers one API call. `method` may end in `.view`; `peer`, the caller's
+/// address, goes into the log line of a refused login.
 async fn dispatch(
     state: &AppState,
     method: &str,
     params: &Params,
     headers: &HeaderMap,
+    peer: Option<IpAddr>,
 ) -> Response {
     let format = Format::of(params);
     let method = method.strip_suffix(".view").unwrap_or(method);
     // The extensions are public, so a client can learn them before logging in.
     if method != "getOpenSubsonicExtensions"
-        && let Err(error) = state.credentials.authenticate(params)
+        && let Err(refusal) = state.credentials.authenticate(params)
     {
-        return response::failed(format, &error);
+        // Clients only say the login failed; the log says why.
+        eprintln!("{}", auth::refusal_line(&refusal, method, params, peer));
+        return response::failed(format, &refusal.error);
     }
     match call(state, method, params, headers).await {
         Ok(Answer::Payload(payload)) => response::ok(format, payload),
@@ -444,7 +453,7 @@ pub(crate) mod test_util {
         pairs: &[(&str, &str)],
         headers: &HeaderMap,
     ) -> Response {
-        dispatch(state, method, &Params::from_pairs(pairs), headers).await
+        dispatch(state, method, &Params::from_pairs(pairs), headers, None).await
     }
 }
 

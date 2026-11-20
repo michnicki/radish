@@ -71,7 +71,7 @@ fn envelope(reply: &Reply) -> Value {
 #[test]
 fn logins_are_checked_and_the_extensions_are_public() {
     let (db, _music) = library("subsonic-auth");
-    let server = start(&db);
+    let mut server = start(&db);
 
     assert_eq!(
         envelope(&server.get(&format!("/rest/ping?{AUTH}")))["status"],
@@ -105,6 +105,20 @@ fn logins_are_checked_and_the_extensions_are_public() {
             .contains("cross-origin-resource-policy: same-origin")
     );
     assert_eq!(server.get("/nope").status, 404);
+
+    let stderr = server.stop();
+    let refused: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("login refused"))
+        .collect();
+    assert_eq!(
+        refused,
+        [
+            "login refused: user \"joe\", password, from 127.0.0.1, method ping: \
+          wrong password (code 40)"
+        ],
+        "{stderr}"
+    );
 }
 
 #[test]

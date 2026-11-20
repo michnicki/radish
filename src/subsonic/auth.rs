@@ -2,10 +2,12 @@
 
 use super::Params;
 use super::response::ApiError;
+use crate::output::Clean;
 use crate::web::same_token;
 use anyhow::{Result, bail};
 use md5::{Digest, Md5};
-use std::fmt;
+use std::fmt::{self, Write as _};
+use std::net::IpAddr;
 
 /// The environment variable that names the user.
 pub const USER_VAR: &str = "RADISH_SUBSONIC_USER";
@@ -65,30 +67,109 @@ impl Credentials {
     /// Checks a request's login: `u` with a password `p` (plain, or `enc:`
     /// and its hex), or `u` with a token `t = md5(password + s)` and its
     /// salt `s`. Comparisons take the same time wherever the values differ.
-    pub(crate) fn authenticate(&self, params: &Params) -> Result<(), ApiError> {
+    pub(crate) fn authenticate(&self, params: &Params) -> Result<(), Refusal> {
         if params.get("apiKey").is_some() {
-            return Err(ApiError::unsupported_auth());
+            return Err(ApiError::unsupported_auth().into());
         }
         let user = params.required("u")?;
         let (password, token, salt) = (params.get("p"), params.get("t"), params.get("s"));
         if password.is_some() && (token.is_some() || salt.is_some()) {
-            return Err(ApiError::conflicting_auth());
+            return Err(ApiError::conflicting_auth().into());
         }
-        let secret_matches = match (password, token, salt) {
-            (Some(password), _, _) => decode_password(password)
-                .is_some_and(|password| same_token(&self.password, &password)),
-            (None, Some(token), Some(salt)) => same_token(
+        let secret = match (password, token, salt) {
+            (Some(password), _, _) => match decode_password(password) {
+                Some(password) => Ok(same_token(&self.password, &password)),
+                None => Err("the enc: password is not hex-encoded UTF-8"),
+            },
+            (None, Some(token), Some(salt)) => Ok(same_token(
                 &md5_hex(&format!("{}{salt}", self.password)),
                 &token.to_ascii_lowercase(),
-            ),
-            (None, Some(_), None) => return Err(ApiError::missing("s")),
-            (None, None, _) => return Err(ApiError::missing("p")),
+            )),
+            (None, Some(_), None) => return Err(ApiError::missing("s").into()),
+            (None, None, _) => return Err(ApiError::missing("p").into()),
         };
-        if same_token(&self.user, user) && secret_matches {
-            Ok(())
-        } else {
-            Err(ApiError::wrong_credentials())
+        // A token can't tell a wrong password from a wrong salt or hash, so
+        // both kinds of login report the password.
+        let reason = match (same_token(&self.user, user), secret) {
+            (true, Ok(true)) => return Ok(()),
+            (false, Ok(true)) => "wrong username",
+            (true, Ok(false)) => "wrong password",
+            (false, Ok(false)) => "wrong username and password",
+            (_, Err(malformed)) => malformed,
+        };
+        Err(Refusal {
+            error: ApiError::wrong_credentials(),
+            reason: reason.to_string(),
+        })
+    }
+}
+
+/// A refused login: the error the client gets, and why, for the server's log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Refusal {
+    /// What the client is told. Code 40 doesn't say which value was wrong.
+    pub(crate) error: ApiError,
+    /// Why the login failed, for the server's log only.
+    pub(crate) reason: String,
+}
+
+impl From<ApiError> for Refusal {
+    /// A refusal whose error message says all there is to say.
+    fn from(error: ApiError) -> Self {
+        Self {
+            reason: error.message.clone(),
+            error,
         }
+    }
+}
+
+/// The server log's line for a refused login.
+///
+/// It names the user, how the request logged in, the caller's address,
+/// the client and the method, so the operator can see which device sends
+/// what. It never shows the password, token or salt.
+pub(crate) fn refusal_line(
+    refusal: &Refusal,
+    method: &str,
+    params: &Params,
+    peer: Option<IpAddr>,
+) -> String {
+    // Quoted, so a stray space or a capital letter in the username shows.
+    let user = params.get("u").map_or_else(
+        || "no user".to_string(),
+        |user| format!("user \"{}\"", Clean(user)),
+    );
+    let mut line = format!("login refused: {user}, {}", login_kind(params));
+    if let Some(peer) = peer {
+        let _ = write!(line, ", from {peer}");
+    }
+    if let Some(client) = params.get("c") {
+        let _ = write!(line, ", client \"{}\"", Clean(client));
+    }
+    let _ = write!(
+        line,
+        ", method {}: {} (code {})",
+        Clean(method),
+        refusal.reason,
+        refusal.error.code
+    );
+    line
+}
+
+/// How a request tries to log in, in a few words.
+fn login_kind(params: &Params) -> &'static str {
+    if params.get("apiKey").is_some() {
+        "API key"
+    } else if let Some(password) = params.get("p") {
+        if password.starts_with("enc:") {
+            "hex password"
+        } else {
+            "password"
+        }
+    } else if params.get("t").is_some() {
+        "token"
+    } else {
+        "no password"
     }
 }
 
@@ -109,9 +190,82 @@ fn md5_hex(text: &str) -> String {
 mod tests {
     use super::*;
 
-    fn check(pairs: &[(&str, &str)]) -> Result<(), ApiError> {
+    fn refuse(pairs: &[(&str, &str)]) -> Result<(), Refusal> {
         let credentials = Credentials::new(Some("joe".into()), Some("sesame".into())).unwrap();
         credentials.authenticate(&Params::from_pairs(pairs))
+    }
+
+    fn check(pairs: &[(&str, &str)]) -> Result<(), ApiError> {
+        refuse(pairs).map_err(|refusal| refusal.error)
+    }
+
+    fn reason(pairs: &[(&str, &str)]) -> String {
+        refuse(pairs).unwrap_err().reason
+    }
+
+    #[test]
+    fn the_log_says_which_value_was_wrong_and_the_client_does_not() {
+        assert_eq!(reason(&[("u", "Joe"), ("p", "sesame")]), "wrong username");
+        assert_eq!(reason(&[("u", "joe"), ("p", "sesame ")]), "wrong password");
+        assert_eq!(
+            reason(&[("u", "joe"), ("t", "0123"), ("s", "c19b2d")]),
+            "wrong password"
+        );
+        assert_eq!(
+            reason(&[("u", "eve"), ("p", "x")]),
+            "wrong username and password"
+        );
+        assert_eq!(
+            reason(&[("u", "joe"), ("p", "enc:zz")]),
+            "the enc: password is not hex-encoded UTF-8"
+        );
+        assert_eq!(reason(&[("u", "joe")]), "Required parameter is missing: p");
+        for pairs in [
+            &[("u", "Joe"), ("p", "sesame")][..],
+            &[("u", "joe"), ("p", "x")],
+        ] {
+            assert_eq!(check(pairs), Err(ApiError::wrong_credentials()));
+        }
+    }
+
+    #[test]
+    fn the_log_line_names_the_caller_but_no_secret() {
+        let params = Params::from_pairs(&[
+            ("u", "Joe"),
+            ("t", "26719a1196d2a940705a59634eb18eab"),
+            ("s", "c19b2d"),
+            ("c", "Symfonium"),
+        ]);
+        let refusal = Credentials::new(Some("joe".into()), Some("sesame".into()))
+            .unwrap()
+            .authenticate(&params)
+            .unwrap_err();
+        let peer = Some("192.168.1.20".parse().unwrap());
+        let line = refusal_line(&refusal, "ping", &params, peer);
+        assert_eq!(
+            line,
+            "login refused: user \"Joe\", token, from 192.168.1.20, client \"Symfonium\", \
+             method ping: wrong username (code 40)"
+        );
+        assert!(!line.contains("26719a") && !line.contains("c19b2d"));
+
+        let params = Params::from_pairs(&[("p", "enc:736573616d65")]);
+        let refusal = Refusal::from(ApiError::missing("u"));
+        assert_eq!(
+            refusal_line(&refusal, "get\u{1b}Song", &params, None),
+            "login refused: no user, hex password, method get\\u{1b}Song: \
+             Required parameter is missing: u (code 10)"
+        );
+        let params = Params::from_pairs(&[("u", "joe\n"), ("apiKey", "k")]);
+        let line = refusal_line(
+            &Refusal::from(ApiError::unsupported_auth()),
+            "ping",
+            &params,
+            None,
+        );
+        assert!(line.starts_with("login refused: user \"joe\\u{a}\", API key, method ping: "));
+        let line = refusal_line(&refusal, "ping", &Params::from_pairs(&[("u", "joe")]), None);
+        assert!(line.starts_with("login refused: user \"joe\", no password, "));
     }
 
     #[test]
