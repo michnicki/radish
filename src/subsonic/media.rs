@@ -10,9 +10,13 @@ use crate::store;
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use lofty::config::ParseOptions;
+use lofty::file::TaggedFileExt;
+use lofty::picture::PictureType;
+use lofty::probe::Probe;
 use sqlx::SqlitePool;
 use std::io::SeekFrom;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 /// How much of a file is read at a time while it is sent.
@@ -186,6 +190,165 @@ fn chunks(
     })
 }
 
+/// File stems that name a release's cover, ignoring case.
+const COVER_STEMS: [&str; 4] = ["cover", "folder", "front", "album"];
+
+/// Extensions of the picture files considered, ignoring case.
+const IMAGE_EXTENSIONS: [&str; 5] = ["jpg", "jpeg", "png", "webp", "gif"];
+
+/// The largest picture sent, in bytes.
+const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+
+/// A picture and its MIME type.
+#[derive(Debug)]
+struct Image {
+    bytes: Vec<u8>,
+    content_type: &'static str,
+}
+
+/// `getCoverArt`: the picture of the album an `al-` ID names, or of a `tr-`
+/// ID's album. `size` is ignored: pictures are sent as they are.
+pub(crate) async fn cover_art(pool: &SqlitePool, params: &Params) -> Result<Response, ApiError> {
+    let missing = || ApiError::not_found("Cover art");
+    let release_id = match Id::parse(params.required("id")?) {
+        Some(Id::Album(id)) => id,
+        Some(Id::Song(id)) => {
+            store::library_track(pool, id)
+                .await?
+                .ok_or_else(missing)?
+                .release_id
+        }
+        _ => return Err(missing()),
+    };
+    let release = store::library_release(pool, release_id)
+        .await?
+        .ok_or_else(missing)?;
+    let first_track = store::release_tracks(pool, release_id)
+        .await?
+        .into_iter()
+        .next()
+        .map(|track| PathBuf::from(track.path));
+    let directory = PathBuf::from(&release.directory);
+    let found = tokio::task::spawn_blocking(move || find_cover(&directory, first_track.as_deref()))
+        .await
+        .map_err(|error| ApiError::from(anyhow::Error::from(error)))?;
+    let image = found.ok_or_else(missing)?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, image.content_type),
+            (header::CACHE_CONTROL, "private, max-age=86400"),
+        ],
+        image.bytes,
+    )
+        .into_response())
+}
+
+/// A release's picture, from its folder and its first track's folder (the
+/// disc folder of a merged release): first a file named like a cover, then
+/// the front cover embedded in the first track, then any other picture.
+/// Only real JPEG, PNG, GIF and WebP data counts, whatever the file name says.
+fn find_cover(directory: &Path, first_track: Option<&Path>) -> Option<Image> {
+    let mut folders = vec![directory.to_path_buf()];
+    if let Some(parent) = first_track.and_then(Path::parent)
+        && parent != directory
+    {
+        folders.push(parent.to_path_buf());
+    }
+    let pictures: Vec<PathBuf> = folders
+        .iter()
+        .flat_map(|folder| pictures_in(folder))
+        .collect();
+    let (named, others): (Vec<&PathBuf>, Vec<&PathBuf>) =
+        pictures.iter().partition(|path| is_cover_name(path));
+    named
+        .into_iter()
+        .find_map(|path| read_image(path))
+        .or_else(|| first_track.and_then(embedded_cover))
+        .or_else(|| others.into_iter().find_map(|path| read_image(path)))
+}
+
+/// The picture files directly in `folder`, by name.
+fn pictures_in(folder: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return Vec::new();
+    };
+    let mut pictures: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    IMAGE_EXTENSIONS
+                        .iter()
+                        .any(|known| known.eq_ignore_ascii_case(extension))
+                })
+        })
+        .filter(|path| path.is_file())
+        .collect();
+    pictures.sort();
+    pictures
+}
+
+fn is_cover_name(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| {
+            COVER_STEMS
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(stem))
+        })
+}
+
+fn read_image(path: &Path) -> Option<Image> {
+    if std::fs::metadata(path).ok()?.len() > MAX_IMAGE_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let content_type = image_type(&bytes)?;
+    Some(Image {
+        bytes,
+        content_type,
+    })
+}
+
+/// The front cover embedded in `track`, else its first picture.
+fn embedded_cover(track: &Path) -> Option<Image> {
+    let file = Probe::open(track)
+        .ok()?
+        .options(ParseOptions::new().read_properties(false))
+        .read()
+        .ok()?;
+    let picture = file
+        .tags()
+        .iter()
+        .find_map(|tag| tag.get_picture_type(PictureType::CoverFront))
+        .or_else(|| file.tags().iter().find_map(|tag| tag.pictures().first()))?;
+    let bytes = picture.data();
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return None;
+    }
+    Some(Image {
+        content_type: image_type(bytes)?,
+        bytes: bytes.to_vec(),
+    })
+}
+
+/// The MIME type of JPEG, PNG, GIF or WebP data, by its first bytes.
+fn image_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +488,130 @@ mod tests {
             70
         );
         assert_eq!(call_json(&state, "stream", &[]).await["error"]["code"], 10);
+    }
+
+    const JPEG: &[u8] = &[
+        0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00,
+    ];
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR";
+
+    /// Writes a WAV file with `picture` embedded as its front cover.
+    fn write_wav_with_cover(path: &Path, picture: &[u8]) {
+        use lofty::config::WriteOptions;
+        use lofty::file::AudioFile;
+        use lofty::picture::{MimeType, Picture};
+        use lofty::tag::{Tag, TagType};
+
+        crate::test_support::write_wav(path);
+        let mut file = Probe::open(path).unwrap().read().unwrap();
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.push_picture(
+            Picture::unchecked(picture.to_vec())
+                .pic_type(PictureType::CoverFront)
+                .mime_type(MimeType::Jpeg)
+                .build(),
+        );
+        file.insert_tag(tag);
+        file.save_to_path(path, WriteOptions::default()).unwrap();
+    }
+
+    #[test]
+    fn image_types_come_from_the_first_bytes() {
+        assert_eq!(image_type(JPEG), Some("image/jpeg"));
+        assert_eq!(image_type(PNG), Some("image/png"));
+        assert_eq!(image_type(b"GIF89a..."), Some("image/gif"));
+        assert_eq!(
+            image_type(b"RIFF\x00\x00\x00\x00WEBPVP8 "),
+            Some("image/webp")
+        );
+        assert_eq!(image_type(b"<svg onload=alert(1)>"), None);
+        assert_eq!(image_type(b""), None);
+    }
+
+    #[test]
+    fn covers_are_found_by_name_then_embedded_then_any_picture() {
+        let dir = ScratchDir::new("subsonic-covers");
+        let album = dir.path().join("album");
+        std::fs::create_dir_all(&album).unwrap();
+        let track = album.join("01.wav");
+        write_wav_with_cover(&track, JPEG);
+        std::fs::write(album.join("00-proof.jpg"), b"GIF89a proof").unwrap();
+        std::fs::write(album.join("Cover.PNG"), PNG).unwrap();
+        std::fs::write(album.join("folder.jpg"), b"not a picture").unwrap();
+
+        let found = find_cover(&album, Some(track.as_path())).unwrap();
+        assert_eq!(
+            (found.content_type, found.bytes.as_slice()),
+            ("image/png", PNG)
+        );
+
+        std::fs::remove_file(album.join("Cover.PNG")).unwrap();
+        let found = find_cover(&album, Some(track.as_path())).unwrap();
+        assert_eq!(
+            (found.content_type, found.bytes.as_slice()),
+            ("image/jpeg", JPEG),
+            "embedded"
+        );
+
+        let plain = album.join("02.wav");
+        crate::test_support::write_wav(&plain);
+        let found = find_cover(&album, Some(plain.as_path())).unwrap();
+        assert_eq!(found.content_type, "image/gif", "any picture in the folder");
+
+        std::fs::remove_file(album.join("00-proof.jpg")).unwrap();
+        assert!(
+            find_cover(&album, Some(plain.as_path())).is_none(),
+            "folder.jpg is not a picture"
+        );
+    }
+
+    #[test]
+    fn a_merged_release_also_looks_in_its_first_track_folder() {
+        let dir = ScratchDir::new("subsonic-disc-cover");
+        let disc = dir.path().join("CD1");
+        std::fs::create_dir_all(&disc).unwrap();
+        std::fs::write(disc.join("cover.jpg"), JPEG).unwrap();
+        let found = find_cover(dir.path(), Some(disc.join("01.mp3").as_path())).unwrap();
+        assert_eq!(found.bytes, JPEG);
+    }
+
+    #[tokio::test]
+    async fn get_cover_art_serves_the_album_picture_for_album_and_song_ids() {
+        let dir = ScratchDir::new("subsonic-cover-art");
+        let folder = dir.path().join("a");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("01.mp3");
+        std::fs::write(&path, b"audio").unwrap();
+        std::fs::write(folder.join("cover.jpg"), JPEG).unwrap();
+        let state = state().await;
+        let track = scanned(
+            path.to_str().unwrap(),
+            "Blue",
+            Some("Artist"),
+            "One",
+            1,
+            2001,
+        );
+        store_tracks(&state.pool, dir.path().to_str().unwrap(), &[track]).await;
+        let track = store::library_tracks(&state.pool, None, 1, 0)
+            .await
+            .unwrap()
+            .remove(0);
+
+        for id in [Id::album(track.release_id), Id::song(track.id)] {
+            let pairs = [("id", id.as_str()), ("size", "300")];
+            let response = call_raw(&state, "getCoverArt", &pairs, &HeaderMap::new()).await;
+            assert_eq!(response.status(), StatusCode::OK, "{id}");
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+            assert_eq!(read(response).await, JPEG);
+        }
+        let artist = call_json(&state, "getCoverArt", &[("id", &Id::artist("Artist"))]).await;
+        assert_eq!(artist["error"]["code"], 70);
+        std::fs::remove_file(folder.join("cover.jpg")).unwrap();
+        let album = Id::album(track.release_id);
+        assert_eq!(
+            call_json(&state, "getCoverArt", &[("id", &album)]).await["error"]["code"],
+            70
+        );
     }
 }

@@ -338,6 +338,9 @@ async fn call(
                 .await
                 .map(Answer::Raw);
         }
+        "getCoverArt" => {
+            return media::cover_art(&state.pool, params).await.map(Answer::Raw);
+        }
         other => return Err(ApiError::unsupported(other)),
     };
     Ok(Answer::Payload(payload))
