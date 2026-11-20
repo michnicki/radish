@@ -15,7 +15,7 @@ use lofty::file::TaggedFileExt;
 use lofty::picture::PictureType;
 use lofty::probe::Probe;
 use sqlx::SqlitePool;
-use std::io::SeekFrom;
+use std::io::{Read, SeekFrom};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -56,10 +56,20 @@ enum ByteRange {
     Unsatisfiable,
 }
 
-/// Reads one `bytes=` range of a file of `len` bytes. Several ranges, other
-/// units and malformed values get the whole file, as RFC 9110 allows.
+/// Reads one `bytes=` range of a file of `len` bytes. The unit is matched
+/// without regard to case. Several ranges, other units and malformed values
+/// get the whole file, as RFC 9110 allows, and so does an empty file, which
+/// has no byte to ask for. An end past what a number holds counts as the end.
 fn parse_range(header: &str, len: u64) -> ByteRange {
-    let Some(spec) = header.trim().strip_prefix("bytes=") else {
+    if len == 0 {
+        return ByteRange::Full;
+    }
+    let header = header.trim();
+    let Some(spec) = header
+        .get(..6)
+        .filter(|unit| unit.eq_ignore_ascii_case("bytes="))
+        .map(|_| &header[6..])
+    else {
         return ByteRange::Full;
     };
     if spec.contains(',') {
@@ -74,7 +84,7 @@ fn parse_range(header: &str, len: u64) -> ByteRange {
         let Some(suffix) = digits(last) else {
             return ByteRange::Full;
         };
-        if suffix == 0 || len == 0 {
+        if suffix == 0 {
             return ByteRange::Unsatisfiable;
         }
         return ByteRange::Part {
@@ -87,11 +97,14 @@ fn parse_range(header: &str, len: u64) -> ByteRange {
     };
     let end = if last.is_empty() {
         None
-    } else {
-        match digits(last) {
-            Some(end) if end >= start => Some(end),
+    } else if last.bytes().all(|byte| byte.is_ascii_digit()) {
+        // Digits too many for a `u64` are an end past any file.
+        match last.parse().unwrap_or(u64::MAX) {
+            end if end >= start => Some(end),
             _ => return ByteRange::Full,
         }
+    } else {
+        return ByteRange::Full;
     };
     if start >= len {
         return ByteRange::Unsatisfiable;
@@ -110,8 +123,10 @@ fn digits(text: &str) -> Option<u64> {
     text.parse().ok()
 }
 
-/// The file at `path` as a response, honouring one `Range`. Any `If-Range`
-/// gets the whole file: the server keeps no validators to check it against.
+/// The file at `path` as a response, honouring one `Range`. An `If-Range`
+/// is honoured only when it is exactly the `Last-Modified` date this
+/// response sends: the server keeps no other validators. Otherwise the whole
+/// file is sent.
 async fn file_response(
     path: &Path,
     content_type: &'static str,
@@ -126,11 +141,17 @@ async fn file_response(
         ));
     }
     let len = metadata.len();
+    let modified = metadata.modified().ok().map(httpdate::fmt_http_date);
+    let range_applies = headers.get(header::IF_RANGE).is_none_or(|validator| {
+        modified
+            .as_deref()
+            .is_some_and(|modified| validator.as_bytes() == modified.as_bytes())
+    });
     let range = match headers
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok())
     {
-        Some(value) if !headers.contains_key(header::IF_RANGE) => parse_range(value, len),
+        Some(value) if range_applies => parse_range(value, len),
         _ => ByteRange::Full,
     };
     let (status, start, count) = match range {
@@ -159,9 +180,7 @@ async fn file_response(
     {
         response_headers.insert(header::CONTENT_RANGE, value);
     }
-    if let Ok(modified) = metadata.modified()
-        && let Ok(value) = HeaderValue::from_str(&httpdate::fmt_http_date(modified))
-    {
+    if let Some(value) = modified.and_then(|modified| HeaderValue::from_str(&modified).ok()) {
         response_headers.insert(header::LAST_MODIFIED, value);
     }
     Ok(response)
@@ -199,6 +218,9 @@ const IMAGE_EXTENSIONS: [&str; 5] = ["jpg", "jpeg", "png", "webp", "gif"];
 /// The largest picture sent, in bytes.
 const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 
+/// How many first bytes [`image_type`] reads.
+const MAGIC_BYTES: u64 = 12;
+
 /// A picture and its MIME type.
 #[derive(Debug)]
 struct Image {
@@ -223,11 +245,9 @@ pub(crate) async fn cover_art(pool: &SqlitePool, params: &Params) -> Result<Resp
     let release = store::library_release(pool, release_id)
         .await?
         .ok_or_else(missing)?;
-    let first_track = store::release_tracks(pool, release_id)
+    let first_track = store::first_track_path(pool, release_id)
         .await?
-        .into_iter()
-        .next()
-        .map(|track| PathBuf::from(track.path));
+        .map(PathBuf::from);
     let directory = PathBuf::from(&release.directory);
     let found = tokio::task::spawn_blocking(move || find_cover(&directory, first_track.as_deref()))
         .await
@@ -300,37 +320,71 @@ fn is_cover_name(path: &Path) -> bool {
         })
 }
 
+/// A picture file of at most [`MAX_IMAGE_BYTES`] whose first bytes are a real
+/// picture. The file is opened once and checked through its handle. Its
+/// first bytes are read before the rest, so a file that isn't a picture is
+/// never read in full, and the rest is read through a limit, so a file that
+/// grows after the check is not either.
 fn read_image(path: &Path) -> Option<Image> {
-    if std::fs::metadata(path).ok()?.len() > MAX_IMAGE_BYTES {
+    // Opening a FIFO waits for a writer, so a path that has stopped being a
+    // regular file since the folder was listed is refused before `open`.
+    if !std::fs::metadata(path).ok()?.is_file() {
         return None;
     }
-    let bytes = std::fs::read(path).ok()?;
+    let mut file = std::fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_IMAGE_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    (&mut file).take(MAGIC_BYTES).read_to_end(&mut bytes).ok()?;
     let content_type = image_type(&bytes)?;
+    bytes.reserve(usize::try_from(metadata.len()).unwrap_or(0));
+    file.take(MAX_IMAGE_BYTES + 1 - MAGIC_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return None;
+    }
     Some(Image {
         bytes,
         content_type,
     })
 }
 
-/// The front cover embedded in `track`, else its first picture.
+/// The front cover embedded in `track`, else its first picture. The picture
+/// is taken out of the parsed tag, so its bytes are not copied.
 fn embedded_cover(track: &Path) -> Option<Image> {
-    let file = Probe::open(track)
+    let mut file = Probe::open(track)
         .ok()?
         .options(ParseOptions::new().read_properties(false))
         .read()
         .ok()?;
-    let picture = file
+    let (tag_type, index) = file
         .tags()
         .iter()
-        .find_map(|tag| tag.get_picture_type(PictureType::CoverFront))
-        .or_else(|| file.tags().iter().find_map(|tag| tag.pictures().first()))?;
-    let bytes = picture.data();
-    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        .find_map(|tag| {
+            let front = tag
+                .pictures()
+                .iter()
+                .position(|picture| picture.pic_type() == PictureType::CoverFront)?;
+            Some((tag.tag_type(), front))
+        })
+        .or_else(|| {
+            file.tags()
+                .iter()
+                .find(|tag| !tag.pictures().is_empty())
+                .map(|tag| (tag.tag_type(), 0))
+        })?;
+    let picture = file.tag(tag_type)?.pictures().get(index)?;
+    if picture.data().len() as u64 > MAX_IMAGE_BYTES {
         return None;
     }
+    let content_type = image_type(picture.data())?;
+    let bytes = file.tag_mut(tag_type)?.remove_picture(index).into_data();
     Some(Image {
-        content_type: image_type(bytes)?,
-        bytes: bytes.to_vec(),
+        bytes,
+        content_type,
     })
 }
 
@@ -362,6 +416,30 @@ mod tests {
             .to_vec()
     }
 
+    /// The `Last-Modified` value a response for `path` carries.
+    async fn whole_modified(path: &Path) -> String {
+        let response = file_response(path, "audio/mpeg", &HeaderMap::new())
+            .await
+            .unwrap();
+        response.headers()[header::LAST_MODIFIED]
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn an_empty_file_is_sent_whole_whatever_range_is_asked() {
+        let dir = ScratchDir::new("subsonic-empty");
+        let path = dir.path().join("empty.mp3");
+        std::fs::write(&path, b"").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-"));
+        let response = file_response(&path, "audio/mpeg", &headers).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "0");
+        assert!(read(response).await.is_empty());
+    }
+
     #[test]
     fn ranges_follow_rfc_9110() {
         let part = |start, end| ByteRange::Part { start, end };
@@ -373,7 +451,17 @@ mod tests {
         assert_eq!(parse_range(" bytes=1-1 ", 100), part(1, 1));
         assert_eq!(parse_range("bytes=100-", 100), ByteRange::Unsatisfiable);
         assert_eq!(parse_range("bytes=-0", 100), ByteRange::Unsatisfiable);
-        assert_eq!(parse_range("bytes=-1", 0), ByteRange::Unsatisfiable);
+        assert_eq!(parse_range("bytes=-1", 0), ByteRange::Full, "empty file");
+        assert_eq!(parse_range("bytes=0-", 0), ByteRange::Full, "empty file");
+        assert_eq!(
+            parse_range("Bytes=0-1", 100),
+            part(0, 1),
+            "unit in any case"
+        );
+        assert_eq!(parse_range("BYTES=5-", 100), part(5, 99));
+        let huge = "99999999999999999999999";
+        assert_eq!(parse_range(&format!("bytes=5-{huge}"), 100), part(5, 99));
+        assert_eq!(parse_range(&format!("bytes={huge}-"), 100), ByteRange::Full);
         for ignored in [
             "bytes=0-1,5-6",
             "bytes=9-3",
@@ -424,6 +512,20 @@ mod tests {
         headers.insert(header::IF_RANGE, HeaderValue::from_static("\"etag\""));
         let guarded = file_response(&path, "audio/mpeg", &headers).await.unwrap();
         assert_eq!(guarded.status(), StatusCode::OK);
+
+        // An `If-Range` that is this response's `Last-Modified` keeps the range.
+        let modified = whole_modified(&path).await;
+        headers.insert(header::IF_RANGE, HeaderValue::from_str(&modified).unwrap());
+        let kept = file_response(&path, "audio/mpeg", &headers).await.unwrap();
+        assert_eq!(kept.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(kept.headers()[header::CONTENT_RANGE], "bytes 10-19/200000");
+        headers.insert(
+            header::IF_RANGE,
+            HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT"),
+        );
+        let stale = file_response(&path, "audio/mpeg", &headers).await.unwrap();
+        assert_eq!(stale.status(), StatusCode::OK);
+        assert_eq!(stale.headers()[header::CONTENT_LENGTH], "200000");
 
         let gone = dir.path().join("gone.mp3");
         assert!(
@@ -563,6 +665,40 @@ mod tests {
             find_cover(&album, Some(plain.as_path())).is_none(),
             "folder.jpg is not a picture"
         );
+    }
+
+    #[test]
+    fn a_picture_over_the_size_cap_is_skipped() {
+        let dir = ScratchDir::new("subsonic-big-cover");
+        let album = dir.path().join("album");
+        std::fs::create_dir_all(&album).unwrap();
+        // "cover" sorts before "folder", so the oversized file is tried first.
+        let big = album.join("cover.jpg");
+        std::fs::write(&big, JPEG).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&big)
+            .unwrap()
+            .set_len(MAX_IMAGE_BYTES + 1)
+            .unwrap();
+        std::fs::write(album.join("folder.png"), PNG).unwrap();
+        assert!(read_image(&big).is_none());
+        let found = find_cover(&album, None).unwrap();
+        assert_eq!(
+            (found.content_type, found.bytes.as_slice()),
+            ("image/png", PNG)
+        );
+
+        // At the cap exactly, the picture is read whole.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&big)
+            .unwrap()
+            .set_len(MAX_IMAGE_BYTES)
+            .unwrap();
+        let found = read_image(&big).unwrap();
+        assert_eq!(found.content_type, "image/jpeg");
+        assert_eq!(found.bytes.len() as u64, MAX_IMAGE_BYTES);
     }
 
     #[test]

@@ -497,6 +497,33 @@ pub async fn release_tracks(pool: &SqlitePool, release_id: i64) -> Result<Vec<Li
     Ok(rows.into_iter().map(clean_track).collect())
 }
 
+/// The path of the first track of a release, in the order of
+/// [`release_tracks`], without reading the rest.
+///
+/// # Errors
+///
+/// Returns an error when the database cannot be read.
+pub async fn first_track_path(pool: &SqlitePool, release_id: i64) -> Result<Option<String>> {
+    let path = sqlx::query_scalar::<_, String>(concat!(
+        "SELECT t.path AS path, ",
+        effective_track_title!(),
+        " AS title, ",
+        effective_track_number!(),
+        " AS track_number, ",
+        effective_disc_number!(),
+        " AS disc_number
+         FROM tracks t ",
+        track_joins!(),
+        "WHERE t.local_release_id = ?1
+         ORDER BY disc_number, track_number, title, t.id
+         LIMIT 1"
+    ))
+    .bind(release_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(path)
+}
+
 /// A page of tracks by ID. With `query`, only tracks whose effective title or
 /// artist contains it.
 ///
@@ -922,6 +949,35 @@ mod tests {
         assert!(
             found.unwrap().is_empty(),
             "the replaced tag is not searched"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_track_path_follows_the_order_of_the_release_tracks() {
+        let pool = connect_in_memory().await.unwrap();
+        // Stored out of order, with a second disc whose first track sorts first by title.
+        let mut disc_two = scanned("/music/a/d2.flac", "Blue", Some("Artist"), "Aaa", 1, 2001);
+        disc_two.disc_number = Some(2);
+        let tracks = [
+            disc_two,
+            scanned("/music/a/02.flac", "Blue", Some("Artist"), "Two", 2, 2001),
+            scanned("/music/a/01.flac", "Blue", Some("Artist"), "One", 1, 2001),
+        ];
+        store_tracks(&pool, "/music/a", &tracks).await;
+        let release_id = library_tracks(&pool, None, 1, 0).await.unwrap()[0].release_id;
+
+        let all = release_tracks(&pool, release_id).await.unwrap();
+        assert_eq!(all[0].path, "/music/a/01.flac");
+        assert_eq!(
+            first_track_path(&pool, release_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(all[0].path.as_str())
+        );
+        assert_eq!(
+            first_track_path(&pool, release_id + 100).await.unwrap(),
+            None
         );
     }
 
