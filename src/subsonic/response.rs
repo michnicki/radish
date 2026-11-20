@@ -76,6 +76,11 @@ impl ApiError {
         Self::with(0, format!("{method} is not supported"))
     }
 
+    /// Code 70: nothing has the ID asked for.
+    pub(crate) fn not_found(what: &str) -> Self {
+        Self::with(70, format!("{what} not found"))
+    }
+
     /// Code 10: the method needs `name`.
     pub(crate) fn missing(name: &str) -> Self {
         Self::with(10, format!("Required parameter is missing: {name}"))

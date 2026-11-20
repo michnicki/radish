@@ -13,6 +13,8 @@
 //! on the wire, so the server belongs on a trusted network or a VPN.
 
 mod auth;
+mod ids;
+mod library;
 mod response;
 
 pub use auth::Credentials;
@@ -117,8 +119,6 @@ fn decode_hex(text: &str) -> Option<Vec<u8>> {
 
 #[derive(Clone)]
 pub(crate) struct AppState {
-    // Nothing reads it until Task 6's library methods; remove the allow then.
-    #[allow(dead_code)]
     pool: SqlitePool,
     credentials: Arc<Credentials>,
 }
@@ -243,9 +243,9 @@ async fn dispatch(
 }
 
 async fn call(
-    _state: &AppState,
+    state: &AppState,
     method: &str,
-    _params: &Params,
+    params: &Params,
     _headers: &HeaderMap,
 ) -> Result<Answer, ApiError> {
     let payload = match method {
@@ -255,6 +255,13 @@ async fn call(
             "openSubsonicExtensions",
             json!([{"name": "formPost", "versions": [1]}]),
         ),
+        "getMusicFolders" => library::music_folders(),
+        "getArtists" => library::artists(&state.pool, "artists").await?,
+        "getIndexes" => library::artists(&state.pool, "indexes").await?,
+        "getArtist" => library::artist(&state.pool, params).await?,
+        "getAlbum" => library::album(&state.pool, params).await?,
+        "getSong" => library::song(&state.pool, params).await?,
+        "getMusicDirectory" => library::music_directory(&state.pool, params).await?,
         other => return Err(ApiError::unsupported(other)),
     };
     Ok(Answer::Payload(payload))

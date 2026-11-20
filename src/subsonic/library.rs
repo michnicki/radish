@@ -1,0 +1,609 @@
+//! The browsing, list and search methods, and the objects they return.
+//!
+//! Every album object also carries the fields of a folder entry (`isDir`,
+//! `title`, `parent`). That lets the folder-style methods (`getIndexes`,
+//! `getMusicDirectory`, `getAlbumList`, `search2`) return the same objects
+//! as the ID3 ones.
+
+use super::Params;
+use super::ids::Id;
+use super::response::{ApiError, Payload};
+use crate::store::{self, LibraryArtist, LibraryRelease, LibraryTrack};
+use serde::Serialize;
+use serde_json::json;
+use sqlx::SqlitePool;
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Leading words left out when artists are sorted and indexed.
+pub(crate) const IGNORED_ARTICLES: &str = "The El La Los Las Le Les";
+
+/// The ID of the one music folder: the whole library.
+pub(crate) const MUSIC_FOLDER_ID: i64 = 1;
+
+/// An album artist (ArtistID3).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Artist {
+    id: String,
+    name: String,
+    album_count: i64,
+}
+
+impl Artist {
+    fn of(artist: &LibraryArtist) -> Self {
+        Self {
+            id: Id::artist(&artist.artist),
+            name: store::display_artist(&artist.artist).to_string(),
+            album_count: artist.album_count,
+        }
+    }
+}
+
+/// An artist with its albums.
+#[derive(Debug, Serialize)]
+struct ArtistWithAlbums {
+    #[serde(flatten)]
+    artist: Artist,
+    album: Vec<Album>,
+}
+
+/// An album (AlbumID3) that can also stand as a folder entry (Child).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Album {
+    id: String,
+    parent: String,
+    is_dir: bool,
+    title: String,
+    name: String,
+    album: String,
+    artist: String,
+    artist_id: String,
+    song_count: i64,
+    duration: i64,
+    created: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    year: Option<i64>,
+    cover_art: String,
+    media_type: &'static str,
+    music_brainz_id: String,
+}
+
+impl Album {
+    fn of(release: &LibraryRelease) -> Self {
+        let name = release.display_name();
+        let artist_id = Id::artist(&release.artist);
+        Self {
+            id: Id::album(release.id),
+            parent: artist_id.clone(),
+            is_dir: true,
+            title: name.clone(),
+            album: name.clone(),
+            name,
+            artist: release.display_artist().to_string(),
+            artist_id,
+            song_count: release.track_count,
+            duration: release.duration_secs.round() as i64,
+            created: release.created_at.clone(),
+            year: release.year,
+            cover_art: Id::album(release.id),
+            media_type: "album",
+            music_brainz_id: release.musicbrainz_id.clone().unwrap_or_default(),
+        }
+    }
+}
+
+/// An album with its songs.
+#[derive(Debug, Serialize)]
+struct AlbumWithSongs {
+    #[serde(flatten)]
+    album: Album,
+    song: Vec<Song>,
+}
+
+/// A song (Child).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Song {
+    id: String,
+    parent: String,
+    is_dir: bool,
+    title: String,
+    album: String,
+    artist: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    track: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disc_number: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    year: Option<i64>,
+    cover_art: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
+    content_type: &'static str,
+    suffix: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bit_rate: Option<i64>,
+    path: String,
+    album_id: String,
+    artist_id: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    created: String,
+    media_type: &'static str,
+    music_brainz_id: String,
+}
+
+impl Song {
+    /// `size` is the file's length, when it was looked up; only small
+    /// responses do that (see [`file_sizes`]).
+    fn of(track: &LibraryTrack, size: Option<u64>) -> Self {
+        let suffix = suffix(&track.path);
+        let album_artist = store::display_artist(&track.album_artist);
+        Self {
+            id: Id::song(track.id),
+            parent: Id::album(track.release_id),
+            is_dir: false,
+            title: track.display_title(),
+            album: track.display_album(),
+            artist: track
+                .artist
+                .clone()
+                .unwrap_or_else(|| album_artist.to_string()),
+            track: track.track_number,
+            disc_number: track.disc_number,
+            year: track.year,
+            cover_art: Id::album(track.release_id),
+            size,
+            content_type: content_type(&suffix),
+            suffix,
+            duration: track.duration_secs.map(|secs| secs.round() as i64),
+            // Tags and embedded pictures count too, so this runs a little high.
+            bit_rate: size
+                .zip(track.duration_secs)
+                .filter(|(_, secs)| *secs > 0.0)
+                .map(|(bytes, secs)| (bytes as f64 * 8.0 / secs / 1000.0).round() as i64),
+            path: relative_path(track),
+            album_id: Id::album(track.release_id),
+            artist_id: Id::artist(&track.album_artist),
+            kind: "music",
+            created: track.created_at.clone(),
+            media_type: "song",
+            music_brainz_id: track.musicbrainz_id.clone().unwrap_or_default(),
+        }
+    }
+}
+
+/// A file's extension in lowercase, `""` when it has none.
+pub(crate) fn suffix(path: &str) -> String {
+    Path::new(path)
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// The MIME type of an audio file with `suffix`, for the scanner's extensions.
+pub(crate) fn content_type(suffix: &str) -> &'static str {
+    match suffix {
+        "mp3" => "audio/mpeg",
+        "flac" => "audio/flac",
+        "m4a" => "audio/mp4",
+        "ogg" | "opus" => "audio/ogg",
+        "wav" => "audio/wav",
+        "aac" => "audio/aac",
+        "wma" => "audio/x-ms-wma",
+        _ => "application/octet-stream",
+    }
+}
+
+/// The track's path under its imported root, which clients use to name cached
+/// files; its file name when it isn't under the root.
+fn relative_path(track: &LibraryTrack) -> String {
+    let path = Path::new(&track.path);
+    track
+        .root
+        .as_deref()
+        .and_then(|root| path.strip_prefix(root).ok())
+        .or_else(|| path.file_name().map(Path::new))
+        .map_or_else(
+            || track.path.clone(),
+            |relative| relative.to_string_lossy().into_owned(),
+        )
+}
+
+/// The length of each track's file, `None` for a file that is gone. Runs on
+/// the blocking pool; used only for one album or one song, never for pages
+/// of a client's full sync, which would stat millions of files.
+async fn file_sizes(tracks: &[LibraryTrack]) -> Result<Vec<Option<u64>>, ApiError> {
+    let paths: Vec<String> = tracks.iter().map(|track| track.path.clone()).collect();
+    tokio::task::spawn_blocking(move || {
+        paths
+            .iter()
+            .map(|path| {
+                std::fs::metadata(path)
+                    .ok()
+                    .filter(std::fs::Metadata::is_file)
+                    .map(|metadata| metadata.len())
+            })
+            .collect()
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow::Error::from(error)))
+}
+
+/// `getMusicFolders`: one folder, the whole library.
+pub(crate) fn music_folders() -> Payload {
+    Payload::new(
+        "musicFolders",
+        json!({"musicFolder": [{"id": MUSIC_FOLDER_ID, "name": "Music"}]}),
+    )
+}
+
+/// `getArtists` (`key` = `artists`) and `getIndexes` (`key` = `indexes`):
+/// every album artist, under the first letter of its sort name.
+pub(crate) async fn artists(pool: &SqlitePool, key: &str) -> Result<Payload, ApiError> {
+    let artists = store::library_artists(pool, None, -1, 0).await?;
+    let mut body = json!({
+        "ignoredArticles": IGNORED_ARTICLES,
+        "index": artist_index(&artists),
+    });
+    if key == "indexes" {
+        // Always now, so clients never keep a stale index.
+        body["lastModified"] = json!(now_millis());
+    }
+    Ok(Payload::new(key, body))
+}
+
+/// Artists grouped by [`index_letter`], each group sorted by [`sort_name`].
+fn artist_index(artists: &[LibraryArtist]) -> Vec<serde_json::Value> {
+    let mut groups: BTreeMap<String, Vec<(String, Artist)>> = BTreeMap::new();
+    for artist in artists {
+        let artist = Artist::of(artist);
+        let sort = sort_name(&artist.name).to_lowercase();
+        groups
+            .entry(index_letter(&sort))
+            .or_default()
+            .push((sort, artist));
+    }
+    groups
+        .into_iter()
+        .map(|(letter, mut members)| {
+            members.sort_by(|a, b| a.0.cmp(&b.0));
+            let artists: Vec<Artist> = members.into_iter().map(|(_, artist)| artist).collect();
+            json!({"name": letter, "artist": artists})
+        })
+        .collect()
+}
+
+/// The name without a leading ignored article: "The Cure" sorts as "Cure".
+fn sort_name(name: &str) -> &str {
+    for article in IGNORED_ARTICLES.split(' ') {
+        let Some(head) = name.get(..article.len()) else {
+            continue;
+        };
+        if head.eq_ignore_ascii_case(article)
+            && let Some(rest) = name[article.len()..].strip_prefix(' ')
+            && !rest.trim().is_empty()
+        {
+            return rest.trim_start();
+        }
+    }
+    name
+}
+
+/// The index a sort name is filed under: its first letter, upper-cased, or
+/// `#` when it doesn't start with a letter.
+fn index_letter(sort_name: &str) -> String {
+    match sort_name.chars().next() {
+        Some(first) if first.is_alphabetic() => first.to_uppercase().collect(),
+        _ => "#".to_string(),
+    }
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+/// `getArtist`: an album artist with its albums.
+pub(crate) async fn artist(pool: &SqlitePool, params: &Params) -> Result<Payload, ApiError> {
+    let (key, releases) = artist_releases(pool, params).await?;
+    let artist = ArtistWithAlbums {
+        artist: Artist {
+            id: Id::artist(&key),
+            name: releases[0].display_artist().to_string(),
+            album_count: releases.len() as i64,
+        },
+        album: releases.iter().map(Album::of).collect(),
+    };
+    Ok(Payload::new("artist", artist))
+}
+
+/// The artist key the `id` parameter names, and the artist's releases (at
+/// least one).
+async fn artist_releases(
+    pool: &SqlitePool,
+    params: &Params,
+) -> Result<(String, Vec<LibraryRelease>), ApiError> {
+    let Some(Id::Artist(key)) = Id::parse(params.required("id")?) else {
+        return Err(ApiError::not_found("Artist"));
+    };
+    let releases = store::artist_releases(pool, &key).await?;
+    if releases.is_empty() {
+        return Err(ApiError::not_found("Artist"));
+    }
+    Ok((key, releases))
+}
+
+/// `getAlbum`: an album with its songs.
+pub(crate) async fn album(pool: &SqlitePool, params: &Params) -> Result<Payload, ApiError> {
+    let (release, songs) = album_songs(pool, params).await?;
+    Ok(Payload::new(
+        "album",
+        AlbumWithSongs {
+            album: Album::of(&release),
+            song: songs,
+        },
+    ))
+}
+
+/// The release the `id` parameter names, and its songs with their sizes.
+async fn album_songs(
+    pool: &SqlitePool,
+    params: &Params,
+) -> Result<(LibraryRelease, Vec<Song>), ApiError> {
+    let Some(Id::Album(id)) = Id::parse(params.required("id")?) else {
+        return Err(ApiError::not_found("Album"));
+    };
+    let release = store::library_release(pool, id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Album"))?;
+    let tracks = store::release_tracks(pool, id).await?;
+    let sizes = file_sizes(&tracks).await?;
+    let songs = tracks
+        .iter()
+        .zip(sizes)
+        .map(|(track, size)| Song::of(track, size))
+        .collect();
+    Ok((release, songs))
+}
+
+/// `getSong`.
+pub(crate) async fn song(pool: &SqlitePool, params: &Params) -> Result<Payload, ApiError> {
+    let Some(Id::Song(id)) = Id::parse(params.required("id")?) else {
+        return Err(ApiError::not_found("Song"));
+    };
+    let track = store::library_track(pool, id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Song"))?;
+    let size = file_sizes(std::slice::from_ref(&track))
+        .await?
+        .pop()
+        .flatten();
+    Ok(Payload::new("song", Song::of(&track, size)))
+}
+
+/// `getMusicDirectory`: an artist's albums or an album's songs, as folders.
+pub(crate) async fn music_directory(
+    pool: &SqlitePool,
+    params: &Params,
+) -> Result<Payload, ApiError> {
+    match Id::parse(params.required("id")?) {
+        Some(Id::Artist(_)) => {
+            let (key, releases) = artist_releases(pool, params).await?;
+            let albums: Vec<Album> = releases.iter().map(Album::of).collect();
+            Ok(Payload::new(
+                "directory",
+                json!({
+                    "id": Id::artist(&key),
+                    "name": releases[0].display_artist(),
+                    "child": albums,
+                }),
+            ))
+        }
+        Some(Id::Album(_)) => {
+            let (release, songs) = album_songs(pool, params).await?;
+            Ok(Payload::new(
+                "directory",
+                json!({
+                    "id": Id::album(release.id),
+                    "name": release.display_name(),
+                    "parent": Id::artist(&release.artist),
+                    "child": songs,
+                }),
+            ))
+        }
+        _ => Err(ApiError::not_found("Directory")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::subsonic::test_util::{call_json, state};
+    use crate::test_support::{ScratchDir, scanned, seed_release, store_tracks};
+    use serde_json::Value;
+
+    #[test]
+    fn sort_names_drop_a_leading_article() {
+        assert_eq!(sort_name("The Cure"), "Cure");
+        assert_eq!(sort_name("los Lobos"), "Lobos");
+        assert_eq!(sort_name("The"), "The");
+        assert_eq!(sort_name("The "), "The ");
+        assert_eq!(sort_name("Theatre"), "Theatre");
+        assert_eq!(index_letter("cure"), "C");
+        assert_eq!(index_letter("ärzte"), "Ä");
+        assert_eq!(index_letter("10cc"), "#");
+        assert_eq!(index_letter(""), "#");
+    }
+
+    #[tokio::test]
+    async fn artists_are_indexed_by_letter_with_their_album_counts() {
+        let state = state().await;
+        seed_release(&state.pool, "/music/a", "Blue", &["One", "Two"]).await;
+        store_tracks(
+            &state.pool,
+            "/other",
+            &[scanned(
+                "/other/c/01.mp3",
+                "Head",
+                Some("The Cure"),
+                "x",
+                1,
+                1985,
+            )],
+        )
+        .await;
+
+        let reply = call_json(&state, "getArtists", &[]).await;
+        assert_eq!(reply["artists"]["ignoredArticles"], IGNORED_ARTICLES);
+        let index = reply["artists"]["index"].as_array().unwrap();
+        let letters: Vec<&str> = index
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(letters, ["A", "C"]);
+        assert_eq!(
+            index[0]["artist"][0],
+            json!({"id": Id::artist("Artist"), "name": "Artist", "albumCount": 1})
+        );
+        assert_eq!(index[1]["artist"][0]["name"], "The Cure");
+
+        let indexes = call_json(&state, "getIndexes", &[]).await;
+        assert_eq!(indexes["indexes"]["ignoredArticles"], IGNORED_ARTICLES);
+        assert!(indexes["indexes"]["lastModified"].as_i64().unwrap() > 0);
+        assert_eq!(indexes["indexes"]["index"], reply["artists"]["index"]);
+
+        let folders = call_json(&state, "getMusicFolders", &[]).await;
+        assert_eq!(
+            folders["musicFolders"]["musicFolder"],
+            json!([{"id": 1, "name": "Music"}])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_artist_leads_to_its_albums_and_an_album_to_its_songs() {
+        let state = state().await;
+        let release = seed_release(&state.pool, "/music/a", "Blue", &["One", "Two"]).await;
+        let artist_id = Id::artist("Artist");
+        let album_id = Id::album(release.id);
+
+        let artist = call_json(&state, "getArtist", &[("id", &artist_id)]).await;
+        assert_eq!(artist["artist"]["id"], artist_id);
+        assert_eq!(artist["artist"]["name"], "Artist");
+        assert_eq!(artist["artist"]["albumCount"], 1);
+        let album = &artist["artist"]["album"][0];
+        assert_eq!(album["id"], album_id);
+        assert_eq!(album["name"], "Blue");
+        assert_eq!(album["title"], "Blue");
+        assert_eq!(album["isDir"], true);
+        assert_eq!(album["parent"], artist_id);
+        assert_eq!(album["artistId"], artist_id);
+        assert_eq!(album["songCount"], 2);
+        assert_eq!(album["duration"], 360);
+        assert_eq!(album["year"], 2001);
+        assert_eq!(album["coverArt"], album_id);
+        assert_eq!(album["mediaType"], "album");
+        assert_eq!(album["musicBrainzId"], "");
+        assert!(album["created"].as_str().unwrap().ends_with('Z'));
+
+        let reply = call_json(&state, "getAlbum", &[("id", &album_id)]).await;
+        assert_eq!(reply["album"]["name"], "Blue");
+        let songs = reply["album"]["song"].as_array().unwrap();
+        assert_eq!(songs.len(), 2);
+        let song = &songs[0];
+        assert_eq!(song["title"], "One");
+        assert_eq!(song["isDir"], false);
+        assert_eq!(song["parent"], album_id);
+        assert_eq!(song["albumId"], album_id);
+        assert_eq!(song["artistId"], artist_id);
+        assert_eq!(song["album"], "Blue");
+        assert_eq!(song["artist"], "Artist");
+        assert_eq!(song["track"], 1);
+        assert_eq!(song["duration"], 180);
+        assert_eq!(song["suffix"], "flac");
+        assert_eq!(song["contentType"], "audio/flac");
+        assert_eq!(song["path"], "01.flac");
+        assert_eq!(song["type"], "music");
+        assert_eq!(song["mediaType"], "song");
+        assert_eq!(song["musicBrainzId"], "");
+        assert_eq!(song["coverArt"], album_id);
+        assert!(song.get("size").is_none(), "the file does not exist");
+
+        let one = call_json(&state, "getSong", &[("id", song["id"].as_str().unwrap())]).await;
+        assert_eq!(one["song"]["title"], "One");
+
+        let by_artist = call_json(&state, "getMusicDirectory", &[("id", &artist_id)]).await;
+        assert_eq!(by_artist["directory"]["name"], "Artist");
+        assert_eq!(by_artist["directory"]["child"][0]["id"], album_id);
+        let by_album = call_json(&state, "getMusicDirectory", &[("id", &album_id)]).await;
+        assert_eq!(by_album["directory"]["name"], "Blue");
+        assert_eq!(by_album["directory"]["parent"], artist_id);
+        assert_eq!(by_album["directory"]["child"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn songs_of_files_on_disk_carry_their_size_and_bit_rate() {
+        let dir = ScratchDir::new("subsonic-sizes");
+        let path = dir.path().join("a").join("01.mp3");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // 4.5 MB over the fixture's 180 s is 200 kbps.
+        std::fs::write(&path, vec![0u8; 4_500_000]).unwrap();
+        let state = state().await;
+        let root = dir.path().to_str().unwrap();
+        let track = scanned(
+            path.to_str().unwrap(),
+            "Blue",
+            Some("Artist"),
+            "One",
+            1,
+            2001,
+        );
+        store_tracks(&state.pool, root, &[track]).await;
+        let id = store::library_tracks(&state.pool, None, 1, 0)
+            .await
+            .unwrap()[0]
+            .id;
+
+        let reply = call_json(&state, "getSong", &[("id", &Id::song(id))]).await;
+        assert_eq!(reply["song"]["size"], 4_500_000);
+        assert_eq!(reply["song"]["bitRate"], 200);
+        assert_eq!(reply["song"]["contentType"], "audio/mpeg");
+        assert_eq!(reply["song"]["path"], "a/01.mp3");
+    }
+
+    #[tokio::test]
+    async fn unknown_or_malformed_ids_are_not_found() {
+        let state = state().await;
+        seed_release(&state.pool, "/music/a", "Blue", &["One"]).await;
+        let code = |reply: Value| reply["error"]["code"].clone();
+        assert_eq!(
+            code(call_json(&state, "getAlbum", &[("id", "al-999")]).await),
+            70
+        );
+        assert_eq!(
+            code(call_json(&state, "getAlbum", &[("id", &Id::song(1))]).await),
+            70
+        );
+        assert_eq!(
+            code(call_json(&state, "getArtist", &[("id", &Id::artist("Nobody"))]).await),
+            70
+        );
+        assert_eq!(
+            code(call_json(&state, "getSong", &[("id", "tr-x")]).await),
+            70
+        );
+        assert_eq!(
+            code(call_json(&state, "getMusicDirectory", &[("id", &Id::song(1))]).await),
+            70
+        );
+        assert_eq!(code(call_json(&state, "getArtist", &[]).await), 10);
+    }
+}
