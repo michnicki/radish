@@ -134,6 +134,7 @@ mod tests {
         assert_eq!(check(&[("u", "joe"), ("p", "enc:736573616d65")]), Ok(()));
         let wrong = Err(ApiError::wrong_credentials());
         assert_eq!(check(&[("u", "joe"), ("p", "enc:zz")]), wrong);
+        assert_eq!(check(&[("u", "joe"), ("p", "enc:ff")]), wrong, "not UTF-8");
         assert_eq!(check(&[("u", "joe"), ("p", "wrong")]), wrong);
         assert_eq!(check(&[("u", "eve"), ("p", "sesame")]), wrong);
     }
@@ -144,6 +145,7 @@ mod tests {
         assert_eq!(code(&[("p", "sesame")]), 10);
         assert_eq!(code(&[("u", "joe")]), 10);
         assert_eq!(code(&[("u", "joe"), ("t", "x")]), 10);
+        assert_eq!(code(&[("u", "joe"), ("s", "salt")]), 10);
         assert_eq!(
             code(&[("u", "joe"), ("p", "sesame"), ("t", "x"), ("s", "y")]),
             43

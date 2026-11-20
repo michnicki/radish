@@ -151,7 +151,8 @@ fn render(format: Format, mut fields: Map<String, Value>) -> Response {
 
 /// Writes `value` as the element `name`. In an object, scalar fields become
 /// attributes, objects child elements and arrays repeated child elements; a
-/// scalar in an array becomes an element with that text. Nulls are left out.
+/// scalar in an array becomes an element with that text. Nulls are left out,
+/// as fields and as array items.
 /// Fields come in key order, since serde_json keeps keys sorted.
 fn write_element(out: &mut String, name: &str, value: &Value) {
     out.push('<');
@@ -185,7 +186,7 @@ fn write_element(out: &mut String, name: &str, value: &Value) {
     for (key, child) in children {
         match child {
             Value::Array(items) => {
-                for item in items {
+                for item in items.iter().filter(|item| !item.is_null()) {
                     write_element(out, key, item);
                 }
             }
@@ -258,7 +259,7 @@ mod tests {
     fn xml_puts_scalars_in_attributes_and_repeats_array_elements() {
         let value = json!({
             "name": "A", "count": 2, "ok": true, "missing": null,
-            "child": {"id": "x"}, "item": [{"id": 1}, {"id": 2}], "text": ["One", "Two"],
+            "child": {"id": "x"}, "item": [{"id": 1}, {"id": 2}], "text": ["One", null, "Two"],
             "none": [], "empty": {}
         });
         assert_eq!(

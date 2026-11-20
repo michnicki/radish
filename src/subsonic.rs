@@ -29,6 +29,7 @@ use axum::routing::get;
 use response::{ApiError, Format, Payload};
 use serde_json::json;
 use sqlx::SqlitePool;
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -38,8 +39,25 @@ use tokio::net::TcpListener;
 const MAX_FORM_BYTES: usize = 16 * 1024;
 
 /// The parameters of one request: the query string, then a form body's.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct Params(Vec<(String, String)>);
+
+/// The parameters that carry a credential: `Params`' `Debug` hides their values.
+const SECRET_PARAMS: [&str; 4] = ["p", "t", "s", "apiKey"];
+
+impl fmt::Debug for Params {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut list = f.debug_list();
+        for (key, value) in &self.0 {
+            if SECRET_PARAMS.contains(&key.as_str()) {
+                list.entry(&(key, "<redacted>"));
+            } else {
+                list.entry(&(key, value));
+            }
+        }
+        list.finish()
+    }
+}
 
 impl Params {
     /// Reads `query`, then `body` when the request is a form POST.
@@ -159,13 +177,23 @@ async fn rest(
     RawQuery(query): RawQuery,
     body: Bytes,
 ) -> Response {
-    let form = http_method == Method::POST
-        && headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("application/x-www-form-urlencoded"));
+    let form = http_method == Method::POST && is_form(&headers);
     let params = Params::parse(query.as_deref(), form.then_some(&body[..]));
     dispatch(&state, &method, &params, &headers).await
+}
+
+/// Whether the request's `Content-Type` is a URL-encoded form. The media type
+/// is compared without regard to case and without its parameters.
+fn is_form(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| {
+            media_type
+                .trim()
+                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        })
 }
 
 /// Adds the security headers to every response. A file or picture opened in a
@@ -293,6 +321,43 @@ mod tests {
     }
 
     #[test]
+    fn params_debug_hides_credentials() {
+        let params = Params::from_pairs(&[
+            ("u", "joe"),
+            ("p", "sesame"),
+            ("t", "tok3n"),
+            ("s", "salt42"),
+            ("apiKey", "k3y"),
+            ("id", "tr-1"),
+        ]);
+        let text = format!("{params:?}");
+        for secret in ["sesame", "tok3n", "salt42", "k3y"] {
+            assert!(!text.contains(secret), "{text}");
+        }
+        assert_eq!(text.matches("<redacted>").count(), 4, "{text}");
+        assert!(text.contains("joe") && text.contains("tr-1"), "{text}");
+    }
+
+    #[test]
+    fn form_content_types_match_in_any_case_with_parameters() {
+        let with = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(value).unwrap());
+            headers
+        };
+        assert!(is_form(&with("application/x-www-form-urlencoded")));
+        assert!(is_form(&with(
+            "Application/X-WWW-Form-Urlencoded; charset=UTF-8"
+        )));
+        assert!(is_form(&with(
+            " application/x-www-form-urlencoded ;charset=utf-8"
+        )));
+        assert!(!is_form(&with("text/plain")));
+        assert!(!is_form(&with("application/x-www-form-urlencoded-x")));
+        assert!(!is_form(&HeaderMap::new()));
+    }
+
+    #[test]
     fn hex_round_trips_and_rejects_anything_else() {
         assert_eq!(hex("Björk".as_bytes()), "426ac3b6726b");
         assert_eq!(decode_hex("426AC3B6726B").unwrap(), "Björk".as_bytes());
@@ -331,6 +396,8 @@ mod tests {
         use super::test_util::call_as;
         let state = state().await;
         assert_eq!(call_as(&state, "ping", &[]).await["error"]["code"], 10);
+        // Authentication comes first, so an unknown method learns nothing.
+        assert_eq!(call_as(&state, "getVideos", &[]).await["error"]["code"], 10);
         assert_eq!(
             call_as(&state, "ping", &[("u", "u"), ("p", "wrong")]).await["error"]["code"],
             40
