@@ -16,6 +16,7 @@
 //! - [`review`]: saved reviews shared by the review prompt and the web page.
 //! - [`runner`]: CLI orchestration and the interactive review screen.
 //! - [`web`]: the web interface behind `radish serve`.
+//! - [`subsonic`]: the OpenSubsonic API behind `radish subsonic`.
 
 pub mod db;
 pub mod deezer;
@@ -35,6 +36,7 @@ pub mod runner;
 pub mod scanner;
 pub mod scene;
 pub mod store;
+pub mod subsonic;
 #[cfg(test)]
 mod test_support;
 pub mod watcher;

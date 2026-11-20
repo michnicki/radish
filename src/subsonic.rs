@@ -1,0 +1,264 @@
+//! An OpenSubsonic API over the library for music players: `radish subsonic`.
+//!
+//! Subsonic clients (Symfonium, Feishin, DSub and others) browse, search and
+//! stream through `/rest/<method>`, also spelled `/rest/<method>.view`, by GET
+//! or by a form POST (the `formPost` extension). Albums are local releases
+//! and artists are album artists, with the effective metadata that `list` and
+//! `search` show. Files are streamed as they are and never transcoded. The
+//! server keeps no per-user state: scrobbles are accepted and dropped, and
+//! favourites, ratings and playlists are refused.
+//!
+//! Every method except `getOpenSubsonicExtensions` needs the configured user's
+//! credentials, as a password or as a salted MD5 token. Neither is encrypted
+//! on the wire, so the server belongs on a trusted network or a VPN.
+
+mod response;
+
+use crate::outln;
+use anyhow::{Context, Result};
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Path, RawQuery, Request, State};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::Response;
+use axum::routing::get;
+use response::{ApiError, Format, Payload};
+use serde_json::json;
+use sqlx::SqlitePool;
+use std::net::SocketAddr;
+use tokio::net::TcpListener;
+
+/// The largest form body accepted, in bytes. A POST carries the same few
+/// parameters a query string would.
+const MAX_FORM_BYTES: usize = 16 * 1024;
+
+/// The parameters of one request: the query string, then a form body's.
+#[derive(Debug, Default)]
+pub(crate) struct Params(Vec<(String, String)>);
+
+impl Params {
+    /// Reads `query`, then `body` when the request is a form POST.
+    pub(crate) fn parse(query: Option<&str>, body: Option<&[u8]>) -> Self {
+        let mut pairs: Vec<(String, String)> = query
+            .map(|query| {
+                form_urlencoded::parse(query.as_bytes())
+                    .into_owned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(body) = body {
+            pairs.extend(form_urlencoded::parse(body).into_owned());
+        }
+        Self(pairs)
+    }
+
+    /// The first value of `name`.
+    pub(crate) fn get(&self, name: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_pairs(pairs: &[(&str, &str)]) -> Self {
+        Self(
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+        )
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct AppState {
+    // Nothing reads it until Task 6's library methods; remove the allow then.
+    #[allow(dead_code)]
+    pool: SqlitePool,
+}
+
+/// Serves the API on `bind` until Ctrl+C.
+///
+/// # Errors
+///
+/// Returns an error when the address can't be bound or the server fails.
+pub async fn serve(pool: SqlitePool, bind: SocketAddr) -> Result<()> {
+    if !bind.ip().is_loopback() {
+        eprintln!(
+            "warning: {bind} is not a loopback address; Subsonic clients send the password, \
+             or a token made from it, unencrypted, so use it only on a trusted network or a VPN"
+        );
+    }
+    let listener = TcpListener::bind(bind)
+        .await
+        .with_context(|| format!("cannot listen on {bind}"))?;
+    let bind = listener.local_addr()?;
+    outln!("Serving http://{bind} (Subsonic API; Ctrl+C to stop)");
+    axum::serve(listener, router(AppState { pool }))
+        .with_graceful_shutdown(async {
+            // A failed signal handler leaves Ctrl+C to the default action.
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+        .context("Subsonic server failed")
+}
+
+fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/rest/{method}", get(rest).post(rest))
+        .layer(DefaultBodyLimit::max(MAX_FORM_BYTES))
+        .fallback(not_found)
+        .layer(middleware::from_fn(security_headers))
+        .with_state(state)
+}
+
+async fn not_found() -> StatusCode {
+    StatusCode::NOT_FOUND
+}
+
+/// Every `/rest/` request. A form POST's body adds to the query string.
+async fn rest(
+    State(state): State<AppState>,
+    Path(method): Path<String>,
+    http_method: Method,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> Response {
+    let form = http_method == Method::POST
+        && headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/x-www-form-urlencoded"));
+    let params = Params::parse(query.as_deref(), form.then_some(&body[..]));
+    dispatch(&state, &method, &params, &headers).await
+}
+
+/// Adds the security headers to every response. A file or picture opened in a
+/// browser is never sniffed as markup, and any script in it can't run.
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; sandbox"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
+
+/// What a method returns: fields for the envelope. (Task 8 adds files.)
+enum Answer {
+    Payload(Payload),
+}
+
+/// Answers one API call. `method` may end in `.view`.
+async fn dispatch(
+    state: &AppState,
+    method: &str,
+    params: &Params,
+    headers: &HeaderMap,
+) -> Response {
+    let format = Format::of(params);
+    let method = method.strip_suffix(".view").unwrap_or(method);
+    match call(state, method, params, headers).await {
+        Ok(Answer::Payload(payload)) => response::ok(format, payload),
+        Err(error) => response::failed(format, &error),
+    }
+}
+
+async fn call(
+    _state: &AppState,
+    method: &str,
+    _params: &Params,
+    _headers: &HeaderMap,
+) -> Result<Answer, ApiError> {
+    let payload = match method {
+        "ping" => Payload::empty(),
+        "getLicense" => Payload::new("license", json!({"valid": true})),
+        "getOpenSubsonicExtensions" => Payload::new(
+            "openSubsonicExtensions",
+            json!([{"name": "formPost", "versions": [1]}]),
+        ),
+        other => return Err(ApiError::unsupported(other)),
+    };
+    Ok(Answer::Payload(payload))
+}
+
+#[cfg(test)]
+pub(crate) mod test_util {
+    use super::*;
+    use serde_json::Value;
+
+    pub(crate) async fn state() -> AppState {
+        AppState {
+            pool: crate::db::connect_in_memory().await.unwrap(),
+        }
+    }
+
+    /// Calls `method` with `f=json` and `pairs`, and returns the envelope.
+    pub(crate) async fn call_json(state: &AppState, method: &str, pairs: &[(&str, &str)]) -> Value {
+        let pairs = [&[("f", "json")][..], pairs].concat();
+        let response = dispatch(
+            state,
+            method,
+            &Params::from_pairs(&pairs),
+            &HeaderMap::new(),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(response.into_body(), 64 << 20)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        value["subsonic-response"].clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_util::{call_json, state};
+    use super::*;
+
+    #[test]
+    fn params_read_the_query_then_the_form_body_and_the_first_value_wins() {
+        let params = Params::parse(Some("u=joe&id=1&q=a%20b"), Some(&b"id=2&p=sesame&q=x"[..]));
+        assert_eq!(params.get("u"), Some("joe"));
+        assert_eq!(params.get("id"), Some("1"));
+        assert_eq!(params.get("p"), Some("sesame"));
+        assert_eq!(params.get("q"), Some("a b"));
+        assert_eq!(params.get("nope"), None);
+    }
+
+    #[tokio::test]
+    async fn system_methods_answer_with_and_without_the_view_suffix() {
+        let state = state().await;
+        assert_eq!(call_json(&state, "ping", &[]).await["status"], "ok");
+        assert_eq!(call_json(&state, "ping.view", &[]).await["status"], "ok");
+        assert_eq!(
+            call_json(&state, "getLicense", &[]).await["license"]["valid"],
+            true
+        );
+        let extensions = call_json(&state, "getOpenSubsonicExtensions", &[]).await;
+        assert_eq!(
+            extensions["openSubsonicExtensions"],
+            json!([{"name": "formPost", "versions": [1]}])
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_methods_fail_with_code_0() {
+        let reply = call_json(&state().await, "getVideos", &[]).await;
+        assert_eq!(reply["status"], "failed");
+        assert_eq!(reply["error"]["code"], 0);
+        assert_eq!(reply["error"]["message"], "getVideos is not supported");
+    }
+}
