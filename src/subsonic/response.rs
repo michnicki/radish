@@ -9,6 +9,7 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
+use std::borrow::Cow;
 
 /// The Subsonic API version served.
 pub(crate) const API_VERSION: &str = "1.16.1";
@@ -41,10 +42,17 @@ impl Payload {
         Self::default()
     }
 
-    /// One field, `key`, holding `value`.
+    /// One field, `key`, holding `value`, serialized once. Pass typed
+    /// structs, not a [`Value`] (use [`Payload::value`] for one): serializing
+    /// a built `Value` copies the whole tree.
     pub(crate) fn new(key: &str, value: impl Serialize) -> Self {
+        Self::value(key, to_value(value))
+    }
+
+    /// One field, `key`, holding a ready `value`, moved in without a copy.
+    pub(crate) fn value(key: &str, value: Value) -> Self {
         let mut fields = Map::new();
-        fields.insert(key.to_string(), to_value(value));
+        fields.insert(key.to_string(), value);
         Self(fields)
     }
 }
@@ -147,7 +155,10 @@ fn envelope(status: &str, mut fields: Map<String, Value>) -> Map<String, Value> 
 fn render(format: Format, mut fields: Map<String, Value>) -> Response {
     match format {
         Format::Json => {
-            let body = json!({ "subsonic-response": fields }).to_string();
+            // `fields` moves into the outer object; `json!` would copy it.
+            let mut outer = Map::new();
+            outer.insert("subsonic-response".to_string(), Value::Object(fields));
+            let body = serde_json::to_string(&outer).expect("a JSON value serializes");
             ([(header::CONTENT_TYPE, "application/json")], body).into_response()
         }
         Format::Xml => {
@@ -209,11 +220,11 @@ fn write_element(out: &mut String, name: &str, value: &Value) {
 }
 
 /// The text of a string, number or boolean; `None` for anything else.
-fn scalar(value: &Value) -> Option<String> {
+fn scalar(value: &Value) -> Option<Cow<'_, str>> {
     match value {
-        Value::String(text) => Some(text.clone()),
-        Value::Number(number) => Some(number.to_string()),
-        Value::Bool(flag) => Some(flag.to_string()),
+        Value::String(text) => Some(Cow::Borrowed(text)),
+        Value::Number(number) => Some(Cow::Owned(number.to_string())),
+        Value::Bool(flag) => Some(Cow::Borrowed(if *flag { "true" } else { "false" })),
         Value::Null | Value::Array(_) | Value::Object(_) => None,
     }
 }

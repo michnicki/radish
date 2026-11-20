@@ -243,23 +243,53 @@ pub(crate) fn music_folders() -> Payload {
     )
 }
 
-/// `getArtists` (`key` = `artists`) and `getIndexes` (`key` = `indexes`):
-/// every album artist, under the first letter of its sort name.
-pub(crate) async fn artists(pool: &SqlitePool, key: &str) -> Result<Payload, ApiError> {
+/// Which artist list `getArtists` or `getIndexes` asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArtistList {
+    /// `getArtists`.
+    Artists,
+    /// `getIndexes`.
+    Indexes,
+}
+
+/// The body of `getArtists` and `getIndexes`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtistIndexes {
+    ignored_articles: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_modified: Option<i64>,
+    index: Vec<Index>,
+}
+
+/// The artists filed under one letter.
+#[derive(Debug, Serialize)]
+struct Index {
+    name: String,
+    artist: Vec<Artist>,
+}
+
+/// `getArtists` and `getIndexes`: every album artist, under the first letter
+/// of its sort name.
+pub(crate) async fn artists(pool: &SqlitePool, list: ArtistList) -> Result<Payload, ApiError> {
     let artists = store::library_artists(pool, None, -1, 0).await?;
-    let mut body = json!({
-        "ignoredArticles": IGNORED_ARTICLES,
-        "index": artist_index(&artists),
-    });
-    if key == "indexes" {
+    let (key, last_modified) = match list {
+        ArtistList::Artists => ("artists", None),
         // Always now, so clients never keep a stale index.
-        body["lastModified"] = json!(now_millis());
-    }
-    Ok(Payload::new(key, body))
+        ArtistList::Indexes => ("indexes", Some(now_millis())),
+    };
+    Ok(Payload::new(
+        key,
+        ArtistIndexes {
+            ignored_articles: IGNORED_ARTICLES,
+            last_modified,
+            index: artist_index(&artists),
+        },
+    ))
 }
 
 /// Artists grouped by [`index_letter`], each group sorted by [`sort_name`].
-fn artist_index(artists: &[LibraryArtist]) -> Vec<serde_json::Value> {
+fn artist_index(artists: &[LibraryArtist]) -> Vec<Index> {
     let mut groups: BTreeMap<String, Vec<(String, Artist)>> = BTreeMap::new();
     for artist in artists {
         let artist = Artist::of(artist);
@@ -271,10 +301,12 @@ fn artist_index(artists: &[LibraryArtist]) -> Vec<serde_json::Value> {
     }
     groups
         .into_iter()
-        .map(|(letter, mut members)| {
+        .map(|(name, mut members)| {
             members.sort_by(|a, b| a.0.cmp(&b.0));
-            let artists: Vec<Artist> = members.into_iter().map(|(_, artist)| artist).collect();
-            json!({"name": letter, "artist": artists})
+            Index {
+                name,
+                artist: members.into_iter().map(|(_, artist)| artist).collect(),
+            }
         })
         .collect()
 }
@@ -318,12 +350,23 @@ pub(crate) async fn artist(pool: &SqlitePool, params: &Params) -> Result<Payload
     let artist = ArtistWithAlbums {
         artist: Artist {
             id: Id::artist(&key),
-            name: releases[0].display_artist().to_string(),
-            album_count: releases.len() as i64,
+            name: artist_name(&releases),
+            album_count: i64::try_from(releases.len()).unwrap_or(i64::MAX),
         },
         album: releases.iter().map(Album::of).collect(),
     };
     Ok(Payload::new("artist", artist))
+}
+
+/// The name the artist list shows for these releases: the smallest of their
+/// keys, which differ at most in case. `releases` is not empty.
+fn artist_name(releases: &[LibraryRelease]) -> String {
+    let key = releases
+        .iter()
+        .map(|release| release.artist.as_str())
+        .min()
+        .unwrap_or_default();
+    store::display_artist(key).to_string()
 }
 
 /// The artist key the `id` parameter names, and the artist's releases (at
@@ -399,18 +442,18 @@ pub(crate) async fn music_directory(
         Some(Id::Artist(_)) => {
             let (key, releases) = artist_releases(pool, params).await?;
             let albums: Vec<Album> = releases.iter().map(Album::of).collect();
-            Ok(Payload::new(
+            Ok(Payload::value(
                 "directory",
                 json!({
                     "id": Id::artist(&key),
-                    "name": releases[0].display_artist(),
+                    "name": artist_name(&releases),
                     "child": albums,
                 }),
             ))
         }
         Some(Id::Album(_)) => {
             let (release, songs) = album_songs(pool, params).await?;
-            Ok(Payload::new(
+            Ok(Payload::value(
                 "directory",
                 json!({
                     "id": Id::album(release.id),
@@ -456,7 +499,7 @@ pub(crate) async fn album_list(
         _ => Vec::new(),
     };
     let albums: Vec<Album> = releases.iter().map(Album::of).collect();
-    Ok(Payload::new(key, json!({ "album": albums })))
+    Ok(Payload::value(key, json!({ "album": albums })))
 }
 
 /// `getRandomSongs`.
@@ -470,7 +513,7 @@ pub(crate) async fn random_songs(pool: &SqlitePool, params: &Params) -> Result<P
     )
     .await?;
     let songs: Vec<Song> = tracks.iter().map(|track| Song::of(track, None)).collect();
-    Ok(Payload::new("randomSongs", json!({ "song": songs })))
+    Ok(Payload::value("randomSongs", json!({ "song": songs })))
 }
 
 /// `search2` (`key` = `searchResult2`) and `search3` (`key` = `searchResult3`):
@@ -519,7 +562,7 @@ pub(crate) async fn search(
     let artists: Vec<Artist> = artists.iter().map(Artist::of).collect();
     let albums: Vec<Album> = releases.iter().map(Album::of).collect();
     let songs: Vec<Song> = tracks.iter().map(|track| Song::of(track, None)).collect();
-    Ok(Payload::new(
+    Ok(Payload::value(
         key,
         json!({ "artist": artists, "album": albums, "song": songs }),
     ))
@@ -535,7 +578,7 @@ fn search_text(query: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::subsonic::test_util::{call_json, state};
+    use crate::subsonic::test_util::{call_json, call_xml, state};
     use crate::test_support::{ScratchDir, scanned, seed_release, store_tracks};
     use serde_json::Value;
 
@@ -685,6 +728,112 @@ mod tests {
         assert_eq!(reply["song"]["bitRate"], 200);
         assert_eq!(reply["song"]["contentType"], "audio/mpeg");
         assert_eq!(reply["song"]["path"], "a/01.mp3");
+
+        // Only the calls that return one album or one song stat the files.
+        let album_id = Id::album(
+            store::library_tracks(&state.pool, None, 1, 0)
+                .await
+                .unwrap()[0]
+                .release_id,
+        );
+        let album = call_json(&state, "getAlbum", &[("id", &album_id)]).await;
+        assert_eq!(album["album"]["song"][0]["size"], 4_500_000);
+        let directory = call_json(&state, "getMusicDirectory", &[("id", &album_id)]).await;
+        assert_eq!(directory["directory"]["child"][0]["size"], 4_500_000);
+
+        let search = call_json(&state, "search3", &[("query", "One")]).await;
+        let songs = search["searchResult3"]["song"].as_array().unwrap();
+        assert_eq!(songs.len(), 1);
+        assert!(songs[0].get("size").is_none(), "search does not stat files");
+        assert!(songs[0].get("bitRate").is_none());
+        let random = call_json(&state, "getRandomSongs", &[]).await;
+        let songs = random["randomSongs"]["song"].as_array().unwrap();
+        assert_eq!(songs.len(), 1);
+        assert!(
+            songs[0].get("size").is_none(),
+            "random songs do not stat files"
+        );
+        let list = call_json(&state, "getAlbumList2", &[("type", "random")]).await;
+        let albums = list["albumList2"]["album"].as_array().unwrap();
+        assert_eq!(albums.len(), 1);
+        assert!(albums[0].get("song").is_none() && albums[0].get("size").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_artist_has_the_same_name_in_the_list_and_on_its_pages() {
+        let state = state().await;
+        // The earlier year puts the release with the larger key first.
+        store_tracks(
+            &state.pool,
+            "/music",
+            &[scanned(
+                "/music/a/01.mp3",
+                "Early",
+                Some("$hVN"),
+                "x",
+                1,
+                1990,
+            )],
+        )
+        .await;
+        store_tracks(
+            &state.pool,
+            "/music",
+            &[scanned(
+                "/music/b/01.mp3",
+                "Late",
+                Some("$HVN"),
+                "x",
+                1,
+                2000,
+            )],
+        )
+        .await;
+
+        let list = call_json(&state, "getArtists", &[]).await;
+        let entry = &list["artists"]["index"][0]["artist"];
+        assert_eq!(entry.as_array().unwrap().len(), 1);
+        assert_eq!(entry[0]["name"], "$HVN");
+        assert_eq!(entry[0]["albumCount"], 2);
+        let id = entry[0]["id"].as_str().unwrap();
+
+        let artist = call_json(&state, "getArtist", &[("id", id)]).await;
+        assert_eq!(artist["artist"]["name"], "$HVN");
+        assert_eq!(artist["artist"]["albumCount"], 2);
+        assert_eq!(artist["artist"]["album"][0]["name"], "Early");
+        let directory = call_json(&state, "getMusicDirectory", &[("id", id)]).await;
+        assert_eq!(directory["directory"]["name"], "$HVN");
+    }
+
+    #[tokio::test]
+    async fn xml_responses_carry_albums_with_song_children_and_attributes() {
+        let state = state().await;
+        let release = seed_release(&state.pool, "/music/a", "Blue", &["One", "Two"]).await;
+        let text = call_xml(&state, "getAlbum", &[("id", &Id::album(release.id))]).await;
+
+        assert!(
+            text.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<subsonic-response ")
+        );
+        assert!(text.contains(" xmlns=\"http://subsonic.org/restapi\""));
+        assert!(text.contains(" status=\"ok\""));
+        assert!(text.ends_with("</album></subsonic-response>"), "{text}");
+        let album = &text[text.find("<album ").expect("an album element")..];
+        let (open, rest) = album.split_once('>').unwrap();
+        assert!(!open.ends_with('/'), "the album has children: {open}");
+        assert!(open.contains(" name=\"Blue\""));
+        assert!(open.contains(" isDir=\"true\""));
+        let songs: Vec<&str> = rest
+            .split("<song ")
+            .skip(1)
+            .map(|song| song.split_once('>').unwrap().0)
+            .collect();
+        assert_eq!(songs.len(), 2, "{rest}");
+        for song in &songs {
+            assert!(song.ends_with('/'), "a song is an empty element: {song}");
+            assert!(song.contains(" isDir=\"false\""), "{song}");
+        }
+        assert!(songs[0].contains(" title=\"One\"") && songs[0].contains(" track=\"1\""));
+        assert!(songs[1].contains(" title=\"Two\"") && songs[1].contains(" track=\"2\""));
     }
 
     #[tokio::test]
@@ -727,15 +876,25 @@ mod tests {
     #[tokio::test]
     async fn album_lists_cover_every_type() {
         let state = state().await;
-        store_tracks(
-            &state.pool,
-            "/music",
-            &[
-                scanned("/music/a/01.mp3", "Beta", Some("Zed"), "x", 1, 1999),
-                scanned("/music/b/01.mp3", "Alpha", Some("Abba"), "x", 1, 2005),
-            ],
-        )
-        .await;
+        // Stored in this order, so the IDs ascend Alpha, Zeta, Beta. The orders
+        // all differ: by title, by artist (Aaron, Abba, Zed), by year and by ID.
+        for (dir, album, artist, year) in [
+            ("a", "Alpha", "Abba", 2005),
+            ("b", "Zeta", "Aaron", 1990),
+            ("c", "Beta", "Zed", 1999),
+        ] {
+            let path = format!("/music/{dir}/01.mp3");
+            let track = scanned(&path, album, Some(artist), "x", 1, year);
+            store_tracks(&state.pool, "/music", &[track]).await;
+        }
+        let by_id = store::library_releases(&state.pool, ReleaseOrder::Id, 10, 0)
+            .await
+            .unwrap();
+        let by_id: Vec<&str> = by_id
+            .iter()
+            .map(|release| release.name.as_deref().unwrap())
+            .collect();
+        assert_eq!(by_id, ["Alpha", "Zeta", "Beta"]);
         let list = |pairs: &'static [(&'static str, &'static str)]| {
             let state = &state;
             async move {
@@ -748,28 +907,41 @@ mod tests {
 
         assert_eq!(
             list(&[("type", "alphabeticalByName")]).await,
-            ["Alpha", "Beta"]
+            ["Alpha", "Beta", "Zeta"]
         );
         assert_eq!(
             list(&[("type", "alphabeticalByArtist")]).await,
-            ["Alpha", "Beta"]
+            ["Zeta", "Alpha", "Beta"]
         );
         assert_eq!(
-            list(&[("type", "byYear"), ("fromYear", "2010"), ("toYear", "1990")]).await,
-            ["Alpha", "Beta"]
+            list(&[("type", "byYear"), ("fromYear", "1980"), ("toYear", "2020")]).await,
+            ["Zeta", "Beta", "Alpha"]
+        );
+        assert_eq!(
+            list(&[("type", "byYear"), ("fromYear", "2020"), ("toYear", "1980")]).await,
+            ["Alpha", "Beta", "Zeta"]
+        );
+        assert_eq!(
+            list(&[("type", "byYear"), ("fromYear", "1995"), ("toYear", "2000")]).await,
+            ["Beta"]
         );
         assert_eq!(
             list(&[("type", "alphabeticalByName"), ("offset", "1")]).await,
-            ["Beta"]
+            ["Beta", "Zeta"]
         );
-        assert_eq!(list(&[("type", "newest"), ("size", "1")]).await.len(), 1);
-        assert_eq!(list(&[("type", "random")]).await.len(), 2);
+        assert_eq!(
+            list(&[("type", "newest")]).await,
+            ["Beta", "Zeta", "Alpha"],
+            "the most recently stored first"
+        );
+        assert_eq!(list(&[("type", "newest"), ("size", "1")]).await, ["Beta"]);
+        assert_eq!(list(&[("type", "random")]).await.len(), 3);
         for empty in ["starred", "frequent", "recent", "highest", "byGenre"] {
             let reply = call_json(&state, "getAlbumList2", &[("type", empty)]).await;
             assert!(names(&reply, "albumList2").is_empty(), "{empty}");
         }
         let old = call_json(&state, "getAlbumList", &[("type", "alphabeticalByName")]).await;
-        assert_eq!(names(&old, "albumList"), ["Alpha", "Beta"]);
+        assert_eq!(names(&old, "albumList"), ["Alpha", "Beta", "Zeta"]);
 
         let code = |reply: Value| reply["error"]["code"].clone();
         let partial = [("type", "byYear"), ("fromYear", "1990")];

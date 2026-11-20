@@ -124,7 +124,13 @@ impl Params {
 
 /// `bytes` as lowercase hex.
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        out.push(char::from(DIGITS[usize::from(byte & 0xf)]));
+    }
+    out
 }
 
 /// The bytes of a hex string of either case; `None` when it is not hex.
@@ -302,8 +308,8 @@ async fn call(
             json!([{"name": "formPost", "versions": [1]}]),
         ),
         "getMusicFolders" => library::music_folders(),
-        "getArtists" => library::artists(&state.pool, "artists").await?,
-        "getIndexes" => library::artists(&state.pool, "indexes").await?,
+        "getArtists" => library::artists(&state.pool, library::ArtistList::Artists).await?,
+        "getIndexes" => library::artists(&state.pool, library::ArtistList::Indexes).await?,
         "getArtist" => library::artist(&state.pool, params).await?,
         "getAlbum" => library::album(&state.pool, params).await?,
         "getSong" => library::song(&state.pool, params).await?,
@@ -385,6 +391,17 @@ pub(crate) mod test_util {
             .unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
         value["subsonic-response"].clone()
+    }
+
+    /// Calls `method` as the user without `f`, so the reply is XML; returns the
+    /// body.
+    pub(crate) async fn call_xml(state: &AppState, method: &str, pairs: &[(&str, &str)]) -> String {
+        let pairs = [&[("u", "u"), ("p", "p")][..], pairs].concat();
+        let response = send(state, method, &pairs, &HeaderMap::new()).await;
+        let bytes = axum::body::to_bytes(response.into_body(), 64 << 20)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
     }
 
     async fn send(
