@@ -81,6 +81,11 @@ impl ApiError {
         Self::with(70, format!("{what} not found"))
     }
 
+    /// Code 0: `name` has a value the method can't use.
+    pub(crate) fn invalid(name: &str) -> Self {
+        Self::with(0, format!("Invalid value for parameter {name}"))
+    }
+
     /// Code 10: the method needs `name`.
     pub(crate) fn missing(name: &str) -> Self {
         Self::with(10, format!("Required parameter is missing: {name}"))

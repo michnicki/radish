@@ -36,6 +36,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
+/// The most items one list, search or page returns.
+pub(crate) const MAX_ITEMS: i64 = 500;
+
 /// The largest form body accepted, in bytes. A POST carries the same few
 /// parameters a query string would.
 const MAX_FORM_BYTES: usize = 16 * 1024;
@@ -88,6 +91,24 @@ impl Params {
     /// The first value of `name`, which the method needs.
     pub(crate) fn required(&self, name: &str) -> Result<&str, ApiError> {
         self.get(name).ok_or_else(|| ApiError::missing(name))
+    }
+
+    /// An integer parameter, `None` when absent.
+    pub(crate) fn integer(&self, name: &str) -> Result<Option<i64>, ApiError> {
+        self.get(name)
+            .map(|value| value.trim().parse().map_err(|_| ApiError::invalid(name)))
+            .transpose()
+    }
+
+    /// A count or size: `default` when absent, kept within 0 and
+    /// [`MAX_ITEMS`]. An explicit 0 means none.
+    pub(crate) fn count(&self, name: &str, default: i64) -> Result<i64, ApiError> {
+        Ok(self.integer(name)?.unwrap_or(default).clamp(0, MAX_ITEMS))
+    }
+
+    /// An offset: 0 when absent, never negative.
+    pub(crate) fn offset(&self, name: &str) -> Result<i64, ApiError> {
+        Ok(self.integer(name)?.unwrap_or(0).max(0))
     }
 
     #[cfg(test)]
@@ -242,12 +263,37 @@ async fn dispatch(
     }
 }
 
+/// Methods answered with an empty object under a key: there is nothing of
+/// the kind to list. Answering beats an error, which clients show.
+const EMPTY_OBJECTS: [(&str, &str); 17] = [
+    ("getStarred", "starred"),
+    ("getStarred2", "starred2"),
+    ("getNowPlaying", "nowPlaying"),
+    ("getSongsByGenre", "songsByGenre"),
+    ("getPlaylists", "playlists"),
+    ("getTopSongs", "topSongs"),
+    ("getSimilarSongs", "similarSongs"),
+    ("getSimilarSongs2", "similarSongs2"),
+    ("getArtistInfo", "artistInfo"),
+    ("getArtistInfo2", "artistInfo2"),
+    ("getAlbumInfo", "albumInfo"),
+    ("getAlbumInfo2", "albumInfo"),
+    ("getBookmarks", "bookmarks"),
+    ("getInternetRadioStations", "internetRadioStations"),
+    ("getPodcasts", "podcasts"),
+    ("getShares", "shares"),
+    ("getLyrics", "lyrics"),
+];
+
 async fn call(
     state: &AppState,
     method: &str,
     params: &Params,
     _headers: &HeaderMap,
 ) -> Result<Answer, ApiError> {
+    if let Some((_, key)) = EMPTY_OBJECTS.iter().find(|(name, _)| *name == method) {
+        return Ok(Answer::Payload(Payload::new(key, json!({}))));
+    }
     let payload = match method {
         "ping" => Payload::empty(),
         "getLicense" => Payload::new("license", json!({"valid": true})),
@@ -262,9 +308,49 @@ async fn call(
         "getAlbum" => library::album(&state.pool, params).await?,
         "getSong" => library::song(&state.pool, params).await?,
         "getMusicDirectory" => library::music_directory(&state.pool, params).await?,
+        "getAlbumList" => library::album_list(&state.pool, params, "albumList").await?,
+        "getAlbumList2" => library::album_list(&state.pool, params, "albumList2").await?,
+        "getRandomSongs" => library::random_songs(&state.pool, params).await?,
+        "search2" => library::search(&state.pool, params, "searchResult2").await?,
+        "search3" => library::search(&state.pool, params, "searchResult3").await?,
+        "getGenres" => Payload::new("genres", json!({"genre": []})),
+        "getUser" => user(&state.credentials),
+        "getScanStatus" => Payload::new(
+            "scanStatus",
+            json!({"scanning": false, "count": crate::store::track_count(&state.pool).await?}),
+        ),
+        // Nothing is kept per user: plays and queues are accepted and dropped.
+        "scrobble" | "savePlayQueue" | "getPlayQueue" => Payload::empty(),
+        "getPlaylist" => return Err(ApiError::not_found("Playlist")),
+        "star" | "unstar" | "setRating" | "createPlaylist" | "updatePlaylist"
+        | "deletePlaylist" => return Err(ApiError::unsupported(method)),
         other => return Err(ApiError::unsupported(other)),
     };
     Ok(Answer::Payload(payload))
+}
+
+/// `getUser`: the one user, allowed to stream, download and fetch covers.
+fn user(credentials: &Credentials) -> Payload {
+    Payload::new(
+        "user",
+        json!({
+            "username": credentials.user(),
+            "scrobblingEnabled": false,
+            "adminRole": false,
+            "settingsRole": false,
+            "downloadRole": true,
+            "uploadRole": false,
+            "playlistRole": false,
+            "coverArtRole": true,
+            "commentRole": false,
+            "podcastRole": false,
+            "streamRole": true,
+            "jukeboxRole": false,
+            "shareRole": false,
+            "videoConversionRole": false,
+            "folder": [library::MUSIC_FOLDER_ID],
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -420,6 +506,67 @@ mod tests {
         assert_eq!(
             call_as(&state, "getOpenSubsonicExtensions.view", &[]).await["status"],
             "ok"
+        );
+    }
+
+    #[test]
+    fn counts_default_and_stay_within_bounds() {
+        let params = Params::from_pairs(&[
+            ("size", "900"),
+            ("offset", "-4"),
+            ("zero", "0"),
+            ("bad", "x"),
+        ]);
+        assert_eq!(params.count("size", 10), Ok(MAX_ITEMS));
+        assert_eq!(params.count("absent", 10), Ok(10));
+        assert_eq!(params.count("zero", 10), Ok(0));
+        assert_eq!(params.offset("offset"), Ok(0));
+        assert_eq!(params.count("bad", 10), Err(ApiError::invalid("bad")));
+    }
+
+    #[tokio::test]
+    async fn stateless_methods_answer_empty_or_not_supported() {
+        let state = state().await;
+        for (method, key) in EMPTY_OBJECTS {
+            let reply = call_json(&state, method, &[]).await;
+            assert_eq!(reply["status"], "ok", "{method}");
+            assert_eq!(reply[key], json!({}), "{method}");
+        }
+        assert_eq!(
+            call_json(&state, "getGenres", &[]).await["genres"],
+            json!({"genre": []})
+        );
+        for method in ["scrobble", "savePlayQueue", "getPlayQueue"] {
+            let reply = call_json(&state, method, &[("id", "tr-1")]).await;
+            assert_eq!(reply["status"], "ok", "{method}");
+            assert!(reply.get("playQueue").is_none(), "{method}");
+        }
+        for method in [
+            "star",
+            "unstar",
+            "setRating",
+            "createPlaylist",
+            "updatePlaylist",
+            "deletePlaylist",
+        ] {
+            assert_eq!(
+                call_json(&state, method, &[]).await["error"]["code"],
+                0,
+                "{method}"
+            );
+        }
+        assert_eq!(
+            call_json(&state, "getPlaylist", &[("id", "1")]).await["error"]["code"],
+            70
+        );
+        let user = call_json(&state, "getUser", &[("username", "u")]).await;
+        assert_eq!(user["user"]["username"], "u");
+        assert_eq!(user["user"]["streamRole"], true);
+        assert_eq!(user["user"]["adminRole"], false);
+        assert_eq!(user["user"]["folder"], json!([1]));
+        assert_eq!(
+            call_json(&state, "getScanStatus", &[]).await["scanStatus"],
+            json!({"scanning": false, "count": 0})
         );
     }
 }

@@ -57,6 +57,11 @@ impl Credentials {
         )
     }
 
+    /// The configured username.
+    pub(crate) fn user(&self) -> &str {
+        &self.user
+    }
+
     /// Checks a request's login: `u` with a password `p` (plain, or `enc:`
     /// and its hex), or `u` with a token `t = md5(password + s)` and its
     /// salt `s`. Comparisons take the same time wherever the values differ.
