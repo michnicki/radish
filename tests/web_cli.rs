@@ -2,19 +2,12 @@
 
 mod support;
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::process::{Command, Stdio};
 use support::{
-    MockServer, db_path, musicbrainz_empty_search, musicbrainz_release_json, temp_dir,
-    write_tagged_wav,
+    MockServer, Reply, Server, db_path, musicbrainz_empty_search, musicbrainz_release_json,
+    temp_dir, write_tagged_wav,
 };
-
-/// How long to wait for the server to announce its address.
-const START_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn radish(db: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_radish"))
@@ -24,129 +17,6 @@ fn radish(db: &Path, args: &[&str]) -> std::process::Output {
         .current_dir(db.parent().unwrap())
         .output()
         .unwrap()
-}
-
-/// A running `radish serve`, killed when dropped.
-struct Server {
-    child: Child,
-    addr: String,
-}
-
-struct Reply {
-    status: u16,
-    headers: String,
-    body: String,
-}
-
-impl Server {
-    fn start(db: &Path) -> Self {
-        Self::start_with(db, &[], &[])
-    }
-
-    /// Starts `serve` with extra arguments and environment, from the
-    /// database's directory, so a `.env` in the checkout is never read.
-    fn start_with(db: &Path, args: &[&str], env: &[(&str, &str)]) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_radish"));
-        command
-            .arg("--db")
-            .arg(db)
-            .args(["serve", "--bind", "127.0.0.1:0"])
-            .args(args)
-            .current_dir(db.parent().unwrap())
-            .env_remove("RADISH_DISCOGS_TOKEN")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for (key, value) in env {
-            command.env(key, value);
-        }
-        let mut child = command.spawn().unwrap();
-
-        let stdout = child.stdout.take().unwrap();
-        let (sender, receiver) = mpsc::channel();
-        std::thread::spawn(move || {
-            let mut line = String::new();
-            let _ = BufReader::new(stdout).read_line(&mut line);
-            let _ = sender.send(line);
-        });
-        let Ok(line) = receiver.recv_timeout(START_TIMEOUT) else {
-            let _ = child.kill();
-            let _ = child.wait();
-            let mut stderr = String::new();
-            let _ = child.stderr.take().unwrap().read_to_string(&mut stderr);
-            panic!("the server did not announce an address; stderr: {stderr}");
-        };
-        let Some(addr) = line
-            .strip_prefix("Serving http://")
-            .and_then(|rest| rest.split_whitespace().next())
-        else {
-            let _ = child.kill();
-            let mut stderr = String::new();
-            let _ = child.stderr.take().unwrap().read_to_string(&mut stderr);
-            panic!("unexpected startup output {line:?}; stderr: {stderr}");
-        };
-        Self {
-            addr: addr.to_string(),
-            child,
-        }
-    }
-
-    /// Sends one request with the given `Host` header (the real address when `None`).
-    fn request(&self, method: &str, path: &str, host: Option<&str>) -> Reply {
-        let host = host.unwrap_or(&self.addr);
-        let mut stream = TcpStream::connect(&self.addr).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        write!(
-            stream,
-            "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-        )
-        .unwrap();
-        read_reply(stream)
-    }
-
-    /// Sends a form `POST`, with extra header lines such as `Sec-Fetch-Site: same-origin`.
-    fn post(&self, path: &str, body: &str, headers: &[&str]) -> Reply {
-        let mut stream = TcpStream::connect(&self.addr).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        let extra: String = headers.iter().map(|line| format!("{line}\r\n")).collect();
-        write!(
-            stream,
-            "POST {path} HTTP/1.1\r\nHost: {}\r\n\
-             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-             {extra}Connection: close\r\n\r\n{body}",
-            self.addr,
-            body.len()
-        )
-        .unwrap();
-        read_reply(stream)
-    }
-
-    fn get(&self, path: &str) -> Reply {
-        self.request("GET", path, None)
-    }
-}
-
-fn read_reply(mut stream: TcpStream) -> Reply {
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).unwrap();
-    let raw = String::from_utf8_lossy(&raw).into_owned();
-    let (head, body) = raw.split_once("\r\n\r\n").unwrap();
-    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
-    Reply {
-        status,
-        headers: head.to_ascii_lowercase(),
-        body: body.to_string(),
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 /// Two tagged albums, one with markup in its tags.

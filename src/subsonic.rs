@@ -18,7 +18,7 @@ mod library;
 mod media;
 mod response;
 
-pub use auth::Credentials;
+pub use auth::{Credentials, PASSWORD_VAR, USER_VAR};
 
 use crate::outln;
 use anyhow::{Context, Result};

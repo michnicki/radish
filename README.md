@@ -54,6 +54,9 @@ radish serve
 
 # The same, fetching releases entered on the review page from the local dump indexes
 radish serve --offline
+
+# Stream to Subsonic players (Symfonium, Feishin, DSub, ...) on the local network
+radish subsonic --bind 0.0.0.0:4533
 ```
 
 All commands accept `--db PATH`. It defaults to `./radish.db`, relative to the current working directory, and the database is created automatically. Use the same database path across commands to access the same library:
@@ -87,6 +90,8 @@ Radish also reads settings from a file named `.env` in the **current directory o
 
 - `RADISH_DISCOGS_TOKEN`
 - `RADISH_INDEX_DIR`
+- `RADISH_SUBSONIC_USER`
+- `RADISH_SUBSONIC_PASSWORD`
 
 Variables already set in the environment always win over the file. Only a regular file named `.env` is read: a missing file, a directory of that name (as in a Python virtualenv), or an unreadable file is ignored without a message. Malformed lines are skipped, and valid keys after them still load. A leading UTF-8 byte order mark is ignored. Service endpoints cannot be set from `.env` (see [Test-server overrides](#test-server-overrides)).
 
@@ -511,6 +516,54 @@ Other defaults to keep in mind:
 - Requests whose `Host` header is not `localhost`, a loopback address, or the bind address get `403`, which stops a web page from reaching the server through DNS rebinding. A wildcard bind (`0.0.0.0`) accepts any host.
 - Tags, paths and provider titles are untrusted. Control and bidirectional characters are escaped as in terminal output, then HTML escaping is applied. Every response carries a `Content-Security-Policy` that allows nothing but the page's own inline style.
 - Errors are pages with the usual header and a link back. Only the `403` for a foreign `Host` and requests the pages never send (a repeated query parameter, an unsupported method) get axum's bare answer instead.
+
+## Subsonic server
+
+`radish subsonic` serves the library over the [OpenSubsonic API](https://opensubsonic.github.io) (Subsonic API 1.16.1), so Subsonic music players can browse, search and stream it: Symfonium, Feishin, DSub, Tempo, Substreamer and others. Point the player at `http://HOST:4533`, with the username and password below.
+
+```bash
+# .env in the directory you run radish from, or the environment. Use single
+# quotes, so a `$` in the password stays as it is.
+RADISH_SUBSONIC_USER=me
+RADISH_SUBSONIC_PASSWORD='a long random password'
+
+radish subsonic                        # this machine only: 127.0.0.1:4533
+radish subsonic --bind 0.0.0.0:4533    # players on other devices
+```
+
+The command refuses to start without both values, before it opens the database.
+
+What players see:
+
+- **Albums** are local releases and **artists** are their album artists. Values are effective: an accepted match's where there is one, the tags otherwise, as in `list` and `search`. Artists whose names differ only in the case of ASCII letters are one artist. A release without any artist is listed under `[Unknown Artist]`, and a release without a title under its folder name. There is one music folder, `Music`, and no genres.
+- **IDs** are `tr-<track ID>` for songs and `al-<release ID>` for albums. An artist's ID is `ar-` followed by the hex of its name. A song keeps its ID until its file moves. An album keeps its ID while the folder groups the same way. An artist keeps its ID while its name stays the same.
+- **Album lists** (`getAlbumList`, `getAlbumList2`) support the types `random`, `newest`, `alphabeticalByName`, `alphabeticalByArtist` and `byYear`. `newest` orders by the order the releases were stored in, last stored first, not by the files' dates. `frequent`, `recent`, `highest`, `starred` and `byGenre` return an empty list.
+- **Streaming** sends files as they are. `maxBitRate`, `format` and `timeOffset` are ignored, and nothing is transcoded. `download` sends the same file. Neither counts as a play.
+  - One `bytes=` range is honoured for seeking (the unit in any case), with `206`; a range that starts past the end of the file gets `416`.
+  - Several ranges, other units and malformed values get the whole file with `200`, and so does an empty file.
+  - `If-Range` is honoured when it equals the `Last-Modified` the server sends. Any other value gets the whole file.
+  - `HEAD` requests are answered with the headers alone.
+- **Cover art**, in this order:
+  1. A picture named `cover`, `folder`, `front` or `album` (`.jpg`, `.jpeg`, `.png`, `.webp` or `.gif`, any case) in the release's folder or in its first track's folder.
+  2. The front cover embedded in the first track, or its first embedded picture when none is marked as the front cover.
+  3. Any other picture in those folders.
+
+  Only real JPEG, PNG, GIF and WebP data is sent, whatever the file name says, and at most 20 MB. For embedded pictures the tighter bound is Lofty's own allocation limit (16 MB by default). The `size` parameter is ignored: pictures are never resized.
+- **Search** matches album artists' names, albums' titles and artists, and songs' titles and artists. An empty query (also `""` or `*`) returns everything in a stable order, page by page, which players use to sync the library.
+- **Song size and bit rate** are only in `getSong`, `getAlbum` and an album's `getMusicDirectory`, from the file on disk. The bit rate is estimated from the size and the duration. Lists and search results leave both out, so a full sync doesn't read the metadata of every file.
+- **No per-user state.**
+  - `scrobble`, `savePlayQueue` and `getPlayQueue` are accepted and answer empty.
+  - `star`, `unstar`, `setRating` and the playlist changes fail as not supported, and `getPlaylist` fails as not found.
+  - Starred songs, playlists, now playing, bookmarks, shares, podcasts, radio stations, lyrics, and artist, album and similar-song information are empty.
+
+Methods: `ping`, `getLicense`, `getOpenSubsonicExtensions`, `getUser`, `getScanStatus`, `getMusicFolders`, `getIndexes`, `getMusicDirectory`, `getArtists`, `getArtist`, `getAlbum`, `getSong`, `getGenres`, `getAlbumList`, `getAlbumList2`, `getRandomSongs`, `search2`, `search3`, `stream`, `download`, `getCoverArt`, and the empty or no-op methods above. Anything else fails with error 0.
+
+Security:
+
+- Every method except `getOpenSubsonicExtensions` needs the login. A player can send it as `u` and `p` (plain, or `enc:` and its hex), or as `u`, a token `t` = md5(password + salt) and the salt `s`. API keys are not supported.
+- Neither form is encrypted, and the token can be replayed. Use the server on loopback, a trusted network, a VPN, or behind a reverse proxy that adds TLS. Pick a password you use nowhere else: the server has to keep it in plain text to check tokens.
+- It listens on loopback unless told otherwise, and any other address prints a warning. Failed logins are not rate-limited.
+- Responses carry `X-Content-Type-Options: nosniff`, a sandboxing `Content-Security-Policy` and `Referrer-Policy: no-referrer`. A request is answered only with the files of tracks in the database, chosen by ID, and with pictures next to them.
 
 ## Storage and output
 

@@ -5,12 +5,14 @@
 
 #![allow(dead_code)]
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::Duration;
 
 pub struct MockServer {
     pub url: String,
@@ -456,4 +458,160 @@ pub fn write_wav_with_data(path: &Path, data_len: usize) {
     bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&data);
     std::fs::write(path, bytes).unwrap();
+}
+
+/// How long to wait for a server to announce its address.
+const START_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A running `radish serve` or `radish subsonic`, killed when dropped.
+pub struct Server {
+    child: Child,
+    pub addr: String,
+}
+
+/// One HTTP reply. `headers` is the header block in lowercase; `body` is the
+/// body as lossy UTF-8, and `bytes` as sent.
+pub struct Reply {
+    pub status: u16,
+    pub headers: String,
+    pub body: String,
+    pub bytes: Vec<u8>,
+}
+
+impl Server {
+    /// Starts `serve` on a free loopback port.
+    pub fn start(db: &Path) -> Self {
+        Self::start_with(db, &[], &[])
+    }
+
+    /// Starts `serve` with extra arguments and environment.
+    pub fn start_with(db: &Path, args: &[&str], env: &[(&str, &str)]) -> Self {
+        let mut command = vec!["serve", "--bind", "127.0.0.1:0"];
+        command.extend_from_slice(args);
+        Self::spawn(db, &command, env)
+    }
+
+    /// Starts `radish --db DB <command_args>` from the database's directory,
+    /// so a `.env` in the checkout is never read. The service credentials of
+    /// the calling environment are removed and `env` is added. The command
+    /// must print `Serving http://ADDR` as its first line.
+    pub fn spawn(db: &Path, command_args: &[&str], env: &[(&str, &str)]) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_radish"));
+        command
+            .arg("--db")
+            .arg(db)
+            .args(command_args)
+            .current_dir(db.parent().unwrap())
+            .env_remove("RADISH_DISCOGS_TOKEN")
+            .env_remove("RADISH_SUBSONIC_USER")
+            .env_remove("RADISH_SUBSONIC_PASSWORD")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().unwrap();
+
+        let stdout = child.stdout.take().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = BufReader::new(stdout).read_line(&mut line);
+            let _ = sender.send(line);
+        });
+        let Ok(line) = receiver.recv_timeout(START_TIMEOUT) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            let mut stderr = String::new();
+            let _ = child.stderr.take().unwrap().read_to_string(&mut stderr);
+            panic!("the server did not announce an address; stderr: {stderr}");
+        };
+        let Some(addr) = line
+            .strip_prefix("Serving http://")
+            .and_then(|rest| rest.split_whitespace().next())
+        else {
+            let _ = child.kill();
+            let mut stderr = String::new();
+            let _ = child.stderr.take().unwrap().read_to_string(&mut stderr);
+            panic!("unexpected startup output {line:?}; stderr: {stderr}");
+        };
+        Self {
+            addr: addr.to_string(),
+            child,
+        }
+    }
+
+    /// Sends one request with the given `Host` header (the real address when `None`).
+    pub fn request(&self, method: &str, path: &str, host: Option<&str>) -> Reply {
+        self.send(method, path, host, &[])
+    }
+
+    /// Sends one request with extra header lines such as `Range: bytes=0-9`.
+    pub fn request_with(&self, method: &str, path: &str, headers: &[&str]) -> Reply {
+        self.send(method, path, None, headers)
+    }
+
+    fn send(&self, method: &str, path: &str, host: Option<&str>, headers: &[&str]) -> Reply {
+        let host = host.unwrap_or(&self.addr);
+        let mut stream = TcpStream::connect(&self.addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let extra: String = headers.iter().map(|line| format!("{line}\r\n")).collect();
+        write!(
+            stream,
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n"
+        )
+        .unwrap();
+        read_reply(stream)
+    }
+
+    /// Sends a form `POST`, with extra header lines such as `Sec-Fetch-Site: same-origin`.
+    pub fn post(&self, path: &str, body: &str, headers: &[&str]) -> Reply {
+        let mut stream = TcpStream::connect(&self.addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let extra: String = headers.iter().map(|line| format!("{line}\r\n")).collect();
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: {}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+             {extra}Connection: close\r\n\r\n{body}",
+            self.addr,
+            body.len()
+        )
+        .unwrap();
+        read_reply(stream)
+    }
+
+    pub fn get(&self, path: &str) -> Reply {
+        self.request("GET", path, None)
+    }
+}
+
+/// Reads a whole reply. The servers send `Content-Length`, never chunks.
+fn read_reply(mut stream: TcpStream) -> Reply {
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).unwrap();
+    let split = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap();
+    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+    let bytes = raw[split + 4..].to_vec();
+    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    Reply {
+        status,
+        headers: head.to_ascii_lowercase(),
+        body: String::from_utf8_lossy(&bytes).into_owned(),
+        bytes,
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }

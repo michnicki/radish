@@ -7,7 +7,7 @@ use radish::layout::{
 use radish::output::{Clean, clean_path};
 use radish::progress::ImportProgress;
 use radish::providers::{ProviderKind, ReleaseId};
-use radish::{db, importer, index, outln, review, runner, store, watcher, web};
+use radish::{db, importer, index, outln, review, runner, store, subsonic, watcher, web};
 use std::io::{self, IsTerminal};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -76,6 +76,15 @@ enum Command {
         /// indexes (MusicBrainz and Discogs; Deezer always uses the network)
         #[arg(long)]
         offline: bool,
+    },
+    /// Stream the library to Subsonic-compatible music players (the
+    /// OpenSubsonic API), with the login in RADISH_SUBSONIC_USER and
+    /// RADISH_SUBSONIC_PASSWORD
+    Subsonic {
+        /// Address to listen on. Use 0.0.0.0:4533 for players on other
+        /// devices; logins are not encrypted, so only on a trusted network.
+        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:4533")]
+        bind: SocketAddr,
     },
     /// List every track in the library
     List,
@@ -459,7 +468,12 @@ fn match_jobs(offline: bool, jobs: Option<u16>) -> usize {
 
 /// The only keys read from `.env`. Endpoint overrides are deliberately excluded
 /// so a stray `.env` can never redirect real credentials to another host.
-const DOTENV_KEYS: [&str; 2] = ["RADISH_DISCOGS_TOKEN", "RADISH_INDEX_DIR"];
+const DOTENV_KEYS: [&str; 4] = [
+    "RADISH_DISCOGS_TOKEN",
+    "RADISH_INDEX_DIR",
+    subsonic::USER_VAR,
+    subsonic::PASSWORD_VAR,
+];
 
 /// Loads allowed keys from `./.env` in the current directory only, never from a
 /// parent. Existing environment variables win. Anything but a readable regular
@@ -598,6 +612,12 @@ async fn run() -> Result<()> {
         _ => Vec::new(),
     };
 
+    // The Subsonic login is checked before the database is opened.
+    let subsonic_credentials = match &cli.command {
+        Command::Subsonic { .. } => Some(subsonic::Credentials::from_env()?),
+        _ => None,
+    };
+
     let pool = db::connect(&cli.db).await?;
 
     match cli.command {
@@ -640,6 +660,11 @@ async fn run() -> Result<()> {
                 review::Source::Network
             };
             web::serve(pool, bind, review::Fetcher::new(source)).await?;
+        }
+        Command::Subsonic { bind } => {
+            let credentials = subsonic_credentials
+                .context("the Subsonic login is read before the database is opened")?;
+            subsonic::serve(pool, bind, credentials).await?;
         }
         Command::Index { action } => match action {
             IndexAction::Build {
@@ -911,6 +936,13 @@ mod tests {
     fn serve_can_fetch_from_the_indexes() {
         assert!(parse(&["serve", "--offline"]).is_ok());
         assert!(parse(&["serve", "--bind", "127.0.0.1:0", "--offline"]).is_ok());
+    }
+
+    #[test]
+    fn subsonic_takes_a_bind_address() {
+        assert!(parse(&["subsonic"]).is_ok());
+        assert!(parse(&["subsonic", "--bind", "0.0.0.0:4533"]).is_ok());
+        assert!(parse(&["subsonic", "--bind", "nonsense"]).is_err());
     }
 
     #[test]

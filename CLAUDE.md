@@ -24,7 +24,7 @@ cargo test --test cli some_test_name     # one integration test file in tests/
 
 The full suite takes about 40 seconds. The single `#[ignore]`d test is a live Discogs smoke test (`RADISH_DISCOGS_TOKEN=… RADISH_DISCOGS_RELEASE_ID=… cargo test --lib live_smoke -- --ignored`); no other test needs the network or credentials.
 
-Manual runs: `cargo run -- --db /tmp/radish-dev.db import /path/to/music`, then `list`, `search`, `releases`, `match`, or `watch` with the same `--db` (default `./radish.db`).
+Manual runs: `cargo run -- --db /tmp/radish-dev.db import /path/to/music`, then `list`, `search`, `releases`, `match`, `watch`, or `subsonic` (needs `RADISH_SUBSONIC_USER` and `RADISH_SUBSONIC_PASSWORD`) with the same `--db` (default `./radish.db`).
 
 ## Architecture
 
@@ -49,6 +49,16 @@ The providers run as a chain: MusicBrainz, then Discogs, then Deezer when the ru
 **Review summaries (`src/store/reviews.rs`).** Each `match_reviews` row stores a summary of its first candidate (`top_score`, `top_can_apply`, `top_reason`, `top_blockers`), computed by `store::summarize` (the Accept button's `matcher::mapping_can_apply`) and written by every review writer; `store::fill_review_summaries` fills every row whose `top_can_apply` is NULL (saved before the columns existed, or reset by a migration) on each open, from `db::initialize`. The queue's sort and filters (`store::QueueView`: provider, sort, acceptable) read them through `idx_match_reviews_summary`; `Lead` is the review that places a release in a view.
 
 **Web interface (`serve`).** `web.rs` is an axum server without JavaScript over the same store: Status (`store::library_status`), Tracks (`store::track_page`, the query behind `list` and `search`), Releases (`store::list_local_releases`), Review (`web/review.rs`: the queue from `store::queue_page`, one release from `review::load`) and Folders (`store::list_folder_units`, `store::folder_view`). Its two writes are `POST /folder` (a folder decision) and `POST /review` (accept a saved candidate with `review::accept_saved`, or fetch a release by ID with `review::Fetcher` and store it with `review::add_fetched`). Both need the process's form token, refuse `Sec-Fetch-Site` other than `same-origin`, and are refused (`403`) unless the server is bound to a loopback address; the routes exist on every bind. Pages are built by pure `render_*` functions, and every untrusted value goes through `web::escape_html` (`output::Clean`, then HTML escaping). The stylesheet is `src/web/style.css`, inlined into every page with `include_str!`. Errors are rendered by `web::error_page` (a page with the header and a link back); only the foreign-`Host` 403 and requests the pages never send stay bare. It binds to loopback by default, and a `guard` middleware rejects foreign `Host` headers (DNS rebinding) and adds the security headers to every response. `layout.rs` holds the plain-text helpers shared by the CLI listings and the pages (`plural`, `grouped`, `Table`, `format_duration`, `track_number`).
+
+**Subsonic API (`subsonic`).**
+- `subsonic.rs` serves the OpenSubsonic API for music players at `/rest/<method>`, also spelled `.view`, by GET or form POST.
+- It has one route that dispatches on the method name (`subsonic::call`).
+- **Login.** Every method but `getOpenSubsonicExtensions` authenticates against `RADISH_SUBSONIC_USER`/`RADISH_SUBSONIC_PASSWORD` (`subsonic::USER_VAR`, `subsonic::PASSWORD_VAR`, which `DOTENV_KEYS` uses), by password or salted MD5 token (`subsonic/auth.rs`). `main.rs::run` reads the credentials before it opens the database.
+- **Responses.** Payloads are serde values. `subsonic/response.rs` renders them as JSON or as Subsonic XML (scalars become attributes); its escaper replaces characters XML cannot carry. Errors are `status="failed"` with HTTP 200.
+- **IDs** are `tr-`/`al-`/`ar-` (`subsonic/ids.rs`). An artist ID is the hex of its key, ASCII-lowercased, to match `COLLATE NOCASE`.
+- **SQL.** All of it is in `store/library.rs`: effective releases, artists and tracks, run per request with no cache. It shares the effective-track fragments (`effective_track_title!` and the others, defined above `mod folders;` in `store.rs`) with `track_rows`, so the API and `list`/`search` agree. Its queries page release and track IDs first, then read the columns for that page (`release_page!`), so deep pages stay fast on 2.76M tracks.
+- **Files.** `subsonic/media.rs` streams files raw with single-range support and finds cover art.
+- **Read-only.** There is no per-user state and no transcoding.
 
 Layering rules:
 - Adapters (`musicbrainz.rs`, `discogs.rs`, `deezer.rs`) convert service payloads into `matcher::RemoteRelease`; provider types never reach `matcher` or `store`. Typed identities (`ReleaseId`, `Mbid`, `ProviderKind`) live in `providers.rs` and are stored as `(provider, TEXT id)`.
